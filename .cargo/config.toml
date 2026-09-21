@@ -1,0 +1,11 @@
+[env]
+WHISPER_DONT_GENERATE_BINDINGS = "1"
+# ggml defaults to sm 52/61/70/75 (ggml/src/CMakeLists.txt), which CUDA 13.4
+# no longer supports. 120 = Blackwell (RTX 5070).
+CMAKE_CUDA_ARCHITECTURES = "120"
+# whisper.cpp 1.7.1 (vendored by whisper-rs-sys) force-sets CMAKE_CXX_STANDARD
+# to 11 and never sets CMAKE_CUDA_STANDARD, so nvcc falls back to its default
+# host dialect. CUDA 13.4's bundled CCCL headers (cub/thrust/libcu++) hard-
+# require C++17, so .cu files fail to compile without this.
+CMAKE_CUDA_STANDARD = "17"
+CMAKE_CUDA_STANDARD_REQUIRED = "ON"

@@ -1,0 +1,17 @@
+[package]
+name = "sttd"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time Speech-to-Text pipeline: cpal + rubato + nnnoiseless + webrtc-vad + whisper-rs"
+license = "MIT"
+
+[dependencies]
+cpal = "0.15"
+rubato = "0.15"
+nnnoiseless = "0.5"
+webrtc-vad = "0.2"
+whisper-rs = { version = "0.13", features = ["cuda"] }
+crossbeam-channel = "0.5"
+ureq = "2"
+anyhow = "1"
+ctrlc = "3"
