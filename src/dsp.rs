@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use rubato::{FftFixedInOut, Resampler};
+use resampler::{ResamplerFft, SampleRate};
 
 // ---------------------------------------------------------------------------
-// Signal primitives: channel downmix + resampler construction
+// Signal primitives: channel downmix + resampling
 // ---------------------------------------------------------------------------
 
 /// Downmix an interleaved multi-channel buffer to mono by averaging.
@@ -15,56 +15,156 @@ pub(crate) fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Build an hw_rate -> `target_rate` resampler with a fixed ~10 ms input
-/// chunk size, so its output lands on a round 10 ms frame count at
-/// `target_rate` (480 for 48 kHz, 160 for 16 kHz). Shared by both
-/// `FrameProcessor` resamplers (`resampler_hw48`, and the `DirectTo16k`
-/// variant of `whisper_resample`) — one formula, so their input chunk sizes
-/// agree whenever that's mathematically possible (see `WhisperResample`).
-pub(crate) fn resampler_for(
-    hw_rate: u32,
-    target_rate: u32,
-) -> Result<(FftFixedInOut<f32>, usize)> {
-    let desired_in = ((hw_rate as f64 / 100.0).round() as usize).max(1);
-    let resampler = FftFixedInOut::<f32>::new(hw_rate as usize, target_rate as usize, desired_in, 1)
-        .with_context(|| format!("failed to create rubato resampler (hw -> {target_rate})"))?;
-    let input_frames = resampler.input_frames_next();
-    Ok((resampler, input_frames))
+/// Raw hw-rate samples per ~10 ms chunk: the external framing every caller
+/// feeds `FrameProcessor::process_frame` with. Deliberately independent of
+/// `ResamplerFft`'s own fixed chunk sizes (see `FftStream`) so the capture
+/// loop and file mode never change with the resampler.
+pub(crate) fn hw_input_frames(hw_rate: u32) -> usize {
+    ((hw_rate as f64 / 100.0).round() as usize).max(1)
 }
 
-/// How the whisper branch gets from hw_rate down to 16 kHz.
+/// Streaming adapter over `ResamplerFft`, whose chunk sizes are fixed
+/// internally (e.g. 1176 in / 1280 out for 44.1 kHz -> 48 kHz) instead of
+/// caller-chosen like rubato's used to be.
 ///
-/// `DirectTo16k` is one resampling hop instead of two (hw -> 48k -> 16k): the
-/// whisper branch never uses the 48 kHz intermediate for anything (it
-/// exists only so RNNoise, which is fixed at 48 kHz, can run for the VAD
-/// branch), so paying for it was pure waste. It's only valid when a
-/// hw_rate -> 16 kHz resampler consumes the *same* input chunk size as the
-/// hw_rate -> 48 kHz one (verified for 16k/44.1k/48k/96k hw rates in
-/// `dual_resamplers_agree_on_input_frames`) — otherwise the two branches
-/// would desync in time. `Via48k` is the original hw->48k->16k path,
-/// reusing the VAD branch's already-resampled 48 kHz frame, kept as a
-/// fallback for any hw rate where that assumption doesn't hold.
-pub(crate) enum WhisperResample {
-    DirectTo16k {
-        resampler: FftFixedInOut<f32>,
-        in_buf: Vec<Vec<f32>>,
-        out_buf: Vec<Vec<f32>>,
-    },
-    Via48k {
-        resampler: FftFixedInOut<f32>,
-        in_buf: Vec<Vec<f32>>,
-        out_buf: Vec<Vec<f32>>,
-    },
+/// `feed` accepts any input length and returns the complete `frame_out`-sized
+/// output frames (480 for 48 kHz, 160 for 16 kHz) it completes; any remainder
+/// stays buffered for the next call. Equal in/out rates bypass the FFT
+/// entirely (bit-exact passthrough) instead of smearing the signal through a
+/// needless round trip.
+///
+/// Both branches keep their own adapter and pair up output frames by order
+/// (see `FrameProcessor::process_frame`): the fixed chunks complete on a
+/// different cadence per branch, so a strict one-call-one-frame mapping is
+/// impossible. Catch-up bursts are bounded — both branches average 100
+/// frames/s — and the queues absorb them.
+///
+/// The first output chunk carries the FFT overlap-add startup transient
+/// (overlaps start at zero) and every output lags the input by `delay()`
+/// input samples; both are absorbed by pre-roll (300 ms) and the silence
+/// hangover (800 ms) the same way earshot's own 16 ms prediction window is.
+pub(crate) struct FftStream {
+    inner: Option<ResamplerFft>,
+    chunk_in: usize,
+    chunk_out: usize,
+    frame_out: usize,
+    pending_in: Vec<f32>,
+    pending_out: Vec<f32>,
+    scratch_in: Vec<f32>,
+    scratch_out: Vec<f32>,
+}
+
+impl FftStream {
+    pub(crate) fn new(in_rate: u32, out_rate: u32, frame_out: usize) -> Result<Self> {
+        if in_rate == out_rate {
+            return Ok(Self {
+                inner: None,
+                chunk_in: frame_out,
+                chunk_out: frame_out,
+                frame_out,
+                pending_in: Vec::new(),
+                pending_out: Vec::new(),
+                scratch_in: Vec::new(),
+                scratch_out: Vec::new(),
+            });
+        }
+        let in_sr = SampleRate::try_from(in_rate)
+            .map_err(|_| supported_rates_error(in_rate))
+            .with_context(|| format!("unsupported input sample rate for ResamplerFft: {in_rate} Hz"))?;
+        let out_sr = SampleRate::try_from(out_rate)
+            .map_err(|_| supported_rates_error(out_rate))
+            .with_context(|| {
+                format!("unsupported output sample rate for ResamplerFft: {out_rate} Hz")
+            })?;
+        let inner = ResamplerFft::new(1, in_sr, out_sr);
+        let chunk_in = inner.chunk_size_input();
+        let chunk_out = inner.chunk_size_output();
+        let scratch_in = vec![0.0f32; chunk_in];
+        let scratch_out = vec![0.0f32; chunk_out];
+        Ok(Self {
+            inner: Some(inner),
+            chunk_in,
+            chunk_out,
+            frame_out,
+            pending_in: Vec::new(),
+            pending_out: Vec::new(),
+            scratch_in,
+            scratch_out,
+        })
+    }
+
+    /// Fixed FFT chunk sizes `(in, out)`; `(frame_out, frame_out)` when
+    /// passing through. For startup logging only.
+    pub(crate) fn chunk_sizes(&self) -> (usize, usize) {
+        (self.chunk_in, self.chunk_out)
+    }
+
+    /// Feed arbitrary input samples; returns every complete `frame_out`-sized
+    /// output frame this input completes (usually 0-2 at 10 ms input
+    /// cadence, occasionally more on catch-up).
+    pub(crate) fn feed(&mut self, input: &[f32]) -> Vec<Vec<f32>> {
+        match self.inner.as_mut() {
+            Some(inner) => {
+                self.pending_in.extend_from_slice(input);
+                while self.pending_in.len() >= self.chunk_in {
+                    self.scratch_in.copy_from_slice(&self.pending_in[..self.chunk_in]);
+                    // Cannot fail: scratch buffers are exactly chunk-sized,
+                    // the only error condition on mono input.
+                    inner
+                        .resample(&self.scratch_in, &mut self.scratch_out)
+                        .expect("FftStream scratch buffers are ResamplerFft chunk-sized");
+                    self.pending_out.extend_from_slice(&self.scratch_out);
+                    self.pending_in.drain(..self.chunk_in);
+                }
+            }
+            None => self.pending_out.extend_from_slice(input),
+        }
+        self.drain_frames()
+    }
+
+    /// Zero-pad a trailing partial input chunk through one final resample so
+    /// tail audio (up to one FFT chunk) isn't lost at shutdown, then return
+    /// every complete output frame left buffered. A trailing partial frame
+    /// (< `frame_out` samples) is still dropped, same as before.
+    pub(crate) fn flush(&mut self) -> Vec<Vec<f32>> {
+        if self.inner.is_some() && !self.pending_in.is_empty() {
+            self.pending_in.resize(self.chunk_in, 0.0);
+            let chunk: Vec<f32> = self.pending_in.drain(..).collect();
+            // Same guarantee as in `feed`: exact chunk size, cannot fail.
+            self.scratch_in.copy_from_slice(&chunk);
+            self.inner
+                .as_mut()
+                .expect("checked is_some above")
+                .resample(&self.scratch_in, &mut self.scratch_out)
+                .expect("FftStream scratch buffers are ResamplerFft chunk-sized");
+            self.pending_out.extend_from_slice(&self.scratch_out);
+        }
+        self.drain_frames()
+    }
+
+    fn drain_frames(&mut self) -> Vec<Vec<f32>> {
+        let mut frames = Vec::new();
+        while self.pending_out.len() >= self.frame_out {
+            frames.push(self.pending_out.drain(..self.frame_out).collect());
+        }
+        frames
+    }
+}
+
+fn supported_rates_error(rate: u32) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{rate} Hz is not a ResamplerFft rate (supported: 16000, 22050, 32000, 44100, \
+         48000, 88200, 96000, 176400, 192000, 384000)"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{DENOISE_RATE, FRAME_16K, FRAME_48K, WHISPER_RATE};
-    use nnnoiseless::DenoiseState;
 
-    /// Test oracle for the raw hw-rate chunk size `resampler_for` settles on:
-    /// a 10 ms slice of the hardware rate.
+    /// Test oracle for the raw hw-rate chunk size `hw_input_frames` settles
+    /// on: a 10 ms slice of the hardware rate.
     fn expected_input_chunk_for(hw_rate: u32) -> usize {
         ((hw_rate as f64 * FRAME_48K as f64 / DENOISE_RATE as f64).round() as usize).max(1)
     }
@@ -81,44 +181,104 @@ mod tests {
         assert_eq!(expected_input_chunk_for(48_000), 480);
         assert_eq!(expected_input_chunk_for(16_000), 160);
         assert_eq!(expected_input_chunk_for(96_000), 960);
-    }
-
-    #[test]
-    fn nnnoiseless_frame_size_is_480() {
-        assert_eq!(DenoiseState::FRAME_SIZE, FRAME_48K);
-    }
-
-    #[test]
-    fn rubato_produces_480_for_common_rates() {
         for hw in [16_000, 44_100, 48_000, 96_000] {
-            let chunk = expected_input_chunk_for(hw);
-            let resampler = FftFixedInOut::<f32>::new(hw as usize, 48_000, chunk, 1).unwrap();
-            assert_eq!(resampler.output_frames_next(), 480, "hw={hw}");
+            assert_eq!(hw_input_frames(hw), expected_input_chunk_for(hw));
         }
     }
 
     #[test]
-    fn rubato_48k_to_16k_produces_160() {
-        let resampler = FftFixedInOut::<f32>::new(48_000, 16_000, FRAME_48K, 1).unwrap();
-        assert_eq!(resampler.input_frames_next(), FRAME_48K);
-        assert_eq!(resampler.output_frames_next(), FRAME_16K);
+    fn passthrough_is_bit_exact() {
+        let mut s = FftStream::new(DENOISE_RATE, DENOISE_RATE, FRAME_48K).unwrap();
+        let input: Vec<f32> = (0..960).map(|i| i as f32 / 960.0).collect();
+        let frames = s.feed(&input);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.concat(), input);
+        // Nothing buffered: passthrough drains exactly.
+        assert!(s.flush().is_empty());
     }
 
     #[test]
-    fn dual_resamplers_agree_on_input_frames() {
-        // `FrameProcessor::new` only takes the `WhisperResample::DirectTo16k`
-        // (single-hop hw->16k) path when a hw->16k resampler consumes the
-        // same input chunk size as the hw->48k one, since both are fed from
-        // the same raw stream in lockstep. Confirms that holds for common
-        // rates, and that both branches still land on a round 10 ms frame
-        // count (480 @ 48k, 160 @ 16k) — i.e. that `resampler_for`'s single
-        // formula (`hw_rate / 100`) is the right one for both targets.
-        for hw in [16_000, 44_100, 48_000, 96_000] {
-            let (r48, in48) = resampler_for(hw, DENOISE_RATE).unwrap();
-            let (r16, in16) = resampler_for(hw, WHISPER_RATE).unwrap();
-            assert_eq!(in48, in16, "hw={hw}: input chunk sizes must match");
-            assert_eq!(r48.output_frames_next(), FRAME_48K, "hw={hw}");
-            assert_eq!(r16.output_frames_next(), FRAME_16K, "hw={hw}");
+    fn fft_48k_to_16k_tracks_input() {
+        // 200 input frames of 480 must yield ~200 output frames of 160:
+        // buffering/short bursts may shift the count by a frame or two, but
+        // every drained frame is exactly sized.
+        let mut s = FftStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K).unwrap();
+        let mut count = 0;
+        for _ in 0..200 {
+            for f in s.feed(&vec![0.0f32; FRAME_48K]) {
+                assert_eq!(f.len(), FRAME_16K);
+                count += 1;
+            }
         }
+        for f in s.flush() {
+            assert_eq!(f.len(), FRAME_16K);
+            count += 1;
+        }
+        assert!(
+            (198..=203).contains(&count),
+            "expected ~200 frames, got {count}"
+        );
+    }
+
+    #[test]
+    fn hw_streams_track_input_for_common_rates() {
+        // Both branches fed the same 10 ms hw chunks must stay in lockstep
+        // (pairing by order in `FrameProcessor` relies on it): equal frame
+        // counts within burst tolerance, exact frame sizes always.
+        for hw in [16_000, 44_100, 48_000, 96_000] {
+            let hw_chunk = hw_input_frames(hw);
+            let mut s48 = FftStream::new(hw, DENOISE_RATE, FRAME_48K).unwrap();
+            let mut s16 = FftStream::new(hw, WHISPER_RATE, FRAME_16K).unwrap();
+            let (mut n48, mut n16) = (0, 0);
+            for _ in 0..200 {
+                let input = vec![0.0f32; hw_chunk];
+                for f in s48.feed(&input) {
+                    assert_eq!(f.len(), FRAME_48K, "hw={hw}");
+                    n48 += 1;
+                }
+                for f in s16.feed(&input) {
+                    assert_eq!(f.len(), FRAME_16K, "hw={hw}");
+                    n16 += 1;
+                }
+            }
+            n48 += s48.flush().len();
+            n16 += s16.flush().len();
+            for (n, want) in [(n48, 200), (n16, 200)] {
+                assert!((198..=203).contains(&n), "hw={hw}: expected ~{want} frames, got {n}");
+            }
+            assert!(
+                n48.abs_diff(n16) <= 2,
+                "hw={hw}: branches diverged ({n48} vs {n16})"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_rates_error() {
+        assert!(FftStream::new(8_000, DENOISE_RATE, FRAME_48K).is_err());
+        assert!(FftStream::new(11_025, WHISPER_RATE, FRAME_16K).is_err());
+        assert!(FftStream::new(24_000, DENOISE_RATE, FRAME_48K).is_err());
+    }
+
+    #[test]
+    fn flush_recovers_trailing_partial_chunk() {
+        // 48k -> 16k needs 768 samples per FFT chunk: two 480-frame feeds
+        // complete one chunk (256 out), leaving 192 buffered. Without a
+        // flush that tail audio would be lost at shutdown.
+        let mut s = FftStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K).unwrap();
+        let fed: usize = (0..2)
+            .map(|_| s.feed(&vec![0.1f32; FRAME_48K]).len())
+            .sum();
+        assert_eq!(fed, 1);
+        let flushed = s.flush();
+        assert!(!flushed.is_empty(), "flush must recover the tail");
+        for f in &flushed {
+            assert_eq!(f.len(), FRAME_16K);
+        }
+        // Steady state plus the padded tail: 960 in -> one 768-chunk (256
+        // out) fed, then the 192-sample remainder padded to a full chunk
+        // (256 more out) = 512 samples = 3 frames; the last 32 samples are
+        // a partial frame and stay dropped.
+        assert_eq!(fed + flushed.len(), 3);
     }
 }

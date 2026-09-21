@@ -1,11 +1,16 @@
 //! Real-time Speech-to-Text pipeline.
 //!
 //! Data flow:
-//! `cpal` (hw rate, stereo) -> downmix mono -> per ~10 ms raw chunk, two
-//! independent `resampler` resamplings (`FrameProcessor`: `ResamplerFft`
-//! behind a 10 ms framing adapter, see `FftStream`):
-//!   - VAD branch:     `resampler` (-> 48 kHz) -> denoise (`STTD_DENOISER`: deepfilter/rnnoise/none, see `denoise`) -> `resampler` (-> 16 kHz) -> `earshot`
-//!   - whisper branch: `resampler` (-> 16 kHz, direct hop) -> utterance buffer
+//! `cpal` (hw rate, stereo) -> downmix mono -> per ~10 ms raw chunk
+//! (`FrameProcessor`: `ResamplerFft` behind a 10 ms framing adapter, see
+//! `FftStream`). By default (`STTD_DENOISER` unset) a single `resampler`
+//! hop (-> 16 kHz) feeds both branches below, each completed frame serving
+//! both roles; with `STTD_DENOISER=deepfilter` the VAD branch instead takes
+//! a 48 kHz detour:
+//!   - VAD branch:     `resampler` (-> 16 kHz, shared hop) -> `earshot`,
+//!       or `resampler` (-> 48 kHz) -> denoise (`deepfilter`, see `denoise`)
+//!       -> `resampler` (-> 16 kHz) -> `earshot`
+//!   - whisper branch: `resampler` (-> 16 kHz, direct hop, raw) -> utterance buffer
 //! An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive speech
 //! frames (a single VAD false positive no longer opens one), with ~300 ms of
 //! pre-roll prepended at that point so quiet word starts aren't clipped.
@@ -92,7 +97,7 @@ fn print_usage() {
          ENV:\n\
          \x20   WHISPER_MODEL_PATH    path to a ggml model (default: {DEFAULT_MODEL_PATH})\n\
          \x20   STTD_DEVICE           substring match (case-insensitive) against an input device name\n\
-         \x20   STTD_DENOISER         VAD-branch denoiser: deepfilter|rnnoise|none (default: deepfilter)\n\
+         \x20   STTD_DENOISER         VAD-branch denoiser: deepfilter|none (default: none)\n\
          \x20   STTD_PROMPT           override the whisper initial_prompt\n\
          \x20   STTD_DUMP_DIR         write each utterance as WAV+TXT into this directory (TXT written\n\
          \x20                         for dropped utterances too, prefixed with the drop reason)\n\
@@ -164,10 +169,11 @@ fn run_microphone_mode() -> Result<()> {
         }
     }
 
-    // `FrameProcessor` owns all resampling (hw -> 48k for the VAD branch,
-    // hw -> 16k for the whisper branch); building it is cheap, fallible
-    // setup like everything above, so it happens here too — before the
-    // model load below.
+    // `FrameProcessor` owns all resampling (a shared hw -> 16k hop by
+    // default, or hw -> 48k -> denoise -> 48k -> 16k for the VAD branch plus
+    // hw -> 16k for whisper with `STTD_DENOISER=deepfilter`); building it is
+    // cheap, fallible setup like everything above, so it happens here too —
+    // before the model load below.
     let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
     let mut fp = FrameProcessor::new(hw_rate, whisper_tx)?;
     let input_frames = fp.required_input_frames();

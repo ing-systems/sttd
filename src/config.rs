@@ -2,13 +2,12 @@
 // Constants / config
 // ---------------------------------------------------------------------------
 
-/// Sample rate required by the VAD branch's denoiser. Shared by both
-/// `STTD_DENOISER` variants: `nnnoiseless` (RNNoise) needs 48 kHz, and the
-/// bundled DeepFilterNet3 model (see `denoise`) happens to be trained at the
-/// same rate, so switching denoisers never touches the resampling chain.
+/// Sample rate required by the VAD branch's denoiser (DeepFilterNet3,
+/// opt-in via `STTD_DENOISER=deepfilter`; see `denoise`). Only the denoised
+/// VAD path uses this rate — the default bypass path resamples straight
+/// from the hw rate to 16 kHz with no 48 kHz intermediate.
 pub(crate) const DENOISE_RATE: u32 = 48_000;
-/// Samples per 10 ms frame at 48 kHz (`DenoiseState::FRAME_SIZE`, and
-/// DeepFilterNet3's `hop_size` — both denoisers agree on this frame size).
+/// Samples per 10 ms frame at 48 kHz (DeepFilterNet3's `hop_size`).
 pub(crate) const FRAME_48K: usize = 480;
 /// Sample rate required by whisper + VAD.
 pub(crate) const WHISPER_RATE: u32 = 16_000;

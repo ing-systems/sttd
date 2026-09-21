@@ -82,17 +82,18 @@ _Avoid_: false positive, noise, garbage
 
 **VAD branch**:
 The signal path whose only job is to judge speech from not-speech:
-denoised and resampled down to the judged rate. Nothing on this branch is ever
+resampled down to the judged rate. Nothing on this branch is ever
 transcribed.
 _Avoid_: detection path, analysis branch
 
 **Denoiser**:
 The model that cleans the VAD branch's 48 kHz frame before it's resampled
-down and handed to `earshot`. Selectable via `STTD_DENOISER`
-(deepfilter/rnnoise/none); only ever runs on the VAD branch, never on the
-whisper branch. The default, DeepFilterNet3, adds a 20 ms lookahead ahead of
-its own output, absorbed by pre-roll (300 ms) and silence hangover (800 ms)
-the same way `earshot`'s own 16 ms prediction window is.
+down and handed to `earshot`. Opt-in via `STTD_DENOISER=deepfilter`
+(default `none`: no denoising, no 48 kHz intermediate — see `direct hop`);
+only ever runs on the VAD branch, never on the whisper branch. DeepFilterNet3
+adds a 20 ms lookahead ahead of its own output, absorbed by pre-roll
+(300 ms) and silence hangover (800 ms) the same way `earshot`'s own 16 ms
+prediction window is.
 _Avoid_: noise suppression (generic), the denoiser (as if only one exists)
 
 **Whisper branch**:
@@ -100,9 +101,10 @@ The signal path that gets transcribed, kept raw and undenoised, because the
 model was trained on raw audio. Its samples are what an utterance is made of.
 _Avoid_: audio branch, main path
 
-**Direct hop / via the 48 kHz intermediate**:
-The whisper branch reaches the model's rate in either one resampling step or
-two, the longer route passing through the rate the denoiser demands. The
-two-step form is the fallback for hardware rates where the one-step form cannot
-stay lined up in time with the VAD branch.
+**Direct hop**:
+The default path to the judged/transcribed rate: hw rate straight to 16 kHz
+in one resampling step, feeding both the VAD verdict and the utterance
+buffer. Only `STTD_DENOISER=deepfilter` routes the VAD branch through the
+48 kHz rate the denoiser demands — that intermediate exists only for the
+denoised VAD branch.
 _Avoid_: upsampling, downsampling, conversion chain
