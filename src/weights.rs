@@ -4,14 +4,18 @@ use anyhow::{Context, Result};
 
 use crate::config::{DEFAULT_MODEL_PATH, MODEL_BASE_URL};
 
-pub(crate) fn resolve_model_path() -> PathBuf {
+/// The whisper model file this run should use, without touching the disk:
+/// `WHISPER_MODEL_PATH` if set, the compiled-in default otherwise.
+pub(crate) fn configured_path() -> PathBuf {
     std::env::var_os("WHISPER_MODEL_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH))
 }
 
-pub(crate) fn ensure_model_available() -> Result<PathBuf> {
-    let path = resolve_model_path();
+/// `configured_path`, guaranteed to exist on return: downloads the model into
+/// place if it isn't already there.
+pub(crate) fn ensure_available() -> Result<PathBuf> {
+    let path = configured_path();
     if path.exists() {
         return Ok(path);
     }
@@ -43,11 +47,11 @@ pub(crate) fn ensure_model_available() -> Result<PathBuf> {
         "[sttd] model not found at {}, downloading {url}...",
         path.display()
     );
-    download_model(&url, &path)?;
+    download(&url, &path)?;
     Ok(path)
 }
 
-fn download_model(url: &str, dest: &Path) -> Result<()> {
+fn download(url: &str, dest: &Path) -> Result<()> {
     let tmp = dest.with_extension("part");
     let resp = ureq::get(url)
         .call()

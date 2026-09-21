@@ -3,7 +3,7 @@
 //! Data flow:
 //! `cpal` (hw rate, stereo) -> downmix mono -> per ~10 ms raw chunk, two
 //! independent `rubato` resamplings (`FrameProcessor`, see `WhisperResample`
-//! for when the second collapses to one hop instead of two):
+//! for when the whisper branch's collapses to one hop instead of two):
 //!   - VAD branch:     `rubato` (-> 48 kHz) -> `nnnoiseless` denoise -> `rubato` (-> 16 kHz) -> `webrtc-vad`
 //!   - whisper branch: `rubato` (-> 16 kHz, direct hop when possible) -> utterance buffer
 //! An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive speech
@@ -13,14 +13,14 @@
 //! or not) until `SILENCE_FRAMES_THRESHOLD` closes it — but only
 //! `MIN_SPEECH_FRAMES` worth of actual VAD-flagged speech, trimmed to
 //! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper,
-//! carried alongside its acoustic evidence (speech-frame count, RMS) as a
-//! `Clip` -> `crossbeam-channel` queue -> isolated `whisper-rs` inference
+//! carried alongside its acoustic evidence (speech-frame count, RMS) as an
+//! `Utterance` -> `crossbeam-channel` queue -> isolated `whisper-rs` inference
 //! thread (CUDA, large-v3-turbo): pre-inference gain toward `STTD_TARGET_RMS`
 //! (`apply_gain`, quiet-but-real speech only, never attenuates) -> average
 //! *text-token* probability gate (`average_text_confidence` excludes the
 //! timestamp tokens every whisper.cpp segment carries; whisper.cpp's own
-//! `no_speech_thold` being a no-op) at a threshold `confidence_threshold`
-//! relaxes when the acoustic evidence already vouches for real speech ->
+//! `no_speech_thold` being a no-op) at a floor `confidence_floor` relaxes when
+//! the acoustic evidence already vouches for real speech ->
 //! known-hallucination-boilerplate filter (`is_hallucination`).
 //!
 //! `sttd --file <wav>` runs the same pipeline offline against a WAV file
@@ -38,20 +38,23 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 mod config;
-mod audio;
-use audio::*;
-mod wav;
-use wav::*;
-mod model;
-use model::*;
+use config::{
+    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
+    DEFAULT_MODEL_PATH, DEFAULT_TARGET_RMS,
+};
+mod capture;
+use capture::*;
+mod dsp;
+mod frame;
+use frame::*;
 mod utterance;
 use utterance::*;
-mod pipeline;
-use pipeline::*;
+mod wav;
+use wav::*;
+mod weights;
+use weights::*;
 mod whisper;
 use whisper::*;
-mod cli;
-use cli::*;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -65,7 +68,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.iter().any(|a| a == "--list-devices") {
-        return list_devices();
+        return print_input_devices();
     }
     if let Some(pos) = args.iter().position(|a| a == "--file") {
         let path = args
@@ -74,14 +77,35 @@ fn main() -> Result<()> {
         return run_file_mode(Path::new(path));
     }
 
-    run_live_mode()
+    run_microphone_mode()
+}
+
+fn print_usage() {
+    eprintln!(
+        "sttd - real-time Polish speech-to-text\n\n\
+         USAGE:\n\
+         \x20   sttd                  listen on the default (or STTD_DEVICE) mic, print transcripts to stdout\n\
+         \x20   sttd --file <path>    transcribe a WAV file offline (for tuning/comparison)\n\
+         \x20   sttd --list-devices   list available input devices and exit\n\n\
+         ENV:\n\
+         \x20   WHISPER_MODEL_PATH    path to a ggml model (default: {DEFAULT_MODEL_PATH})\n\
+         \x20   STTD_DEVICE           substring match (case-insensitive) against an input device name\n\
+         \x20   STTD_PROMPT           override the whisper initial_prompt\n\
+         \x20   STTD_DUMP_DIR         write each utterance as WAV+TXT into this directory (TXT written\n\
+         \x20                         for dropped utterances too, prefixed with the drop reason)\n\
+         \x20   STTD_MIN_RMS          min speech-only RMS to keep an utterance (default: {DEFAULT_MIN_SPEECH_RMS})\n\
+         \x20   STTD_MIN_CONF         min avg token confidence, weak acoustic evidence (default: {DEFAULT_MIN_CONFIDENCE})\n\
+         \x20   STTD_MIN_CONF_STRONG  min avg token confidence, strong acoustic evidence (default: {DEFAULT_MIN_CONFIDENCE_STRONG})\n\
+         \x20   STTD_TARGET_RMS       pre-inference gain target RMS, 0 disables (default: {DEFAULT_TARGET_RMS})\n\
+         \x20   STTD_DEBUG_TOKENS     1 = dump per-token id/text/p/plog/is_timestamp to stderr\n"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Live (microphone) mode
+// Microphone mode
 // ---------------------------------------------------------------------------
 
-fn run_live_mode() -> Result<()> {
+fn run_microphone_mode() -> Result<()> {
     // Cheap, fallible audio setup first (device pick, hw config, resampler,
     // stream) — *before* loading the model onto the GPU. Spawning the whisper
     // worker starts an async CUDA context init on its own thread; if any of
@@ -125,7 +149,7 @@ fn run_live_mode() -> Result<()> {
     // Ctrl-C sets the flag; the loop below flushes trailing speech first.
     {
         let running = Arc::clone(&running);
-        if let Err(e) = ctrlc_handler(move || running.store(false, Ordering::SeqCst)) {
+        if let Err(e) = install_ctrlc_handler(move || running.store(false, Ordering::SeqCst)) {
             eprintln!("[sttd] warning: {e:?} (Ctrl-C will terminate immediately)");
         }
     }
@@ -134,13 +158,13 @@ fn run_live_mode() -> Result<()> {
     // hw -> 16k for the whisper branch); building it is cheap, fallible
     // setup like everything above, so it happens here too — before the
     // model load below.
-    let (whisper_tx, whisper_rx): (Sender<Clip>, Receiver<Clip>) = unbounded();
+    let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
     let mut fp = FrameProcessor::new(hw_rate, whisper_tx)?;
-    let input_frames = fp.input_frames();
+    let input_frames = fp.required_input_frames();
 
     // ---- now the heavy part: resolve/download the model and load it onto
     // the GPU on its own thread. Capture is already running above.
-    let model_path = ensure_model_available()?;
+    let model_path = ensure_available()?;
     eprintln!("[sttd] model: {}", model_path.display());
     let whisper_handle = spawn_whisper_worker(whisper_rx, model_path);
 
@@ -170,11 +194,18 @@ fn run_live_mode() -> Result<()> {
     // exits — otherwise the last utterance can be silently dropped, and an
     // in-flight CUDA op can race process teardown the same way an early `?`
     // above used to.
-    fp.finish();
+    fp.flush_trailing_speech();
     drop(fp);
     whisper_handle.join().ok();
     eprintln!("[sttd] stopped");
     Ok(())
+}
+
+/// Install the Ctrl-C handler that stops the processing loop. A failed
+/// install isn't fatal: Ctrl-C then terminates the process immediately,
+/// losing only the trailing-speech flush.
+fn install_ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
+    ctrlc::set_handler(cb).context("failed to install Ctrl-C handler")
 }
 
 // ---------------------------------------------------------------------------
@@ -182,8 +213,8 @@ fn run_live_mode() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_file_mode(path: &Path) -> Result<()> {
-    // Same ordering rationale as run_live_mode: do the cheap, fallible setup
-    // (read + validate the WAV, build the resampler) before loading the
+    // Same ordering rationale as run_microphone_mode: do the cheap, fallible
+    // setup (read + validate the WAV, build the resampler) before loading the
     // model onto the GPU, so a bad file fails fast instead of racing
     // whisper.cpp's CUDA teardown.
     let wav = read_wav_mono_f32(path)?;
@@ -195,11 +226,11 @@ fn run_file_mode(path: &Path) -> Result<()> {
         wav.samples.len() as f64 / wav.sample_rate as f64
     );
 
-    let (whisper_tx, whisper_rx): (Sender<Clip>, Receiver<Clip>) = unbounded();
+    let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
     let mut fp = FrameProcessor::new(wav.sample_rate, whisper_tx.clone())?;
-    let input_frames = fp.input_frames();
+    let input_frames = fp.required_input_frames();
 
-    let model_path = ensure_model_available()?;
+    let model_path = ensure_available()?;
     eprintln!("[sttd] model: {}", model_path.display());
     let whisper_handle = spawn_whisper_worker(whisper_rx, model_path);
 
@@ -210,7 +241,7 @@ fn run_file_mode(path: &Path) -> Result<()> {
     }
     // A trailing partial chunk (< input_frames samples, at most ~30 ms) is
     // dropped; fine for offline comparison runs.
-    fp.finish();
+    fp.flush_trailing_speech();
 
     drop(fp);
     drop(whisper_tx);

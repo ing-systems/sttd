@@ -1,19 +1,48 @@
 use anyhow::{Context, Result};
-use cpal::traits::DeviceTrait;
+use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::Sender;
 
+use crate::dsp::downmix_to_mono;
+
 // ---------------------------------------------------------------------------
-// Capture
+// Input device: discovery, selection, capture
 // ---------------------------------------------------------------------------
 
-/// Downmix an interleaved multi-channel buffer to mono by averaging.
-pub(crate) fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
-    if channels <= 1 {
-        return data.to_vec();
+/// Print every available input device and its default config to stdout.
+pub(crate) fn print_input_devices() -> Result<()> {
+    let host = cpal::default_host();
+    for device in host
+        .input_devices()
+        .context("failed to enumerate input devices")?
+    {
+        let name = device.name().unwrap_or_else(|_| "<unknown>".into());
+        match device.default_input_config() {
+            Ok(cfg) => println!("{name}  ({} Hz, {} ch)", cfg.sample_rate().0, cfg.channels()),
+            Err(_) => println!("{name}  (config unavailable)"),
+        }
     }
-    data.chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
+    Ok(())
+}
+
+/// Pick the input device: `STTD_DEVICE` (substring match, case-insensitive)
+/// if set, otherwise the system default. Without this the tool is stuck on
+/// whatever the OS considers the default mic (e.g. a webcam capsule).
+pub(crate) fn select_input_device(host: &cpal::Host) -> Result<cpal::Device> {
+    if let Ok(wanted) = std::env::var("STTD_DEVICE") {
+        let wanted_lower = wanted.to_lowercase();
+        let mut devices = host
+            .input_devices()
+            .context("failed to enumerate input devices")?;
+        let found = devices.find(|d| {
+            d.name()
+                .map(|n| n.to_lowercase().contains(&wanted_lower))
+                .unwrap_or(false)
+        });
+        return found
+            .with_context(|| format!("STTD_DEVICE={wanted:?} matched no input device (see --list-devices)"));
+    }
+    host.default_input_device()
+        .context("no default input device available")
 }
 
 /// Build the cpal input stream for the device's native sample format.
@@ -84,24 +113,5 @@ pub(crate) fn build_input_stream(
             Ok(stream)
         }
         fmt => anyhow::bail!("unsupported sample format: {fmt:?}"),
-    }
-}
-
-/// Install a Ctrl-C handler that flips `running` to false.
-///
-/// Uses the `ctrlc` crate so the main loop can flush trailing speech before
-/// exiting. Failures are logged, never fatal.
-pub(crate) fn ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
-    ctrlc::set_handler(cb).context("failed to install Ctrl-C handler")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn downmix_averages_channels() {
-        assert_eq!(downmix_to_mono(&[1.0, 3.0, 2.0, 4.0], 2), vec![2.0, 3.0]);
-        assert_eq!(downmix_to_mono(&[1.0, 2.0, 3.0], 1), vec![1.0, 2.0, 3.0]);
     }
 }

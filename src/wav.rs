@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::audio::downmix_to_mono;
+use crate::dsp::downmix_to_mono;
 
 // ---------------------------------------------------------------------------
 // WAV I/O (utterance dumps + `--file` mode); no extra dependency.

@@ -57,18 +57,18 @@ pub(crate) const MAX_UTTERANCE_SAMPLES: usize = WHISPER_RATE as usize * 30;
 /// signal. ~-50 dBFS. Override with `STTD_MIN_RMS` while tuning against real
 /// mic noise.
 pub(crate) const DEFAULT_MIN_SPEECH_RMS: f32 = 0.003;
-/// Target speech-only RMS for the pre-inference gain applied to a clip that
-/// already cleared the acoustic gates (see `apply_gain`). Only ever
+/// Target speech-only RMS for the pre-inference gain applied to an utterance
+/// that already cleared the acoustic gates (see `apply_gain`). Only ever
 /// amplifies, never attenuates — quiet-but-real speech (e.g. the
 /// rms=0.01178 case that prompted this) gets a boost toward whisper's
 /// comfort zone. `0` disables gain entirely. Override with `STTD_TARGET_RMS`.
 pub(crate) const DEFAULT_TARGET_RMS: f32 = 0.05;
 /// Ceiling on the gain `apply_gain` will apply (8x = +18 dB), so a near-
-/// silent clip that slipped past `STTD_MIN_RMS` doesn't get blown up into
-/// clipped noise.
+/// silent utterance that slipped past `STTD_MIN_RMS` doesn't get blown up
+/// into clipped noise.
 pub(crate) const MAX_GAIN: f32 = 8.0;
 /// Minimum average whisper token probability for a transcript to be kept,
-/// used when the utterance's *acoustic* evidence (see `Clip`) is weak.
+/// used when the utterance's *acoustic* evidence (see `Evidence`) is weak.
 /// whisper.cpp declares `no_speech_thold` but never reads it (`whisper.h`:
 /// `float no_speech_thold; // TODO: not implemented` — confirmed against the
 /// vendored whisper.cpp 1.7.1 source, `whisper_full_default_params` is its
@@ -77,13 +77,13 @@ pub(crate) const MAX_GAIN: f32 = 8.0;
 /// `STTD_MIN_CONF`.
 pub(crate) const DEFAULT_MIN_CONFIDENCE: f32 = 0.6;
 /// Relaxed confidence floor used when the utterance already carries strong
-/// acoustic evidence of real speech (see `confidence_threshold`). Whisper's
+/// acoustic evidence of real speech (see `confidence_floor`). Whisper's
 /// average token probability on genuine-but-hard speech regularly lands
 /// around 0.4-0.5 — the same range a silence hallucination can land in — so
 /// a single scalar threshold can't separate the two cases; VAD/RMS evidence
 /// can. Override with `STTD_MIN_CONF_STRONG`.
 pub(crate) const DEFAULT_MIN_CONFIDENCE_STRONG: f32 = 0.35;
-/// `speech_frames` (see `Utterance`) required to count as "strong" acoustic
+/// `speech_frames` (see `Evidence`) required to count as "strong" acoustic
 /// evidence: 500 ms of VAD-flagged speech, well past `MIN_SPEECH_FRAMES`.
 pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
 /// Multiple of `min_speech_rms` required to count as "strong" acoustic
@@ -91,7 +91,7 @@ pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
 pub(crate) const STRONG_RMS_FACTOR: f32 = 3.0;
 
 /// Whisper model auto-download. The URL is derived from the filename (see
-/// `ensure_model_available`), so `WHISPER_MODEL_PATH` can point at any
+/// `ensure_available`), so `WHISPER_MODEL_PATH` can point at any
 /// ggml model published in this repo, not just the compiled-in default.
 pub(crate) const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 pub(crate) const DEFAULT_MODEL_PATH: &str = "models/ggml-large-v3-turbo.bin";
@@ -109,7 +109,8 @@ pub(crate) const DEFAULT_PROMPT: &str = "Rozmowa techniczna po polsku.";
 /// on silence/low-energy audio (subtitle-credit boilerplate picked up from
 /// training data), compared after lowercasing, stripping punctuation, and
 /// folding Polish diacritics to their ASCII base letter (see
-/// `fold_diacritics`) — so patterns are written here without diacritics too.
+/// `fold_polish_diacritic`) — so patterns are written here without diacritics
+/// too.
 pub(crate) const HALLUCINATION_PATTERNS: &[&str] = &[
     "napisy stworzone przez spolecznosc amara org",
     "napisy",
@@ -124,7 +125,7 @@ pub(crate) const HALLUCINATION_PATTERNS: &[&str] = &[
 /// Read an f32 override from an env var, falling back to `default` if the
 /// var is unset or fails to parse (logging a warning in the latter case, so
 /// a typo'd override doesn't silently revert to the default).
-pub(crate) fn env_f32(key: &str, default: f32) -> f32 {
+pub(crate) fn f32_from_env(key: &str, default: f32) -> f32 {
     match std::env::var(key) {
         Ok(v) => v.trim().parse().unwrap_or_else(|_| {
             eprintln!(

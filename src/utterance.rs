@@ -1,185 +1,228 @@
 use std::collections::VecDeque;
 
-use crossbeam_channel::Sender;
-
 use crate::config::{
-    MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES, SILENCE_FRAMES_THRESHOLD,
-    STRONG_RMS_FACTOR, STRONG_SPEECH_FRAMES, TAIL_KEEP_SAMPLES,
+    FRAME_16K, MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES, RING_FRAMES,
+    SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
 };
 
-/// Per-utterance buffering state, reset every time an utterance is flushed
-/// (whether accepted or dropped). Kept as one struct rather than loose
-/// `&mut` parameters so `flush_utterance` can reset everything atomically
-/// and so new gates (see `flush_utterance`) can add fields without touching
-/// every call site.
-#[derive(Default)]
-pub(crate) struct Utterance {
-    /// Whisper-branch audio (16 kHz), from the moment the utterance opens.
-    pub(crate) buf: Vec<f32>,
-    /// Consecutive non-speech frames since the last speech frame, once the
-    /// utterance is open. Drives the close decision (`SILENCE_FRAMES_THRESHOLD`).
-    pub(crate) silence_frames: u32,
-    /// Consecutive speech frames seen before the utterance has opened.
-    /// Drives the open decision (`ONSET_SPEECH_FRAMES`); reset to 0 on any
-    /// non-speech frame.
-    pub(crate) onset_run: u32,
-    /// Total VAD-flagged speech frames over the utterance's whole life
-    /// (including pre-open onset frames). Drives `MIN_SPEECH_FRAMES`.
-    pub(crate) speech_frames: u32,
-    /// `buf.len()` as of the last speech frame appended. Used to trim
-    /// trailing silence down to `TAIL_KEEP_SAMPLES` at flush time.
-    pub(crate) samples_at_last_speech: usize,
-    /// Sum of squared samples from VAD-flagged speech frames only (silence
-    /// padding excluded), paired with `speech_sample_count` so
-    /// `flush_utterance` can compute an RMS over just the speech content.
-    pub(crate) speech_energy_sum_sq: f64,
-    pub(crate) speech_sample_count: usize,
-}
-
-/// One utterance plus the acoustic evidence `flush_utterance` gathered for
-/// it while buffering. The whisper worker needs this to decide how much
-/// trust the acoustics already earned, before deciding how much trust to
-/// demand from the model's own confidence (see `confidence_threshold`) —
-/// evidence that used to be computed and then thrown away at the
-/// `Sender<Vec<f32>>` boundary.
-pub(crate) struct Clip {
-    pub(crate) pcm: Vec<f32>,
+/// What the acoustics observed about an utterance, independent of what whisper
+/// made of it: how many frames the VAD judged to be speech, and how loud that
+/// speech was. A downstream gate needs this to tell "the model is unsure about
+/// real speech" apart from "the model invented something over silence" — the
+/// two cases a single confidence threshold can't separate (see
+/// `confidence_floor`).
+pub(crate) struct Evidence {
     /// Total VAD-flagged speech frames over the utterance's life (see
-    /// `Utterance::speech_frames`).
+    /// `UtteranceBuffer::speech_frames`).
     pub(crate) speech_frames: u32,
-    /// RMS over VAD-flagged speech frames only (see `Utterance::speech_energy_sum_sq`).
+    /// RMS over VAD-flagged speech frames only (see
+    /// `UtteranceBuffer::speech_energy_sum_sq`).
     pub(crate) rms: f32,
 }
 
-/// Confidence floor for this utterance's transcript. The confidence gate
-/// exists to catch hallucinations on silence/noise; where the acoustics
-/// already testify to real speech, it has nothing to add, and applying the
-/// strict floor anyway discards the only transcript we have. It doesn't
-/// disappear entirely: the relaxed floor still catches a repetition-loop
-/// decode (avg_p ~0.1), which isn't a transcript of anything.
-pub(crate) fn confidence_threshold(
-    clip: &Clip,
-    min_rms: f32,
-    weak: f32,
-    strong: f32,
-) -> (f32, &'static str) {
-    if clip.speech_frames >= STRONG_SPEECH_FRAMES && clip.rms >= min_rms * STRONG_RMS_FACTOR {
-        (strong, "strong")
-    } else {
-        (weak, "weak")
-    }
+/// One utterance that cleared `UtteranceBuffer::close` and is ready for
+/// whisper: the trimmed 16 kHz audio plus the `Evidence` gathered while
+/// buffering it. Evidence that used to be computed and then thrown away at the
+/// `Sender<Vec<f32>>` boundary.
+pub(crate) struct Utterance {
+    pub(crate) pcm: Vec<f32>,
+    pub(crate) evidence: Evidence,
 }
 
-/// Pure utterance-buffering decision: given the current VAD verdict, decide
-/// whether to append `frame` and whether the utterance should be flushed now.
-/// Extracted out of `FrameProcessor::process_frame` so it's unit-testable
-/// without a live VAD signal.
-///
-/// Two behaviors, both load-bearing for hallucination avoidance:
-/// - An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive
-///   speech frames, not the first one, so a single VAD false positive no
-///   longer opens (and thus sends) a full utterance. The onset frames
-///   themselves aren't lost: `preroll` already contains them by the time
-///   the utterance opens, since the caller updates it every frame
-///   regardless of `is_speech`.
-/// - Once open, every frame is appended regardless of `is_speech` (non-
-///   speech frames become natural in-utterance padding instead of being
-///   spliced out) — but `speech_frames`/`samples_at_last_speech`/energy are
-///   tracked only from VAD-flagged frames, so `flush_utterance` can later
-///   gate and trim on actual speech content instead of total buffer length.
-pub(crate) fn buffer_frame(
-    utt: &mut Utterance,
-    preroll: &VecDeque<f32>,
-    frame: &[f32],
-    is_speech: bool,
-) -> bool {
-    if is_speech {
-        utt.onset_run += 1;
-        utt.speech_frames += 1;
-        for &s in frame {
-            utt.speech_energy_sum_sq += (s as f64) * (s as f64);
-        }
-        utt.speech_sample_count += frame.len();
+/// Whether `UtteranceBuffer::push_frame` wants the caller to close the
+/// utterance and hand it on.
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) enum FrameAction {
+    Continue,
+    Flush,
+}
 
-        if utt.buf.is_empty() {
-            if utt.onset_run < ONSET_SPEECH_FRAMES {
-                return false;
+/// Per-utterance buffering state, reset every time an utterance is closed
+/// (whether accepted or dropped). Kept as one struct rather than loose
+/// `&mut` parameters so `close` can reset everything atomically and so new
+/// gates (see `close`) can add fields without touching every call site.
+///
+/// Also owns the pre-roll ring, because it has to be read on the frame that
+/// opens an utterance and written on *every* frame regardless of the VAD
+/// verdict — an invariant the caller could only uphold by remembering to. Only
+/// `reset` clears it: the ring deliberately spans utterances, holding the
+/// run-up to the *next* onset.
+#[derive(Default)]
+pub(crate) struct UtteranceBuffer {
+    /// Rolling ~300 ms of recent whisper-branch audio (see the struct doc).
+    preroll: VecDeque<f32>,
+    /// Whisper-branch audio (16 kHz), from the moment the utterance opens.
+    buf: Vec<f32>,
+    /// Consecutive non-speech frames since the last speech frame, once the
+    /// utterance is open. Drives the close decision (`SILENCE_FRAMES_THRESHOLD`).
+    silence_frames: u32,
+    /// Consecutive speech frames seen before the utterance has opened.
+    /// Drives the open decision (`ONSET_SPEECH_FRAMES`); reset to 0 on any
+    /// non-speech frame.
+    onset_run: u32,
+    /// Total VAD-flagged speech frames over the utterance's whole life
+    /// (including pre-open onset frames). Drives `MIN_SPEECH_FRAMES`.
+    speech_frames: u32,
+    /// `buf.len()` as of the last speech frame appended. Used to trim
+    /// trailing silence down to `TAIL_KEEP_SAMPLES` at close time.
+    samples_at_last_speech: usize,
+    /// Sum of squared samples from VAD-flagged speech frames only (silence
+    /// padding excluded), paired with `speech_sample_count` so
+    /// `close` can compute an RMS over just the speech content.
+    speech_energy_sum_sq: f64,
+    speech_sample_count: usize,
+}
+
+impl UtteranceBuffer {
+    pub(crate) fn new() -> Self {
+        Self {
+            preroll: VecDeque::with_capacity(RING_FRAMES * FRAME_16K),
+            ..Default::default()
+        }
+    }
+
+    /// Whether an utterance has opened and is still accumulating.
+    pub(crate) fn is_open(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
+    /// Buffer one 16 kHz frame with the VAD's verdict on it, and report whether
+    /// the utterance now wants closing. Both behaviors below are load-bearing
+    /// for hallucination avoidance:
+    /// - An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive
+    ///   speech frames, not the first one, so a single VAD false positive no
+    ///   longer opens (and thus sends) a full utterance. The onset frames
+    ///   themselves aren't lost: `record_preroll` holds them by the time the
+    ///   utterance opens, since it runs on every frame regardless of
+    ///   `is_speech`.
+    /// - Once open, every frame is appended regardless of `is_speech` (non-
+    ///   speech frames become natural in-utterance padding instead of being
+    ///   spliced out) — but `speech_frames`/`samples_at_last_speech`/energy are
+    ///   tracked only from VAD-flagged frames, so `close` can later gate and
+    ///   trim on actual speech content instead of total buffer length.
+    ///
+    /// Split from `absorb` only so the pre-roll ring can't be skipped by
+    /// `absorb`'s early returns. Unit-testable without a live VAD signal.
+    pub(crate) fn push_frame(&mut self, frame: &[f32], is_speech: bool) -> FrameAction {
+        let action = self.absorb(frame, is_speech);
+        self.record_preroll(frame);
+        action
+    }
+
+    fn absorb(&mut self, frame: &[f32], is_speech: bool) -> FrameAction {
+        if is_speech {
+            self.onset_run += 1;
+            self.speech_frames += 1;
+            for &s in frame {
+                self.speech_energy_sum_sq += (s as f64) * (s as f64);
             }
-            utt.buf.extend(preroll.iter().copied());
-        }
-        utt.buf.extend_from_slice(frame);
-        utt.samples_at_last_speech = utt.buf.len();
-        utt.silence_frames = 0;
-        utt.buf.len() >= MAX_UTTERANCE_SAMPLES
-    } else {
-        utt.onset_run = 0;
-        if !utt.buf.is_empty() {
-            utt.buf.extend_from_slice(frame);
-            utt.silence_frames += 1;
-            utt.silence_frames > SILENCE_FRAMES_THRESHOLD
+            self.speech_sample_count += frame.len();
+
+            if self.buf.is_empty() {
+                if self.onset_run < ONSET_SPEECH_FRAMES {
+                    return FrameAction::Continue;
+                }
+                self.buf.extend(self.preroll.iter().copied());
+            }
+            self.buf.extend_from_slice(frame);
+            self.samples_at_last_speech = self.buf.len();
+            self.silence_frames = 0;
+            if self.buf.len() >= MAX_UTTERANCE_SAMPLES {
+                FrameAction::Flush
+            } else {
+                FrameAction::Continue
+            }
         } else {
-            false
+            self.onset_run = 0;
+            if self.buf.is_empty() {
+                return FrameAction::Continue;
+            }
+            self.buf.extend_from_slice(frame);
+            self.silence_frames += 1;
+            if self.silence_frames > SILENCE_FRAMES_THRESHOLD {
+                FrameAction::Flush
+            } else {
+                FrameAction::Continue
+            }
         }
     }
-}
 
-/// Decide whether the accumulated utterance is real speech and, if so, trim
-/// its trailing silence and move it into the whisper queue. Resets `utt` to
-/// its default state either way; `send` failure (worker gone) is logged,
-/// never panics, so the audio loop survives.
-///
-/// Two gates, both defending against the same failure mode: a VAD false
-/// positive (a click, a breath, mains hum) opening an utterance that
-/// pre-roll and silence hangover then pad out to ~1-2s of near-silence —
-/// which whisper, lacking any working confidence gate of its own (see
-/// `DEFAULT_MIN_CONFIDENCE`'s doc comment), would otherwise happily
-/// hallucinate a sentence for:
-/// - `MIN_SPEECH_FRAMES`: not enough VAD-flagged speech overall.
-/// - `min_rms`: VAD-flagged frames present, but too quiet to be real speech.
-pub(crate) fn flush_utterance(utt: &mut Utterance, whisper_tx: &Sender<Clip>, min_rms: f32) {
-    let speech_frames = utt.speech_frames;
-    if speech_frames < MIN_SPEECH_FRAMES {
-        eprintln!(
-            "[sttd] dropping utterance ({speech_frames} speech frames, {} samples)",
-            utt.buf.len()
-        );
-        *utt = Utterance::default();
-        return;
+    /// Record `frame` as recent audio, so it can be prepended as pre-roll if an
+    /// utterance opens in the next `RING_FRAMES` frames.
+    fn record_preroll(&mut self, frame: &[f32]) {
+        self.preroll.extend(frame.iter().copied());
+        while self.preroll.len() > RING_FRAMES * FRAME_16K {
+            self.preroll.pop_front();
+        }
     }
 
-    let rms = if utt.speech_sample_count > 0 {
-        (utt.speech_energy_sum_sq / utt.speech_sample_count as f64).sqrt() as f32
-    } else {
-        0.0
-    };
-    if rms < min_rms {
+    /// Decide whether the accumulated utterance is real speech and, if so, trim
+    /// its trailing silence and return it. Resets `self` to its (empty) default
+    /// state either way, leaving the pre-roll ring intact.
+    ///
+    /// Two gates, both defending against the same failure mode: a VAD false
+    /// positive (a click, a breath, mains hum) opening an utterance that
+    /// pre-roll and silence hangover then pad out to ~1-2s of near-silence —
+    /// which whisper, lacking any working confidence gate of its own (see
+    /// `DEFAULT_MIN_CONFIDENCE`'s doc comment), would otherwise happily
+    /// hallucinate a sentence for:
+    /// - `MIN_SPEECH_FRAMES`: not enough VAD-flagged speech overall.
+    /// - `min_rms`: VAD-flagged frames present, but too quiet to be real speech.
+    pub(crate) fn close(&mut self, min_rms: f32) -> Option<Utterance> {
+        let speech_frames = self.speech_frames;
+        if speech_frames < MIN_SPEECH_FRAMES {
+            eprintln!(
+                "[sttd] dropping utterance ({speech_frames} speech frames, {} samples)",
+                self.buf.len()
+            );
+            self.reset();
+            return None;
+        }
+
+        let rms = if self.speech_sample_count > 0 {
+            (self.speech_energy_sum_sq / self.speech_sample_count as f64).sqrt() as f32
+        } else {
+            0.0
+        };
+        if rms < min_rms {
+            eprintln!(
+                "[sttd] dropping low-energy utterance ({speech_frames} speech frames, \
+                 rms={rms:.5} < {min_rms:.5})"
+            );
+            self.reset();
+            return None;
+        }
+
+        // Trim the tail: `SILENCE_FRAMES_THRESHOLD` decided *when* to close this
+        // utterance, but everything past `samples_at_last_speech +
+        // TAIL_KEEP_SAMPLES` is silence hangover that doesn't need to reach
+        // whisper.
+        let tail_end = (self.samples_at_last_speech + TAIL_KEEP_SAMPLES).min(self.buf.len());
+        self.buf.truncate(tail_end);
+
+        let pcm = std::mem::take(&mut self.buf);
         eprintln!(
-            "[sttd] dropping low-energy utterance ({speech_frames} speech frames, \
-             rms={rms:.5} < {min_rms:.5})"
+            "[sttd] utterance: {} samples ({speech_frames} speech frames, rms={rms:.5}) -> whisper",
+            pcm.len()
         );
-        *utt = Utterance::default();
-        return;
+        let utterance = Utterance {
+            pcm,
+            evidence: Evidence { speech_frames, rms },
+        };
+        self.reset();
+        Some(utterance)
     }
 
-    // Trim the tail: `SILENCE_FRAMES_THRESHOLD` decided *when* to close this
-    // utterance, but everything past `samples_at_last_speech +
-    // TAIL_KEEP_SAMPLES` is silence hangover that doesn't need to reach
-    // whisper.
-    let tail_end = (utt.samples_at_last_speech + TAIL_KEEP_SAMPLES).min(utt.buf.len());
-    utt.buf.truncate(tail_end);
-
-    let pcm = std::mem::take(&mut utt.buf);
-    eprintln!(
-        "[sttd] utterance: {} samples ({speech_frames} speech frames, rms={rms:.5}) -> whisper",
-        pcm.len()
-    );
-    *utt = Utterance::default();
-    if let Err(e) = whisper_tx.send(Clip {
-        pcm,
-        speech_frames,
-        rms,
-    }) {
-        eprintln!("[sttd] whisper queue closed: {e}");
+    /// Clear the utterance state for the next one, keeping `preroll` (see the
+    /// struct doc). Every field other than `preroll` must be reset here.
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.silence_frames = 0;
+        self.onset_run = 0;
+        self.speech_frames = 0;
+        self.samples_at_last_speech = 0;
+        self.speech_energy_sum_sq = 0.0;
+        self.speech_sample_count = 0;
     }
 }
 
@@ -187,173 +230,177 @@ pub(crate) fn flush_utterance(utt: &mut Utterance, whisper_tx: &Sender<Clip>, mi
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
-        FRAME_16K, MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES, RING_FRAMES,
+        DEFAULT_MIN_SPEECH_RMS, FRAME_16K, MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES,
         SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
     };
 
     #[test]
-    fn buffer_frame_keeps_non_speech_inside_open_utterance() {
+    fn push_frame_keeps_non_speech_inside_open_utterance() {
         // Regression for the original bug: non-speech frames in the middle
         // of an utterance used to be silently dropped instead of appended.
-        let mut utt = Utterance {
+        let mut buffer = UtteranceBuffer {
             buf: vec![0.5f32; 10],
             ..Default::default()
         };
-        let preroll = VecDeque::new();
         let frame = vec![0.0f32; FRAME_16K];
-        let flush = buffer_frame(&mut utt, &preroll, &frame, false);
-        assert!(!flush);
-        assert_eq!(utt.buf.len(), 10 + FRAME_16K);
-        assert_eq!(utt.silence_frames, 1);
+        let action = buffer.push_frame(&frame, false);
+        assert_eq!(action, FrameAction::Continue);
+        assert_eq!(buffer.buf.len(), 10 + FRAME_16K);
+        assert_eq!(buffer.silence_frames, 1);
     }
 
     #[test]
-    fn buffer_frame_ignores_non_speech_before_utterance_starts() {
-        let mut utt = Utterance::default();
-        let preroll = VecDeque::new();
+    fn push_frame_ignores_non_speech_before_utterance_starts() {
+        let mut buffer = UtteranceBuffer::default();
         let frame = vec![0.0f32; FRAME_16K];
-        let flush = buffer_frame(&mut utt, &preroll, &frame, false);
-        assert!(!flush);
-        assert!(utt.buf.is_empty());
+        assert_eq!(buffer.push_frame(&frame, false), FrameAction::Continue);
+        assert!(buffer.buf.is_empty());
     }
 
     #[test]
     fn single_vad_hit_does_not_open_utterance() {
         // Regression for the production bug: one VAD false positive (a
         // click, a breath) used to open a full utterance immediately.
-        let mut utt = Utterance::default();
-        let preroll = VecDeque::new();
+        let mut buffer = UtteranceBuffer::default();
         let frame = vec![0.5f32; FRAME_16K];
 
         for _ in 0..(ONSET_SPEECH_FRAMES - 1) {
-            let flush = buffer_frame(&mut utt, &preroll, &frame, true);
-            assert!(!flush);
-            assert!(utt.buf.is_empty(), "must not open before ONSET_SPEECH_FRAMES");
+            assert_eq!(buffer.push_frame(&frame, true), FrameAction::Continue);
+            assert!(
+                buffer.buf.is_empty(),
+                "must not open before ONSET_SPEECH_FRAMES"
+            );
         }
         // The frame that reaches ONSET_SPEECH_FRAMES opens it.
-        buffer_frame(&mut utt, &preroll, &frame, true);
-        assert!(!utt.buf.is_empty(), "must open at ONSET_SPEECH_FRAMES");
+        buffer.push_frame(&frame, true);
+        assert!(!buffer.buf.is_empty(), "must open at ONSET_SPEECH_FRAMES");
     }
 
     #[test]
-    fn buffer_frame_prepends_preroll_on_utterance_start() {
-        let mut utt = Utterance::default();
-        let mut preroll = VecDeque::new();
-        preroll.extend(vec![0.25f32; FRAME_16K * 2]);
-        let frame = vec![0.5f32; FRAME_16K];
-
-        for _ in 0..(ONSET_SPEECH_FRAMES - 1) {
-            buffer_frame(&mut utt, &preroll, &frame, true);
+    fn push_frame_prepends_preroll_on_utterance_start() {
+        // The ring accumulates while the utterance is still closed, so by the
+        // time it opens the run-up is already there to be prepended. Driving
+        // frames through `push_frame` rather than pre-filling the ring is the
+        // point: the ring is an implementation detail of the buffer now.
+        let mut buffer = UtteranceBuffer::new();
+        let silence = vec![0.25f32; FRAME_16K];
+        for _ in 0..2 {
+            buffer.push_frame(&silence, false);
         }
-        assert!(utt.buf.is_empty());
-        buffer_frame(&mut utt, &preroll, &frame, true);
-        assert_eq!(utt.buf.len(), FRAME_16K * 3);
-        assert!(utt.buf[..FRAME_16K * 2].iter().all(|&s| s == 0.25));
-        assert!(utt.buf[FRAME_16K * 2..].iter().all(|&s| s == 0.5));
+
+        let speech = vec![0.5f32; FRAME_16K];
+        for _ in 0..(ONSET_SPEECH_FRAMES - 1) {
+            buffer.push_frame(&speech, true);
+        }
+        assert!(buffer.buf.is_empty());
+
+        buffer.push_frame(&speech, true);
+        // The 2 pre-roll frames, then the ONSET_SPEECH_FRAMES frames that opened it.
+        let preroll_samples = FRAME_16K * 2;
+        assert_eq!(
+            buffer.buf.len(),
+            preroll_samples + FRAME_16K * ONSET_SPEECH_FRAMES as usize
+        );
+        assert!(buffer.buf[..preroll_samples].iter().all(|&s| s == 0.25));
+        assert!(buffer.buf[preroll_samples..].iter().all(|&s| s == 0.5));
     }
 
     #[test]
-    fn buffer_frame_flushes_after_silence_threshold() {
-        let mut utt = Utterance {
+    fn push_frame_reports_flush_after_silence_threshold() {
+        let mut buffer = UtteranceBuffer {
             buf: vec![0.5f32; 10],
             silence_frames: SILENCE_FRAMES_THRESHOLD,
             ..Default::default()
         };
-        let preroll = VecDeque::new();
         let frame = vec![0.0f32; FRAME_16K];
-        let flush = buffer_frame(&mut utt, &preroll, &frame, false);
-        assert!(flush);
+        assert_eq!(buffer.push_frame(&frame, false), FrameAction::Flush);
     }
 
     #[test]
     fn utterance_from_log_is_rejected() {
         // Regression for the production log: a 7-speech-frame VAD blip,
         // padded by pre-roll and a full silence hangover, used to produce
-        // an 18_880-sample utterance that whisper then hallucinated
-        // "Dziękuje za uwagę." for.
-        let mut utt = Utterance::default();
-        let mut preroll = VecDeque::new();
-        preroll.extend(vec![0.0f32; RING_FRAMES * FRAME_16K]);
+        // an utterance that whisper then hallucinated "Dziękuje za uwagę."
+        // for.
+        let mut buffer = UtteranceBuffer::new();
         let speech = vec![0.3f32; FRAME_16K];
         let silence = vec![0.0f32; FRAME_16K];
 
         for _ in 0..7 {
-            buffer_frame(&mut utt, &preroll, &speech, true);
+            buffer.push_frame(&speech, true);
         }
-        let mut flush = false;
+        let mut action = FrameAction::Continue;
         for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
-            flush = buffer_frame(&mut utt, &preroll, &silence, false);
-            if flush {
+            action = buffer.push_frame(&silence, false);
+            if action == FrameAction::Flush {
                 break;
             }
         }
-        assert!(flush, "silence hangover should eventually close the utterance");
+        assert_eq!(
+            action,
+            FrameAction::Flush,
+            "silence hangover should eventually close the utterance"
+        );
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        flush_utterance(&mut utt, &tx, 0.0); // rms gate disabled: isolate MIN_SPEECH_FRAMES
+        // rms gate disabled: isolate MIN_SPEECH_FRAMES
         assert!(
-            rx.try_recv().is_err(),
+            buffer.close(0.0).is_none(),
             "an utterance with too little VAD-flagged speech must be dropped"
         );
     }
 
     #[test]
     fn real_utterance_survives_gates() {
-        let mut utt = Utterance::default();
-        let preroll = VecDeque::new();
+        let mut buffer = UtteranceBuffer::new();
         let speech = vec![0.3f32; FRAME_16K];
         for _ in 0..25 {
-            buffer_frame(&mut utt, &preroll, &speech, true);
+            buffer.push_frame(&speech, true);
         }
         let silence = vec![0.0f32; FRAME_16K];
         for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
-            buffer_frame(&mut utt, &preroll, &silence, false);
+            buffer.push_frame(&silence, false);
         }
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        flush_utterance(&mut utt, &tx, DEFAULT_MIN_SPEECH_RMS);
-        let got = rx.try_recv().expect("real speech must be sent to whisper");
-        assert!(!got.pcm.is_empty());
-        assert_eq!(got.speech_frames, 25);
-        assert!(got.rms > 0.0);
+        let utterance = buffer
+            .close(DEFAULT_MIN_SPEECH_RMS)
+            .expect("real speech must be sent to whisper");
+        assert!(!utterance.pcm.is_empty());
+        assert_eq!(utterance.evidence.speech_frames, 25);
+        assert!(utterance.evidence.rms > 0.0);
     }
 
     #[test]
     fn tail_is_trimmed_to_200ms() {
-        let mut utt = Utterance::default();
-        let preroll = VecDeque::new();
+        let mut buffer = UtteranceBuffer::new();
         let speech = vec![0.3f32; FRAME_16K];
         for _ in 0..25 {
-            buffer_frame(&mut utt, &preroll, &speech, true);
+            buffer.push_frame(&speech, true);
         }
-        let samples_at_last_speech = utt.samples_at_last_speech;
+        let samples_at_last_speech = buffer.samples_at_last_speech;
         let silence = vec![0.0f32; FRAME_16K];
         for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
-            buffer_frame(&mut utt, &preroll, &silence, false);
+            buffer.push_frame(&silence, false);
         }
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        flush_utterance(&mut utt, &tx, 0.0);
-        let got = rx.try_recv().unwrap();
-        assert_eq!(got.pcm.len(), samples_at_last_speech + TAIL_KEEP_SAMPLES);
+        let utterance = buffer.close(0.0).unwrap();
+        assert_eq!(
+            utterance.pcm.len(),
+            samples_at_last_speech + TAIL_KEEP_SAMPLES
+        );
     }
 
     #[test]
-    fn flush_drops_short_and_sends_long() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-
-        let mut short = Utterance {
+    fn close_rejects_short_and_returns_long() {
+        let mut short = UtteranceBuffer {
             buf: vec![0.0f32; 5_000],
             speech_frames: MIN_SPEECH_FRAMES - 1,
             speech_sample_count: 1,
             speech_energy_sum_sq: 1.0, // high RMS: isolate the frame-count gate
             ..Default::default()
         };
-        flush_utterance(&mut short, &tx, 0.0);
-        assert!(rx.try_recv().is_err());
+        assert!(short.close(0.0).is_none());
 
-        let mut long = Utterance {
+        let mut long = UtteranceBuffer {
             buf: vec![0.5f32; 5_000],
             speech_frames: MIN_SPEECH_FRAMES,
             samples_at_last_speech: 5_000,
@@ -361,60 +408,7 @@ mod tests {
             speech_energy_sum_sq: 1.0,
             ..Default::default()
         };
-        flush_utterance(&mut long, &tx, 0.0);
-        let got = rx.try_recv().unwrap();
-        assert_eq!(got.pcm.len(), 5_000);
-    }
-
-    #[test]
-    fn strong_acoustic_evidence_relaxes_confidence_gate() {
-        // Exact numbers from the production log this fix addresses:
-        // "[sttd] utterance: 34720 samples (137 speech frames, rms=0.01178)
-        // -> whisper" followed by "dropped low-confidence transcript
-        // (avg_p=0.478 < 0.600)" for a transcript the user confirmed was
-        // close to correct (one misheard word), not a hallucination.
-        let clip = Clip {
-            pcm: Vec::new(),
-            speech_frames: 137,
-            rms: 0.01178,
-        };
-        let (threshold, gate) = confidence_threshold(
-            &clip,
-            DEFAULT_MIN_SPEECH_RMS,
-            DEFAULT_MIN_CONFIDENCE,
-            DEFAULT_MIN_CONFIDENCE_STRONG,
-        );
-        assert_eq!(gate, "strong");
-        assert_eq!(threshold, DEFAULT_MIN_CONFIDENCE_STRONG);
-        assert!(
-            0.478 >= threshold,
-            "avg_p=0.478 must clear the relaxed threshold {threshold}"
-        );
-    }
-
-    #[test]
-    fn weak_evidence_keeps_strict_gate() {
-        // Regression for the hole 71c05b0 closed: an utterance with barely
-        // enough VAD-flagged speech to survive `flush_utterance`'s own
-        // gates, and RMS just above the noise floor, must still face the
-        // strict confidence floor — even at the same avg_p (0.478) that the
-        // strong-evidence case above lets through.
-        let clip = Clip {
-            pcm: Vec::new(),
-            speech_frames: MIN_SPEECH_FRAMES,
-            rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
-        };
-        let (threshold, gate) = confidence_threshold(
-            &clip,
-            DEFAULT_MIN_SPEECH_RMS,
-            DEFAULT_MIN_CONFIDENCE,
-            DEFAULT_MIN_CONFIDENCE_STRONG,
-        );
-        assert_eq!(gate, "weak");
-        assert_eq!(threshold, DEFAULT_MIN_CONFIDENCE);
-        assert!(
-            0.478 < threshold,
-            "avg_p=0.478 must NOT clear the strict threshold {threshold}"
-        );
+        let utterance = long.close(0.0).unwrap();
+        assert_eq!(utterance.pcm.len(), 5_000);
     }
 }

@@ -7,13 +7,13 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::config::{
     DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
-    DEFAULT_PROMPT, DEFAULT_TARGET_RMS, HALLUCINATION_PATTERNS, MAX_GAIN, WHISPER_MIN_SAMPLES,
-    WHISPER_RATE, env_f32,
+    DEFAULT_PROMPT, DEFAULT_TARGET_RMS, HALLUCINATION_PATTERNS, MAX_GAIN, STRONG_RMS_FACTOR,
+    STRONG_SPEECH_FRAMES, WHISPER_MIN_SAMPLES, WHISPER_RATE, f32_from_env,
 };
-use crate::utterance::{Clip, confidence_threshold};
+use crate::utterance::{Evidence, Utterance};
 use crate::wav::write_wav_mono16;
 
-pub(crate) fn spawn_whisper_worker(rx: Receiver<Clip>, model_path: PathBuf) -> JoinHandle<()> {
+pub(crate) fn spawn_whisper_worker(rx: Receiver<Utterance>, model_path: PathBuf) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("whisper".into())
         .spawn(move || {
@@ -22,6 +22,46 @@ pub(crate) fn spawn_whisper_worker(rx: Receiver<Clip>, model_path: PathBuf) -> J
             }
         })
         .expect("failed to spawn whisper thread")
+}
+
+/// How much trust an utterance's acoustics have already earned, which selects
+/// the confidence floor its transcript then has to clear.
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) enum EvidenceStrength {
+    Weak,
+    Strong,
+}
+
+impl std::fmt::Display for EvidenceStrength {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // These spellings go straight into the log lines below, so they are
+        // fixed.
+        f.write_str(match self {
+            Self::Weak => "weak",
+            Self::Strong => "strong",
+        })
+    }
+}
+
+/// Confidence floor for this utterance's transcript, paired with the
+/// `EvidenceStrength` that selected it. The confidence gate exists to catch
+/// hallucinations on silence/noise; where the acoustics already testify to
+/// real speech, it has nothing to add, and applying the strict floor anyway
+/// discards the only transcript we have. It doesn't disappear entirely: the
+/// relaxed floor still catches a repetition-loop decode (avg_p ~0.1), which
+/// isn't a transcript of anything.
+pub(crate) fn confidence_floor(
+    evidence: &Evidence,
+    min_rms: f32,
+    weak_floor: f32,
+    strong_floor: f32,
+) -> (f32, EvidenceStrength) {
+    if evidence.speech_frames >= STRONG_SPEECH_FRAMES && evidence.rms >= min_rms * STRONG_RMS_FACTOR
+    {
+        (strong_floor, EvidenceStrength::Strong)
+    } else {
+        (weak_floor, EvidenceStrength::Weak)
+    }
 }
 
 /// Write `reason` as `<dump_dir>/<tag>.txt` for an utterance that was
@@ -37,7 +77,7 @@ fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
     }
 }
 
-fn whisper_loop(rx: &Receiver<Clip>, model_path: &Path) -> Result<()> {
+fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
     let path_str = model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
@@ -58,13 +98,13 @@ fn whisper_loop(rx: &Receiver<Clip>, model_path: &Path) -> Result<()> {
     eprintln!("[sttd] whisper ready (model={model_name}, pl, beam=5, threads=8, gpu=true)");
 
     let prompt = std::env::var("STTD_PROMPT").unwrap_or_else(|_| DEFAULT_PROMPT.to_string());
-    let min_confidence = env_f32("STTD_MIN_CONF", DEFAULT_MIN_CONFIDENCE);
-    let min_confidence_strong = env_f32("STTD_MIN_CONF_STRONG", DEFAULT_MIN_CONFIDENCE_STRONG);
+    let min_confidence = f32_from_env("STTD_MIN_CONF", DEFAULT_MIN_CONFIDENCE);
+    let min_confidence_strong = f32_from_env("STTD_MIN_CONF_STRONG", DEFAULT_MIN_CONFIDENCE_STRONG);
     // Same override `FrameProcessor::new` reads for the acoustic gate,
     // re-read here rather than threaded through the channel: it's one env
-    // lookup and keeps `Clip` free of config, only evidence.
-    let min_speech_rms = env_f32("STTD_MIN_RMS", DEFAULT_MIN_SPEECH_RMS);
-    let target_rms = env_f32("STTD_TARGET_RMS", DEFAULT_TARGET_RMS);
+    // lookup and keeps `Utterance` free of config, only evidence.
+    let min_speech_rms = f32_from_env("STTD_MIN_RMS", DEFAULT_MIN_SPEECH_RMS);
+    let target_rms = f32_from_env("STTD_TARGET_RMS", DEFAULT_TARGET_RMS);
     let debug_tokens = std::env::var("STTD_DEBUG_TOKENS")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -76,8 +116,8 @@ fn whisper_loop(rx: &Receiver<Clip>, model_path: &Path) -> Result<()> {
     }
 
     let mut utterance_no: u64 = 0;
-    for clip in rx.iter() {
-        if clip.pcm.is_empty() {
+    for utterance in rx.iter() {
+        if utterance.pcm.is_empty() {
             continue;
         }
         utterance_no += 1;
@@ -85,12 +125,17 @@ fn whisper_loop(rx: &Receiver<Clip>, model_path: &Path) -> Result<()> {
 
         if let Some(dir) = &dump_dir {
             let wav_path = dir.join(format!("{tag}.wav"));
-            if let Err(e) = write_wav_mono16(&wav_path, &clip.pcm, WHISPER_RATE) {
+            if let Err(e) = write_wav_mono16(&wav_path, &utterance.pcm, WHISPER_RATE) {
                 eprintln!("[sttd] failed to dump {}: {e:?}", wav_path.display());
             }
         }
 
-        let gained = apply_gain(&clip.pcm, clip.rms, target_rms, MAX_GAIN);
+        let gained = apply_gain(
+            &utterance.pcm,
+            utterance.evidence.rms,
+            target_rms,
+            MAX_GAIN,
+        );
 
         match transcribe(&mut state, token_beg, &gained, &prompt, debug_tokens) {
             Ok(t) => {
@@ -99,25 +144,25 @@ fn whisper_loop(rx: &Receiver<Clip>, model_path: &Path) -> Result<()> {
                     dump_drop_reason(&dump_dir, &tag, "DROPPED(empty)");
                     continue;
                 }
-                let (threshold, gate) = confidence_threshold(
-                    &clip,
+                let (floor, strength) = confidence_floor(
+                    &utterance.evidence,
                     min_speech_rms,
                     min_confidence,
                     min_confidence_strong,
                 );
                 eprintln!(
-                    "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={threshold:.3} \
-                     ({gate} evidence)",
-                    t.avg_prob, t.avg_logprob
+                    "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={floor:.3} \
+                     ({strength} evidence)",
+                    t.confidence.prob, t.confidence.logprob
                 );
-                if t.avg_prob < threshold {
+                if t.confidence.prob < floor {
                     eprintln!("[sttd] {tag}: dropped low-confidence transcript: {trimmed:?}");
                     dump_drop_reason(
                         &dump_dir,
                         &tag,
                         &format!(
-                            "DROPPED(low-conf avg_p={:.3} < {threshold:.3}, {gate}): {trimmed}",
-                            t.avg_prob
+                            "DROPPED(low-conf avg_p={:.3} < {floor:.3}, {strength}): {trimmed}",
+                            t.confidence.prob
                         ),
                     );
                     continue;
@@ -146,7 +191,7 @@ fn whisper_loop(rx: &Receiver<Clip>, model_path: &Path) -> Result<()> {
 }
 
 /// Apply gain toward `target_rms`, computed from the speech-only `rms`
-/// `flush_utterance` already measured (not recomputed over `pcm`, which
+/// `UtteranceBuffer::close` already measured (not recomputed over `pcm`, which
 /// includes the padded silence tail). Only ever amplifies (gain >= 1.0) and
 /// never attenuates: a clip reaching this point already cleared the acoustic
 /// gates, so there's no silence here to accidentally boost. Caps at
@@ -185,20 +230,26 @@ pub(crate) fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
     out
 }
 
-/// Result of one whisper inference: the joined segment text plus confidence
-/// averaged over *text* tokens only (see `average_text_confidence`).
-struct Transcript {
-    text: String,
+/// Confidence of one inference, averaged over *text* tokens only (see
+/// `average_text_confidence`).
+pub(crate) struct TokenConfidence {
     /// `sttd`'s stand-in for whisper.cpp's `no_speech_thold`, which is
     /// declared in `whisper_full_params` but never actually read by the
     /// decoder (see `DEFAULT_MIN_CONFIDENCE`'s doc comment) — so whisper.cpp
     /// itself never rejects a low-confidence segment, and the caller must
     /// do it based on this value.
-    avg_prob: f32,
+    pub(crate) prob: f32,
     /// Same average, in log space — the statistic whisper.cpp's own
     /// fallback ladder uses internally (`whisper.cpp`: `avg_logprobs`),
-    /// logged alongside `avg_prob` for comparable-scale tuning.
-    avg_logprob: f32,
+    /// logged alongside `prob` for comparable-scale tuning.
+    pub(crate) logprob: f32,
+}
+
+/// Result of one whisper inference: the joined segment text plus its
+/// `TokenConfidence`.
+struct Transcript {
+    text: String,
+    confidence: TokenConfidence,
 }
 
 /// Average token probability/log-probability over *text* tokens only, given
@@ -214,7 +265,7 @@ struct Transcript {
 pub(crate) fn average_text_confidence(
     tokens: &[(whisper_rs::WhisperToken, f32, f32)],
     token_beg: whisper_rs::WhisperToken,
-) -> (f32, f32, usize) {
+) -> TokenConfidence {
     let mut prob_sum = 0f64;
     let mut logprob_sum = 0f64;
     let mut count = 0usize;
@@ -227,13 +278,15 @@ pub(crate) fn average_text_confidence(
         count += 1;
     }
     if count == 0 {
-        (0.0, 0.0, 0)
+        TokenConfidence {
+            prob: 0.0,
+            logprob: 0.0,
+        }
     } else {
-        (
-            (prob_sum / count as f64) as f32,
-            (logprob_sum / count as f64) as f32,
-            count,
-        )
+        TokenConfidence {
+            prob: (prob_sum / count as f64) as f32,
+            logprob: (logprob_sum / count as f64) as f32,
+        }
     }
 }
 
@@ -249,9 +302,9 @@ fn transcribe(
     prompt: &str,
     debug_tokens: bool,
 ) -> Result<Transcript> {
-    // Pad sub-second utterances (e.g. 300-999 ms that pass MIN_UTTERANCE_SAMPLES)
-    // so whisper processes them instead of warning "input is too short" and
-    // returning zero segments.
+    // Pad sub-second utterances (e.g. 300-999 ms, which the acoustic gates are
+    // happy to pass) so whisper processes them instead of warning "input is too
+    // short" and returning zero segments.
     let padded;
     let pcm_16k = if pcm_16k.len() < WHISPER_MIN_SAMPLES {
         padded = pad_with_dither(pcm_16k, WHISPER_MIN_SAMPLES);
@@ -331,21 +384,17 @@ fn transcribe(
             }
         }
     }
-    let (avg_prob, avg_logprob, _text_token_count) = average_text_confidence(&tokens, token_beg);
-    Ok(Transcript {
-        text: out,
-        avg_prob,
-        avg_logprob,
-    })
+    let confidence = average_text_confidence(&tokens, token_beg);
+    Ok(Transcript { text: out, confidence })
 }
 
-/// Fold a Polish diacritic to its ASCII base letter; every other char is
+/// Fold a single Polish diacritic to its ASCII base letter; every other char is
 /// returned unchanged. Applied before comparing against
 /// `HALLUCINATION_PATTERNS` (themselves written without diacritics) so a
 /// transcript like "Dziękuje za uwagę" — a plausible ASR misspelling of
 /// "Dziękuję za uwagę" — still matches instead of sliding past on a single
 /// ogonek.
-pub(crate) fn fold_diacritics(c: char) -> char {
+pub(crate) fn fold_polish_diacritic(c: char) -> char {
     match c {
         'ą' => 'a',
         'ć' => 'c',
@@ -365,13 +414,13 @@ pub(crate) fn fold_diacritics(c: char) -> char {
 pub(crate) fn is_hallucination(text: &str) -> bool {
     // Punctuation becomes a space (not dropped): "Amara.org" must normalize
     // to "amara org" to match the pattern list, not "amaraorg". Diacritics
-    // are folded (see `fold_diacritics`) before the alphanumeric check, not
-    // after, since they're themselves alphanumeric and would otherwise
+    // are folded (see `fold_polish_diacritic`) before the alphanumeric check,
+    // not after, since they're themselves alphanumeric and would otherwise
     // survive untouched.
     let normalized: String = text
         .to_lowercase()
         .chars()
-        .map(fold_diacritics)
+        .map(fold_polish_diacritic)
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -384,7 +433,10 @@ pub(crate) fn is_hallucination(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DEFAULT_TARGET_RMS, MAX_GAIN, WHISPER_MIN_SAMPLES};
+    use crate::config::{
+        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
+        DEFAULT_TARGET_RMS, MAX_GAIN, MIN_SPEECH_FRAMES, WHISPER_MIN_SAMPLES,
+    };
 
     #[test]
     fn confidence_ignores_timestamp_tokens() {
@@ -393,7 +445,8 @@ mod tests {
         // segment (whisper.cpp:6191-6193: `tokens_cur[i0..=i]`, where i0 and
         // i bracket the segment with its opening/closing timestamp tokens),
         // diluting the score. Worst on short utterances, which carry
-        // relatively more timestamp weight.
+        // relatively more timestamp weight. The expected means below are a
+        // 3-token average, so including the two 0.99 tokens would miss them.
         let token_beg: whisper_rs::WhisperToken = 50364; // whisper.cpp's typical <|0.00|> id
         let tokens = vec![
             (token_beg, 0.99, -0.01),      // leading timestamp: must be excluded
@@ -402,14 +455,63 @@ mod tests {
             (102, 0.4, -0.9),              // text
             (token_beg + 50, 0.99, -0.01), // closing timestamp: must be excluded
         ];
-        let (avg_prob, avg_logprob, count) = average_text_confidence(&tokens, token_beg);
-        assert_eq!(count, 3);
-        assert!((avg_prob - (0.9 + 0.5 + 0.4) / 3.0).abs() < 1e-6);
-        assert!((avg_logprob - (-0.1 - 0.7 - 0.9) / 3.0).abs() < 1e-6);
+        let confidence = average_text_confidence(&tokens, token_beg);
+        assert!((confidence.prob - (0.9 + 0.5 + 0.4) / 3.0).abs() < 1e-6);
+        assert!((confidence.logprob - (-0.1 - 0.7 - 0.9) / 3.0).abs() < 1e-6);
     }
 
     #[test]
-    fn normalization_gain_is_capped() {
+    fn strong_acoustic_evidence_relaxes_confidence_gate() {
+        // Exact numbers from the production log this fix addresses:
+        // "[sttd] utterance: 34720 samples (137 speech frames, rms=0.01178)
+        // -> whisper" followed by "dropped low-confidence transcript
+        // (avg_p=0.478 < 0.600)" for a transcript the user confirmed was
+        // close to correct (one misheard word), not a hallucination.
+        let evidence = Evidence {
+            speech_frames: 137,
+            rms: 0.01178,
+        };
+        let (floor, strength) = confidence_floor(
+            &evidence,
+            DEFAULT_MIN_SPEECH_RMS,
+            DEFAULT_MIN_CONFIDENCE,
+            DEFAULT_MIN_CONFIDENCE_STRONG,
+        );
+        assert_eq!(strength, EvidenceStrength::Strong);
+        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE_STRONG);
+        assert!(
+            0.478 >= floor,
+            "avg_p=0.478 must clear the relaxed threshold {floor}"
+        );
+    }
+
+    #[test]
+    fn weak_evidence_keeps_strict_gate() {
+        // Regression for the hole 71c05b0 closed: an utterance with barely
+        // enough VAD-flagged speech to survive `close`'s own gates, and RMS
+        // just above the noise floor, must still face the strict confidence
+        // floor — even at the same avg_p (0.478) that the strong-evidence
+        // case above lets through.
+        let evidence = Evidence {
+            speech_frames: MIN_SPEECH_FRAMES,
+            rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
+        };
+        let (floor, strength) = confidence_floor(
+            &evidence,
+            DEFAULT_MIN_SPEECH_RMS,
+            DEFAULT_MIN_CONFIDENCE,
+            DEFAULT_MIN_CONFIDENCE_STRONG,
+        );
+        assert_eq!(strength, EvidenceStrength::Weak);
+        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE);
+        assert!(
+            0.478 < floor,
+            "avg_p=0.478 must NOT clear the strict threshold {floor}"
+        );
+    }
+
+    #[test]
+    fn apply_gain_is_capped() {
         // A near-silent clip (rms=0.0001) must not get amplified by the raw
         // target/rms ratio (500x here) — that would blow quantization noise
         // up into something whisper mistakes for speech. Capped at
@@ -425,14 +527,14 @@ mod tests {
     }
 
     #[test]
-    fn normalization_gain_disabled_by_zero_target() {
+    fn apply_gain_disabled_by_zero_target() {
         let pcm = vec![0.01f32; 100];
         let out = apply_gain(&pcm, 0.01, 0.0, MAX_GAIN);
         assert_eq!(out, pcm);
     }
 
     #[test]
-    fn normalization_gain_never_attenuates() {
+    fn apply_gain_never_attenuates() {
         // A clip already louder than the target must be left alone, not
         // turned down toward it — this gate only ever helps quiet-but-real
         // speech, never touches an already-strong signal.
