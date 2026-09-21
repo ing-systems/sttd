@@ -5,11 +5,17 @@
 //! frames) -> per 10 ms frame, two branches:
 //!   - VAD branch:     `nnnoiseless` denoise -> `rubato` (-> 16 kHz) -> `webrtc-vad`
 //!   - whisper branch: (unprocessed)         -> `rubato` (-> 16 kHz) -> utterance buffer
-//! The VAD decides only *when* to cut an utterance, never what to keep: every
-//! frame while an utterance is open is appended (speech or not), and ~300 ms
-//! of pre-roll is prepended at onset so quiet word starts aren't clipped.
+//! An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive speech
+//! frames (a single VAD false positive no longer opens one), with ~300 ms of
+//! pre-roll prepended at that point so quiet word starts aren't clipped.
+//! Once open, every frame is appended regardless of the VAD verdict (speech
+//! or not) until `SILENCE_FRAMES_THRESHOLD` closes it — but only
+//! `MIN_SPEECH_FRAMES` worth of actual VAD-flagged speech, trimmed to
+//! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper.
 //! -> `crossbeam-channel` queue -> isolated `whisper-rs` inference thread
-//! (CUDA, large-v3-turbo).
+//! (CUDA, large-v3-turbo) -> average-token-probability gate
+//! (`DEFAULT_MIN_CONFIDENCE`, whisper.cpp's own `no_speech_thold` being a
+//! no-op) -> known-hallucination-boilerplate filter (`is_hallucination`).
 //!
 //! `sttd --file <wav>` runs the same pipeline offline against a WAV file
 //! instead of the microphone, for comparing tuning changes against a fixed
@@ -50,11 +56,29 @@ const FRAME_16K: usize = 160;
 const RING_FRAMES: usize = 30;
 
 /// Silence hangover before cutting an utterance: 800 ms = 80 x 10 ms frames.
+/// This only decides *when* to close an utterance; how much of that silence
+/// actually reaches whisper is capped separately by `TAIL_KEEP_SAMPLES`.
 const SILENCE_FRAMES_THRESHOLD: u32 = 80;
-/// Drop utterances shorter than this (avoids whispering on blips). Short
-/// enough to keep one-word Polish utterances (tak/nie/co/już) that the VAD
-/// has already trimmed down.
-const MIN_UTTERANCE_SAMPLES: usize = 4_800; // 300 ms @ 16 kHz
+/// Consecutive speech frames required before an utterance is opened at all.
+/// A single VAD false positive (a click, a breath, mains hum) used to be
+/// enough to open a full utterance — padded out to ~1.2-1.9s by pre-roll and
+/// silence hangover, which whisper then dutifully hallucinated a sentence
+/// for. The onset frames themselves aren't lost: `preroll` already holds
+/// them by the time the utterance opens, since it's updated every frame
+/// regardless of the VAD verdict.
+const ONSET_SPEECH_FRAMES: u32 = 3; // 30 ms
+/// Total VAD-flagged speech frames (over the utterance's whole life, not
+/// just at onset) required to actually send it to whisper. This is the gate
+/// that replaces the old, dead `MIN_UTTERANCE_SAMPLES`: that constant
+/// compared against the *buffer* length, which is dominated by pre-roll and
+/// silence hangover and so was satisfied by every utterance, always.
+const MIN_SPEECH_FRAMES: u32 = 20; // 200 ms
+/// How much trailing silence (past the last speech frame) is kept when an
+/// utterance is sent to whisper. `SILENCE_FRAMES_THRESHOLD` still decides
+/// when to *close* the utterance; this trims how much of that hangover is
+/// actually *transmitted*, so a one-word utterance isn't ~70% silence by the
+/// time it reaches the model.
+const TAIL_KEEP_SAMPLES: usize = 3_200; // 200 ms @ 16 kHz
 /// Whisper refuses input whose *computed mel length* is under 1000 ms (see
 /// whisper.cpp `whisper_full`: `if (seek_end < seek_start + 100)`). That
 /// length isn't raw sample count / 16: mel framing pads and windows the
@@ -66,6 +90,20 @@ const MIN_UTTERANCE_SAMPLES: usize = 4_800; // 300 ms @ 16 kHz
 const WHISPER_MIN_SAMPLES: usize = 16_400;
 /// Force-flush long speech even without silence (whisper is ~30 s max).
 const MAX_UTTERANCE_SAMPLES: usize = WHISPER_RATE as usize * 30;
+/// Minimum RMS amplitude across an utterance's VAD-flagged speech frames
+/// (silence padding excluded). Catches transient VAD false positives that
+/// pass `ONSET_SPEECH_FRAMES`/`MIN_SPEECH_FRAMES` but carry essentially no
+/// signal. ~-50 dBFS. Override with `STTD_MIN_RMS` while tuning against real
+/// mic noise.
+const DEFAULT_MIN_SPEECH_RMS: f32 = 0.003;
+/// Minimum average whisper token probability for a transcript to be kept.
+/// whisper.cpp declares `no_speech_thold` but never reads it (`whisper.h`:
+/// `float no_speech_thold; // TODO: not implemented` — confirmed against the
+/// vendored whisper.cpp 1.7.1 source, `whisper_full_default_params` is its
+/// only reference in the whole file), so whisper.cpp itself never rejects a
+/// low-confidence segment; this is the actual gate. Override with
+/// `STTD_MIN_CONF`.
+const DEFAULT_MIN_CONFIDENCE: f32 = 0.6;
 
 /// Whisper model auto-download. The URL is derived from the filename (see
 /// `ensure_model_available`), so `WHISPER_MODEL_PATH` can point at any
@@ -73,26 +111,45 @@ const MAX_UTTERANCE_SAMPLES: usize = WHISPER_RATE as usize * 30;
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 const DEFAULT_MODEL_PATH: &str = "models/ggml-large-v3-turbo.bin";
 
-/// Default `initial_prompt`: primes Polish orthography/diacritics and the
-/// technical vocabulary this tool is normally dictated into. Override with
-/// `STTD_PROMPT`.
-const DEFAULT_PROMPT: &str = "Rozmowa techniczna po polsku. Terminy: Kubernetes, Docker, \
-Rust, cargo, commit, merge request, repozytorium, deployment, kontener, backend, frontend, \
-API, endpoint, debugowanie, refaktoryzacja, Linux, systemd, Wayland, Neovim.";
+/// Default `initial_prompt`: primes Polish orthography/diacritics only.
+/// Used to carry a long list of IT vocabulary (Kubernetes, Docker, ...), but
+/// whisper.cpp feeds `initial_prompt` into the decoder as prior context
+/// (`prompt_past`), and on low/no-signal audio the model falls back on that
+/// prior instead of the (absent) acoustic evidence — i.e. it would recite
+/// from the prompt itself. Override with `STTD_PROMPT` to opt back into a
+/// domain vocabulary at the cost of that risk.
+const DEFAULT_PROMPT: &str = "Rozmowa techniczna po polsku.";
 
 /// Transcripts that are near-exact matches for common Whisper hallucinations
 /// on silence/low-energy audio (subtitle-credit boilerplate picked up from
-/// training data), compared after lowercasing and stripping punctuation.
+/// training data), compared after lowercasing, stripping punctuation, and
+/// folding Polish diacritics to their ASCII base letter (see
+/// `fold_diacritics`) — so patterns are written here without diacritics too.
 const HALLUCINATION_PATTERNS: &[&str] = &[
-    "napisy stworzone przez społeczność amara org",
+    "napisy stworzone przez spolecznosc amara org",
     "napisy",
     "napisy pl",
     "subtitles by",
-    "dziękuję za obejrzenie",
-    "dziękuję za uwagę",
+    "dziekuje za obejrzenie",
+    "dziekuje za uwage",
     "zapraszam do subskrypcji",
-    "zapraszam do subskrypcji kanału",
+    "zapraszam do subskrypcji kanalu",
 ];
+
+/// Read an f32 override from an env var, falling back to `default` if the
+/// var is unset or fails to parse (logging a warning in the latter case, so
+/// a typo'd override doesn't silently revert to the default).
+fn env_f32(key: &str, default: f32) -> f32 {
+    match std::env::var(key) {
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+            eprintln!(
+                "[sttd] warning: {key}={v:?} is not a valid number, using default {default}"
+            );
+            default
+        }),
+        Err(_) => default,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -380,12 +437,43 @@ struct FrameProcessor {
     vad_i16: Vec<i16>,
 
     /// Rolling ~300 ms of whisper-branch audio, prepended to an utterance
-    /// the instant it starts so onsets aren't clipped by VAD latency.
+    /// the instant it opens so onsets aren't clipped by VAD/onset latency.
     preroll: VecDeque<f32>,
-    speech_buf: Vec<f32>,
-    silence_frames: u32,
+    utterance: Utterance,
+    /// `STTD_MIN_RMS` override (or `DEFAULT_MIN_SPEECH_RMS`), read once at
+    /// startup and reused for every utterance.
+    min_speech_rms: f32,
 
     whisper_tx: Sender<Vec<f32>>,
+}
+
+/// Per-utterance buffering state, reset every time an utterance is flushed
+/// (whether accepted or dropped). Kept as one struct rather than loose
+/// `&mut` parameters so `flush_utterance` can reset everything atomically
+/// and so new gates (see `flush_utterance`) can add fields without touching
+/// every call site.
+#[derive(Default)]
+struct Utterance {
+    /// Whisper-branch audio (16 kHz), from the moment the utterance opens.
+    buf: Vec<f32>,
+    /// Consecutive non-speech frames since the last speech frame, once the
+    /// utterance is open. Drives the close decision (`SILENCE_FRAMES_THRESHOLD`).
+    silence_frames: u32,
+    /// Consecutive speech frames seen before the utterance has opened.
+    /// Drives the open decision (`ONSET_SPEECH_FRAMES`); reset to 0 on any
+    /// non-speech frame.
+    onset_run: u32,
+    /// Total VAD-flagged speech frames over the utterance's whole life
+    /// (including pre-open onset frames). Drives `MIN_SPEECH_FRAMES`.
+    speech_frames: u32,
+    /// `buf.len()` as of the last speech frame appended. Used to trim
+    /// trailing silence down to `TAIL_KEEP_SAMPLES` at flush time.
+    samples_at_last_speech: usize,
+    /// Sum of squared samples from VAD-flagged speech frames only (silence
+    /// padding excluded), paired with `speech_sample_count` so
+    /// `flush_utterance` can compute an RMS over just the speech content.
+    speech_energy_sum_sq: f64,
+    speech_sample_count: usize,
 }
 
 impl FrameProcessor {
@@ -437,8 +525,8 @@ impl FrameProcessor {
             vad,
             vad_i16: vec![0i16; FRAME_16K],
             preroll: VecDeque::with_capacity(RING_FRAMES * FRAME_16K),
-            speech_buf: Vec::with_capacity(MAX_UTTERANCE_SAMPLES),
-            silence_frames: 0,
+            utterance: Utterance::default(),
+            min_speech_rms: env_f32("STTD_MIN_RMS", DEFAULT_MIN_SPEECH_RMS),
             whisper_tx,
         })
     }
@@ -506,13 +594,7 @@ impl FrameProcessor {
         };
 
         // ---- utterance buffering --------------------------------------------
-        let should_flush = buffer_frame(
-            &mut self.speech_buf,
-            &mut self.silence_frames,
-            &self.preroll,
-            &whisper16,
-            is_speech,
-        );
+        let should_flush = buffer_frame(&mut self.utterance, &self.preroll, &whisper16, is_speech);
         if should_flush {
             self.flush();
         }
@@ -525,13 +607,12 @@ impl FrameProcessor {
     }
 
     fn flush(&mut self) {
-        flush_utterance(&mut self.speech_buf, &self.whisper_tx);
-        self.silence_frames = 0;
+        flush_utterance(&mut self.utterance, &self.whisper_tx, self.min_speech_rms);
     }
 
     /// Flush any trailing speech. Call once at shutdown / end of input.
     fn finish(&mut self) {
-        if !self.speech_buf.is_empty() {
+        if !self.utterance.buf.is_empty() {
             self.flush();
         }
     }
@@ -542,48 +623,100 @@ impl FrameProcessor {
 /// Extracted out of `FrameProcessor::process_frame` so it's unit-testable
 /// without a live VAD signal.
 ///
-/// The VAD decides only *when* to cut an utterance, never what to keep: once
-/// `speech_buf` is non-empty, every frame is appended regardless of `is_speech`
-/// (non-speech frames become natural in-utterance padding instead of being
-/// spliced out). `preroll` is prepended the instant an utterance starts.
-fn buffer_frame(
-    speech_buf: &mut Vec<f32>,
-    silence_frames: &mut u32,
-    preroll: &VecDeque<f32>,
-    frame: &[f32],
-    is_speech: bool,
-) -> bool {
+/// Two behaviors, both load-bearing for hallucination avoidance:
+/// - An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive
+///   speech frames, not the first one, so a single VAD false positive no
+///   longer opens (and thus sends) a full utterance. The onset frames
+///   themselves aren't lost: `preroll` already contains them by the time
+///   the utterance opens, since the caller updates it every frame
+///   regardless of `is_speech`.
+/// - Once open, every frame is appended regardless of `is_speech` (non-
+///   speech frames become natural in-utterance padding instead of being
+///   spliced out) — but `speech_frames`/`samples_at_last_speech`/energy are
+///   tracked only from VAD-flagged frames, so `flush_utterance` can later
+///   gate and trim on actual speech content instead of total buffer length.
+fn buffer_frame(utt: &mut Utterance, preroll: &VecDeque<f32>, frame: &[f32], is_speech: bool) -> bool {
     if is_speech {
-        if speech_buf.is_empty() {
-            speech_buf.extend(preroll.iter().copied());
+        utt.onset_run += 1;
+        utt.speech_frames += 1;
+        for &s in frame {
+            utt.speech_energy_sum_sq += (s as f64) * (s as f64);
         }
-        speech_buf.extend_from_slice(frame);
-        *silence_frames = 0;
-        speech_buf.len() >= MAX_UTTERANCE_SAMPLES
-    } else if !speech_buf.is_empty() {
-        speech_buf.extend_from_slice(frame);
-        *silence_frames += 1;
-        *silence_frames > SILENCE_FRAMES_THRESHOLD
+        utt.speech_sample_count += frame.len();
+
+        if utt.buf.is_empty() {
+            if utt.onset_run < ONSET_SPEECH_FRAMES {
+                return false;
+            }
+            utt.buf.extend(preroll.iter().copied());
+        }
+        utt.buf.extend_from_slice(frame);
+        utt.samples_at_last_speech = utt.buf.len();
+        utt.silence_frames = 0;
+        utt.buf.len() >= MAX_UTTERANCE_SAMPLES
     } else {
-        false
+        utt.onset_run = 0;
+        if !utt.buf.is_empty() {
+            utt.buf.extend_from_slice(frame);
+            utt.silence_frames += 1;
+            utt.silence_frames > SILENCE_FRAMES_THRESHOLD
+        } else {
+            false
+        }
     }
 }
 
-/// Move the accumulated utterance into the whisper queue.
+/// Decide whether the accumulated utterance is real speech and, if so, trim
+/// its trailing silence and move it into the whisper queue. Resets `utt` to
+/// its default state either way; `send` failure (worker gone) is logged,
+/// never panics, so the audio loop survives.
 ///
-/// Short blips are discarded; `send` failure (worker gone) is logged, never
-/// panics, so the audio loop survives.
-fn flush_utterance(speech_buf: &mut Vec<f32>, whisper_tx: &Sender<Vec<f32>>) {
-    if speech_buf.len() < MIN_UTTERANCE_SAMPLES {
+/// Two gates, both defending against the same failure mode: a VAD false
+/// positive (a click, a breath, mains hum) opening an utterance that
+/// pre-roll and silence hangover then pad out to ~1-2s of near-silence —
+/// which whisper, lacking any working confidence gate of its own (see
+/// `DEFAULT_MIN_CONFIDENCE`'s doc comment), would otherwise happily
+/// hallucinate a sentence for:
+/// - `MIN_SPEECH_FRAMES`: not enough VAD-flagged speech overall.
+/// - `min_rms`: VAD-flagged frames present, but too quiet to be real speech.
+fn flush_utterance(utt: &mut Utterance, whisper_tx: &Sender<Vec<f32>>, min_rms: f32) {
+    let speech_frames = utt.speech_frames;
+    if speech_frames < MIN_SPEECH_FRAMES {
         eprintln!(
-            "[sttd] dropping short utterance ({} samples)",
-            speech_buf.len()
+            "[sttd] dropping utterance ({speech_frames} speech frames, {} samples)",
+            utt.buf.len()
         );
-        speech_buf.clear();
+        *utt = Utterance::default();
         return;
     }
-    let utterance = std::mem::take(speech_buf);
-    eprintln!("[sttd] utterance: {} samples -> whisper", utterance.len());
+
+    let rms = if utt.speech_sample_count > 0 {
+        (utt.speech_energy_sum_sq / utt.speech_sample_count as f64).sqrt() as f32
+    } else {
+        0.0
+    };
+    if rms < min_rms {
+        eprintln!(
+            "[sttd] dropping low-energy utterance ({speech_frames} speech frames, \
+             rms={rms:.5} < {min_rms:.5})"
+        );
+        *utt = Utterance::default();
+        return;
+    }
+
+    // Trim the tail: `SILENCE_FRAMES_THRESHOLD` decided *when* to close this
+    // utterance, but everything past `samples_at_last_speech +
+    // TAIL_KEEP_SAMPLES` is silence hangover that doesn't need to reach
+    // whisper.
+    let tail_end = (utt.samples_at_last_speech + TAIL_KEEP_SAMPLES).min(utt.buf.len());
+    utt.buf.truncate(tail_end);
+
+    let utterance = std::mem::take(&mut utt.buf);
+    eprintln!(
+        "[sttd] utterance: {} samples ({speech_frames} speech frames, rms={rms:.5}) -> whisper",
+        utterance.len()
+    );
+    *utt = Utterance::default();
     if let Err(e) = whisper_tx.send(utterance) {
         eprintln!("[sttd] whisper queue closed: {e}");
     }
@@ -793,6 +926,7 @@ fn whisper_loop(rx: &Receiver<Vec<f32>>, model_path: &Path) -> Result<()> {
     eprintln!("[sttd] whisper ready (model={model_name}, pl, beam=5, threads=8, gpu=true)");
 
     let prompt = std::env::var("STTD_PROMPT").unwrap_or_else(|_| DEFAULT_PROMPT.to_string());
+    let min_confidence = env_f32("STTD_MIN_CONF", DEFAULT_MIN_CONFIDENCE);
     let dump_dir = std::env::var_os("STTD_DUMP_DIR").map(PathBuf::from);
     if let Some(dir) = &dump_dir {
         std::fs::create_dir_all(dir)
@@ -815,9 +949,16 @@ fn whisper_loop(rx: &Receiver<Vec<f32>>, model_path: &Path) -> Result<()> {
         }
 
         match transcribe(&mut state, &pcm, &prompt) {
-            Ok(text) => {
+            Ok((text, confidence)) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
+                    continue;
+                }
+                if confidence < min_confidence {
+                    eprintln!(
+                        "[sttd] dropped low-confidence transcript (avg_p={confidence:.3} \
+                         < {min_confidence:.3}): {trimmed:?}"
+                    );
                     continue;
                 }
                 if is_hallucination(trimmed) {
@@ -856,11 +997,17 @@ fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
     out
 }
 
+/// Runs one whisper inference and returns `(transcript, avg_token_prob)`.
+/// The average token probability is `sttd`'s stand-in for whisper.cpp's
+/// `no_speech_thold`, which is declared in `whisper_full_params` but never
+/// actually read by the decoder (see `DEFAULT_MIN_CONFIDENCE`'s doc
+/// comment) — so whisper.cpp itself never rejects a low-confidence segment,
+/// and the caller must do it based on this value.
 fn transcribe(
     state: &mut whisper_rs::WhisperState,
     pcm_16k: &[f32],
     prompt: &str,
-) -> Result<String> {
+) -> Result<(String, f32)> {
     // Pad sub-second utterances (e.g. 300-999 ms that pass MIN_UTTERANCE_SAMPLES)
     // so whisper processes them instead of warning "input is too short" and
     // returning zero segments.
@@ -887,10 +1034,20 @@ fn transcribe(
     params.set_suppress_blank(true);
     params.set_suppress_non_speech_tokens(true);
     params.set_temperature(0.0);
+    // Fallback ladder [0.0, 0.2, .., 1.0]: rescues genuinely hard speech
+    // from a repetition loop. It is *not* a rejection mechanism — whisper.cpp
+    // only re-tries at a non-final temperature when `avg_logprobs <
+    // logprob_thold`; at the final temperature (here, 1.0) the result is
+    // accepted unconditionally (`whisper.cpp`: `if (it != temperatures.size()
+    // - 1) { ... success = false ... }`). Confidence rejection is done by
+    // the caller instead, via `full_get_token_prob` (see this function's
+    // doc comment).
     params.set_temperature_inc(0.2);
     params.set_entropy_thold(2.4);
     params.set_logprob_thold(-1.0);
-    params.set_no_speech_thold(0.6);
+    // No `set_no_speech_thold` call: whisper.cpp declares the field but the
+    // decoder never reads it (`whisper.h`: `float no_speech_thold; // TODO:
+    // not implemented`) — setting it is a no-op, not a safety net.
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -899,6 +1056,8 @@ fn transcribe(
     state.full(params, pcm_16k).context("whisper full failed")?;
     let n = state.full_n_segments().context("no segments")?;
     let mut out = String::new();
+    let mut prob_sum = 0f64;
+    let mut prob_count = 0usize;
     for i in 0..n {
         match state.full_get_segment_text_lossy(i) {
             Ok(s) => {
@@ -912,8 +1071,40 @@ fn transcribe(
             }
             Err(e) => eprintln!("[sttd] segment {i} read failed: {e:?}"),
         }
+        let n_tokens = state.full_n_tokens(i).unwrap_or(0);
+        for t in 0..n_tokens {
+            if let Ok(p) = state.full_get_token_prob(i, t) {
+                prob_sum += p as f64;
+                prob_count += 1;
+            }
+        }
     }
-    Ok(out)
+    let avg_confidence = if prob_count > 0 {
+        (prob_sum / prob_count as f64) as f32
+    } else {
+        0.0
+    };
+    Ok((out, avg_confidence))
+}
+
+/// Fold a Polish diacritic to its ASCII base letter; every other char is
+/// returned unchanged. Applied before comparing against
+/// `HALLUCINATION_PATTERNS` (themselves written without diacritics) so a
+/// transcript like "Dziękuje za uwagę" — a plausible ASR misspelling of
+/// "Dziękuję za uwagę" — still matches instead of sliding past on a single
+/// ogonek.
+fn fold_diacritics(c: char) -> char {
+    match c {
+        'ą' => 'a',
+        'ć' => 'c',
+        'ę' => 'e',
+        'ł' => 'l',
+        'ń' => 'n',
+        'ó' => 'o',
+        'ś' => 's',
+        'ź' | 'ż' => 'z',
+        _ => c,
+    }
 }
 
 /// Whether `text` (a full transcript) is a known Whisper hallucination on
@@ -921,10 +1112,14 @@ fn transcribe(
 /// sentences that merely contain e.g. "dziękuję" are never caught.
 fn is_hallucination(text: &str) -> bool {
     // Punctuation becomes a space (not dropped): "Amara.org" must normalize
-    // to "amara org" to match the pattern list, not "amaraorg".
+    // to "amara org" to match the pattern list, not "amaraorg". Diacritics
+    // are folded (see `fold_diacritics`) before the alphanumeric check, not
+    // after, since they're themselves alphanumeric and would otherwise
+    // survive untouched.
     let normalized: String = text
         .to_lowercase()
         .chars()
+        .map(fold_diacritics)
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1090,74 +1285,178 @@ mod tests {
     fn buffer_frame_keeps_non_speech_inside_open_utterance() {
         // Regression for the original bug: non-speech frames in the middle
         // of an utterance used to be silently dropped instead of appended.
-        let mut speech_buf = vec![0.5f32; 10];
-        let mut silence_frames = 0;
+        let mut utt = Utterance {
+            buf: vec![0.5f32; 10],
+            ..Default::default()
+        };
         let preroll = VecDeque::new();
         let frame = vec![0.0f32; FRAME_16K];
-        let flush = buffer_frame(&mut speech_buf, &mut silence_frames, &preroll, &frame, false);
+        let flush = buffer_frame(&mut utt, &preroll, &frame, false);
         assert!(!flush);
-        assert_eq!(speech_buf.len(), 10 + FRAME_16K);
-        assert_eq!(silence_frames, 1);
+        assert_eq!(utt.buf.len(), 10 + FRAME_16K);
+        assert_eq!(utt.silence_frames, 1);
     }
 
     #[test]
     fn buffer_frame_ignores_non_speech_before_utterance_starts() {
-        let mut speech_buf: Vec<f32> = Vec::new();
-        let mut silence_frames = 0;
+        let mut utt = Utterance::default();
         let preroll = VecDeque::new();
         let frame = vec![0.0f32; FRAME_16K];
-        let flush = buffer_frame(&mut speech_buf, &mut silence_frames, &preroll, &frame, false);
+        let flush = buffer_frame(&mut utt, &preroll, &frame, false);
         assert!(!flush);
-        assert!(speech_buf.is_empty());
+        assert!(utt.buf.is_empty());
+    }
+
+    #[test]
+    fn single_vad_hit_does_not_open_utterance() {
+        // Regression for the production bug: one VAD false positive (a
+        // click, a breath) used to open a full utterance immediately.
+        let mut utt = Utterance::default();
+        let preroll = VecDeque::new();
+        let frame = vec![0.5f32; FRAME_16K];
+
+        for _ in 0..(ONSET_SPEECH_FRAMES - 1) {
+            let flush = buffer_frame(&mut utt, &preroll, &frame, true);
+            assert!(!flush);
+            assert!(utt.buf.is_empty(), "must not open before ONSET_SPEECH_FRAMES");
+        }
+        // The frame that reaches ONSET_SPEECH_FRAMES opens it.
+        buffer_frame(&mut utt, &preroll, &frame, true);
+        assert!(!utt.buf.is_empty(), "must open at ONSET_SPEECH_FRAMES");
     }
 
     #[test]
     fn buffer_frame_prepends_preroll_on_utterance_start() {
-        let mut speech_buf: Vec<f32> = Vec::new();
-        let mut silence_frames = 0;
+        let mut utt = Utterance::default();
         let mut preroll = VecDeque::new();
         preroll.extend(vec![0.25f32; FRAME_16K * 2]);
         let frame = vec![0.5f32; FRAME_16K];
-        buffer_frame(&mut speech_buf, &mut silence_frames, &preroll, &frame, true);
-        assert_eq!(speech_buf.len(), FRAME_16K * 3);
-        assert!(speech_buf[..FRAME_16K * 2].iter().all(|&s| s == 0.25));
-        assert!(speech_buf[FRAME_16K * 2..].iter().all(|&s| s == 0.5));
+
+        for _ in 0..(ONSET_SPEECH_FRAMES - 1) {
+            buffer_frame(&mut utt, &preroll, &frame, true);
+        }
+        assert!(utt.buf.is_empty());
+        buffer_frame(&mut utt, &preroll, &frame, true);
+        assert_eq!(utt.buf.len(), FRAME_16K * 3);
+        assert!(utt.buf[..FRAME_16K * 2].iter().all(|&s| s == 0.25));
+        assert!(utt.buf[FRAME_16K * 2..].iter().all(|&s| s == 0.5));
     }
 
     #[test]
     fn buffer_frame_flushes_after_silence_threshold() {
-        let mut speech_buf = vec![0.5f32; 10];
-        let mut silence_frames = SILENCE_FRAMES_THRESHOLD;
+        let mut utt = Utterance {
+            buf: vec![0.5f32; 10],
+            silence_frames: SILENCE_FRAMES_THRESHOLD,
+            ..Default::default()
+        };
         let preroll = VecDeque::new();
         let frame = vec![0.0f32; FRAME_16K];
-        let flush = buffer_frame(&mut speech_buf, &mut silence_frames, &preroll, &frame, false);
+        let flush = buffer_frame(&mut utt, &preroll, &frame, false);
         assert!(flush);
+    }
+
+    #[test]
+    fn utterance_from_log_is_rejected() {
+        // Regression for the production log: a 7-speech-frame VAD blip,
+        // padded by pre-roll and a full silence hangover, used to produce
+        // an 18_880-sample utterance that whisper then hallucinated
+        // "Dziękuje za uwagę." for.
+        let mut utt = Utterance::default();
+        let mut preroll = VecDeque::new();
+        preroll.extend(vec![0.0f32; RING_FRAMES * FRAME_16K]);
+        let speech = vec![0.3f32; FRAME_16K];
+        let silence = vec![0.0f32; FRAME_16K];
+
+        for _ in 0..7 {
+            buffer_frame(&mut utt, &preroll, &speech, true);
+        }
+        let mut flush = false;
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            flush = buffer_frame(&mut utt, &preroll, &silence, false);
+            if flush {
+                break;
+            }
+        }
+        assert!(flush, "silence hangover should eventually close the utterance");
+
+        let (tx, rx) = unbounded();
+        flush_utterance(&mut utt, &tx, 0.0); // rms gate disabled: isolate MIN_SPEECH_FRAMES
+        assert!(
+            rx.try_recv().is_err(),
+            "an utterance with too little VAD-flagged speech must be dropped"
+        );
+    }
+
+    #[test]
+    fn real_utterance_survives_gates() {
+        let mut utt = Utterance::default();
+        let preroll = VecDeque::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..25 {
+            buffer_frame(&mut utt, &preroll, &speech, true);
+        }
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            buffer_frame(&mut utt, &preroll, &silence, false);
+        }
+
+        let (tx, rx) = unbounded();
+        flush_utterance(&mut utt, &tx, DEFAULT_MIN_SPEECH_RMS);
+        let got = rx.try_recv().expect("real speech must be sent to whisper");
+        assert!(!got.is_empty());
+    }
+
+    #[test]
+    fn tail_is_trimmed_to_200ms() {
+        let mut utt = Utterance::default();
+        let preroll = VecDeque::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..25 {
+            buffer_frame(&mut utt, &preroll, &speech, true);
+        }
+        let samples_at_last_speech = utt.samples_at_last_speech;
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            buffer_frame(&mut utt, &preroll, &silence, false);
+        }
+
+        let (tx, rx) = unbounded();
+        flush_utterance(&mut utt, &tx, 0.0);
+        let got = rx.try_recv().unwrap();
+        assert_eq!(got.len(), samples_at_last_speech + TAIL_KEEP_SAMPLES);
     }
 
     #[test]
     fn flush_drops_short_and_sends_long() {
         let (tx, rx) = unbounded();
-        let mut short = vec![0.0f32; MIN_UTTERANCE_SAMPLES - 1];
-        flush_utterance(&mut short, &tx);
-        assert!(short.is_empty());
+
+        let mut short = Utterance {
+            buf: vec![0.0f32; 5_000],
+            speech_frames: MIN_SPEECH_FRAMES - 1,
+            speech_sample_count: 1,
+            speech_energy_sum_sq: 1.0, // high RMS: isolate the frame-count gate
+            ..Default::default()
+        };
+        flush_utterance(&mut short, &tx, 0.0);
         assert!(rx.try_recv().is_err());
 
-        let mut long = vec![0.5f32; MIN_UTTERANCE_SAMPLES + 10];
-        flush_utterance(&mut long, &tx);
-        assert!(long.is_empty());
+        let mut long = Utterance {
+            buf: vec![0.5f32; 5_000],
+            speech_frames: MIN_SPEECH_FRAMES,
+            samples_at_last_speech: 5_000,
+            speech_sample_count: 1,
+            speech_energy_sum_sq: 1.0,
+            ..Default::default()
+        };
+        flush_utterance(&mut long, &tx, 0.0);
         let got = rx.try_recv().unwrap();
-        assert_eq!(got.len(), MIN_UTTERANCE_SAMPLES + 10);
+        assert_eq!(got.len(), 5_000);
     }
 
     #[test]
     fn silence_threshold_is_800ms() {
         assert_eq!(SILENCE_FRAMES_THRESHOLD, 80);
         assert_eq!(SILENCE_FRAMES_THRESHOLD * 10, 800);
-    }
-
-    #[test]
-    fn min_utterance_is_300ms() {
-        assert_eq!(MIN_UTTERANCE_SAMPLES, 4_800);
     }
 
     #[test]
@@ -1198,6 +1497,15 @@ mod tests {
         assert!(is_hallucination("  napisy  "));
         assert!(is_hallucination("..."));
         assert!(is_hallucination(""));
+    }
+
+    #[test]
+    fn hallucination_filter_handles_diacritics() {
+        // "Dziękuje za uwagę." (log-observed hallucination) differs from the
+        // pattern "dziękuję za uwagę" by a single ogonek; without diacritic
+        // folding this exact-match filter let it straight through.
+        assert!(is_hallucination("Dziękuje za uwagę."));
+        assert!(is_hallucination("dziekuje za uwage"));
     }
 
     #[test]
