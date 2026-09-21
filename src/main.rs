@@ -1,21 +1,27 @@
 //! Real-time Speech-to-Text pipeline.
 //!
 //! Data flow:
-//! `cpal` (hw rate, stereo) -> downmix mono -> `rubato` (-> 48 kHz, 480-sample
-//! frames) -> per 10 ms frame, two branches:
-//!   - VAD branch:     `nnnoiseless` denoise -> `rubato` (-> 16 kHz) -> `webrtc-vad`
-//!   - whisper branch: (unprocessed)         -> `rubato` (-> 16 kHz) -> utterance buffer
+//! `cpal` (hw rate, stereo) -> downmix mono -> per ~10 ms raw chunk, two
+//! independent `rubato` resamplings (`FrameProcessor`, see `WhisperResample`
+//! for when the second collapses to one hop instead of two):
+//!   - VAD branch:     `rubato` (-> 48 kHz) -> `nnnoiseless` denoise -> `rubato` (-> 16 kHz) -> `webrtc-vad`
+//!   - whisper branch: `rubato` (-> 16 kHz, direct hop when possible) -> utterance buffer
 //! An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive speech
 //! frames (a single VAD false positive no longer opens one), with ~300 ms of
 //! pre-roll prepended at that point so quiet word starts aren't clipped.
 //! Once open, every frame is appended regardless of the VAD verdict (speech
 //! or not) until `SILENCE_FRAMES_THRESHOLD` closes it — but only
 //! `MIN_SPEECH_FRAMES` worth of actual VAD-flagged speech, trimmed to
-//! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper.
-//! -> `crossbeam-channel` queue -> isolated `whisper-rs` inference thread
-//! (CUDA, large-v3-turbo) -> average-token-probability gate
-//! (`DEFAULT_MIN_CONFIDENCE`, whisper.cpp's own `no_speech_thold` being a
-//! no-op) -> known-hallucination-boilerplate filter (`is_hallucination`).
+//! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper,
+//! carried alongside its acoustic evidence (speech-frame count, RMS) as a
+//! `Clip` -> `crossbeam-channel` queue -> isolated `whisper-rs` inference
+//! thread (CUDA, large-v3-turbo): pre-inference gain toward `STTD_TARGET_RMS`
+//! (`apply_gain`, quiet-but-real speech only, never attenuates) -> average
+//! *text-token* probability gate (`average_text_confidence` excludes the
+//! timestamp tokens every whisper.cpp segment carries; whisper.cpp's own
+//! `no_speech_thold` being a no-op) at a threshold `confidence_threshold`
+//! relaxes when the acoustic evidence already vouches for real speech ->
+//! known-hallucination-boilerplate filter (`is_hallucination`).
 //!
 //! `sttd --file <wav>` runs the same pipeline offline against a WAV file
 //! instead of the microphone, for comparing tuning changes against a fixed
@@ -96,7 +102,18 @@ const MAX_UTTERANCE_SAMPLES: usize = WHISPER_RATE as usize * 30;
 /// signal. ~-50 dBFS. Override with `STTD_MIN_RMS` while tuning against real
 /// mic noise.
 const DEFAULT_MIN_SPEECH_RMS: f32 = 0.003;
-/// Minimum average whisper token probability for a transcript to be kept.
+/// Target speech-only RMS for the pre-inference gain applied to a clip that
+/// already cleared the acoustic gates (see `apply_gain`). Only ever
+/// amplifies, never attenuates — quiet-but-real speech (e.g. the
+/// rms=0.01178 case that prompted this) gets a boost toward whisper's
+/// comfort zone. `0` disables gain entirely. Override with `STTD_TARGET_RMS`.
+const DEFAULT_TARGET_RMS: f32 = 0.05;
+/// Ceiling on the gain `apply_gain` will apply (8x = +18 dB), so a near-
+/// silent clip that slipped past `STTD_MIN_RMS` doesn't get blown up into
+/// clipped noise.
+const MAX_GAIN: f32 = 8.0;
+/// Minimum average whisper token probability for a transcript to be kept,
+/// used when the utterance's *acoustic* evidence (see `Clip`) is weak.
 /// whisper.cpp declares `no_speech_thold` but never reads it (`whisper.h`:
 /// `float no_speech_thold; // TODO: not implemented` — confirmed against the
 /// vendored whisper.cpp 1.7.1 source, `whisper_full_default_params` is its
@@ -104,6 +121,19 @@ const DEFAULT_MIN_SPEECH_RMS: f32 = 0.003;
 /// low-confidence segment; this is the actual gate. Override with
 /// `STTD_MIN_CONF`.
 const DEFAULT_MIN_CONFIDENCE: f32 = 0.6;
+/// Relaxed confidence floor used when the utterance already carries strong
+/// acoustic evidence of real speech (see `confidence_threshold`). Whisper's
+/// average token probability on genuine-but-hard speech regularly lands
+/// around 0.4-0.5 — the same range a silence hallucination can land in — so
+/// a single scalar threshold can't separate the two cases; VAD/RMS evidence
+/// can. Override with `STTD_MIN_CONF_STRONG`.
+const DEFAULT_MIN_CONFIDENCE_STRONG: f32 = 0.35;
+/// `speech_frames` (see `Utterance`) required to count as "strong" acoustic
+/// evidence: 500 ms of VAD-flagged speech, well past `MIN_SPEECH_FRAMES`.
+const STRONG_SPEECH_FRAMES: u32 = 50;
+/// Multiple of `min_speech_rms` required to count as "strong" acoustic
+/// evidence.
+const STRONG_RMS_FACTOR: f32 = 3.0;
 
 /// Whisper model auto-download. The URL is derived from the filename (see
 /// `ensure_model_available`), so `WHISPER_MODEL_PATH` can point at any
@@ -186,7 +216,13 @@ fn print_usage() {
          \x20   WHISPER_MODEL_PATH    path to a ggml model (default: {DEFAULT_MODEL_PATH})\n\
          \x20   STTD_DEVICE           substring match (case-insensitive) against an input device name\n\
          \x20   STTD_PROMPT           override the whisper initial_prompt\n\
-         \x20   STTD_DUMP_DIR         write each utterance as WAV+TXT into this directory\n"
+         \x20   STTD_DUMP_DIR         write each utterance as WAV+TXT into this directory (TXT written\n\
+         \x20                         for dropped utterances too, prefixed with the drop reason)\n\
+         \x20   STTD_MIN_RMS          min speech-only RMS to keep an utterance (default: {DEFAULT_MIN_SPEECH_RMS})\n\
+         \x20   STTD_MIN_CONF         min avg token confidence, weak acoustic evidence (default: {DEFAULT_MIN_CONFIDENCE})\n\
+         \x20   STTD_MIN_CONF_STRONG  min avg token confidence, strong acoustic evidence (default: {DEFAULT_MIN_CONFIDENCE_STRONG})\n\
+         \x20   STTD_TARGET_RMS       pre-inference gain target RMS, 0 disables (default: {DEFAULT_TARGET_RMS})\n\
+         \x20   STTD_DEBUG_TOKENS     1 = dump per-token id/text/p/plog/is_timestamp to stderr\n"
     );
 }
 
@@ -238,15 +274,6 @@ fn run_live_mode() -> Result<()> {
         hw_rate, channels, sample_format
     );
 
-    let (mut resampler, input_frames) = make_hw_to_48k_resampler(hw_rate)?;
-    eprintln!(
-        "[sttd] rubato: {hw_rate} -> {DENOISE_RATE}, in={input_frames} out={}",
-        resampler.output_frames_next()
-    );
-    let mut resample_in = resampler.input_buffer_allocate(true);
-    let mut resample_out = resampler.output_buffer_allocate(true);
-
-    let mut pending_48k: Vec<f32> = Vec::with_capacity(FRAME_48K * 4);
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
     // Raw mono captures (hw rate, f32 in [-1, 1]) from the cpal callback.
@@ -267,13 +294,19 @@ fn run_live_mode() -> Result<()> {
         }
     }
 
+    // `FrameProcessor` owns all resampling (hw -> 48k for the VAD branch,
+    // hw -> 16k for the whisper branch); building it is cheap, fallible
+    // setup like everything above, so it happens here too — before the
+    // model load below.
+    let (whisper_tx, whisper_rx): (Sender<Clip>, Receiver<Clip>) = unbounded();
+    let mut fp = FrameProcessor::new(hw_rate, whisper_tx)?;
+    let input_frames = fp.input_frames();
+
     // ---- now the heavy part: resolve/download the model and load it onto
     // the GPU on its own thread. Capture is already running above.
     let model_path = ensure_model_available()?;
     eprintln!("[sttd] model: {}", model_path.display());
-    let (whisper_tx, whisper_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = unbounded();
     let whisper_handle = spawn_whisper_worker(whisper_rx, model_path);
-    let mut fp = FrameProcessor::new(whisper_tx)?;
 
     // ---- main processing loop (NOT the audio callback) --------------------
     while running.load(Ordering::SeqCst) {
@@ -284,27 +317,11 @@ fn run_live_mode() -> Result<()> {
             accumulator.extend_from_slice(&chunk);
         }
 
-        // Resample full input chunks -> pending 48 kHz stream.
+        // Raw hw-rate chunks -> FrameProcessor (denoise/VAD + whisper
+        // branches, all resampling included).
         while accumulator.len() >= input_frames {
-            resample_in[0][..input_frames].copy_from_slice(&accumulator[..input_frames]);
+            fp.process_frame(&accumulator[..input_frames]);
             accumulator.drain(..input_frames);
-
-            let (used_in, produced) =
-                match resampler.process_into_buffer(&resample_in, &mut resample_out, None) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[sttd] resample error: {e}");
-                        break;
-                    }
-                };
-            debug_assert_eq!(used_in, input_frames);
-            pending_48k.extend_from_slice(&resample_out[0][..produced]);
-        }
-
-        // 480-sample 48 kHz frames -> denoise/VAD + whisper branches.
-        while pending_48k.len() >= FRAME_48K {
-            fp.process_frame(&pending_48k[..FRAME_48K]);
-            pending_48k.drain(..FRAME_48K);
         }
 
         if !got_audio && accumulator.len() < input_frames {
@@ -345,13 +362,16 @@ fn select_input_device(host: &cpal::Host) -> Result<cpal::Device> {
         .context("no default input device available")
 }
 
-/// Build the hw_rate -> 48 kHz resampler with a fixed input chunk size
-/// chosen so its output is exactly `FRAME_48K` samples.
-fn make_hw_to_48k_resampler(hw_rate: u32) -> Result<(FftFixedInOut<f32>, usize)> {
-    let desired_in =
-        ((hw_rate as f64 * FRAME_48K as f64 / DENOISE_RATE as f64).round() as usize).max(1);
-    let resampler = FftFixedInOut::<f32>::new(hw_rate as usize, DENOISE_RATE as usize, desired_in, 1)
-        .context("failed to create rubato resampler (hw -> 48k)")?;
+/// Build an hw_rate -> `target_rate` resampler with a fixed ~10 ms input
+/// chunk size, so its output lands on a round 10 ms frame count at
+/// `target_rate` (480 for 48 kHz, 160 for 16 kHz). Shared by both
+/// `FrameProcessor` resamplers (`resampler_hw48`, and the `Direct` variant
+/// of `whisper_resample`) — one formula, so their input chunk sizes agree
+/// whenever that's mathematically possible (see `WhisperResample`).
+fn make_resampler(hw_rate: u32, target_rate: u32) -> Result<(FftFixedInOut<f32>, usize)> {
+    let desired_in = ((hw_rate as f64 / 100.0).round() as usize).max(1);
+    let resampler = FftFixedInOut::<f32>::new(hw_rate as usize, target_rate as usize, desired_in, 1)
+        .with_context(|| format!("failed to create rubato resampler (hw -> {target_rate})"))?;
     let input_frames = resampler.input_frames_next();
     Ok((resampler, input_frames))
 }
@@ -374,31 +394,18 @@ fn run_file_mode(path: &Path) -> Result<()> {
         wav.samples.len() as f64 / wav.sample_rate as f64
     );
 
-    let (mut resampler, input_frames) = make_hw_to_48k_resampler(wav.sample_rate)?;
-    let mut resample_in = resampler.input_buffer_allocate(true);
-    let mut resample_out = resampler.output_buffer_allocate(true);
+    let (whisper_tx, whisper_rx): (Sender<Clip>, Receiver<Clip>) = unbounded();
+    let mut fp = FrameProcessor::new(wav.sample_rate, whisper_tx.clone())?;
+    let input_frames = fp.input_frames();
 
     let model_path = ensure_model_available()?;
     eprintln!("[sttd] model: {}", model_path.display());
-    let (whisper_tx, whisper_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = unbounded();
     let whisper_handle = spawn_whisper_worker(whisper_rx, model_path);
-    let mut fp = FrameProcessor::new(whisper_tx.clone())?;
 
-    let mut pending_48k: Vec<f32> = Vec::with_capacity(FRAME_48K * 4);
     let mut offset = 0usize;
     while offset + input_frames <= wav.samples.len() {
-        resample_in[0][..input_frames].copy_from_slice(&wav.samples[offset..offset + input_frames]);
+        fp.process_frame(&wav.samples[offset..offset + input_frames]);
         offset += input_frames;
-
-        let (_, produced) = resampler
-            .process_into_buffer(&resample_in, &mut resample_out, None)
-            .context("resample error")?;
-        pending_48k.extend_from_slice(&resample_out[0][..produced]);
-
-        while pending_48k.len() >= FRAME_48K {
-            fp.process_frame(&pending_48k[..FRAME_48K]);
-            pending_48k.drain(..FRAME_48K);
-        }
     }
     // A trailing partial chunk (< input_frames samples, at most ~30 ms) is
     // dropped; fine for offline comparison runs.
@@ -414,19 +421,30 @@ fn run_file_mode(path: &Path) -> Result<()> {
 // Frame processing: denoise/VAD branch + whisper branch + utterance buffer
 // ---------------------------------------------------------------------------
 
-/// Owns all per-frame DSP/VAD/buffering state. Fed one 480-sample 48 kHz
-/// frame at a time by either the live capture loop or file mode, so both
-/// share identical utterance-detection behavior.
+/// Owns all per-frame DSP/VAD/buffering state, including the hw-rate ->
+/// 48 kHz / hw-rate -> 16 kHz resamplers (previously built and driven by the
+/// caller). Fed one raw hw-rate chunk at a time (`input_frames()` samples)
+/// by either the live capture loop or file mode, so both share identical
+/// resampling and utterance-detection behavior.
 struct FrameProcessor {
-    // 48 kHz -> 16 kHz resamplers. Two independent instances (not shared)
-    // since each carries its own internal filter state and consumes a
-    // different signal (denoised vs. raw).
+    // hw_rate -> 48 kHz (RNNoise's required rate). Always used to feed the
+    // VAD branch, since denoise needs 48 kHz; its input chunk size
+    // (`hw_input_frames`) is the raw hw-rate frame size every caller must
+    // feed `process_frame` with.
+    resampler_hw48: FftFixedInOut<f32>,
+    resample_hw48_in: Vec<Vec<f32>>,
+    resample_hw48_out: Vec<Vec<f32>>,
+    hw_input_frames: usize,
+
+    // 48 kHz -> 16 kHz, VAD branch only (post-denoise).
     resampler_vad: FftFixedInOut<f32>,
-    resampler_whisper: FftFixedInOut<f32>,
     resample_vad_in: Vec<Vec<f32>>,
     resample_vad_out: Vec<Vec<f32>>,
-    resample_whisper_in: Vec<Vec<f32>>,
-    resample_whisper_out: Vec<Vec<f32>>,
+
+    /// Whisper branch resampling: a direct hw_rate -> 16 kHz hop when the
+    /// hw rate allows it (see `WhisperResample`), avoiding the redundant
+    /// 48 kHz intermediate whisper's (non-denoised) signal never needed.
+    whisper_resample: WhisperResample,
 
     denoise: Box<DenoiseState<'static>>,
     denoise_in: Vec<f32>,
@@ -444,7 +462,32 @@ struct FrameProcessor {
     /// startup and reused for every utterance.
     min_speech_rms: f32,
 
-    whisper_tx: Sender<Vec<f32>>,
+    whisper_tx: Sender<Clip>,
+}
+
+/// How the whisper branch gets from hw_rate down to 16 kHz.
+///
+/// `Direct` is one resampling hop instead of two (hw -> 48k -> 16k): the
+/// whisper branch never uses the 48 kHz intermediate for anything (it
+/// exists only so RNNoise, which is fixed at 48 kHz, can run for the VAD
+/// branch), so paying for it was pure waste. It's only valid when a
+/// hw_rate -> 16 kHz resampler consumes the *same* input chunk size as the
+/// hw_rate -> 48 kHz one (verified for 16k/44.1k/48k/96k hw rates in
+/// `dual_resamplers_agree_on_input_frames`) — otherwise the two branches
+/// would desync in time. `Chained` is the original hw->48k->16k path,
+/// reusing the VAD branch's already-resampled 48 kHz frame, kept as a
+/// fallback for any hw rate where that assumption doesn't hold.
+enum WhisperResample {
+    Direct {
+        resampler: FftFixedInOut<f32>,
+        in_buf: Vec<Vec<f32>>,
+        out_buf: Vec<Vec<f32>>,
+    },
+    Chained {
+        resampler: FftFixedInOut<f32>,
+        in_buf: Vec<Vec<f32>>,
+        out_buf: Vec<Vec<f32>>,
+    },
 }
 
 /// Per-utterance buffering state, reset every time an utterance is flushed
@@ -476,8 +519,46 @@ struct Utterance {
     speech_sample_count: usize,
 }
 
+/// One utterance plus the acoustic evidence `flush_utterance` gathered for
+/// it while buffering. The whisper worker needs this to decide how much
+/// trust the acoustics already earned, before deciding how much trust to
+/// demand from the model's own confidence (see `confidence_threshold`) —
+/// evidence that used to be computed and then thrown away at the
+/// `Sender<Vec<f32>>` boundary.
+struct Clip {
+    pcm: Vec<f32>,
+    /// Total VAD-flagged speech frames over the utterance's life (see
+    /// `Utterance::speech_frames`).
+    speech_frames: u32,
+    /// RMS over VAD-flagged speech frames only (see `Utterance::speech_energy_sum_sq`).
+    rms: f32,
+}
+
+/// Confidence floor for this utterance's transcript. The confidence gate
+/// exists to catch hallucinations on silence/noise; where the acoustics
+/// already testify to real speech, it has nothing to add, and applying the
+/// strict floor anyway discards the only transcript we have. It doesn't
+/// disappear entirely: the relaxed floor still catches a repetition-loop
+/// decode (avg_p ~0.1), which isn't a transcript of anything.
+fn confidence_threshold(clip: &Clip, min_rms: f32, weak: f32, strong: f32) -> (f32, &'static str) {
+    if clip.speech_frames >= STRONG_SPEECH_FRAMES && clip.rms >= min_rms * STRONG_RMS_FACTOR {
+        (strong, "strong")
+    } else {
+        (weak, "weak")
+    }
+}
+
 impl FrameProcessor {
-    fn new(whisper_tx: Sender<Vec<f32>>) -> Result<Self> {
+    fn new(hw_rate: u32, whisper_tx: Sender<Clip>) -> Result<Self> {
+        let (resampler_hw48, hw_input_frames) = make_resampler(hw_rate, DENOISE_RATE)
+            .context("failed to create rubato resampler (hw -> 48k)")?;
+        eprintln!(
+            "[sttd] rubato: {hw_rate} -> {DENOISE_RATE}, in={hw_input_frames} out={}",
+            resampler_hw48.output_frames_next()
+        );
+        let resample_hw48_in = resampler_hw48.input_buffer_allocate(true);
+        let resample_hw48_out = resampler_hw48.output_buffer_allocate(true);
+
         let resampler_vad = FftFixedInOut::<f32>::new(
             DENOISE_RATE as usize,
             WHISPER_RATE as usize,
@@ -485,22 +566,56 @@ impl FrameProcessor {
             1,
         )
         .context("failed to create rubato resampler (48k -> 16k, vad branch)")?;
-        let resampler_whisper = FftFixedInOut::<f32>::new(
-            DENOISE_RATE as usize,
-            WHISPER_RATE as usize,
-            FRAME_48K,
-            1,
-        )
-        .context("failed to create rubato resampler (48k -> 16k, whisper branch)")?;
         debug_assert_eq!(resampler_vad.input_frames_next(), FRAME_48K);
         debug_assert_eq!(resampler_vad.output_frames_next(), FRAME_16K);
-        debug_assert_eq!(resampler_whisper.input_frames_next(), FRAME_48K);
-        debug_assert_eq!(resampler_whisper.output_frames_next(), FRAME_16K);
-
         let resample_vad_in = resampler_vad.input_buffer_allocate(true);
         let resample_vad_out = resampler_vad.output_buffer_allocate(true);
-        let resample_whisper_in = resampler_whisper.input_buffer_allocate(true);
-        let resample_whisper_out = resampler_whisper.output_buffer_allocate(true);
+
+        // Try a direct hw -> 16k hop for the whisper branch; only usable
+        // when it consumes the same-sized raw hw chunk as the hw -> 48k
+        // resampler above, since both are fed from the same raw stream in
+        // lockstep (see `WhisperResample`).
+        let whisper_resample = match make_resampler(hw_rate, WHISPER_RATE) {
+            Ok((resampler, hw16_input_frames)) if hw16_input_frames == hw_input_frames => {
+                debug_assert_eq!(resampler.output_frames_next(), FRAME_16K);
+                let in_buf = resampler.input_buffer_allocate(true);
+                let out_buf = resampler.output_buffer_allocate(true);
+                WhisperResample::Direct {
+                    resampler,
+                    in_buf,
+                    out_buf,
+                }
+            }
+            other => {
+                match &other {
+                    Ok((_, hw16_input_frames)) => eprintln!(
+                        "[sttd] hw->16k and hw->48k resamplers disagree on input chunk size \
+                         ({hw16_input_frames} vs {hw_input_frames} samples) at {hw_rate} Hz; \
+                         falling back to hw->48k->16k for the whisper branch"
+                    ),
+                    Err(e) => eprintln!(
+                        "[sttd] failed to build a direct hw->16k resampler ({e}); falling back \
+                         to hw->48k->16k for the whisper branch"
+                    ),
+                }
+                let resampler = FftFixedInOut::<f32>::new(
+                    DENOISE_RATE as usize,
+                    WHISPER_RATE as usize,
+                    FRAME_48K,
+                    1,
+                )
+                .context("failed to create rubato resampler (48k -> 16k, whisper branch)")?;
+                debug_assert_eq!(resampler.input_frames_next(), FRAME_48K);
+                debug_assert_eq!(resampler.output_frames_next(), FRAME_16K);
+                let in_buf = resampler.input_buffer_allocate(true);
+                let out_buf = resampler.output_buffer_allocate(true);
+                WhisperResample::Chained {
+                    resampler,
+                    in_buf,
+                    out_buf,
+                }
+            }
+        };
 
         let mut vad =
             Vad::new(WHISPER_RATE as i32).map_err(|_| anyhow::anyhow!("invalid VAD rate"))?;
@@ -512,12 +627,14 @@ impl FrameProcessor {
             .map_err(|_| anyhow::anyhow!("failed to set VAD mode"))?;
 
         Ok(Self {
+            resampler_hw48,
+            resample_hw48_in,
+            resample_hw48_out,
+            hw_input_frames,
             resampler_vad,
-            resampler_whisper,
             resample_vad_in,
             resample_vad_out,
-            resample_whisper_in,
-            resample_whisper_out,
+            whisper_resample,
             denoise: DenoiseState::new(),
             denoise_in: vec![0.0f32; FRAME_48K],
             denoise_out: vec![0.0f32; FRAME_48K],
@@ -531,9 +648,44 @@ impl FrameProcessor {
         })
     }
 
-    /// Process one 480-sample 48 kHz frame.
-    fn process_frame(&mut self, frame_48k_raw: &[f32]) {
-        debug_assert_eq!(frame_48k_raw.len(), FRAME_48K);
+    /// The raw hw-rate chunk size every call to `process_frame` must be fed.
+    fn input_frames(&self) -> usize {
+        self.hw_input_frames
+    }
+
+    /// Process one raw hw-rate chunk (`input_frames()` samples).
+    fn process_frame(&mut self, frame_hw_raw: &[f32]) {
+        debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);
+
+        // ---- hw -> 48 kHz: shared basis for the VAD branch (denoise needs
+        // 48 kHz), and for the whisper branch too when using the `Chained`
+        // fallback -----------------------------------------------------------
+        self.resample_hw48_in[0][..frame_hw_raw.len()].copy_from_slice(frame_hw_raw);
+        let frame48_produced = match self.resampler_hw48.process_into_buffer(
+            &self.resample_hw48_in,
+            &mut self.resample_hw48_out,
+            None,
+        ) {
+            Ok((_, produced)) => produced,
+            Err(e) => {
+                eprintln!("[sttd] hw->48k resample error: {e}");
+                return;
+            }
+        };
+        if frame48_produced != FRAME_48K {
+            // Denoise's frame API is fixed-size; an unexpected chunk count
+            // (resampler startup/edge case) would desync it. Skip this
+            // frame rather than feed denoise a mismatched buffer.
+            eprintln!(
+                "[sttd] hw->48k produced {frame48_produced} samples, expected {FRAME_48K}; \
+                 skipping frame"
+            );
+            return;
+        }
+        // Owned: needed below both for denoise and, in the `Chained` case,
+        // for the whisper branch's own resample call, which would otherwise
+        // alias this borrow of `self`.
+        let frame_48k_raw = self.resample_hw48_out[0][..FRAME_48K].to_vec();
 
         // ---- VAD branch: denoise, then resample to 16 kHz -----------------
         for (i, s) in frame_48k_raw.iter().enumerate() {
@@ -557,23 +709,37 @@ impl FrameProcessor {
             }
         };
 
-        // ---- whisper branch: raw (no denoise), resample to 16 kHz --------
-        self.resample_whisper_in[0][..FRAME_48K].copy_from_slice(frame_48k_raw);
-        let whisper_produced = match self.resampler_whisper.process_into_buffer(
-            &self.resample_whisper_in,
-            &mut self.resample_whisper_out,
-            None,
-        ) {
-            Ok((_, produced)) => produced,
-            Err(e) => {
-                eprintln!("[sttd] whisper resample error: {e}");
-                return;
+        // ---- whisper branch: raw (no denoise) -------------------------------
+        let whisper16 = match &mut self.whisper_resample {
+            WhisperResample::Direct {
+                resampler,
+                in_buf,
+                out_buf,
+            } => {
+                in_buf[0][..frame_hw_raw.len()].copy_from_slice(frame_hw_raw);
+                match resampler.process_into_buffer(in_buf, out_buf, None) {
+                    Ok((_, produced)) => out_buf[0][..produced].to_vec(),
+                    Err(e) => {
+                        eprintln!("[sttd] whisper resample error: {e}");
+                        return;
+                    }
+                }
+            }
+            WhisperResample::Chained {
+                resampler,
+                in_buf,
+                out_buf,
+            } => {
+                in_buf[0][..FRAME_48K].copy_from_slice(&frame_48k_raw);
+                match resampler.process_into_buffer(in_buf, out_buf, None) {
+                    Ok((_, produced)) => out_buf[0][..produced].to_vec(),
+                    Err(e) => {
+                        eprintln!("[sttd] whisper resample error: {e}");
+                        return;
+                    }
+                }
             }
         };
-        // Owned (not borrowed from `self`): `self.flush()` below needs
-        // exclusive access to `*self`, which an outstanding borrow of
-        // `self.resample_whisper_out` would conflict with. 160 floats.
-        let whisper16 = self.resample_whisper_out[0][..whisper_produced].to_vec();
 
         // ---- VAD decision --------------------------------------------------
         // `vad_i16` is pre-sized for the steady-state FRAME_16K case; guard
@@ -679,7 +845,7 @@ fn buffer_frame(utt: &mut Utterance, preroll: &VecDeque<f32>, frame: &[f32], is_
 /// hallucinate a sentence for:
 /// - `MIN_SPEECH_FRAMES`: not enough VAD-flagged speech overall.
 /// - `min_rms`: VAD-flagged frames present, but too quiet to be real speech.
-fn flush_utterance(utt: &mut Utterance, whisper_tx: &Sender<Vec<f32>>, min_rms: f32) {
+fn flush_utterance(utt: &mut Utterance, whisper_tx: &Sender<Clip>, min_rms: f32) {
     let speech_frames = utt.speech_frames;
     if speech_frames < MIN_SPEECH_FRAMES {
         eprintln!(
@@ -711,13 +877,17 @@ fn flush_utterance(utt: &mut Utterance, whisper_tx: &Sender<Vec<f32>>, min_rms: 
     let tail_end = (utt.samples_at_last_speech + TAIL_KEEP_SAMPLES).min(utt.buf.len());
     utt.buf.truncate(tail_end);
 
-    let utterance = std::mem::take(&mut utt.buf);
+    let pcm = std::mem::take(&mut utt.buf);
     eprintln!(
         "[sttd] utterance: {} samples ({speech_frames} speech frames, rms={rms:.5}) -> whisper",
-        utterance.len()
+        pcm.len()
     );
     *utt = Utterance::default();
-    if let Err(e) = whisper_tx.send(utterance) {
+    if let Err(e) = whisper_tx.send(Clip {
+        pcm,
+        speech_frames,
+        rms,
+    }) {
         eprintln!("[sttd] whisper queue closed: {e}");
     }
 }
@@ -895,7 +1065,7 @@ fn download_model(url: &str, dest: &Path) -> Result<()> {
 // Whisper worker
 // ---------------------------------------------------------------------------
 
-fn spawn_whisper_worker(rx: Receiver<Vec<f32>>, model_path: PathBuf) -> JoinHandle<()> {
+fn spawn_whisper_worker(rx: Receiver<Clip>, model_path: PathBuf) -> JoinHandle<()> {
     thread::Builder::new()
         .name("whisper".into())
         .spawn(move || {
@@ -906,7 +1076,20 @@ fn spawn_whisper_worker(rx: Receiver<Vec<f32>>, model_path: PathBuf) -> JoinHand
         .expect("failed to spawn whisper thread")
 }
 
-fn whisper_loop(rx: &Receiver<Vec<f32>>, model_path: &Path) -> Result<()> {
+/// Write `reason` as `<dump_dir>/<tag>.txt` for an utterance that was
+/// dropped rather than printed, so `STTD_DUMP_DIR` output stays correlatable
+/// with the stderr log: previously a dropped utterance left only a WAV with
+/// no indication of what became of it or why.
+fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
+    if let Some(dir) = dump_dir {
+        let txt_path = dir.join(format!("{tag}.txt"));
+        if let Err(e) = std::fs::write(&txt_path, reason) {
+            eprintln!("[sttd] failed to write {}: {e:?}", txt_path.display());
+        }
+    }
+}
+
+fn whisper_loop(rx: &Receiver<Clip>, model_path: &Path) -> Result<()> {
     let path_str = model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
@@ -919,6 +1102,7 @@ fn whisper_loop(rx: &Receiver<Vec<f32>>, model_path: &Path) -> Result<()> {
     let mut state = ctx
         .create_state()
         .context("failed to create whisper state")?;
+    let token_beg = ctx.token_beg();
 
     let model_name = ctx
         .model_type_readable()
@@ -927,6 +1111,15 @@ fn whisper_loop(rx: &Receiver<Vec<f32>>, model_path: &Path) -> Result<()> {
 
     let prompt = std::env::var("STTD_PROMPT").unwrap_or_else(|_| DEFAULT_PROMPT.to_string());
     let min_confidence = env_f32("STTD_MIN_CONF", DEFAULT_MIN_CONFIDENCE);
+    let min_confidence_strong = env_f32("STTD_MIN_CONF_STRONG", DEFAULT_MIN_CONFIDENCE_STRONG);
+    // Same override `FrameProcessor::new` reads for the acoustic gate,
+    // re-read here rather than threaded through the channel: it's one env
+    // lookup and keeps `Clip` free of config, only evidence.
+    let min_speech_rms = env_f32("STTD_MIN_RMS", DEFAULT_MIN_SPEECH_RMS);
+    let target_rms = env_f32("STTD_TARGET_RMS", DEFAULT_TARGET_RMS);
+    let debug_tokens = std::env::var("STTD_DEBUG_TOKENS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let dump_dir = std::env::var_os("STTD_DUMP_DIR").map(PathBuf::from);
     if let Some(dir) = &dump_dir {
         std::fs::create_dir_all(dir)
@@ -935,48 +1128,95 @@ fn whisper_loop(rx: &Receiver<Vec<f32>>, model_path: &Path) -> Result<()> {
     }
 
     let mut utterance_no: u64 = 0;
-    for pcm in rx.iter() {
-        if pcm.is_empty() {
+    for clip in rx.iter() {
+        if clip.pcm.is_empty() {
             continue;
         }
         utterance_no += 1;
+        let tag = format!("utt_{utterance_no:06}");
 
         if let Some(dir) = &dump_dir {
-            let wav_path = dir.join(format!("utt_{utterance_no:06}.wav"));
-            if let Err(e) = write_wav_mono16(&wav_path, &pcm, WHISPER_RATE) {
+            let wav_path = dir.join(format!("{tag}.wav"));
+            if let Err(e) = write_wav_mono16(&wav_path, &clip.pcm, WHISPER_RATE) {
                 eprintln!("[sttd] failed to dump {}: {e:?}", wav_path.display());
             }
         }
 
-        match transcribe(&mut state, &pcm, &prompt) {
-            Ok((text, confidence)) => {
-                let trimmed = text.trim();
+        let gained = apply_gain(&clip.pcm, clip.rms, target_rms, MAX_GAIN);
+
+        match transcribe(&mut state, token_beg, &gained, &prompt, debug_tokens) {
+            Ok(t) => {
+                let trimmed = t.text.trim();
                 if trimmed.is_empty() {
+                    dump_drop_reason(&dump_dir, &tag, "DROPPED(empty)");
                     continue;
                 }
-                if confidence < min_confidence {
-                    eprintln!(
-                        "[sttd] dropped low-confidence transcript (avg_p={confidence:.3} \
-                         < {min_confidence:.3}): {trimmed:?}"
+                let (threshold, gate) = confidence_threshold(
+                    &clip,
+                    min_speech_rms,
+                    min_confidence,
+                    min_confidence_strong,
+                );
+                eprintln!(
+                    "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={threshold:.3} \
+                     ({gate} evidence)",
+                    t.avg_prob, t.avg_logprob
+                );
+                if t.avg_prob < threshold {
+                    eprintln!("[sttd] {tag}: dropped low-confidence transcript: {trimmed:?}");
+                    dump_drop_reason(
+                        &dump_dir,
+                        &tag,
+                        &format!(
+                            "DROPPED(low-conf avg_p={:.3} < {threshold:.3}, {gate}): {trimmed}",
+                            t.avg_prob
+                        ),
                     );
                     continue;
                 }
                 if is_hallucination(trimmed) {
-                    eprintln!("[sttd] dropped likely hallucination: {trimmed:?}");
+                    eprintln!("[sttd] {tag}: dropped likely hallucination: {trimmed:?}");
+                    dump_drop_reason(
+                        &dump_dir,
+                        &tag,
+                        &format!("DROPPED(hallucination): {trimmed}"),
+                    );
                     continue;
                 }
                 println!("{trimmed}");
                 if let Some(dir) = &dump_dir {
-                    let txt_path = dir.join(format!("utt_{utterance_no:06}.txt"));
+                    let txt_path = dir.join(format!("{tag}.txt"));
                     if let Err(e) = std::fs::write(&txt_path, trimmed) {
                         eprintln!("[sttd] failed to write {}: {e:?}", txt_path.display());
                     }
                 }
             }
-            Err(e) => eprintln!("[sttd] transcription failed: {e:?}"),
+            Err(e) => eprintln!("[sttd] {tag}: transcription failed: {e:?}"),
         }
     }
     Ok(())
+}
+
+/// Apply gain toward `target_rms`, computed from the speech-only `rms`
+/// `flush_utterance` already measured (not recomputed over `pcm`, which
+/// includes the padded silence tail). Only ever amplifies (gain >= 1.0) and
+/// never attenuates: a clip reaching this point already cleared the acoustic
+/// gates, so there's no silence here to accidentally boost. Caps at
+/// `max_gain`, and backs off further if that gain would clip the loudest
+/// sample past 0.99. `target_rms <= 0.0` or `rms <= 0.0` disables gain.
+fn apply_gain(pcm: &[f32], rms: f32, target_rms: f32, max_gain: f32) -> Vec<f32> {
+    if target_rms <= 0.0 || rms <= 0.0 {
+        return pcm.to_vec();
+    }
+    let mut gain = (target_rms / rms).clamp(1.0, max_gain);
+    if gain <= 1.0 {
+        return pcm.to_vec();
+    }
+    let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak > 0.0 {
+        gain = gain.min(0.99 / peak);
+    }
+    pcm.iter().map(|&s| s * gain).collect()
 }
 
 /// Pad sub-second audio with quiet dithered noise instead of exact digital
@@ -997,17 +1237,70 @@ fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
     out
 }
 
-/// Runs one whisper inference and returns `(transcript, avg_token_prob)`.
-/// The average token probability is `sttd`'s stand-in for whisper.cpp's
-/// `no_speech_thold`, which is declared in `whisper_full_params` but never
-/// actually read by the decoder (see `DEFAULT_MIN_CONFIDENCE`'s doc
-/// comment) — so whisper.cpp itself never rejects a low-confidence segment,
-/// and the caller must do it based on this value.
+/// Result of one whisper inference: the joined segment text plus confidence
+/// averaged over *text* tokens only (see `average_text_confidence`).
+struct Transcript {
+    text: String,
+    /// `sttd`'s stand-in for whisper.cpp's `no_speech_thold`, which is
+    /// declared in `whisper_full_params` but never actually read by the
+    /// decoder (see `DEFAULT_MIN_CONFIDENCE`'s doc comment) — so whisper.cpp
+    /// itself never rejects a low-confidence segment, and the caller must
+    /// do it based on this value.
+    avg_prob: f32,
+    /// Same average, in log space — the statistic whisper.cpp's own
+    /// fallback ladder uses internally (`whisper.cpp`: `avg_logprobs`),
+    /// logged alongside `avg_prob` for comparable-scale tuning.
+    avg_logprob: f32,
+}
+
+/// Average token probability/log-probability over *text* tokens only, given
+/// each token's `(id, p, plog)`. Timestamp tokens (`id >= token_beg`) sit in
+/// every whisper.cpp segment — a leading `<|0.00|>` and a closing `<|t|>`
+/// (confirmed in the vendored whisper.cpp 1.7.1 source,
+/// `whisper.cpp:6191-6193`: `result_all.back().tokens` is filled from
+/// `tokens_cur[i0..=i]`, where token `i` is the timestamp token that closed
+/// the segment and `tokens_cur[i0]` the timestamp that opened it) — and
+/// their probability says nothing about transcript quality. Averaging them
+/// in dilutes the score, worst on short utterances, which is exactly where
+/// keeping the gate accurate matters most.
+fn average_text_confidence(
+    tokens: &[(whisper_rs::WhisperToken, f32, f32)],
+    token_beg: whisper_rs::WhisperToken,
+) -> (f32, f32, usize) {
+    let mut prob_sum = 0f64;
+    let mut logprob_sum = 0f64;
+    let mut count = 0usize;
+    for &(id, p, plog) in tokens {
+        if id >= token_beg {
+            continue;
+        }
+        prob_sum += p as f64;
+        logprob_sum += plog as f64;
+        count += 1;
+    }
+    if count == 0 {
+        (0.0, 0.0, 0)
+    } else {
+        (
+            (prob_sum / count as f64) as f32,
+            (logprob_sum / count as f64) as f32,
+            count,
+        )
+    }
+}
+
+/// Runs one whisper inference. `token_beg` (from `ctx.token_beg()`) is
+/// needed to tell text tokens from timestamp tokens when scoring confidence
+/// (see `average_text_confidence`). `debug_tokens` dumps every token's
+/// id/text/p/plog/is-timestamp to stderr, for confirming that scoring on a
+/// real utterance (`STTD_DEBUG_TOKENS=1`).
 fn transcribe(
     state: &mut whisper_rs::WhisperState,
+    token_beg: whisper_rs::WhisperToken,
     pcm_16k: &[f32],
     prompt: &str,
-) -> Result<(String, f32)> {
+    debug_tokens: bool,
+) -> Result<Transcript> {
     // Pad sub-second utterances (e.g. 300-999 ms that pass MIN_UTTERANCE_SAMPLES)
     // so whisper processes them instead of warning "input is too short" and
     // returning zero segments.
@@ -1056,8 +1349,7 @@ fn transcribe(
     state.full(params, pcm_16k).context("whisper full failed")?;
     let n = state.full_n_segments().context("no segments")?;
     let mut out = String::new();
-    let mut prob_sum = 0f64;
-    let mut prob_count = 0usize;
+    let mut tokens: Vec<(whisper_rs::WhisperToken, f32, f32)> = Vec::new();
     for i in 0..n {
         match state.full_get_segment_text_lossy(i) {
             Ok(s) => {
@@ -1073,18 +1365,30 @@ fn transcribe(
         }
         let n_tokens = state.full_n_tokens(i).unwrap_or(0);
         for t in 0..n_tokens {
-            if let Ok(p) = state.full_get_token_prob(i, t) {
-                prob_sum += p as f64;
-                prob_count += 1;
+            if let Ok(data) = state.full_get_token_data(i, t) {
+                if debug_tokens {
+                    let text = state
+                        .full_get_token_text_lossy(i, t)
+                        .unwrap_or_else(|_| "?".to_string());
+                    eprintln!(
+                        "[sttd]   token seg={i} idx={t} id={} p={:.3} plog={:.3} \
+                         timestamp={} {text:?}",
+                        data.id,
+                        data.p,
+                        data.plog,
+                        data.id >= token_beg
+                    );
+                }
+                tokens.push((data.id, data.p, data.plog));
             }
         }
     }
-    let avg_confidence = if prob_count > 0 {
-        (prob_sum / prob_count as f64) as f32
-    } else {
-        0.0
-    };
-    Ok((out, avg_confidence))
+    let (avg_prob, avg_logprob, _text_token_count) = average_text_confidence(&tokens, token_beg);
+    Ok(Transcript {
+        text: out,
+        avg_prob,
+        avg_logprob,
+    })
 }
 
 /// Fold a Polish diacritic to its ASCII base letter; every other char is
@@ -1274,6 +1578,24 @@ mod tests {
     }
 
     #[test]
+    fn dual_resamplers_agree_on_input_frames() {
+        // `FrameProcessor::new` only takes the `WhisperResample::Direct`
+        // (single-hop hw->16k) path when a hw->16k resampler consumes the
+        // same input chunk size as the hw->48k one, since both are fed from
+        // the same raw stream in lockstep. Confirms that holds for common
+        // rates, and that both branches still land on a round 10 ms frame
+        // count (480 @ 48k, 160 @ 16k) — i.e. that `make_resampler`'s single
+        // formula (`hw_rate / 100`) is the right one for both targets.
+        for hw in [16_000, 44_100, 48_000, 96_000] {
+            let (r48, in48) = make_resampler(hw, DENOISE_RATE).unwrap();
+            let (r16, in16) = make_resampler(hw, WHISPER_RATE).unwrap();
+            assert_eq!(in48, in16, "hw={hw}: input chunk sizes must match");
+            assert_eq!(r48.output_frames_next(), FRAME_48K, "hw={hw}");
+            assert_eq!(r16.output_frames_next(), FRAME_16K, "hw={hw}");
+        }
+    }
+
+    #[test]
     fn vad_accepts_10ms_16k_frame() {
         let mut vad = Vad::new(16_000).unwrap();
         vad.fvad_set_mode(VadMode::Aggressive).unwrap();
@@ -1403,7 +1725,9 @@ mod tests {
         let (tx, rx) = unbounded();
         flush_utterance(&mut utt, &tx, DEFAULT_MIN_SPEECH_RMS);
         let got = rx.try_recv().expect("real speech must be sent to whisper");
-        assert!(!got.is_empty());
+        assert!(!got.pcm.is_empty());
+        assert_eq!(got.speech_frames, 25);
+        assert!(got.rms > 0.0);
     }
 
     #[test]
@@ -1423,7 +1747,7 @@ mod tests {
         let (tx, rx) = unbounded();
         flush_utterance(&mut utt, &tx, 0.0);
         let got = rx.try_recv().unwrap();
-        assert_eq!(got.len(), samples_at_last_speech + TAIL_KEEP_SAMPLES);
+        assert_eq!(got.pcm.len(), samples_at_last_speech + TAIL_KEEP_SAMPLES);
     }
 
     #[test]
@@ -1450,7 +1774,114 @@ mod tests {
         };
         flush_utterance(&mut long, &tx, 0.0);
         let got = rx.try_recv().unwrap();
-        assert_eq!(got.len(), 5_000);
+        assert_eq!(got.pcm.len(), 5_000);
+    }
+
+    #[test]
+    fn strong_acoustic_evidence_relaxes_confidence_gate() {
+        // Exact numbers from the production log this fix addresses:
+        // "[sttd] utterance: 34720 samples (137 speech frames, rms=0.01178)
+        // -> whisper" followed by "dropped low-confidence transcript
+        // (avg_p=0.478 < 0.600)" for a transcript the user confirmed was
+        // close to correct (one misheard word), not a hallucination.
+        let clip = Clip {
+            pcm: Vec::new(),
+            speech_frames: 137,
+            rms: 0.01178,
+        };
+        let (threshold, gate) = confidence_threshold(
+            &clip,
+            DEFAULT_MIN_SPEECH_RMS,
+            DEFAULT_MIN_CONFIDENCE,
+            DEFAULT_MIN_CONFIDENCE_STRONG,
+        );
+        assert_eq!(gate, "strong");
+        assert_eq!(threshold, DEFAULT_MIN_CONFIDENCE_STRONG);
+        assert!(
+            0.478 >= threshold,
+            "avg_p=0.478 must clear the relaxed threshold {threshold}"
+        );
+    }
+
+    #[test]
+    fn weak_evidence_keeps_strict_gate() {
+        // Regression for the hole 71c05b0 closed: an utterance with barely
+        // enough VAD-flagged speech to survive `flush_utterance`'s own
+        // gates, and RMS just above the noise floor, must still face the
+        // strict confidence floor — even at the same avg_p (0.478) that the
+        // strong-evidence case above lets through.
+        let clip = Clip {
+            pcm: Vec::new(),
+            speech_frames: MIN_SPEECH_FRAMES,
+            rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
+        };
+        let (threshold, gate) = confidence_threshold(
+            &clip,
+            DEFAULT_MIN_SPEECH_RMS,
+            DEFAULT_MIN_CONFIDENCE,
+            DEFAULT_MIN_CONFIDENCE_STRONG,
+        );
+        assert_eq!(gate, "weak");
+        assert_eq!(threshold, DEFAULT_MIN_CONFIDENCE);
+        assert!(
+            0.478 < threshold,
+            "avg_p=0.478 must NOT clear the strict threshold {threshold}"
+        );
+    }
+
+    #[test]
+    fn confidence_ignores_timestamp_tokens() {
+        // Regression: naively averaging over every token (as the code used
+        // to) pulls in the two timestamp tokens whisper.cpp emits per
+        // segment (whisper.cpp:6191-6193: `tokens_cur[i0..=i]`, where i0 and
+        // i bracket the segment with its opening/closing timestamp tokens),
+        // diluting the score. Worst on short utterances, which carry
+        // relatively more timestamp weight.
+        let token_beg: whisper_rs::WhisperToken = 50364; // whisper.cpp's typical <|0.00|> id
+        let tokens = vec![
+            (token_beg, 0.99, -0.01),      // leading timestamp: must be excluded
+            (100, 0.9, -0.1),              // text
+            (101, 0.5, -0.7),              // text
+            (102, 0.4, -0.9),              // text
+            (token_beg + 50, 0.99, -0.01), // closing timestamp: must be excluded
+        ];
+        let (avg_prob, avg_logprob, count) = average_text_confidence(&tokens, token_beg);
+        assert_eq!(count, 3);
+        assert!((avg_prob - (0.9 + 0.5 + 0.4) / 3.0).abs() < 1e-6);
+        assert!((avg_logprob - (-0.1 - 0.7 - 0.9) / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalization_gain_is_capped() {
+        // A near-silent clip (rms=0.0001) must not get amplified by the raw
+        // target/rms ratio (500x here) — that would blow quantization noise
+        // up into something whisper mistakes for speech. Capped at
+        // MAX_GAIN, and backed off further if it would clip.
+        let pcm = vec![0.0001f32; 100];
+        let out = apply_gain(&pcm, 0.0001, DEFAULT_TARGET_RMS, MAX_GAIN);
+        let applied_gain = out[0] / pcm[0];
+        assert!(
+            applied_gain <= MAX_GAIN + 1e-3,
+            "gain={applied_gain} exceeds cap {MAX_GAIN}"
+        );
+        assert!(out.iter().all(|&s| s.abs() <= 0.99 + 1e-6));
+    }
+
+    #[test]
+    fn normalization_gain_disabled_by_zero_target() {
+        let pcm = vec![0.01f32; 100];
+        let out = apply_gain(&pcm, 0.01, 0.0, MAX_GAIN);
+        assert_eq!(out, pcm);
+    }
+
+    #[test]
+    fn normalization_gain_never_attenuates() {
+        // A clip already louder than the target must be left alone, not
+        // turned down toward it — this gate only ever helps quiet-but-real
+        // speech, never touches an already-strong signal.
+        let pcm = vec![0.2f32; 100];
+        let out = apply_gain(&pcm, 0.2, DEFAULT_TARGET_RMS, MAX_GAIN);
+        assert_eq!(out, pcm);
     }
 
     #[test]
