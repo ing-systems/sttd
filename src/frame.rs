@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 use rubato::{FftFixedInOut, Resampler};
-use webrtc_vad::{Vad, VadMode};
 
 use crate::config::{
-    DENOISE_RATE, DEFAULT_MIN_SPEECH_RMS, FRAME_16K, FRAME_48K, WHISPER_RATE, f32_from_env,
+    DENOISE_RATE, DEFAULT_MIN_SPEECH_RMS, DEFAULT_VAD_THRESHOLD, FRAME_16K, FRAME_48K,
+    WHISPER_RATE, f32_from_env,
 };
 use crate::denoise::{Denoiser, DenoiserKind};
 use crate::dsp::{WhisperResample, resampler_for};
 use crate::utterance::{FrameAction, Utterance, UtteranceBuffer};
+use crate::vad::SpeechDetector;
 
 // ---------------------------------------------------------------------------
 // Frame processing: denoise/VAD branch + whisper branch + utterance buffer
@@ -42,8 +43,7 @@ pub(crate) struct FrameProcessor {
     denoiser: Denoiser,
     clean48_vad: Vec<f32>,
 
-    vad: Vad,
-    vad_i16: Vec<i16>,
+    vad: SpeechDetector,
 
     utterance: UtteranceBuffer,
     /// `STTD_MIN_RMS` override (or `DEFAULT_MIN_SPEECH_RMS`), read once at
@@ -122,14 +122,9 @@ impl FrameProcessor {
             }
         };
 
-        let mut vad =
-            Vad::new(WHISPER_RATE as i32).map_err(|_| anyhow::anyhow!("invalid VAD rate"))?;
-        // Aggressive (not VeryAggressive): with pre-roll (1.4) and the fix
-        // that stops discarding mid-utterance non-speech (1.1), the cost of
-        // a false positive is a few extra ms of silence, while a false
-        // negative here used to mean lost phonemes.
-        vad.fvad_set_mode(VadMode::Aggressive)
-            .map_err(|_| anyhow::anyhow!("failed to set VAD mode"))?;
+        // `STTD_VAD_THRESHOLD` override (or `DEFAULT_VAD_THRESHOLD`): the
+        // minimum earshot score for a window to count as speech (see `vad`).
+        let vad = SpeechDetector::new(f32_from_env("STTD_VAD_THRESHOLD", DEFAULT_VAD_THRESHOLD));
 
         Ok(Self {
             resampler_hw48,
@@ -143,7 +138,6 @@ impl FrameProcessor {
             denoiser: Denoiser::new(DenoiserKind::from_env())?,
             clean48_vad: vec![0.0f32; FRAME_48K],
             vad,
-            vad_i16: vec![0i16; FRAME_16K],
             utterance: UtteranceBuffer::new(),
             min_speech_rms: f32_from_env("STTD_MIN_RMS", DEFAULT_MIN_SPEECH_RMS),
             whisper_tx,
@@ -238,22 +232,7 @@ impl FrameProcessor {
         };
 
         // ---- VAD decision --------------------------------------------------
-        // `vad_i16` is pre-sized for the steady-state FRAME_16K case; guard
-        // against a resampler startup/edge call producing a different count
-        // instead of panicking on an out-of-bounds write.
-        if self.vad_i16.len() < vad_produced {
-            self.vad_i16.resize(vad_produced, 0);
-        }
-        for (i, s) in self.resample_vad_out[0][..vad_produced].iter().enumerate() {
-            self.vad_i16[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        }
-        let is_speech = match self.vad.is_voice_segment(&self.vad_i16[..vad_produced]) {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("[sttd] VAD rejected frame length");
-                false
-            }
-        };
+        let is_speech = self.vad.verdict(&self.resample_vad_out[0][..vad_produced]);
 
         // ---- utterance buffering --------------------------------------------
         if self.utterance.push_frame(&whisper16, is_speech) == FrameAction::Flush {
@@ -277,19 +256,5 @@ impl FrameProcessor {
         if self.utterance.is_open() {
             self.enqueue_utterance();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::FRAME_16K;
-
-    #[test]
-    fn webrtc_vad_accepts_10ms_16k_frame() {
-        let mut vad = Vad::new(16_000).unwrap();
-        vad.fvad_set_mode(VadMode::Aggressive).unwrap();
-        let silence = vec![0i16; FRAME_16K];
-        assert!(vad.is_voice_segment(&silence).is_ok());
     }
 }

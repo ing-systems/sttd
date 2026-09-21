@@ -13,7 +13,7 @@ use crate::config::{DENOISE_RATE, FRAME_48K};
 // ---------------------------------------------------------------------------
 
 /// Which model cleans the VAD branch's 48 kHz frame before it's resampled
-/// down to 16 kHz for `webrtc-vad`. Chosen once at startup via
+/// down to 16 kHz for `earshot`. Chosen once at startup via
 /// `STTD_DENOISER` and fixed for the process's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DenoiserKind {

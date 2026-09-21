@@ -2,7 +2,7 @@
 name = "sttd"
 version = "0.1.0"
 edition = "2021"
-description = "Real-time Speech-to-Text pipeline: cpal + rubato + deep_filter/nnnoiseless + webrtc-vad + whisper-rs"
+description = "Real-time Speech-to-Text pipeline: cpal + rubato + deep_filter/nnnoiseless + earshot + whisper-rs"
 license = "MIT"
 
 [dependencies]
@@ -11,7 +11,7 @@ rubato = "0.15"
 nnnoiseless = "0.5"
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"] }
 ndarray = "0.15"
-webrtc-vad = "0.2"
+earshot = { version = "1.2", features = ["alloc"] }
 whisper-rs = { version = "0.13", features = ["cuda"] }
 crossbeam-channel = "0.5"
 ureq = "2"

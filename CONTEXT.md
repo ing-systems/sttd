@@ -44,7 +44,9 @@ _Avoid_: confidence, quality score
 **VAD verdict**:
 The per-frame judgement of whether that frame holds speech. It is evidence, not
 a fact: a click, a breath or mains hum can carry it, and real speech can fail
-it.
+it. Produced by `earshot`, whose neural predictions land on a fixed 16 ms
+window rather than the pipeline's 10 ms frame cadence; the verdict for a frame
+that falls between windows re-reports the last prediction rather than guessing.
 _Avoid_: speech detection, voice activity (as a verdict)
 
 ### Deciding not to emit
@@ -86,11 +88,11 @@ _Avoid_: detection path, analysis branch
 
 **Denoiser**:
 The model that cleans the VAD branch's 48 kHz frame before it's resampled
-down and handed to `webrtc-vad`. Selectable via `STTD_DENOISER`
+down and handed to `earshot`. Selectable via `STTD_DENOISER`
 (deepfilter/rnnoise/none); only ever runs on the VAD branch, never on the
 whisper branch. The default, DeepFilterNet3, adds a 20 ms lookahead ahead of
 its own output, absorbed by pre-roll (300 ms) and silence hangover (800 ms)
-the same way VAD's own onset latency is.
+the same way `earshot`'s own 16 ms prediction window is.
 _Avoid_: noise suppression (generic), the denoiser (as if only one exists)
 
 **Whisper branch**:

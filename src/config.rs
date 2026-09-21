@@ -87,6 +87,11 @@ pub(crate) const DEFAULT_MIN_CONFIDENCE: f32 = 0.6;
 /// a single scalar threshold can't separate the two cases; VAD/RMS evidence
 /// can. Override with `STTD_MIN_CONF_STRONG`.
 pub(crate) const DEFAULT_MIN_CONFIDENCE_STRONG: f32 = 0.35;
+/// Minimum earshot score (see `vad`) for a 16 ms window to count as speech.
+/// earshot returns a score in `[0, 1]`; upstream suggests 0.5 as the general
+/// voice threshold. Override with `STTD_VAD_THRESHOLD` while tuning against
+/// real mic noise.
+pub(crate) const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
 /// `speech_frames` (see `Evidence`) required to count as "strong" acoustic
 /// evidence: 500 ms of VAD-flagged speech, well past `MIN_SPEECH_FRAMES`.
 pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
