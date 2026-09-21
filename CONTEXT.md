@@ -84,6 +84,15 @@ denoised and resampled down to the judged rate. Nothing on this branch is ever
 transcribed.
 _Avoid_: detection path, analysis branch
 
+**Denoiser**:
+The model that cleans the VAD branch's 48 kHz frame before it's resampled
+down and handed to `webrtc-vad`. Selectable via `STTD_DENOISER`
+(deepfilter/rnnoise/none); only ever runs on the VAD branch, never on the
+whisper branch. The default, DeepFilterNet3, adds a 20 ms lookahead ahead of
+its own output, absorbed by pre-roll (300 ms) and silence hangover (800 ms)
+the same way VAD's own onset latency is.
+_Avoid_: noise suppression (generic), the denoiser (as if only one exists)
+
 **Whisper branch**:
 The signal path that gets transcribed, kept raw and undenoised, because the
 model was trained on raw audio. Its samples are what an utterance is made of.

@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
-use nnnoiseless::DenoiseState;
 use rubato::{FftFixedInOut, Resampler};
 use webrtc_vad::{Vad, VadMode};
 
 use crate::config::{
     DENOISE_RATE, DEFAULT_MIN_SPEECH_RMS, FRAME_16K, FRAME_48K, WHISPER_RATE, f32_from_env,
 };
+use crate::denoise::{Denoiser, DenoiserKind};
 use crate::dsp::{WhisperResample, resampler_for};
 use crate::utterance::{FrameAction, Utterance, UtteranceBuffer};
 
@@ -39,9 +39,7 @@ pub(crate) struct FrameProcessor {
     /// 48 kHz intermediate whisper's (non-denoised) signal never needed.
     whisper_resample: WhisperResample,
 
-    denoise: Box<DenoiseState<'static>>,
-    denoise_in: Vec<f32>,
-    denoise_out: Vec<f32>,
+    denoiser: Denoiser,
     clean48_vad: Vec<f32>,
 
     vad: Vad,
@@ -142,9 +140,7 @@ impl FrameProcessor {
             resample_vad_in,
             resample_vad_out,
             whisper_resample,
-            denoise: DenoiseState::new(),
-            denoise_in: vec![0.0f32; FRAME_48K],
-            denoise_out: vec![0.0f32; FRAME_48K],
+            denoiser: Denoiser::new(DenoiserKind::from_env())?,
             clean48_vad: vec![0.0f32; FRAME_48K],
             vad,
             vad_i16: vec![0i16; FRAME_16K],
@@ -194,14 +190,8 @@ impl FrameProcessor {
         let frame_48k_raw = self.resample_hw48_out[0][..FRAME_48K].to_vec();
 
         // ---- VAD branch: denoise, then resample to 16 kHz -----------------
-        for (i, s) in frame_48k_raw.iter().enumerate() {
-            self.denoise_in[i] = (s * 32768.0).clamp(-32768.0, 32767.0);
-        }
-        self.denoise
-            .process_frame(&mut self.denoise_out, &self.denoise_in);
-        for (i, s) in self.denoise_out.iter().enumerate() {
-            self.clean48_vad[i] = s / 32768.0;
-        }
+        self.denoiser
+            .denoise_frame(&frame_48k_raw, &mut self.clean48_vad);
         self.resample_vad_in[0][..FRAME_48K].copy_from_slice(&self.clean48_vad);
         let vad_produced = match self.resampler_vad.process_into_buffer(
             &self.resample_vad_in,

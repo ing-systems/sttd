@@ -4,7 +4,7 @@
 //! `cpal` (hw rate, stereo) -> downmix mono -> per ~10 ms raw chunk, two
 //! independent `rubato` resamplings (`FrameProcessor`, see `WhisperResample`
 //! for when the whisper branch's collapses to one hop instead of two):
-//!   - VAD branch:     `rubato` (-> 48 kHz) -> `nnnoiseless` denoise -> `rubato` (-> 16 kHz) -> `webrtc-vad`
+//!   - VAD branch:     `rubato` (-> 48 kHz) -> denoise (`STTD_DENOISER`: deepfilter/rnnoise/none, see `denoise`) -> `rubato` (-> 16 kHz) -> `webrtc-vad`
 //!   - whisper branch: `rubato` (-> 16 kHz, direct hop when possible) -> utterance buffer
 //! An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive speech
 //! frames (a single VAD false positive no longer opens one), with ~300 ms of
@@ -44,6 +44,7 @@ use config::{
 };
 mod capture;
 use capture::*;
+mod denoise;
 mod dsp;
 mod frame;
 use frame::*;
@@ -90,6 +91,7 @@ fn print_usage() {
          ENV:\n\
          \x20   WHISPER_MODEL_PATH    path to a ggml model (default: {DEFAULT_MODEL_PATH})\n\
          \x20   STTD_DEVICE           substring match (case-insensitive) against an input device name\n\
+         \x20   STTD_DENOISER         VAD-branch denoiser: deepfilter|rnnoise|none (default: deepfilter)\n\
          \x20   STTD_PROMPT           override the whisper initial_prompt\n\
          \x20   STTD_DUMP_DIR         write each utterance as WAV+TXT into this directory (TXT written\n\
          \x20                         for dropped utterances too, prefixed with the drop reason)\n\
