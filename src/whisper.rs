@@ -6,18 +6,35 @@ use crossbeam_channel::Receiver;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::config::{
-    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
-    DEFAULT_PROMPT, DEFAULT_TARGET_RMS, HALLUCINATION_PATTERNS, MAX_GAIN, STRONG_RMS_FACTOR,
-    STRONG_SPEECH_FRAMES, WHISPER_MIN_SAMPLES, WHISPER_RATE, bool_from_env, f32_from_env,
+    HALLUCINATION_PATTERNS, MAX_GAIN, STRONG_RMS_FACTOR, STRONG_SPEECH_FRAMES,
+    WHISPER_MIN_SAMPLES, WHISPER_RATE,
 };
 use crate::utterance::{Evidence, Utterance};
 use crate::wav::write_wav_mono16;
 
-pub(crate) fn spawn_whisper_worker(rx: Receiver<Utterance>, model_path: PathBuf) -> JoinHandle<()> {
+/// Tunables the whisper worker needs, resolved once from `Cli`.
+#[derive(Debug, Clone)]
+pub(crate) struct WhisperOptions {
+    pub(crate) prompt: String,
+    pub(crate) min_confidence: f32,
+    pub(crate) min_confidence_strong: f32,
+    pub(crate) min_speech_rms: f32,
+    pub(crate) target_rms: f32,
+    pub(crate) debug_tokens: bool,
+    pub(crate) dump_dir: Option<PathBuf>,
+    pub(crate) copy_enabled: bool,
+    pub(crate) paste_enabled: bool,
+}
+
+pub(crate) fn spawn_whisper_worker(
+    rx: Receiver<Utterance>,
+    model_path: PathBuf,
+    opts: WhisperOptions,
+) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("whisper".into())
         .spawn(move || {
-            if let Err(e) = whisper_loop(&rx, &model_path) {
+            if let Err(e) = whisper_loop(&rx, &model_path, &opts) {
                 eprintln!("[sttd] whisper worker failed: {e:?}");
             }
         })
@@ -123,7 +140,7 @@ pub(crate) fn paste_at_cursor() -> std::io::Result<()> {
     }
 }
 
-fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
+fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path, opts: &WhisperOptions) -> Result<()> {
     let path_str = model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
@@ -143,38 +160,36 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
         .unwrap_or_else(|_| "unknown".to_string());
     eprintln!("[sttd] whisper ready (model={model_name}, pl, beam=5, threads=8, gpu=true)");
 
-    let prompt = std::env::var("STTD_PROMPT").unwrap_or_else(|_| DEFAULT_PROMPT.to_string());
-    let min_confidence = f32_from_env("STTD_MIN_CONF", DEFAULT_MIN_CONFIDENCE);
-    let min_confidence_strong = f32_from_env("STTD_MIN_CONF_STRONG", DEFAULT_MIN_CONFIDENCE_STRONG);
-    // Same override `FrameProcessor::new` reads for the acoustic gate,
-    // re-read here rather than threaded through the channel: it's one env
-    // lookup and keeps `Utterance` free of config, only evidence.
-    let min_speech_rms = f32_from_env("STTD_MIN_RMS", DEFAULT_MIN_SPEECH_RMS);
-    let target_rms = f32_from_env("STTD_TARGET_RMS", DEFAULT_TARGET_RMS);
-    let debug_tokens = std::env::var("STTD_DEBUG_TOKENS")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let dump_dir = std::env::var_os("STTD_DUMP_DIR").map(PathBuf::from);
+    let prompt = opts.prompt.clone();
+    let min_confidence = opts.min_confidence;
+    let min_confidence_strong = opts.min_confidence_strong;
+    // Same value `FrameProcessor::new` receives for the acoustic gate,
+    // passed via `WhisperOptions` rather than threaded through the channel:
+    // keeps `Utterance` free of config, only evidence.
+    let min_speech_rms = opts.min_speech_rms;
+    let target_rms = opts.target_rms;
+    let debug_tokens = opts.debug_tokens;
+    let dump_dir = opts.dump_dir.clone();
     if let Some(dir) = &dump_dir {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
         eprintln!("[sttd] dumping utterances to {}", dir.display());
     }
-    let copy_enabled = bool_from_env("STTD_COPY", true);
+    let copy_enabled = opts.copy_enabled;
     // Becomes `false` permanently after the first "binary not found" so a
     // machine without wl-clipboard installed logs one warning instead of
     // one per utterance.
     let mut clipboard_available = copy_enabled;
     if !copy_enabled {
-        eprintln!("[sttd] clipboard copy disabled (STTD_COPY=0)");
+        eprintln!("[sttd] clipboard copy disabled (--copy=false)");
     }
-    let paste_enabled = bool_from_env("STTD_PASTE", true);
+    let paste_enabled = opts.paste_enabled;
     // Same one-warning latch as above, for machines without `wtype`.
     let mut paste_available = paste_enabled;
     if !paste_enabled {
-        eprintln!("[sttd] auto-paste disabled (STTD_PASTE=0)");
+        eprintln!("[sttd] auto-paste disabled (--paste=false)");
     } else if !copy_enabled {
-        eprintln!("[sttd] warning: STTD_PASTE is enabled but STTD_COPY=0, paste will be skipped (nothing fresh to paste)");
+        eprintln!("[sttd] warning: --paste is enabled but --copy=false, paste will be skipped (nothing fresh to paste)");
     }
 
     let mut utterance_no: u64 = 0;
@@ -249,7 +264,7 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
                         Ok(()) => copied = true,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             eprintln!(
-                                "[sttd] warning: STTD_COPY is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
+                                "[sttd] warning: --copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
                             );
                             clipboard_available = false;
                         }
@@ -261,7 +276,7 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             eprintln!(
-                                "[sttd] warning: STTD_PASTE is enabled but `wtype` was not found on PATH; disabling auto-paste"
+                                "[sttd] warning: --paste is enabled but `wtype` was not found on PATH; disabling auto-paste"
                             );
                             paste_available = false;
                         }

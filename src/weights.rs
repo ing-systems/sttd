@@ -2,22 +2,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config::{DEFAULT_MODEL_PATH, MODEL_BASE_URL};
+use crate::config::MODEL_BASE_URL;
 
-/// The whisper model file this run should use, without touching the disk:
-/// `WHISPER_MODEL_PATH` if set, the compiled-in default otherwise.
-pub(crate) fn configured_path() -> PathBuf {
-    std::env::var_os("WHISPER_MODEL_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH))
-}
-
-/// `configured_path`, guaranteed to exist on return: downloads the model into
+/// `model`, guaranteed to exist on return: downloads the model into
 /// place if it isn't already there.
-pub(crate) fn ensure_available() -> Result<PathBuf> {
-    let path = configured_path();
+pub(crate) fn ensure_available(model: &Path) -> Result<PathBuf> {
+    let path = model;
     if path.exists() {
-        return Ok(path);
+        return Ok(path.to_path_buf());
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -46,8 +38,8 @@ pub(crate) fn ensure_available() -> Result<PathBuf> {
         "[sttd] model not found at {}, downloading {url}...",
         path.display()
     );
-    download(&url, &path)?;
-    Ok(path)
+    download(&url, path)?;
+    Ok(path.to_path_buf())
 }
 
 /// Download URL for a `ggml-*.bin` model filename (full or quantized,
@@ -93,6 +85,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DEFAULT_MODEL_PATH, MODEL_BASE_URL};
 
     #[test]
     fn default_model_is_quantized_q8() {

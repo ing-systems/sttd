@@ -6,6 +6,7 @@ description = "Real-time Speech-to-Text pipeline: cpal + resampler + deep_filter
 license = "MIT"
 
 [dependencies]
+clap = { version = "4", features = ["derive", "env"] }
 cpal = "0.15"
 resampler = "0.5"
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"] }

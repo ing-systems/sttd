@@ -14,47 +14,21 @@ use crate::config::{DENOISE_RATE, FRAME_48K};
 /// Which model cleans the VAD branch's 48 kHz frame before it's resampled
 /// down to 16 kHz for `earshot`. Chosen once at startup via
 /// `STTD_DENOISER` and fixed for the process's lifetime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum DenoiserKind {
     /// DeepFilterNet3 (tract/onnx). Opt-in via `STTD_DENOISER=deepfilter`:
     /// markedly better than raw audio on non-stationary noise, at the cost
     /// of a 20 ms lookahead and a heavier per-frame model pass. Runs at
     /// exactly `DENOISE_RATE`/`FRAME_48K`, so it drops into the pipeline's
     /// 48 kHz VAD-branch frame with no resampling changes.
+    #[value(name = "deepfilter")]
     DeepFilter,
     /// No denoising (default): the VAD branch resamples straight from the
     /// hw rate to 16 kHz with no 48 kHz intermediate at all (see
     /// `FrameProcessor`). Useful to isolate how much a denoiser is actually
     /// helping (or hurting) VAD verdicts on a given recording.
+    #[value(name = "none")]
     Bypass,
-}
-
-impl DenoiserKind {
-    /// Parse an `STTD_DENOISER` value. Pure function so it's testable without
-    /// touching the environment.
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "deepfilter" => Some(Self::DeepFilter),
-            "none" => Some(Self::Bypass),
-            _ => None,
-        }
-    }
-
-    /// `STTD_DENOISER`, falling back to `Bypass` (with a warning) if
-    /// unrecognized — same override pattern as `f32_from_env`. Unset means
-    /// `Bypass` with no warning: denoising is opt-in.
-    pub(crate) fn from_env() -> Self {
-        match std::env::var("STTD_DENOISER") {
-            Ok(v) => Self::parse(&v).unwrap_or_else(|| {
-                eprintln!(
-                    "[sttd] warning: STTD_DENOISER={v:?} is not one of \
-                     deepfilter|none, using default none"
-                );
-                Self::Bypass
-            }),
-            Err(_) => Self::Bypass,
-        }
-    }
 }
 
 /// The active denoiser, built once by `FrameProcessor::new` when the
@@ -132,12 +106,22 @@ mod tests {
 
     #[test]
     fn denoiser_kind_parses_known_values() {
-        assert_eq!(DenoiserKind::parse("deepfilter"), Some(DenoiserKind::DeepFilter));
-        assert_eq!(DenoiserKind::parse("DeepFilter"), Some(DenoiserKind::DeepFilter));
-        assert_eq!(DenoiserKind::parse("none"), Some(DenoiserKind::Bypass));
-        assert_eq!(DenoiserKind::parse("rnnoise"), None);
-        assert_eq!(DenoiserKind::parse("bzdura"), None);
-        assert_eq!(DenoiserKind::parse(""), None);
+        use clap::ValueEnum;
+        assert_eq!(
+            DenoiserKind::from_str("deepfilter", true).ok(),
+            Some(DenoiserKind::DeepFilter)
+        );
+        assert_eq!(
+            DenoiserKind::from_str("DeepFilter", true).ok(),
+            Some(DenoiserKind::DeepFilter)
+        );
+        assert_eq!(
+            DenoiserKind::from_str("none", true).ok(),
+            Some(DenoiserKind::Bypass)
+        );
+        assert!(DenoiserKind::from_str("rnnoise", true).is_err());
+        assert!(DenoiserKind::from_str("bzdura", true).is_err());
+        assert!(DenoiserKind::from_str("", true).is_err());
     }
 
     #[test]

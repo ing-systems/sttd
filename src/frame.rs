@@ -3,10 +3,7 @@ use std::collections::VecDeque;
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 
-use crate::config::{
-    DENOISE_RATE, DEFAULT_MIN_SPEECH_RMS, DEFAULT_VAD_THRESHOLD, FRAME_16K, FRAME_48K,
-    WHISPER_RATE, f32_from_env,
-};
+use crate::config::{DENOISE_RATE, FRAME_16K, FRAME_48K, WHISPER_RATE};
 use crate::denoise::{Denoiser, DenoiserKind};
 use crate::dsp::{FftStream, hw_input_frames};
 use crate::utterance::{FrameAction, Utterance, UtteranceBuffer};
@@ -34,14 +31,13 @@ pub(crate) struct FrameProcessor {
     vad: SpeechDetector,
 
     utterance: UtteranceBuffer,
-    /// `STTD_MIN_RMS` override (or `DEFAULT_MIN_SPEECH_RMS`), read once at
-    /// startup and reused for every utterance.
+    /// `min_speech_rms`, read once at startup and reused for every utterance.
     min_speech_rms: f32,
 
     whisper_tx: Sender<Utterance>,
 }
 
-/// The VAD branch's signal path, chosen once at startup from `STTD_DENOISER`
+/// The VAD branch's signal path, chosen once at startup from `--denoiser`
 /// and fixed for the process's lifetime.
 enum VadPath {
     /// Default (`none`): a single hw_rate -> 16 kHz hop feeds both the VAD
@@ -69,9 +65,15 @@ enum VadPath {
 }
 
 impl FrameProcessor {
-    pub(crate) fn new(hw_rate: u32, whisper_tx: Sender<Utterance>) -> Result<Self> {
+    pub(crate) fn new(
+        hw_rate: u32,
+        whisper_tx: Sender<Utterance>,
+        denoiser_kind: DenoiserKind,
+        vad_threshold: f32,
+        min_speech_rms: f32,
+    ) -> Result<Self> {
         let hw_input_frames = hw_input_frames(hw_rate);
-        let vad_path = match DenoiserKind::from_env() {
+        let vad_path = match denoiser_kind {
             DenoiserKind::Bypass => {
                 let resampler = FftStream::new(hw_rate, WHISPER_RATE, FRAME_16K)
                     .with_context(|| format!("failed to create resampler (hw -> {WHISPER_RATE})"))?;
@@ -104,9 +106,8 @@ impl FrameProcessor {
             }
         };
 
-        // `STTD_VAD_THRESHOLD` override (or `DEFAULT_VAD_THRESHOLD`): the
-        // minimum earshot score for a window to count as speech (see `vad`).
-        let vad = SpeechDetector::new(f32_from_env("STTD_VAD_THRESHOLD", DEFAULT_VAD_THRESHOLD));
+        // Minimum earshot score for a window to count as speech (see `vad`).
+        let vad = SpeechDetector::new(vad_threshold);
 
         Ok(Self {
             hw_input_frames,
@@ -115,7 +116,7 @@ impl FrameProcessor {
             pending_whisper: VecDeque::new(),
             vad,
             utterance: UtteranceBuffer::new(),
-            min_speech_rms: f32_from_env("STTD_MIN_RMS", DEFAULT_MIN_SPEECH_RMS),
+            min_speech_rms,
             whisper_tx,
         })
     }

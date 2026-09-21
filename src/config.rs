@@ -130,37 +130,15 @@ pub(crate) const HALLUCINATION_PATTERNS: &[&str] = &[
     "zapraszam do subskrypcji kanalu",
 ];
 
-/// Read an f32 override from an env var, falling back to `default` if the
-/// var is unset or fails to parse (logging a warning in the latter case, so
-/// a typo'd override doesn't silently revert to the default).
-pub(crate) fn f32_from_env(key: &str, default: f32) -> f32 {
-    match std::env::var(key) {
-        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
-            eprintln!(
-                "[sttd] warning: {key}={v:?} is not a valid number, using default {default}"
-            );
-            default
-        }),
-        Err(_) => default,
-    }
-}
-
-/// Read a bool override from an env var, falling back to `default` if unset
-/// or unparsable. Accepts `1/0`, `true/false`, `yes/no`, `on/off`
-/// (case-insensitive); anything else logs a warning and uses `default`.
-pub(crate) fn bool_from_env(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(v) => match v.trim().to_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => {
-                eprintln!(
-                    "[sttd] warning: {key}={v:?} is not a valid bool, using default {default}"
-                );
-                default
-            }
-        },
-        Err(_) => default,
+/// Parse a bool CLI/env value. Accepts `1/0`, `true/false`, `yes/no`,
+/// `on/off` (case-insensitive, surrounding whitespace ignored). Used as the
+/// clap `value_parser` for every bool flag so `--copy no`, `STTD_COPY=0`
+/// and `STTD_COPY=off` all agree.
+pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
+    match s.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("expected 1/0, true/false, yes/no or on/off, got {s:?}")),
     }
 }
 
@@ -169,12 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bool_from_env_parses_common_spellings() {
-        // Unique key so parallel tests sharing the process env can't clash.
-        let key = "STTD_TEST_BOOL_FROM_ENV";
-        std::env::remove_var(key);
-        assert!(bool_from_env(key, true));
-        assert!(!bool_from_env(key, false));
+    fn parse_bool_accepts_common_spellings() {
         for (val, expected) in [
             ("1", true),
             ("0", false),
@@ -188,13 +161,10 @@ mod tests {
             ("off", false),
             ("  Yes  ", true),
         ] {
-            std::env::set_var(key, val);
-            assert_eq!(bool_from_env(key, !expected), expected, "val={val:?}");
+            assert_eq!(parse_bool(val), Ok(expected), "val={val:?}");
         }
-        std::env::set_var(key, "bogus");
-        assert!(bool_from_env(key, true));
-        assert!(!bool_from_env(key, false));
-        std::env::remove_var(key);
+        assert!(parse_bool("bogus").is_err());
+        assert!(parse_bool("").is_err());
     }
 
     #[test]
