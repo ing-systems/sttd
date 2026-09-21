@@ -146,9 +146,57 @@ pub(crate) fn f32_from_env(key: &str, default: f32) -> f32 {
     }
 }
 
+/// Read a bool override from an env var, falling back to `default` if unset
+/// or unparsable. Accepts `1/0`, `true/false`, `yes/no`, `on/off`
+/// (case-insensitive); anything else logs a warning and uses `default`.
+pub(crate) fn bool_from_env(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => match v.trim().to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => {
+                eprintln!(
+                    "[sttd] warning: {key}={v:?} is not a valid bool, using default {default}"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bool_from_env_parses_common_spellings() {
+        // Unique key so parallel tests sharing the process env can't clash.
+        let key = "STTD_TEST_BOOL_FROM_ENV";
+        std::env::remove_var(key);
+        assert!(bool_from_env(key, true));
+        assert!(!bool_from_env(key, false));
+        for (val, expected) in [
+            ("1", true),
+            ("0", false),
+            ("true", true),
+            ("false", false),
+            ("TRUE", true),
+            ("False", false),
+            ("yes", true),
+            ("no", false),
+            ("on", true),
+            ("off", false),
+            ("  Yes  ", true),
+        ] {
+            std::env::set_var(key, val);
+            assert_eq!(bool_from_env(key, !expected), expected, "val={val:?}");
+        }
+        std::env::set_var(key, "bogus");
+        assert!(bool_from_env(key, true));
+        assert!(!bool_from_env(key, false));
+        std::env::remove_var(key);
+    }
 
     #[test]
     fn silence_threshold_is_800ms() {

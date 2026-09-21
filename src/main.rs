@@ -2,10 +2,10 @@
 //!
 //! Data flow:
 //! `cpal` (hw rate, stereo) -> downmix mono -> per ~10 ms raw chunk, two
-//! independent `rubato` resamplings (`FrameProcessor`, see `WhisperResample`
-//! for when the whisper branch's collapses to one hop instead of two):
-//!   - VAD branch:     `rubato` (-> 48 kHz) -> denoise (`STTD_DENOISER`: deepfilter/rnnoise/none, see `denoise`) -> `rubato` (-> 16 kHz) -> `earshot`
-//!   - whisper branch: `rubato` (-> 16 kHz, direct hop when possible) -> utterance buffer
+//! independent `resampler` resamplings (`FrameProcessor`: `ResamplerFft`
+//! behind a 10 ms framing adapter, see `FftStream`):
+//!   - VAD branch:     `resampler` (-> 48 kHz) -> denoise (`STTD_DENOISER`: deepfilter/rnnoise/none, see `denoise`) -> `resampler` (-> 16 kHz) -> `earshot`
+//!   - whisper branch: `resampler` (-> 16 kHz, direct hop) -> utterance buffer
 //! An utterance only *opens* after `ONSET_SPEECH_FRAMES` consecutive speech
 //! frames (a single VAD false positive no longer opens one), with ~300 ms of
 //! pre-roll prepended at that point so quiet word starts aren't clipped.
@@ -100,6 +100,13 @@ fn print_usage() {
          \x20   STTD_MIN_CONF         min avg token confidence, weak acoustic evidence (default: {DEFAULT_MIN_CONFIDENCE})\n\
          \x20   STTD_MIN_CONF_STRONG  min avg token confidence, strong acoustic evidence (default: {DEFAULT_MIN_CONFIDENCE_STRONG})\n\
          \x20   STTD_TARGET_RMS       pre-inference gain target RMS, 0 disables (default: {DEFAULT_TARGET_RMS})\n\
+         \x20   STTD_COPY             1/0 = copy each accepted transcript to the Wayland clipboard via\n\
+         \x20                         `wl-copy` (default: 1; disabled after one warning if\n\
+         \x20                         `wl-copy` is not on PATH)\n\
+         \x20   STTD_PASTE            1/0 = paste the clipboard at the cursor via fixed Ctrl+V\n\
+         \x20                         (`wtype -M ctrl -k v -m ctrl`, default: 1; disabled after\n\
+         \x20                         one warning if `wtype` is not on PATH; skipped when the\n\
+         \x20                         copy above did not run)\n\
          \x20   STTD_DEBUG_TOKENS     1 = dump per-token id/text/p/plog/is_timestamp to stderr\n"
     );
 }

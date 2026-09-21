@@ -8,7 +8,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use crate::config::{
     DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
     DEFAULT_PROMPT, DEFAULT_TARGET_RMS, HALLUCINATION_PATTERNS, MAX_GAIN, STRONG_RMS_FACTOR,
-    STRONG_SPEECH_FRAMES, WHISPER_MIN_SAMPLES, WHISPER_RATE, f32_from_env,
+    STRONG_SPEECH_FRAMES, WHISPER_MIN_SAMPLES, WHISPER_RATE, bool_from_env, f32_from_env,
 };
 use crate::utterance::{Evidence, Utterance};
 use crate::wav::write_wav_mono16;
@@ -77,6 +77,52 @@ fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
     }
 }
 
+/// Copy `text` to the Wayland clipboard via `wl-copy` (from wl-clipboard).
+/// Pipes the trimmed transcript over `wl-copy`'s stdin with no trailing
+/// newline, so the user can paste it immediately. Returns the `io::Error`
+/// unwrapped (not `anyhow`) so the caller can match `NotFound` and disable
+/// itself with a single warning on machines without wl-clipboard.
+pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .expect("wl-copy spawned without piped stdin")
+        .write_all(text.as_bytes())?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "wl-copy exited with {status}"
+        )))
+    }
+}
+
+/// Paste the clipboard at the current cursor position via `wtype`
+/// (fixed `Ctrl+V`). Wayland has no universal "paste here" request, so the
+/// transcript is first copied with `wl-copy` and then the paste keystroke is
+/// synthesized through the virtual-keyboard protocol. Returns `io::Error`
+/// unwrapped so the caller can match `NotFound` and disable itself with a
+/// single warning on machines without `wtype`.
+pub(crate) fn paste_at_cursor() -> std::io::Result<()> {
+    use std::process::Command;
+    let status = Command::new("wtype")
+        .args(["-M", "ctrl", "-k", "v", "-m", "ctrl"])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "wtype exited with {status}"
+        )))
+    }
+}
+
 fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
     let path_str = model_path
         .to_str()
@@ -113,6 +159,22 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
         eprintln!("[sttd] dumping utterances to {}", dir.display());
+    }
+    let copy_enabled = bool_from_env("STTD_COPY", true);
+    // Becomes `false` permanently after the first "binary not found" so a
+    // machine without wl-clipboard installed logs one warning instead of
+    // one per utterance.
+    let mut clipboard_available = copy_enabled;
+    if !copy_enabled {
+        eprintln!("[sttd] clipboard copy disabled (STTD_COPY=0)");
+    }
+    let paste_enabled = bool_from_env("STTD_PASTE", true);
+    // Same one-warning latch as above, for machines without `wtype`.
+    let mut paste_available = paste_enabled;
+    if !paste_enabled {
+        eprintln!("[sttd] auto-paste disabled (STTD_PASTE=0)");
+    } else if !copy_enabled {
+        eprintln!("[sttd] warning: STTD_PASTE is enabled but STTD_COPY=0, paste will be skipped (nothing fresh to paste)");
     }
 
     let mut utterance_no: u64 = 0;
@@ -177,6 +239,35 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
                     continue;
                 }
                 println!("{trimmed}");
+                // Track whether this utterance actually refreshed the
+                // clipboard: paste synthesizes Ctrl+V, so it must only run
+                // on fresh content, never on stale clipboard or a failed
+                // copy.
+                let mut copied = false;
+                if clipboard_available {
+                    match copy_to_clipboard(trimmed) {
+                        Ok(()) => copied = true,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            eprintln!(
+                                "[sttd] warning: STTD_COPY is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
+                            );
+                            clipboard_available = false;
+                        }
+                        Err(e) => eprintln!("[sttd] {tag}: clipboard copy failed: {e:?}"),
+                    }
+                }
+                if paste_available && copied {
+                    match paste_at_cursor() {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            eprintln!(
+                                "[sttd] warning: STTD_PASTE is enabled but `wtype` was not found on PATH; disabling auto-paste"
+                            );
+                            paste_available = false;
+                        }
+                        Err(e) => eprintln!("[sttd] {tag}: auto-paste failed: {e:?}"),
+                    }
+                }
                 if let Some(dir) = &dump_dir {
                     let txt_path = dir.join(format!("{tag}.txt"));
                     if let Err(e) = std::fs::write(&txt_path, trimmed) {
