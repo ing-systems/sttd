@@ -20,7 +20,7 @@
 //! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper,
 //! carried alongside its acoustic evidence (speech-frame count, RMS) as an
 //! `Utterance` -> `crossbeam-channel` queue -> isolated `whisper-rs` inference
-//! thread (CUDA, large-v3-turbo): pre-inference gain toward `STTD_TARGET_RMS`
+//! thread (CUDA, large-v3-turbo-q8_0): pre-inference gain toward `STTD_TARGET_RMS`
 //! (`apply_gain`, quiet-but-real speech only, never attenuates) -> average
 //! *text-token* probability gate (`average_text_confidence` excludes the
 //! timestamp tokens every whisper.cpp segment carries; whisper.cpp's own

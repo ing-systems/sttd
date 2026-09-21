@@ -102,7 +102,7 @@ pub(crate) const STRONG_RMS_FACTOR: f32 = 3.0;
 /// `ensure_available`), so `WHISPER_MODEL_PATH` can point at any
 /// ggml model published in this repo, not just the compiled-in default.
 pub(crate) const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-pub(crate) const DEFAULT_MODEL_PATH: &str = "models/ggml-large-v3-turbo.bin";
+pub(crate) const DEFAULT_MODEL_PATH: &str = "models/ggml-large-v3-turbo-q8_0.bin";
 
 /// Default `initial_prompt`: primes Polish orthography/diacritics only.
 /// Used to carry a long list of IT vocabulary (Kubernetes, Docker, ...), but

@@ -35,20 +35,29 @@ pub(crate) fn ensure_available() -> Result<PathBuf> {
         .file_name()
         .and_then(|n| n.to_str())
         .with_context(|| format!("model path has no filename: {}", path.display()))?;
-    if !file_name.starts_with("ggml-") || !file_name.ends_with(".bin") {
+    let Some(url) = download_url(file_name) else {
         anyhow::bail!(
             "model not found at {} and its filename doesn't look like a whisper.cpp \
              model (expected ggml-<name>.bin); download it manually",
             path.display()
         );
-    }
-    let url = format!("{MODEL_BASE_URL}{file_name}");
+    };
     eprintln!(
         "[sttd] model not found at {}, downloading {url}...",
         path.display()
     );
     download(&url, &path)?;
     Ok(path)
+}
+
+/// Download URL for a `ggml-*.bin` model filename (full or quantized,
+/// e.g. `ggml-large-v3-turbo-q8_0.bin`), or `None` when the filename
+/// doesn't look like a whisper.cpp model.
+pub(crate) fn download_url(file_name: &str) -> Option<String> {
+    if !file_name.starts_with("ggml-") || !file_name.ends_with(".bin") {
+        return None;
+    }
+    Some(format!("{MODEL_BASE_URL}{file_name}"))
 }
 
 fn download(url: &str, dest: &Path) -> Result<()> {
@@ -79,4 +88,44 @@ fn download(url: &str, dest: &Path) -> Result<()> {
         bytes as f64 / 1_048_576.0
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_model_is_quantized_q8() {
+        let file_name = Path::new(DEFAULT_MODEL_PATH)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("default model path has a filename");
+        assert_eq!(file_name, "ggml-large-v3-turbo-q8_0.bin");
+        let url = download_url(file_name).expect("default model must have a download URL");
+        assert_eq!(url, format!("{MODEL_BASE_URL}{file_name}"));
+    }
+
+    #[test]
+    fn quantized_filenames_resolve_to_hf_urls() {
+        for file_name in [
+            "ggml-large-v3-turbo-q8_0.bin",
+            "ggml-large-v3-turbo-q5_0.bin",
+            "ggml-large-v3-turbo.bin",
+        ] {
+            let url = download_url(file_name).expect("ggml-*.bin must resolve");
+            assert_eq!(url, format!("{MODEL_BASE_URL}{file_name}"));
+        }
+    }
+
+    #[test]
+    fn non_ggml_filenames_are_rejected() {
+        for file_name in [
+            "whisper-large-v3-turbo-q8_0.gguf",
+            "model.bin",
+            "ggml-large-v3-turbo-q8_0.gguf",
+            "",
+        ] {
+            assert!(download_url(file_name).is_none(), "must reject {file_name:?}");
+        }
+    }
 }
