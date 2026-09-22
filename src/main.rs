@@ -321,6 +321,7 @@ fn resolve_model_input(cli: &Cli) -> Result<std::path::PathBuf> {
 fn whisper_options(cli: &Cli) -> WhisperOptions {
     WhisperOptions {
         prompt: cli.prompt.clone(),
+        language: cli.language,
         min_confidence: cli.min_conf,
         min_confidence_strong: cli.min_conf_strong,
         min_speech_rms: cli.min_rms,

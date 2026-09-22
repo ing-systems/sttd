@@ -7,15 +7,20 @@ use crate::config::{
     DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_TARGET_RMS, DEFAULT_VAD_THRESHOLD, parse_bool,
 };
 use crate::denoise::DenoiserKind;
+use crate::whisper::Language;
 
-/// Real-time Polish speech-to-text.
+/// Real-time Polish-English speech-to-text.
 ///
 /// Precedence for every tunable is: CLI flag > environment variable >
 /// compiled-in default. Env names use the `STTD_*` spellings;
 /// `WHISPER_MODEL_PATH` remains a silent fallback for `--model` so current
 /// setups keep working.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "sttd", version, about = "Real-time Polish speech-to-text")]
+#[command(
+    name = "sttd",
+    version,
+    about = "Real-time Polish-English speech-to-text"
+)]
 pub(crate) struct Cli {
     /// Transcribe a WAV file offline instead of the microphone.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["list_devices", "list_models"])]
@@ -52,6 +57,17 @@ pub(crate) struct Cli {
     /// Override the whisper initial prompt.
     #[arg(long, env = "STTD_PROMPT", default_value = DEFAULT_PROMPT)]
     pub(crate) prompt: String,
+
+    /// Whisper decoding language: `pl` forces Polish, `en` forces English,
+    /// `auto` detects per utterance.
+    #[arg(
+        long,
+        env = "STTD_LANGUAGE",
+        value_enum,
+        ignore_case = true,
+        default_value_t = Language::Polish
+    )]
+    pub(crate) language: Language,
 
     /// Write each utterance as WAV+TXT into this directory (TXT written
     /// for dropped utterances too, prefixed with the drop reason).
@@ -163,6 +179,7 @@ mod tests {
             PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin")
         );
         assert_eq!(cli.prompt, DEFAULT_PROMPT);
+        assert_eq!(cli.language, crate::whisper::Language::Polish);
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
         assert_eq!(cli.min_conf, DEFAULT_MIN_CONFIDENCE);
         assert_eq!(cli.min_conf_strong, DEFAULT_MIN_CONFIDENCE_STRONG);
@@ -207,6 +224,18 @@ mod tests {
     #[test]
     fn cli_list_models_conflicts_with_file() {
         assert!(Cli::try_parse_from(["sttd", "--list-models", "--file", "a.wav"]).is_err());
+    }
+
+    #[test]
+    fn cli_language_accepts_pl_en_auto() {
+        use crate::whisper::Language;
+        let cli = Cli::try_parse_from(["sttd", "--language", "en"]).expect("en must parse");
+        assert_eq!(cli.language, Language::English);
+        let cli = Cli::try_parse_from(["sttd", "--language", "auto"]).expect("auto must parse");
+        assert_eq!(cli.language, Language::Auto);
+        let cli = Cli::try_parse_from(["sttd", "--language", "PL"]).expect("case-insensitive");
+        assert_eq!(cli.language, Language::Polish);
+        assert!(Cli::try_parse_from(["sttd", "--language", "de"]).is_err());
     }
 
     #[test]

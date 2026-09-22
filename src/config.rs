@@ -151,14 +151,15 @@ pub(crate) fn valid_model_specs() -> String {
         .join(", ")
 }
 
-/// Default `initial_prompt`: primes Polish orthography/diacritics only.
-/// Used to carry a long list of IT vocabulary (Kubernetes, Docker, ...), but
-/// whisper.cpp feeds `initial_prompt` into the decoder as prior context
-/// (`prompt_past`), and on low/no-signal audio the model falls back on that
-/// prior instead of the (absent) acoustic evidence — i.e. it would recite
-/// from the prompt itself. Override with `STTD_PROMPT` to opt back into a
-/// domain vocabulary at the cost of that risk.
-pub(crate) const DEFAULT_PROMPT: &str = "Rozmowa techniczna po polsku.";
+/// Default `initial_prompt`: primes Polish orthography/diacritics and English
+/// IT vocabulary, without a long keyword list. It used to carry many domain
+/// words (Kubernetes, Docker, ...), but whisper.cpp feeds `initial_prompt`
+/// into the decoder as prior context (`prompt_past`), and on low/no-signal
+/// audio the model falls back on that prior instead of the (absent) acoustic
+/// evidence — i.e. it would recite from the prompt itself. Override with
+/// `STTD_PROMPT` to opt back into a domain vocabulary at the cost of that risk.
+pub(crate) const DEFAULT_PROMPT: &str =
+    "Technical conversation in Polish and English. Rozmowa techniczna po polsku i angielsku.";
 
 /// Transcripts that are near-exact matches for common Whisper hallucinations
 /// on silence/low-energy audio (subtitle-credit boilerplate picked up from

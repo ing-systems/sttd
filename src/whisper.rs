@@ -12,10 +12,55 @@ use crate::config::{
 use crate::utterance::{Evidence, Utterance};
 use crate::wav::write_wav_mono16;
 
+/// Whisper decoding language, chosen once at startup via `STTD_LANGUAGE`
+/// and fixed for the process's lifetime. One inference decodes in exactly
+/// one language — but different utterances may use different languages when
+/// `Auto` lets whisper.cpp detect it per utterance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Language {
+    /// Force Polish decoding (`set_language(Some("pl"))`).
+    #[value(name = "pl")]
+    Polish,
+    /// Force English decoding (`set_language(Some("en"))`).
+    #[value(name = "en")]
+    English,
+    /// Per-utterance auto-detection (`set_language(None)`).
+    #[value(name = "auto")]
+    Auto,
+}
+
+impl Language {
+    /// Whisper language code for `FullParams::set_language`, or `None` for
+    /// auto-detection.
+    pub(crate) fn as_whisper_code(self) -> Option<&'static str> {
+        match self {
+            Self::Polish => Some("pl"),
+            Self::English => Some("en"),
+            Self::Auto => None,
+        }
+    }
+
+    /// Stable short spelling for log lines.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Polish => "pl",
+            Self::English => "en",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Tunables the whisper worker needs, resolved once from `Cli`.
 #[derive(Debug, Clone)]
 pub(crate) struct WhisperOptions {
     pub(crate) prompt: String,
+    pub(crate) language: Language,
     pub(crate) min_confidence: f32,
     pub(crate) min_confidence_strong: f32,
     pub(crate) min_speech_rms: f32,
@@ -213,9 +258,13 @@ fn whisper_init_and_run(
     let model_name = ctx
         .model_type_readable()
         .unwrap_or_else(|_| "unknown".to_string());
-    eprintln!("[sttd] whisper ready (model={model_name}, pl, beam=5, threads=8, gpu=true)");
+    eprintln!(
+        "[sttd] whisper ready (model={model_name}, lang={}, beam=5, threads=8, gpu=true)",
+        opts.language.as_str()
+    );
 
     let prompt = opts.prompt.clone();
+    let language = opts.language;
     let min_confidence = opts.min_confidence;
     let min_confidence_strong = opts.min_confidence_strong;
     // Same value `FrameProcessor::new` receives for the acoustic gate,
@@ -288,7 +337,14 @@ fn whisper_init_and_run(
             MAX_GAIN,
         );
 
-        match transcribe(&mut state, token_beg, gained.as_ref(), &prompt, debug_tokens) {
+        match transcribe(
+            &mut state,
+            token_beg,
+            gained.as_ref(),
+            &prompt,
+            language,
+            debug_tokens,
+        ) {
             Ok(t) => {
                 let trimmed = t.text.trim();
                 if trimmed.is_empty() {
@@ -495,6 +551,7 @@ fn transcribe(
     token_beg: whisper_rs::WhisperToken,
     pcm_16k: &[f32],
     prompt: &str,
+    language: Language,
     debug_tokens: bool,
 ) -> Result<Transcript> {
     // Pad sub-second utterances (e.g. 300-999 ms, which the acoustic gates are
@@ -513,7 +570,7 @@ fn transcribe(
         patience: -1.0,
     });
     params.set_n_threads(8);
-    params.set_language(Some("pl"));
+    params.set_language(language.as_whisper_code());
     params.set_translate(false);
     // Leaked per call: whisper.cpp reads a fresh initial_prompt C-string on
     // every whisper_full and whisper-rs's FullParams has no Drop to free it
@@ -658,6 +715,16 @@ mod tests {
         DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
         DEFAULT_TARGET_RMS, MAX_GAIN, MIN_SPEECH_FRAMES, WHISPER_MIN_SAMPLES,
     };
+
+    #[test]
+    fn language_maps_to_whisper_code() {
+        assert_eq!(Language::Polish.as_whisper_code(), Some("pl"));
+        assert_eq!(Language::English.as_whisper_code(), Some("en"));
+        assert_eq!(Language::Auto.as_whisper_code(), None);
+        assert_eq!(Language::Polish.as_str(), "pl");
+        assert_eq!(Language::English.as_str(), "en");
+        assert_eq!(Language::Auto.as_str(), "auto");
+    }
 
     #[test]
     fn confidence_ignores_timestamp_tokens() {
@@ -871,6 +938,7 @@ mod tests {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let opts = WhisperOptions {
             prompt: String::new(),
+            language: Language::Polish,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
             min_confidence_strong: DEFAULT_MIN_CONFIDENCE_STRONG,
             min_speech_rms: DEFAULT_MIN_SPEECH_RMS,
