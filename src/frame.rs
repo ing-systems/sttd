@@ -72,25 +72,59 @@ impl FrameProcessor {
         self.signal.pending_depths()
     }
 
+    /// Current warm noise floor (for carrying it across a device rebuild —
+    /// see `adopt_noise_floor`; a rebuild constructs a brand new
+    /// `FrameProcessor`, so `discard_pending`'s "floor preserved" guarantee
+    /// doesn't apply across that boundary on its own).
+    pub(crate) fn noise_floor(&self) -> f32 {
+        self.vad.noise_floor()
+    }
+
+    /// Adopt a floor learned by a previous `FrameProcessor` (device rebuild).
+    /// Without this, a rebuild silently drops back to `NoiseTracker`'s
+    /// default (0.001), running the VAD at the un-lifted base threshold for
+    /// the ~2 s the EMA needs to relearn a noisy room — exactly the window
+    /// where false triggers turn into hallucinated utterances.
+    pub(crate) fn adopt_noise_floor(&mut self, floor: f32) {
+        self.vad.set_floor(floor);
+    }
+
     /// Process one raw hw-rate chunk (`required_input_frames()` samples).
     /// Returns the closed utterance, if any — the caller owns the `rtrb`
     /// handoff to the whisper thread. At most one utterance can close per
-    /// call (reopening needs `ONSET_SPEECH_FRAMES` fresh speech frames).
+    /// call (reopening needs `ONSET_SPEECH_FRAMES` fresh speech frames, which
+    /// a chunk's few-pairs surplus past a hangover close can never supply).
+    ///
+    /// Keeps iterating past a close instead of returning immediately: `feed`
+    /// occasionally completes two pairs for one hw chunk (non-integer rate
+    /// ratios), and returning early used to silently drop the second pair —
+    /// the first ~10 ms of the *next* utterance's pre-roll, plus its VAD
+    /// verdict and noise-floor update.
     pub(crate) fn process_frame(&mut self, frame_hw_raw: &[f32]) -> Option<Utterance> {
         debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);
 
+        let mut closed = None;
         for (vad16, whisper16) in self.signal.feed(frame_hw_raw) {
             let mut vad_frame = (*vad16).clone();
             let mut whisper_frame = (*whisper16).clone();
-            self.agc
-                .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
+            // Pre-AGC whisper RMS: the acoustic evidence `UtteranceBuffer`
+            // scores (`Evidence.rms`, `gate::floor_for`'s weak/strong split)
+            // must describe what the mic heard, not what the AGC did to it —
+            // see `push_frame_evidenced`.
+            let pre_agc_rms =
+                self.agc
+                    .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
             let is_speech = self.vad.verdict(&vad_frame);
             self.prev_speech = is_speech;
-            if self.utterance.push_frame(&whisper_frame, is_speech) == FrameAction::Flush {
-                return self.close_current();
+            if self
+                .utterance
+                .push_frame_evidenced(&whisper_frame, is_speech, pre_agc_rms)
+                == FrameAction::Flush
+            {
+                closed = self.close_current();
             }
         }
-        None
+        closed
     }
 
     /// Close the open utterance and return it if it cleared the acoustic
@@ -124,22 +158,70 @@ impl FrameProcessor {
     }
 
     /// Flush any trailing speech. Call once at shutdown / end of input.
-    /// Returns the trailing utterance, if any.
+    /// Returns the trailing utterance, if any. Keeps iterating past a
+    /// mid-flush close instead of returning immediately (see
+    /// `process_frame`'s doc comment for why).
     pub(crate) fn flush_trailing_speech(&mut self) -> Option<Utterance> {
+        let mut closed = None;
         for (vad16, whisper16) in self.signal.flush() {
             let mut vad_frame = (*vad16).clone();
             let mut whisper_frame = (*whisper16).clone();
-            self.agc
-                .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
+            let pre_agc_rms =
+                self.agc
+                    .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
             let is_speech = self.vad.verdict(&vad_frame);
             self.prev_speech = is_speech;
-            if self.utterance.push_frame(&whisper_frame, is_speech) == FrameAction::Flush {
-                return self.close_current();
+            if self
+                .utterance
+                .push_frame_evidenced(&whisper_frame, is_speech, pre_agc_rms)
+                == FrameAction::Flush
+            {
+                closed = self.close_current();
             }
         }
-        if self.utterance.is_open() {
-            return self.close_current();
+        if closed.is_none() && self.utterance.is_open() {
+            closed = self.close_current();
         }
-        None
+        closed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG};
+
+    fn processor() -> FrameProcessor {
+        FrameProcessor::new(
+            16_000,
+            DenoiserKind::Bypass,
+            0.5,
+            true,
+            GateConfig::new(0.003, 0.25, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG),
+            80,
+            0.0,
+            8.0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn noise_floor_round_trips_through_adopt() {
+        // Regression for the device-rebuild fix: a rebuild constructs a
+        // brand new FrameProcessor (hence a brand new SpeechDetector /
+        // NoiseTracker at the default 0.001 floor), so the warm floor must
+        // be carried across explicitly rather than assumed preserved.
+        let mut fp = processor();
+        assert!((fp.noise_floor() - 0.001).abs() < 1e-6, "fresh floor default");
+        fp.adopt_noise_floor(0.02);
+        assert!((fp.noise_floor() - 0.02).abs() < 1e-6, "adopted floor must read back");
+
+        let mut rebuilt = processor();
+        assert!((rebuilt.noise_floor() - 0.001).abs() < 1e-6, "new instance starts cold");
+        rebuilt.adopt_noise_floor(fp.noise_floor());
+        assert!(
+            (rebuilt.noise_floor() - 0.02).abs() < 1e-6,
+            "rebuild must carry the old instance's floor forward"
+        );
     }
 }

@@ -3,14 +3,14 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::config::{
-    parse_beam_size, parse_bool, parse_context_chars, parse_entropy_thold, parse_hangover_ms,
-    parse_logprob_thold, parse_temperature, parse_temperature_inc, parse_threads,
-    DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD,
-    DEFAULT_HANGOVER_MS, DEFAULT_LOGPROB_THOLD, DEFAULT_MIN_CONFIDENCE,
-    DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC,
-    DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TARGET_RMS, DEFAULT_TEMPERATURE,
-    DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS, DEFAULT_TRANSLATE, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT,
-    DEFAULT_VAD_THRESHOLD,
+    parse_beam_size, parse_bool, parse_context_chars, parse_entropy_thold, parse_fraction,
+    parse_hangover_ms, parse_linear_rms, parse_logprob_thold, parse_temperature,
+    parse_temperature_inc, parse_threads, DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS,
+    DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_HANGOVER_MS, DEFAULT_LOGPROB_THOLD,
+    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
+    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS,
+    DEFAULT_TARGET_RMS, DEFAULT_TEMPERATURE, DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS,
+    DEFAULT_TRANSLATE, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
@@ -151,7 +151,7 @@ pub(crate) struct Cli {
     pub(crate) gpu: bool,
 
     /// Minimum earshot score for a 16 ms window to count as speech.
-    #[arg(long, env = "STTD_VAD_THRESHOLD", default_value_t = DEFAULT_VAD_THRESHOLD, help_heading = "Acoustic gates")]
+    #[arg(long, env = "STTD_VAD_THRESHOLD", default_value_t = DEFAULT_VAD_THRESHOLD, value_parser = parse_fraction, help_heading = "Acoustic gates")]
     pub(crate) vad_threshold: f32,
 
     /// Adapt the VAD threshold to the background noise floor with hysteresis
@@ -160,11 +160,11 @@ pub(crate) struct Cli {
     pub(crate) vad_adapt: bool,
 
     /// Min speech-only RMS to keep an utterance.
-    #[arg(long, env = "STTD_MIN_RMS", default_value_t = DEFAULT_MIN_SPEECH_RMS, help_heading = "Acoustic gates")]
+    #[arg(long, env = "STTD_MIN_RMS", default_value_t = DEFAULT_MIN_SPEECH_RMS, value_parser = parse_linear_rms, help_heading = "Acoustic gates")]
     pub(crate) min_rms: f32,
 
     /// Min share of transmitted frames flagged as speech (long utterances exempt).
-    #[arg(long, env = "STTD_MIN_DENSITY", default_value_t = DEFAULT_MIN_DENSITY, help_heading = "Acoustic gates")]
+    #[arg(long, env = "STTD_MIN_DENSITY", default_value_t = DEFAULT_MIN_DENSITY, value_parser = parse_fraction, help_heading = "Acoustic gates")]
     pub(crate) min_density: f32,
 
     /// Silence hangover before an utterance closes (ms, step 10). Lower =
@@ -174,11 +174,11 @@ pub(crate) struct Cli {
     pub(crate) hangover_ms: u64,
 
     /// Frame-level Agc target RMS (VAD-gated shared gain, speech-only), 0 disables.
-    #[arg(long, env = "STTD_TARGET_RMS", default_value_t = DEFAULT_TARGET_RMS, help_heading = "Acoustic gates")]
+    #[arg(long, env = "STTD_TARGET_RMS", default_value_t = DEFAULT_TARGET_RMS, value_parser = parse_linear_rms, help_heading = "Acoustic gates")]
     pub(crate) target_rms: f32,
 
     /// Min avg token confidence, weak acoustic evidence.
-    #[arg(long, env = "STTD_MIN_CONF", default_value_t = DEFAULT_MIN_CONFIDENCE, help_heading = "Transcript gates")]
+    #[arg(long, env = "STTD_MIN_CONF", default_value_t = DEFAULT_MIN_CONFIDENCE, value_parser = parse_fraction, help_heading = "Transcript gates")]
     pub(crate) min_conf: f32,
 
     /// Min avg token confidence, strong acoustic evidence.
@@ -186,6 +186,7 @@ pub(crate) struct Cli {
         long,
         env = "STTD_MIN_CONF_STRONG",
         default_value_t = DEFAULT_MIN_CONFIDENCE_STRONG,
+        value_parser = parse_fraction,
         help_heading = "Transcript gates"
     )]
     pub(crate) min_conf_strong: f32,

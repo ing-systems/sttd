@@ -89,10 +89,18 @@ impl SpeechDetector {
         }
     }
 
-    /// Current noise floor (for logging/tuning).
-    #[allow(dead_code)]
+    /// Current noise floor (for logging/tuning, and for carrying the warm
+    /// estimate across a device rebuild — see `set_floor`).
     pub(crate) fn noise_floor(&self) -> f32 {
         self.noise.floor()
+    }
+
+    /// Adopt a floor learned elsewhere (a device rebuild replaces this whole
+    /// `SpeechDetector`, so `reset()`'s "keep the floor" guarantee doesn't
+    /// apply — the caller must carry it across explicitly via this setter).
+    /// Clamped the same as `NoiseTracker::update_background`.
+    pub(crate) fn set_floor(&mut self, floor: f32) {
+        self.noise.set_floor(floor);
     }
 
     /// Feed one 10 ms VAD-branch frame (16 kHz, `[-1, 1]`); returns the

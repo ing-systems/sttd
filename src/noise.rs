@@ -22,6 +22,17 @@ pub(crate) const NOISE_MAX_LIFT: f32 = 0.2;
 /// Hysteresis between enter/exit: exit = enter - this. Kills single-window
 /// flicker without touching the base threshold.
 pub(crate) const VAD_HYSTERESIS: f32 = 0.1;
+/// Absolute floor for `exit_threshold`, independent of `base`. A `--vad-
+/// threshold`/`STTD_VAD_THRESHOLD` below `VAD_HYSTERESIS` (0.1) — legal input,
+/// `parse_fraction` only rejects outside `0.0..=1.0` — would otherwise clamp
+/// `enter_threshold(base) - VAD_HYSTERESIS` to exactly `0.0`; earshot's score
+/// is never negative, so `score >= 0.0` is then always true and `raw_speech`
+/// latches permanently open once it first triggers (see
+/// `SpeechDetector::verdict`), silencing the noise floor forever and forcing
+/// every utterance to the 30 s hard cap. `0.02` sits well below real speech
+/// scores but above silence-level earshot noise, so the latch can always
+/// break regardless of how `--vad-threshold` is configured.
+pub(crate) const EXIT_THRESHOLD_FLOOR: f32 = 0.02;
 
 /// Slow background RMS estimate. Warm across pause, frozen across speech.
 #[derive(Debug, Clone)]
@@ -37,6 +48,12 @@ impl NoiseTracker {
     /// Current floor estimate (linear RMS, not dB).
     pub(crate) fn floor(&self) -> f32 {
         self.floor
+    }
+
+    /// Adopt a floor learned elsewhere (see `SpeechDetector::set_floor`),
+    /// clamped the same as `update_background`.
+    pub(crate) fn set_floor(&mut self, floor: f32) {
+        self.floor = floor.clamp(0.0001, 0.05);
     }
 
     /// RMS of one 16 kHz frame.
@@ -70,9 +87,13 @@ impl NoiseTracker {
     }
 
     /// Exit threshold: enter minus hysteresis. Once open, an utterance holds
-    /// on through a weaker window instead of chopping on one flicker.
+    /// on through a weaker window instead of chopping on one flicker. Never
+    /// below `EXIT_THRESHOLD_FLOOR` — see its doc comment for why a bare
+    /// `clamp(0.0, 1.0)` here isn't safe for every valid `base`.
     pub(crate) fn exit_threshold(&self, base: f32) -> f32 {
-        (self.enter_threshold(base) - VAD_HYSTERESIS).clamp(0.0, 1.0)
+        (self.enter_threshold(base) - VAD_HYSTERESIS)
+            .clamp(0.0, 1.0)
+            .max(EXIT_THRESHOLD_FLOOR)
     }
 }
 
@@ -97,6 +118,27 @@ mod tests {
     }
 
     #[test]
+    fn exit_threshold_never_hits_zero_on_a_low_base() {
+        // Regression: a quiet room (near-zero floor lift) with a low
+        // --vad-threshold used to clamp exit_threshold to exactly 0.0, and
+        // any valid earshot score (>= 0.0) then satisfies `score >= exit`
+        // unconditionally, latching the VAD permanently open. A low base is
+        // legal input (parse_fraction only rejects outside 0.0..=1.0), so
+        // the floor must hold regardless of configuration.
+        let n = NoiseTracker::new(); // fresh: floor lift ~0
+        for base in [0.0, 0.02, 0.05, 0.09] {
+            let exit = n.exit_threshold(base);
+            assert!(
+                exit >= EXIT_THRESHOLD_FLOOR,
+                "base={base}: exit={exit} below floor"
+            );
+            assert!(exit > 0.0, "base={base}: exit={exit} must never be exactly 0");
+        }
+        // A high base is unaffected by the floor (hysteresis alone clears it).
+        assert!(n.exit_threshold(0.5) > EXIT_THRESHOLD_FLOOR + 0.1);
+    }
+
+    #[test]
     fn loud_room_lifts_threshold_with_cap() {
         let mut n = NoiseTracker::new();
         let loud = vec![0.02f32; 160];
@@ -107,6 +149,19 @@ mod tests {
         assert!(enter > 0.5, "enter={enter} floor={}", n.floor());
         assert!(enter <= 0.5 + NOISE_MAX_LIFT + 1e-6, "enter={enter}");
         assert_eq!(n.exit_threshold(0.5), enter - VAD_HYSTERESIS);
+    }
+
+    #[test]
+    fn set_floor_adopts_and_clamps() {
+        let mut n = NoiseTracker::new();
+        n.set_floor(0.01);
+        assert!((n.floor() - 0.01).abs() < 1e-6);
+        // Clamped the same as update_background: out-of-range input can't
+        // wedge the tracker outside its valid range.
+        n.set_floor(-1.0);
+        assert_eq!(n.floor(), 0.0001);
+        n.set_floor(10.0);
+        assert_eq!(n.floor(), 0.05);
     }
 
     #[test]

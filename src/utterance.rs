@@ -161,24 +161,62 @@ impl UtteranceBuffer {
     ///
     /// Split from `absorb` only so the pre-roll ring can't be skipped by
     /// `absorb`'s early returns. Unit-testable without a live VAD signal.
+    /// Test/default entry point: acoustic evidence is scored from `frame`'s
+    /// own RMS (see `push_frame_evidenced` for the production path, which
+    /// scores evidence from a separately-supplied pre-AGC RMS instead).
+    /// Test-only in production (`FrameProcessor` calls `push_frame_evidenced`
+    /// directly), kept as the ergonomic entry point for the many tests below
+    /// that don't care about the AGC distinction.
+    #[allow(dead_code)]
     pub(crate) fn push_frame(&mut self, frame: &[f32], is_speech: bool) -> FrameAction {
-        let action = self.absorb(frame, is_speech);
+        let evidence_rms = frame_rms(frame);
+        self.push_frame_evidenced(frame, is_speech, evidence_rms)
+    }
+
+    /// Same as `push_frame`, but scores acoustic evidence
+    /// (`speech_energy_sum_sq`/`speech_frame_rms`, hence `Evidence.rms` and
+    /// the weak/strong confidence split — see `gate::GateConfig::floor_for`)
+    /// from `evidence_rms` instead of `frame`'s own RMS. `frame` is still
+    /// what gets appended to the buffered utterance (and sent to whisper) and
+    /// still drives the quiet-run/early-split RMS check below — only the
+    /// acoustic-evidence accounting is redirected.
+    ///
+    /// `FrameProcessor::process_frame` passes the *pre-AGC* whisper-frame RMS
+    /// (`Agc::process_pair`'s return value) here, so evidence describes what
+    /// the microphone actually heard rather than what the shared-gain AGC did
+    /// to it afterward: `Agc` can amplify quiet-but-real speech up to 8x
+    /// toward `--target-rms`, which used to make almost every utterance read
+    /// as strong acoustic evidence (`STRONG_RMS_FACTOR` measured against
+    /// AGC output, not the microphone) regardless of how quiet the speech
+    /// actually was.
+    pub(crate) fn push_frame_evidenced(
+        &mut self,
+        frame: &[f32],
+        is_speech: bool,
+        evidence_rms: f32,
+    ) -> FrameAction {
+        let action = self.absorb(frame, is_speech, evidence_rms);
         self.record_preroll(frame);
         action
     }
 
-    fn absorb(&mut self, frame: &[f32], is_speech: bool) -> FrameAction {
-        // Frame loudness drives both the weighted density (speech frames)
-        // and the low-energy early split (any frame while open).
+    fn absorb(&mut self, frame: &[f32], is_speech: bool, evidence_rms: f32) -> FrameAction {
+        // Frame loudness (of the buffered/transmitted signal) drives the
+        // low-energy early split (any frame while open); `evidence_rms`
+        // (possibly a different, pre-AGC value) drives the acoustic evidence
+        // accounting below instead.
         let frame_rms = frame_rms(frame);
         if is_speech {
             self.onset_run += 1;
             self.speech_frames += 1;
-            for &s in frame {
-                self.speech_energy_sum_sq += (s as f64) * (s as f64);
-            }
+            // `evidence_rms^2 * len` is exactly the sum of squared samples a
+            // frame at that RMS would have (RMS is defined as
+            // sqrt(sum_sq/len)), so this stays an exact accumulator (not an
+            // approximation) whenever `evidence_rms == frame_rms(frame)`,
+            // i.e. for every `push_frame` (test/default) call.
+            self.speech_energy_sum_sq += (evidence_rms as f64).powi(2) * frame.len() as f64;
             self.speech_sample_count += frame.len();
-            self.speech_frame_rms.push(frame_rms);
+            self.speech_frame_rms.push(evidence_rms);
 
             if self.buf.is_empty() {
                 if self.onset_run < ONSET_SPEECH_FRAMES {
@@ -201,14 +239,15 @@ impl UtteranceBuffer {
             self.buf.extend_from_slice(frame);
             self.samples_at_last_speech = self.buf.len();
             self.silence_frames = 0;
-            // A speech frame is never a quiet run.
-            self.quiet_run = 0;
             if self.buf.len() >= MAX_UTTERANCE_SAMPLES {
+                self.quiet_run = 0;
                 FrameAction::Flush
             } else if self.buf.len() >= EARLY_SPLIT_SAMPLES && frame_rms < EARLY_SPLIT_QUIET_RMS {
                 // Word-boundary dip inside a long utterance: count it even
                 // though the VAD latch still says speech (see the
-                // non-speech arm below for the shared flush).
+                // non-speech arm below for the shared flush). Must not reset
+                // to 0 first, or a run of quiet-but-VAD-flagged frames could
+                // never accumulate past 1.
                 self.quiet_run += 1;
                 if self.quiet_run >= EARLY_SPLIT_QUIET_FRAMES {
                     FrameAction::Flush
@@ -216,6 +255,8 @@ impl UtteranceBuffer {
                     FrameAction::Continue
                 }
             } else {
+                // Speech frame loud enough that it isn't part of a quiet run.
+                self.quiet_run = 0;
                 FrameAction::Continue
             }
         } else {
@@ -527,7 +568,8 @@ mod tests {
     use crate::config::{
         DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
         DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES, EARLY_SPLIT_QUIET_FRAMES,
-        EARLY_SPLIT_SAMPLES, EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, INTERIM_SPLIT_SAMPLES,
+        EARLY_SPLIT_QUIET_RMS, EARLY_SPLIT_SAMPLES, EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K,
+        INTERIM_SPLIT_SAMPLES,
         INTERIM_SPLIT_SILENCE_FRAMES, MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES,
         ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES, RING_FRAMES, SILENCE_FRAMES_THRESHOLD,
         STRONG_RMS_FACTOR, TAIL_KEEP_SAMPLES, TAIL_MAX_SAMPLES, TAIL_MIN_SAMPLES,
@@ -767,6 +809,44 @@ mod tests {
     }
 
     #[test]
+    fn agc_gained_buffer_does_not_inflate_evidence_rms() {
+        // Regression (M1): the buffered/transmitted frame can be far louder
+        // than the evidence_rms passed alongside it (Agc gains the former
+        // toward --target-rms before FrameProcessor calls
+        // push_frame_evidenced, but evidence_rms is the pre-gain value —
+        // see Agc::process_pair). Evidence.rms must reflect the quiet
+        // microphone signal, not the loud buffered audio, so a genuinely
+        // quiet utterance still reads as Weak acoustic evidence even after
+        // AGC pushed it toward the target.
+        let mut buffer = UtteranceBuffer::new();
+        let quiet_evidence_rms = 0.004; // just above DEFAULT_MIN_SPEECH_RMS
+        let agc_gained_frame = vec![0.04f32; FRAME_16K]; // AGC's --target-rms
+        for _ in 0..25 {
+            buffer.push_frame_evidenced(&agc_gained_frame, true, quiet_evidence_rms);
+        }
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            buffer.push_frame_evidenced(&silence, false, 0.0);
+        }
+        let utterance = buffer
+            .close(&gate_for(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY))
+            .expect("quiet-but-real speech must still clear the acoustic gates");
+        assert!(
+            (utterance.evidence.rms - quiet_evidence_rms).abs() < 1e-4,
+            "Evidence.rms must be the pre-AGC value, got {} (buffered frame was 0.04)",
+            utterance.evidence.rms
+        );
+        let gate = gate_for(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY);
+        let (_, strength) =
+            gate.floor_for(utterance.evidence.speech_frames, utterance.evidence.rms);
+        assert_eq!(
+            strength,
+            crate::gate::EvidenceStrength::Weak,
+            "quiet mic evidence must stay Weak even though the buffered audio was gained to 0.04"
+        );
+    }
+
+    #[test]
     fn scattered_flicker_fails_density_gate() {
         // 25 speech frames — past MIN_SPEECH_FRAMES — but scattered across a
         // long silence span (VAD flicker on noise, never 81 silent frames in
@@ -934,6 +1014,36 @@ mod tests {
             buffer.push_frame(&loud_silence, false),
             FrameAction::Flush,
             "100 ms VAD pause past 28 s must close even when loud"
+        );
+    }
+
+    #[test]
+    fn near_cap_vad_latched_quiet_dip_still_splits_early() {
+        // Regression: the speech arm used to reset `quiet_run` to 0 on every
+        // speech frame *before* incrementing it, so a run of quiet-but-still-
+        // VAD-flagged frames (earshot's latch riding through a word-boundary
+        // dip) could never reach EARLY_SPLIT_QUIET_FRAMES and this path was
+        // dead. Past 28 s, VAD still says speech but energy drops below
+        // EARLY_SPLIT_QUIET_RMS for 5 consecutive frames: must still flush,
+        // exactly like the VAD-false case in
+        // `near_cap_pause_splits_early_in_silence`.
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..(EARLY_SPLIT_SAMPLES / FRAME_16K + 5) {
+            buffer.push_frame(&speech, true);
+        }
+        assert!(buffer.buf.len() >= EARLY_SPLIT_SAMPLES);
+        let quiet_but_speech = vec![EARLY_SPLIT_QUIET_RMS / 2.0; FRAME_16K];
+        for _ in 0..(EARLY_SPLIT_QUIET_FRAMES - 1) {
+            assert_eq!(
+                buffer.push_frame(&quiet_but_speech, true),
+                FrameAction::Continue
+            );
+        }
+        assert_eq!(
+            buffer.push_frame(&quiet_but_speech, true),
+            FrameAction::Flush,
+            "50 ms VAD-latched quiet dip past 28 s must close early"
         );
     }
 

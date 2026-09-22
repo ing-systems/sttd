@@ -103,18 +103,25 @@ impl Agc {
     /// through at unity with no adaptation; speech adapts the envelope from
     /// the whisper (stored) branch then applies the same gain to both so the
     /// verdict always describes the buffered audio.
+    ///
+    /// Returns `whisper`'s RMS *before* any gain is applied, on every code
+    /// path (including the silence/gated-off early returns). Callers use
+    /// this as the utterance buffer's acoustic evidence (`Evidence.rms`,
+    /// `gate::floor_for`'s weak/strong split) instead of `frame_rms` on the
+    /// (possibly gained) buffered audio — evidence should describe what the
+    /// microphone actually heard, not what this AGC did to it afterward.
     pub(crate) fn process_pair(
         &mut self,
         vad: &mut [f32],
         whisper: &mut [f32],
         prev_speech: bool,
-    ) {
-        if !prev_speech || self.target <= 0.0 {
-            return;
-        }
+    ) -> f32 {
         let rms = frame_rms(whisper);
+        if !prev_speech || self.target <= 0.0 {
+            return rms;
+        }
         if rms < AGC_MIN_RMS || !rms.is_finite() {
-            return;
+            return rms;
         }
         let n = whisper.len().max(1) as f32;
         let frame_attack = self.attack_coef.powf(n);
@@ -145,6 +152,7 @@ impl Agc {
                 }
             }
         }
+        rms
     }
 
     /// Reset to unity gain + target envelope for pause/discard transitions.
@@ -220,5 +228,58 @@ mod tests {
         assert!(agc.gain() > 1.0);
         agc.reset();
         assert_eq!(agc.gain(), 1.0);
+    }
+
+    #[test]
+    fn process_pair_returns_pre_gain_rms_not_post_gain() {
+        // Regression for the strong/weak evidence collapse (M1): callers use
+        // this return value to score acoustic evidence (see
+        // UtteranceBuffer::push_frame_evidenced), so it must describe the
+        // microphone, not what this frame ends up amplified to.
+        let mut agc = Agc::new(0.04, 8.0);
+        // Warm the envelope toward a quiet target first so the first real
+        // speech frame below gets a real (>1x) gain applied, not the initial
+        // unity gain.
+        for _ in 0..50 {
+            let mut vad = vec![0.005f32; FRAME_16K];
+            let mut whisper = vec![0.005f32; FRAME_16K];
+            agc.process_pair(&mut vad, &mut whisper, true);
+        }
+        assert!(agc.gain() > 1.0, "gain must have risen, got {}", agc.gain());
+
+        let mut vad = vec![0.005f32; FRAME_16K];
+        let mut whisper = vec![0.005f32; FRAME_16K];
+        let pre_gain_rms = agc.process_pair(&mut vad, &mut whisper, true);
+        // The buffer itself was amplified...
+        let post_gain_rms = frame_rms(&whisper);
+        assert!(
+            post_gain_rms > pre_gain_rms * 1.2,
+            "sanity: frame must actually have been amplified, pre={pre_gain_rms} post={post_gain_rms}"
+        );
+        // ...but the returned value must still be the original, pre-gain RMS.
+        assert!(
+            (pre_gain_rms - 0.005).abs() < 1e-4,
+            "process_pair must return the pre-gain RMS, got {pre_gain_rms}"
+        );
+    }
+
+    #[test]
+    fn process_pair_returns_rms_even_when_gated_off() {
+        // Both early-return paths (not prev_speech, or target <= 0) must
+        // still report the frame's RMS rather than 0.0/garbage — a caller
+        // scoring acoustic evidence on a silence-gated frame needs the real
+        // value just as much as on an adapted one.
+        let mut agc = Agc::new(0.04, 8.0);
+        let mut vad = vec![0.01f32; FRAME_16K];
+        let mut whisper = vec![0.01f32; FRAME_16K];
+        let rms = agc.process_pair(&mut vad, &mut whisper, false); // prev_speech=false
+        assert!((rms - 0.01).abs() < 1e-4, "got {rms}");
+        assert_eq!(whisper, vec![0.01f32; FRAME_16K], "gated-off frame must pass through untouched");
+
+        let mut agc_off = Agc::new(0.0, 8.0); // target <= 0 disables entirely
+        let mut vad2 = vec![0.01f32; FRAME_16K];
+        let mut whisper2 = vec![0.01f32; FRAME_16K];
+        let rms2 = agc_off.process_pair(&mut vad2, &mut whisper2, true);
+        assert!((rms2 - 0.01).abs() < 1e-4, "got {rms2}");
     }
 }

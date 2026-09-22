@@ -194,8 +194,23 @@ pub(crate) const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
 /// the pause-state reset fix.
 pub(crate) const DEFAULT_VAD_ADAPT: bool = true;
 /// `speech_frames` (see `Evidence`) required to count as "strong" acoustic
-/// evidence when paired with `STRONG_RMS_FACTOR` energy: 200 ms (20 frames,
-/// matching `MIN_SPEECH_FRAMES`) so energetic short words can earn strong evidence too.
+/// evidence when paired with `STRONG_RMS_FACTOR` energy: 200 ms (20 frames),
+/// deliberately equal to `MIN_SPEECH_FRAMES` so an energetic short word
+/// ("Ale", "Nie", ~200-250 ms) can still earn strong evidence — see the
+/// `strong floor` change in the "Fix short word drops" commit, which aligned
+/// these two constants on purpose.
+///
+/// Since `check_acoustic` already rejects anything below `MIN_SPEECH_FRAMES`,
+/// this equality means the frame-count half of `floor_for`'s test is always
+/// true by the time it runs: strong-vs-weak reduces to the RMS half alone
+/// (`rms >= min_speech_rms * STRONG_RMS_FACTOR`). That's fine *as long as*
+/// `rms` genuinely describes the microphone: it must be measured **before**
+/// `Agc`'s shared-gain runs, or the AGC's own amplification toward
+/// `--target-rms` (up to 8x, well above the strong cutoff) makes nearly
+/// every utterance read as strong regardless of how quiet the original
+/// speech was — see `Agc::process_pair`'s return value and
+/// `UtteranceBuffer::push_frame_evidenced`, which is what actually keeps
+/// this constant meaningful.
 pub(crate) const STRONG_SPEECH_FRAMES: u32 = 20;
 /// Multiple of `min_speech_rms` required to count as "strong" acoustic
 /// evidence.
@@ -323,6 +338,14 @@ pub(crate) fn valid_model_specs() -> String {
 /// `STTD_PROMPT` to opt back into a domain vocabulary at the cost of that risk.
 pub(crate) const DEFAULT_PROMPT: &str =
     "Technical conversation in Polish and English. Rozmowa techniczna po polsku i angielsku.";
+
+/// `initial_prompt` used when `--translate` is on and the user did not
+/// override `--prompt`/`STTD_PROMPT` (see `resolve_prompt`): English-only,
+/// because whisper.cpp feeds it as prior decoder context (`prompt_past`) and
+/// a Polish prior drags translate-mode output back to Polish (or makes the
+/// model recite the prompt instead of translating). This exact string gave
+/// the best translation in local `--file` tests.
+pub(crate) const DEFAULT_TRANSLATE_PROMPT: &str = "Technical conversation in English.";
 
 /// How many trailing chars of accepted transcripts are appended to the
 /// whisper `initial_prompt` as conversational context (see `prompt_context`
@@ -500,6 +523,47 @@ pub(crate) fn hangover_frames(ms: u64) -> u32 {
     (ms / 10) as u32
 }
 
+/// Upper bound for `--min-rms`/`--target-rms`: both are linear RMS on
+/// `[-1, 1]` samples, and 0.5 is already deep clipping territory — anything
+/// higher is certainly a typo (e.g. a dBFS value pasted in by mistake), not a
+/// tuning choice. `0` stays valid (disables the corresponding gate/AGC).
+pub(crate) const MAX_LINEAR_RMS: f32 = 0.5;
+
+/// Parse a `[0.0, 1.0]` fraction: shared by `--vad-threshold`, `--min-conf`,
+/// `--min-conf-strong` and `--min-density`, every one of them a probability
+/// or a share of frames. Out-of-range values (negative, or `> 1.0`) used to
+/// parse silently and misbehave downstream instead of failing at startup.
+/// Note this alone doesn't close the `--vad-threshold` wedge: any in-range
+/// base below `noise::VAD_HYSTERESIS` (0.1) still clamps
+/// `NoiseTracker::exit_threshold` toward 0.0 — that's fixed separately by
+/// flooring `exit_threshold` itself (see `noise.rs`).
+pub(crate) fn parse_fraction(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number 0.0..=1.0, got {s:?}"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("expected a number 0.0..=1.0, got {s:?}"))
+    }
+}
+
+/// Parse a linear RMS amplitude: shared by `--min-rms` and `--target-rms`.
+/// `0.0` is valid (disables the RMS gate / the AGC respectively); see
+/// `MAX_LINEAR_RMS` for the upper bound.
+pub(crate) fn parse_linear_rms(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number 0.0..={MAX_LINEAR_RMS}, got {s:?}"))?;
+    if (0.0..=MAX_LINEAR_RMS).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("expected a number 0.0..={MAX_LINEAR_RMS}, got {s:?}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +640,27 @@ mod tests {
         assert!(parse_context_chars("2001").is_err());
         assert!(parse_context_chars("-1").is_err());
         assert!(parse_context_chars("bogus").is_err());
+    }
+
+    #[test]
+    fn parse_fraction_accepts_0_to_1() {
+        assert_eq!(parse_fraction("0"), Ok(0.0));
+        assert_eq!(parse_fraction("0.5"), Ok(0.5));
+        assert_eq!(parse_fraction("1"), Ok(1.0));
+        assert_eq!(parse_fraction("1.0"), Ok(1.0));
+        assert!(parse_fraction("-0.01").is_err());
+        assert!(parse_fraction("1.01").is_err());
+        assert!(parse_fraction("bogus").is_err());
+    }
+
+    #[test]
+    fn parse_linear_rms_accepts_0_to_max() {
+        assert_eq!(parse_linear_rms("0"), Ok(0.0));
+        assert_eq!(parse_linear_rms("0.003"), Ok(0.003));
+        assert_eq!(parse_linear_rms("0.5"), Ok(MAX_LINEAR_RMS));
+        assert!(parse_linear_rms("-0.001").is_err());
+        assert!(parse_linear_rms("0.51").is_err());
+        assert!(parse_linear_rms("bogus").is_err());
     }
 
     #[test]

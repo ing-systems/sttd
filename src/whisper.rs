@@ -229,6 +229,21 @@ pub(crate) fn should_autopause(autopause_enabled: bool, emitted: bool) -> bool {
     autopause_enabled && emitted
 }
 
+/// Whether the worker should drain the whisper queue right now: exactly on
+/// the false->true edge of `paused` (`was_paused` is the pause state as of
+/// the last time the caller checked it). Pure so the edge condition is
+/// testable without a live `rtrb` queue or thread; the actual drain (`rx.pop`
+/// in a loop) stays a side effect in the caller.
+///
+/// Utterances queued just before a pause is noticed must not survive it:
+/// with `--copy`/`--paste` on by default, transcribing them on resume types
+/// stale content into whatever window has focus, possibly minutes later.
+/// Firing only on the edge (not on every paused tick) means a long pause
+/// drains once, not on a busy-loop.
+pub(crate) fn should_drain_on_pause(was_paused: bool, now_paused: bool) -> bool {
+    now_paused && !was_paused
+}
+
 #[allow(clippy::too_many_arguments)]
 fn whisper_init_and_run(
     rx: &mut Consumer<Utterance>,
@@ -344,12 +359,13 @@ fn whisper_init_and_run(
         // path above only covers the long-pause case.
         let mut was_paused = paused.load(Ordering::Relaxed);
 
-        // Full-pipeline hold: while paused the queue (and stash) holds —
-        // nothing transcribes until resume. Stash replay below also waits.
-        for utterance in std::mem::take(&mut stash) {
+        // Full-pipeline hold: while paused the stash holds — nothing
+        // transcribes until resume.
+        let mut stash_iter = std::mem::take(&mut stash).into_iter();
+        for utterance in stash_iter.by_ref() {
             if paused.load(Ordering::Relaxed) {
-                // Still paused (reload raced a re-pause): re-stash and wait.
-                stash.push(utterance);
+                // Re-paused mid-replay: stop here: the remainder is handled
+                // below.
                 break;
             }
             if utterance.pcm.is_empty() {
@@ -387,6 +403,19 @@ fn whisper_init_and_run(
                 }
             }
         }
+        // A re-pause mid-replay drops the rest of the stash outright, same
+        // as the live queue's pause-edge drain (`should_drain_on_pause`):
+        // stale audio from before an arbitrary-length pause shouldn't
+        // silently wait for a future resume and then transcribe/auto-paste.
+        // (This also fixes what used to be a plain bug: `break` after
+        // re-stashing only the current entry discarded every entry still in
+        // the iterator, unlogged.)
+        let dropped_stash = stash_iter.count();
+        if dropped_stash > 0 {
+            log::warn!(
+                "dropping {dropped_stash} stashed utterance(s) (re-paused during reload replay)"
+            );
+        }
 
         // Loaded loop: transcribe until the pause-idle timeout asks for an
         // unload (`false`), or the producer is gone (`true` = shut down).
@@ -397,6 +426,23 @@ fn whisper_init_and_run(
             // Full hold: while paused, idle without popping so queued
             // utterances wait for resume instead of transcribing through pause.
             if paused.load(Ordering::Relaxed) {
+                if should_drain_on_pause(was_paused, true) {
+                    // Pause edge: drop whatever is already queued. Without
+                    // this, utterances closed just before the pause was
+                    // noticed survive it and transcribe (and, with --copy/
+                    // --paste on by default, get typed into whatever window
+                    // has focus) on resume — possibly minutes later.
+                    // Consistent with the shutdown-while-paused drain a few
+                    // lines below, and with `hold_pipeline`'s own discard
+                    // semantics on the capture side of this same edge.
+                    let mut n = 0;
+                    while rx.pop().is_ok() {
+                        n += 1;
+                    }
+                    if n > 0 {
+                        log::warn!("dropping {n} queued utterance(s) (paused)");
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(50));
                 was_paused = true;
                 if should_unload(
@@ -516,13 +562,21 @@ fn whisper_init_and_run(
                     }
                     std::thread::sleep(Duration::from_millis(20));
                     let now_paused = paused.load(Ordering::Relaxed);
+                    // Only clear `was_paused` here (mirroring the `Ok` arm
+                    // above); never set it true. The top-of-loop paused
+                    // branch is the sole place a false->true transition runs
+                    // the pause-edge queue drain (see its comment) — setting
+                    // `was_paused = now_paused` unconditionally here used to
+                    // race ahead of that check (this Err arm can observe the
+                    // pause flag flip before the top-of-loop branch does),
+                    // silently skipping the drain for that transition.
                     if !now_paused {
                         last_unpaused = Instant::now();
                         if sound_enabled && was_paused {
                             crate::sound::play_ready();
                         }
+                        was_paused = false;
                     }
-                    was_paused = now_paused;
                     if should_unload(
                         auto_unload,
                         now_paused,
@@ -818,6 +872,17 @@ pub(crate) fn infer_rtf(samples: usize, infer_ms: f64) -> (f64, f64) {
     (audio_sec, rtf)
 }
 
+/// Samples whisper actually decoded for a conditioned utterance of
+/// `conditioned_len` samples: `transcribe` pads anything under
+/// `WHISPER_MIN_SAMPLES` (see `pad_with_dither`) before inference, so the
+/// un-padded length alone understates a short utterance's decoded audio —
+/// inflating `rtf` and the `--metrics` `audio_sec` column by up to ~1.7x on
+/// exactly the sub-second utterances confidence-floor tuning cares about
+/// most. Pure for tests.
+pub(crate) fn decoded_sample_count(conditioned_len: usize) -> usize {
+    conditioned_len.max(WHISPER_MIN_SAMPLES)
+}
+
 /// Pick which backlog utterances survive shedding: top `keep` by
 /// (density, rms), ties to newer arrivals; survivors return as
 /// chronological indices. Pure for tests; the worker transcribes the
@@ -881,7 +946,7 @@ pub(crate) fn format_metrics_row(
 fn write_metrics_row(
     metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
     tag: &str,
-    pcm: &[f32],
+    samples: usize,
     evidence: &crate::utterance::Evidence,
     prob: f32,
     logprob: f32,
@@ -893,7 +958,7 @@ fn write_metrics_row(
     let Some(w) = metrics else { return };
     let row = format_metrics_row(
         tag,
-        pcm.len(),
+        samples,
         evidence,
         prob,
         logprob,
@@ -966,7 +1031,13 @@ fn transcribe_and_emit(
         running,
     );
     let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let (audio_sec, rtf) = infer_rtf(utterance.pcm.len(), infer_ms);
+    // What whisper actually decoded: `transcribe` pads anything under
+    // WHISPER_MIN_SAMPLES (see `pad_with_dither`) before inference, so
+    // `utterance.pcm.len()` alone understates the audio a short utterance
+    // was measured against, inflating `rtf` by up to ~1.7x on the very
+    // sub-second utterances the confidence-floor tuning cares about most.
+    let decoded_samples = decoded_sample_count(conditioned.len());
+    let (audio_sec, rtf) = infer_rtf(decoded_samples, infer_ms);
     if rtf > crate::config::RTF_WARN_RTF {
         log::warn!(
             "{tag}: inference slower than realtime (rtf={rtf:.2}, {infer_ms:.0} ms for \
@@ -983,13 +1054,17 @@ fn transcribe_and_emit(
                 t.confidence.prob,
             );
             let emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit { .. });
-            if emitted {
+            // Translate mode decodes standalone: feeding back prior outputs
+            // as `initial_prompt` context would bias the next translation
+            // (translated English, or a source-language leak, as prior), so
+            // only transcribe mode grows the conversational tail.
+            if emitted && !translate {
                 push_prompt_context(prompt_tail, trimmed, prompt_context_chars);
             }
             write_metrics_row(
                 metrics,
                 &tag,
-                &utterance.pcm,
+                decoded_samples,
                 &utterance.evidence,
                 t.confidence.prob,
                 t.confidence.logprob,
@@ -1217,6 +1292,14 @@ fn transcribe(
     // (crate-level quirk). A few hundred bytes per utterance; not worth
     // engineering around.
     params.set_initial_prompt(prompt);
+    // This module manages conversational context explicitly through
+    // `initial_prompt` + `push_prompt_context` (drops never feed the tail —
+    // see its doc comment), which only holds if whisper.cpp clears its own
+    // `prompt_past` between calls. The vendored whisper.cpp defaults
+    // `no_context` to `true` already, but pin it explicitly rather than rely
+    // on an upstream default that could flip silently and double-feed
+    // context.
+    params.set_no_context(true);
     params.set_suppress_blank(true);
     params.set_suppress_non_speech_tokens(true);
     params.set_temperature(temperature);
@@ -1620,6 +1703,22 @@ mod tests {
     }
 
     #[test]
+    fn decoded_sample_count_reflects_the_pad_floor() {
+        // Regression: RTF/metrics used to be computed on the un-padded
+        // utterance length, understating a short utterance's actual decoded
+        // audio (transcribe pads up to WHISPER_MIN_SAMPLES) and inflating
+        // rtf accordingly.
+        assert_eq!(decoded_sample_count(0), WHISPER_MIN_SAMPLES);
+        assert_eq!(decoded_sample_count(9_600), WHISPER_MIN_SAMPLES); // 600 ms padded up
+        assert_eq!(decoded_sample_count(WHISPER_MIN_SAMPLES), WHISPER_MIN_SAMPLES);
+        // Already long enough: passes through untouched (no padding happens).
+        assert_eq!(
+            decoded_sample_count(WHISPER_MIN_SAMPLES + 5_000),
+            WHISPER_MIN_SAMPLES + 5_000
+        );
+    }
+
+    #[test]
     fn shed_survivors_keep_best_by_density_then_rms() {
         // 6 backlogged, keep 4: the two weakest densities drop, order stays
         // chronological for prompt context.
@@ -1873,6 +1972,18 @@ mod tests {
         // drops and failed inferences (false) must not steal the shot.
         assert!(!should_autopause(true, false));
         assert!(should_autopause(true, true));
+    }
+
+    #[test]
+    fn drain_on_pause_fires_only_on_the_edge() {
+        // The transition into pause (edge) drains once...
+        assert!(should_drain_on_pause(false, true));
+        // ...but a tick that's already paused (no fresh edge) must not
+        // re-drain on every 50 ms poll of a long pause.
+        assert!(!should_drain_on_pause(true, true));
+        // Not paused: nothing to drain either way.
+        assert!(!should_drain_on_pause(false, false));
+        assert!(!should_drain_on_pause(true, false));
     }
 
     #[test]

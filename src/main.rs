@@ -72,7 +72,7 @@ use signal_hook::iterator::Signals;
 mod cli;
 use cli::Cli;
 mod config;
-use config::{model_file_for_spec, DEFAULT_MODELS_DIR, MODEL_CATALOG};
+use config::{model_file_for_spec, DEFAULT_MODELS_DIR, DEFAULT_PROMPT, DEFAULT_TRANSLATE_PROMPT, MODEL_CATALOG};
 mod capture;
 use capture::*;
 mod daemon;
@@ -248,7 +248,9 @@ fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
 /// Push a closed utterance into the bounded whisper ring. Never blocks the
 /// processing loop: a full ring drops the newest with a warn (in practice the
 /// worker-side weakest-first shed keeps the backlog small so this rarely
-/// fires). A dead worker (`is_abandoned`) is also just a warn.
+/// fires). A dead worker (`is_abandoned`) is also just a warn. Microphone mode
+/// only — file mode uses `push_utterance_blocking` (see its doc comment for
+/// why dropping is wrong there).
 fn push_utterance(whisper_tx: &mut Producer<Utterance>, utterance: Utterance) {
     if whisper_tx.is_abandoned() {
         log::warn!("whisper worker gone, dropping utterance");
@@ -256,6 +258,37 @@ fn push_utterance(whisper_tx: &mut Producer<Utterance>, utterance: Utterance) {
     }
     if let Err(rtrb::PushError::Full(_)) = whisper_tx.push(utterance) {
         log::warn!("whisper queue full, dropping newest utterance");
+    }
+}
+
+/// Push a closed utterance into the bounded whisper ring, retrying on
+/// backpressure instead of dropping. File mode (`shed_stale = false`)
+/// promises lossless offline decoding, but resampling runs at ~100x realtime
+/// while inference runs at roughly realtime, so the producer routinely
+/// outruns `WHISPER_QUEUE_CAP` (16) on any recording longer than a few tens
+/// of seconds. `push_utterance`'s drop-newest policy would silently discard
+/// most of a long file; this instead waits for the worker to make room,
+/// which is safe here because file mode has no realtime deadline to protect.
+/// Returns once pushed or the worker is gone (dead worker still just warns,
+/// same as `push_utterance`).
+fn push_utterance_blocking(whisper_tx: &mut Producer<Utterance>, utterance: Utterance) {
+    if whisper_tx.is_abandoned() {
+        log::warn!("whisper worker gone, dropping utterance");
+        return;
+    }
+    let mut pending = utterance;
+    loop {
+        match whisper_tx.push(pending) {
+            Ok(()) => return,
+            Err(rtrb::PushError::Full(back)) => {
+                if whisper_tx.is_abandoned() {
+                    log::warn!("whisper worker gone, dropping utterance");
+                    return;
+                }
+                pending = back;
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
@@ -363,14 +396,18 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     }
     while running.load(Ordering::Acquire) {
         // USB mics vanish mid-session: rebuild the device + stream + resamplers
-        // instead of capturing deaf. Stale audio is discarded; the noise floor
-        // (warm) survives inside the VAD.
+        // instead of capturing deaf. Stale audio is discarded; the noise
+        // floor is carried across explicitly (see `adopt_noise_floor`) since
+        // the rebuild constructs a brand new `FrameProcessor`/`SpeechDetector`
+        // rather than resetting the old one.
         if telemetry.device_gone.load(Ordering::Acquire) {
             rebuild_attempts += 1;
             log::warn!("input device lost, rebuild attempt #{rebuild_attempts}...");
+            let warm_noise_floor = fp.noise_floor();
             thread::sleep(Duration::from_secs(2));
             match open_input_path(&host, cli, &telemetry) {
-                Ok((new_rate, new_stream, new_fp, new_raw_rx)) => {
+                Ok((new_rate, new_stream, mut new_fp, new_raw_rx)) => {
+                    new_fp.adopt_noise_floor(warm_noise_floor);
                     hw_rate = new_rate;
                     stream = new_stream;
                     fp = new_fp;
@@ -512,8 +549,10 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 /// stream before returning. Used for the initial open (fails fast, so a bad
 /// `--device`/`--channel` aborts before the model loads) and for rebuilds
 /// after `DeviceNotAvailable` (see the main loop). A rebuild re-creates the
-/// resamplers for the (possibly changed) hw rate; utterance state is lost and
-/// warm VAD noise floor is kept. The raw `rtrb` ring is created here (capacity
+/// resamplers for the (possibly changed) hw rate and returns a brand new
+/// `FrameProcessor`, so utterance state is lost; the caller carries the warm
+/// VAD noise floor across explicitly via `adopt_noise_floor` (this function
+/// itself has no memory of it). The raw `rtrb` ring is created here (capacity
 /// follows the hw rate); the utterance ring lives in the caller and survives
 /// rebuilds.
 ///
@@ -720,14 +759,14 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     let mut offset = 0usize;
     while offset + input_frames <= wav.samples.len() {
         if let Some(utterance) = fp.process_frame(&wav.samples[offset..offset + input_frames]) {
-            push_utterance(&mut whisper_tx, utterance);
+            push_utterance_blocking(&mut whisper_tx, utterance);
         }
         offset += input_frames;
     }
     // A trailing partial chunk (< input_frames samples, at most ~30 ms) is
     // dropped; fine for offline comparison runs.
     if let Some(utterance) = fp.flush_trailing_speech() {
-        push_utterance(&mut whisper_tx, utterance);
+        push_utterance_blocking(&mut whisper_tx, utterance);
     }
 
     drop(fp);
@@ -747,10 +786,26 @@ fn resolve_model_input(cli: &Cli) -> Result<std::path::PathBuf> {
     ensure_available(&path)
 }
 
+/// Effective whisper `initial_prompt`. With `--translate` and an uncustomized
+/// prompt the base is the English-only `DEFAULT_TRANSLATE_PROMPT`:
+/// whisper.cpp feeds `initial_prompt` as prior decoder context
+/// (`prompt_past`), and the default Polish/English prompt drags
+/// translate-mode output back to Polish (or makes the model recite the
+/// prompt instead of translating). An explicit `--prompt`/`STTD_PROMPT`
+/// always wins — detected by differing from `DEFAULT_PROMPT`. Pure over its
+/// inputs for tests.
+pub(crate) fn resolve_prompt(translate: bool, prompt: &str) -> String {
+    if translate && prompt == DEFAULT_PROMPT {
+        DEFAULT_TRANSLATE_PROMPT.to_string()
+    } else {
+        prompt.to_string()
+    }
+}
+
 fn whisper_options(cli: &Cli, shed_stale: bool) -> WhisperOptions {
     WhisperOptions {
         model_spec: cli.model_input(),
-        prompt: cli.prompt.clone(),
+        prompt: resolve_prompt(cli.translate, &cli.prompt),
         prompt_context_chars: cli.prompt_context_chars,
         language: cli.language,
         translate: cli.translate,
@@ -790,6 +845,19 @@ fn gate_config(cli: &Cli) -> gate::GateConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_prompt_swaps_english_base_for_default_prompt_under_translate() {
+        use crate::config::{DEFAULT_PROMPT, DEFAULT_TRANSLATE_PROMPT};
+        assert_eq!(resolve_prompt(false, DEFAULT_PROMPT), DEFAULT_PROMPT);
+        assert_eq!(resolve_prompt(false, "custom"), "custom");
+        assert_eq!(
+            resolve_prompt(true, DEFAULT_PROMPT),
+            DEFAULT_TRANSLATE_PROMPT
+        );
+        assert_eq!(resolve_prompt(true, "custom"), "custom");
+        assert_eq!(resolve_prompt(true, ""), "");
+    }
 
     #[test]
     fn selected_spec_matches_spec_exactly() {
