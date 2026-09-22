@@ -122,7 +122,8 @@ impl SignalPath {
 
     /// Totals for lockstep monitoring: `(fed_chunks, paired_frames,
     /// max_pending)`. `max_pending` is the largest pre-drain queue seen so
-    /// far (either branch).
+    /// far (either branch). Test-only reader; prod uses `pending_depths`.
+    #[allow(dead_code)]
     pub(crate) fn stats(&self) -> (u64, u64, usize) {
         (self.fed_chunks, self.paired_frames, self.max_pending)
     }

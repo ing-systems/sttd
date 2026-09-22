@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::config::{
-    parse_beam_size, parse_bool, parse_threads, DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS,
-    DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_TARGET_RMS,
-    DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
+    parse_beam_size, parse_bool, parse_context_chars, parse_threads, DEFAULT_AUTO_UNLOAD,
+    DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC,
+    DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TARGET_RMS, DEFAULT_THREADS,
+    DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::whisper::Language;
@@ -69,6 +70,11 @@ pub(crate) struct Cli {
     /// Override the whisper initial prompt.
     #[arg(short, long, env = "STTD_PROMPT", default_value = DEFAULT_PROMPT, help_heading = "Model")]
     pub(crate) prompt: String,
+
+    /// Trailing chars of accepted transcripts appended to the initial prompt
+    /// (`0` = off). Only emitted transcripts feed it — drops never do.
+    #[arg(long, env = "STTD_PROMPT_CONTEXT_CHARS", default_value_t = DEFAULT_PROMPT_CONTEXT_CHARS, value_parser = parse_context_chars, value_name = "N", help_heading = "Model")]
+    pub(crate) prompt_context_chars: usize,
 
     /// VAD-branch denoiser.
     #[arg(
@@ -377,6 +383,7 @@ mod tests {
             PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin")
         );
         assert_eq!(cli.prompt, DEFAULT_PROMPT);
+        assert_eq!(cli.prompt_context_chars, DEFAULT_PROMPT_CONTEXT_CHARS);
         assert_eq!(cli.language, crate::whisper::Language::Polish);
         assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
         assert_eq!(cli.threads, DEFAULT_THREADS);

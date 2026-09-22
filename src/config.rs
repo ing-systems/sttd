@@ -231,6 +231,16 @@ pub(crate) fn valid_model_specs() -> String {
 pub(crate) const DEFAULT_PROMPT: &str =
     "Technical conversation in Polish and English. Rozmowa techniczna po polsku i angielsku.";
 
+/// How many trailing chars of accepted transcripts are appended to the
+/// whisper `initial_prompt` as conversational context (see `prompt_context`
+/// in `whisper`). `0` disables the carryover. Override with
+/// `STTD_PROMPT_CONTEXT_CHARS`.
+pub(crate) const DEFAULT_PROMPT_CONTEXT_CHARS: usize = 150;
+/// Hard cap for `--prompt-context-chars`: whisper.cpp's `initial_prompt`
+/// is prior context, not storage — past a few hundred chars it starts
+/// reciting the prompt on low-signal audio (see `DEFAULT_PROMPT`).
+pub(crate) const MAX_PROMPT_CONTEXT_CHARS: usize = 2000;
+
 /// Transcripts that are near-exact matches for common Whisper hallucinations
 /// on silence/low-energy audio (subtitle-credit boilerplate picked up from
 /// training data), compared after lowercasing, stripping punctuation, and
@@ -291,6 +301,28 @@ pub(crate) fn parse_threads(s: &str) -> Result<i32, String> {
     }
 }
 
+/// Parse `--prompt-context-chars`/`STTD_PROMPT_CONTEXT_CHARS`: 0 disables,
+/// max `MAX_PROMPT_CONTEXT_CHARS`.
+pub(crate) fn parse_context_chars(s: &str) -> Result<usize, String> {
+    let v: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| {
+            format!(
+                "expected an integer 0..={} (0 = off), got {s:?}",
+                MAX_PROMPT_CONTEXT_CHARS
+            )
+        })?;
+    if v <= MAX_PROMPT_CONTEXT_CHARS {
+        Ok(v)
+    } else {
+        Err(format!(
+            "expected an integer 0..={} (0 = off), got {s:?}",
+            MAX_PROMPT_CONTEXT_CHARS
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +362,17 @@ mod tests {
         assert_eq!(DEFAULT_BEAM_SIZE, 5);
         assert_eq!(DEFAULT_THREADS, 8);
         assert!(DEFAULT_USE_GPU);
+    }
+
+    #[test]
+    fn parse_context_chars_accepts_zero_to_max() {
+        assert_eq!(parse_context_chars("0"), Ok(0));
+        assert_eq!(parse_context_chars("150"), Ok(150));
+        assert_eq!(parse_context_chars("2000"), Ok(MAX_PROMPT_CONTEXT_CHARS));
+        assert_eq!(DEFAULT_PROMPT_CONTEXT_CHARS, 150);
+        assert!(parse_context_chars("2001").is_err());
+        assert!(parse_context_chars("-1").is_err());
+        assert!(parse_context_chars("bogus").is_err());
     }
 
     #[test]

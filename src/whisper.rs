@@ -66,6 +66,7 @@ impl std::fmt::Display for Language {
 pub(crate) struct WhisperOptions {
     pub(crate) model_spec: String,
     pub(crate) prompt: String,
+    pub(crate) prompt_context_chars: usize,
     pub(crate) language: Language,
     pub(crate) gate: GateConfig,
     pub(crate) target_rms: f32,
@@ -218,6 +219,7 @@ fn whisper_init_and_run(
         .context("model path is not valid UTF-8")?;
 
     let prompt = opts.prompt.clone();
+    let prompt_context_chars = opts.prompt_context_chars;
     let language = opts.language;
     let gate = opts.gate.clone();
     let target_rms = opts.target_rms;
@@ -230,6 +232,11 @@ fn whisper_init_and_run(
 
     let mut first_load = true;
     let mut utterance_no: u64 = 0;
+    // Sliding conversational context: tail of accepted transcripts, appended
+    // to `initial_prompt` per inference. Survives model reloads (same
+    // conversation); only emits feed it, drops never do. Fresh per process —
+    // file mode gets a new worker per run.
+    let mut prompt_tail = String::new();
     // Utterances that arrive while the model is unloaded (resume raced the
     // reload, or shutdown raced it): replayed in order after the next load.
     // In practice this stays empty while paused, since the main loop
@@ -311,6 +318,8 @@ fn whisper_init_and_run(
                 &utterance,
                 utterance_no,
                 &prompt,
+                &mut prompt_tail,
+                prompt_context_chars,
                 language,
                 &gate,
                 target_rms,
@@ -352,6 +361,8 @@ fn whisper_init_and_run(
                         &utterance,
                         utterance_no,
                         &prompt,
+                        &mut prompt_tail,
+                        prompt_context_chars,
                         language,
                         &gate,
                         target_rms,
@@ -480,6 +491,50 @@ fn load_whisper_context(
     ctx_result
 }
 
+/// Build the `initial_prompt` for one inference: base prompt plus the tail
+/// of accepted transcripts. Drops never enter the tail (the caller only
+/// pushes on emit), so noise can't poison later decodes. `0` chars disables
+/// the carryover entirely.
+pub(crate) fn build_effective_prompt(base: &str, context_tail: &str) -> String {
+    let tail = context_tail.trim();
+    if tail.is_empty() {
+        return base.to_string();
+    }
+    let base_trimmed = base.trim_end();
+    if base_trimmed.is_empty() {
+        return tail.to_string();
+    }
+    format!("{base_trimmed} {tail}")
+}
+
+/// Append an emitted transcript to the prompt-context tail, keeping only the
+/// last `max_chars` chars on a char boundary. `0` disables (clears, so a
+/// runtime toggle can't leave stale context). Empty text is a no-op.
+pub(crate) fn push_prompt_context(tail: &mut String, emitted_text: &str, max_chars: usize) {
+    if max_chars == 0 {
+        tail.clear();
+        return;
+    }
+    let text = emitted_text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if !tail.is_empty() {
+        tail.push(' ');
+    }
+    tail.push_str(text);
+    // Truncate to the last `max_chars` chars without splitting UTF-8.
+    if tail.chars().count() > max_chars {
+        let skip = tail.chars().count() - max_chars;
+        let byte_idx = tail
+            .char_indices()
+            .nth(skip)
+            .map(|(i, _)| i)
+            .unwrap_or(tail.len());
+        tail.drain(..byte_idx);
+    }
+}
+
 /// One utterance through conditioning, gain, inference, gate and emission.
 /// Tag numbering is owned by the caller so it stays monotonic across reloads.
 /// Returns whether the transcript was actually emitted (vs dropped or failed),
@@ -490,7 +545,9 @@ fn transcribe_and_emit(
     token_beg: whisper_rs::WhisperToken,
     utterance: &Utterance,
     utterance_no: u64,
-    prompt: &str,
+    base_prompt: &str,
+    prompt_tail: &mut String,
+    prompt_context_chars: usize,
     language: Language,
     gate: &crate::gate::GateConfig,
     target_rms: f32,
@@ -505,12 +562,13 @@ fn transcribe_and_emit(
     let rms_for_gain =
         conditioned_speech_rms(&utterance.pcm, &conditioned, utterance.evidence.rms);
     let gained = apply_gain(&conditioned, rms_for_gain, target_rms, MAX_GAIN);
+    let effective_prompt = build_effective_prompt(base_prompt, prompt_tail);
 
     match transcribe(
         state,
         token_beg,
         gained.as_ref(),
-        prompt,
+        &effective_prompt,
         language,
         debug_tokens,
         beam_size,
@@ -528,6 +586,9 @@ fn transcribe_and_emit(
                 verdict,
                 crate::gate::TranscriptVerdict::Emit { .. }
             );
+            if emitted {
+                push_prompt_context(prompt_tail, trimmed, prompt_context_chars);
+            }
             emitter.emit(Emission {
                 tag: &tag,
                 pcm: &utterance.pcm,
@@ -925,6 +986,45 @@ mod tests {
     }
 
     #[test]
+    fn prompt_context_builds_and_truncates() {
+        // Empty tail -> base unchanged (hot path, no allocation surprise).
+        assert_eq!(build_effective_prompt("base", ""), "base");
+        assert_eq!(build_effective_prompt("base", "   "), "base");
+        assert_eq!(
+            build_effective_prompt("base.", "Dzień dobry"),
+            "base. Dzień dobry"
+        );
+        // Empty base -> bare tail (custom --prompt "").
+        assert_eq!(build_effective_prompt("", "hej"), "hej");
+
+        // Push appends with a space, truncates to last N chars.
+        let mut tail = String::new();
+        push_prompt_context(&mut tail, "pierwsze zdanie.", 150);
+        assert_eq!(tail, "pierwsze zdanie.");
+        push_prompt_context(&mut tail, "Drugie zdanie.", 150);
+        assert_eq!(tail, "pierwsze zdanie. Drugie zdanie.");
+
+        // Overflow keeps the tail, drops the head.
+        let mut long = String::new();
+        push_prompt_context(&mut long, "aaa bbb ccc", 7);
+        assert_eq!(long, "bbb ccc", "tail={long:?}");
+
+        // Polish diacritics are never split: truncation lands on a char
+        // boundary even mid-ogonek.
+        let mut diac = String::new();
+        push_prompt_context(&mut diac, "ąęłńóśźż", 4);
+        assert_eq!(diac.chars().count(), 4);
+        assert_eq!(diac, "óśźż");
+
+        // Disabled clears; empty text is a no-op (drops never reach here,
+        // but double-guard the seam).
+        push_prompt_context(&mut tail, "ignored", 0);
+        assert!(tail.is_empty());
+        push_prompt_context(&mut tail, "   ", 150);
+        assert!(tail.is_empty());
+    }
+
+    #[test]
     fn weak_evidence_keeps_strict_gate() {
         // Regression for the hole 71c05b0 closed: an utterance with barely
         // enough VAD-flagged speech to survive `close`'s own gates, and RMS
@@ -1288,6 +1388,7 @@ mod tests {
         let opts = WhisperOptions {
             model_spec: "bogus".to_string(),
             prompt: String::new(),
+            prompt_context_chars: crate::config::DEFAULT_PROMPT_CONTEXT_CHARS,
             language: Language::Polish,
             gate: GateConfig::new(
                 DEFAULT_MIN_SPEECH_RMS,

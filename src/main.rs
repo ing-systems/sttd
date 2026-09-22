@@ -595,6 +595,7 @@ fn whisper_options(cli: &Cli) -> WhisperOptions {
     WhisperOptions {
         model_spec: cli.model_input(),
         prompt: cli.prompt.clone(),
+        prompt_context_chars: cli.prompt_context_chars,
         language: cli.language,
         gate: gate_config(cli),
         target_rms: cli.target_rms,
