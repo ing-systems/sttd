@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::config::{
-    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PAUSED_UNLOAD_AFTER_SECS,
-    DEFAULT_PROMPT, DEFAULT_TARGET_RMS, DEFAULT_VAD_THRESHOLD, parse_bool,
+    parse_beam_size, parse_bool, parse_threads, DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC,
+    DEFAULT_PAUSED_UNLOAD_AFTER_SECS, DEFAULT_PROMPT, DEFAULT_TARGET_RMS, DEFAULT_THREADS,
+    DEFAULT_USE_GPU, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::whisper::Language;
@@ -39,7 +40,13 @@ pub(crate) struct Cli {
     /// Model spec (e.g. `small`, `large-v3-turbo-q8_0`) or path to a ggml
     /// whisper model file (auto-downloaded if missing). `STTD_MODEL` wins
     /// over the legacy `WHISPER_MODEL_PATH` fallback; CLI wins over both.
-    #[arg(short, long, env = "STTD_MODEL", value_name = "SPEC|PATH", help_heading = "Model")]
+    #[arg(
+        short,
+        long,
+        env = "STTD_MODEL",
+        value_name = "SPEC|PATH",
+        help_heading = "Model"
+    )]
     pub(crate) model: Option<String>,
 
     /// List known whisper models (with installed/default markers) and exit.
@@ -73,6 +80,26 @@ pub(crate) struct Cli {
         help_heading = "Model"
     )]
     pub(crate) denoiser: DenoiserKind,
+
+    /// Beam width of whisper's beam-search decoder (`1` = greedy).
+    #[arg(long, env = "STTD_BEAM_SIZE", default_value_t = DEFAULT_BEAM_SIZE, value_parser = parse_beam_size, value_name = "N", help_heading = "Model")]
+    pub(crate) beam_size: i32,
+
+    /// Decoder thread count; `0` = auto (`available_parallelism`).
+    #[arg(long, env = "STTD_THREADS", default_value_t = DEFAULT_THREADS, value_parser = parse_threads, value_name = "N", help_heading = "Model")]
+    pub(crate) threads: i32,
+
+    /// Load the model onto the GPU (`off`/`0` = CPU-only).
+    #[arg(
+        long,
+        env = "STTD_GPU",
+        default_value_t = DEFAULT_USE_GPU,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Model"
+    )]
+    pub(crate) gpu: bool,
 
     /// Minimum earshot score for a 16 ms window to count as speech.
     #[arg(long, env = "STTD_VAD_THRESHOLD", default_value_t = DEFAULT_VAD_THRESHOLD, help_heading = "Acoustic gates")]
@@ -178,13 +205,23 @@ pub(crate) struct Cli {
 
     /// PID file written by `--start` and read by `--stop`/`--status`.
     /// Defaults to `<tmp>/sttd.pid`.
-    #[arg(long, env = "STTD_PID_FILE", value_name = "PATH", help_heading = "Runtime")]
+    #[arg(
+        long,
+        env = "STTD_PID_FILE",
+        value_name = "PATH",
+        help_heading = "Runtime"
+    )]
     pub(crate) pid_file: Option<PathBuf>,
 
     /// Combined stdout+stderr log (append) for `--start`. Transcripts
     /// (`println!`) and diagnostics (`log`) both land here.
     /// Defaults to `<tmp>/sttd.log`.
-    #[arg(long, env = "STTD_LOG_FILE", value_name = "PATH", help_heading = "Runtime")]
+    #[arg(
+        long,
+        env = "STTD_LOG_FILE",
+        value_name = "PATH",
+        help_heading = "Runtime"
+    )]
     pub(crate) log_file: Option<PathBuf>,
 
     /// Stop the background daemon: SIGTERM its pid (graceful flush),
@@ -221,17 +258,24 @@ impl Cli {
     /// Raw `--model` value with env precedence resolved: CLI (`STTD_MODEL`
     /// via clap) > legacy `WHISPER_MODEL_PATH` > compiled-in default spec.
     pub(crate) fn model_input(&self) -> String {
-        effective_model_input(self.model.as_deref(), std::env::var("WHISPER_MODEL_PATH").ok())
+        effective_model_input(
+            self.model.as_deref(),
+            std::env::var("WHISPER_MODEL_PATH").ok(),
+        )
     }
 
     /// Effective pid-file path: `--pid-file`/`STTD_PID_FILE` or `<tmp>/sttd.pid`.
     pub(crate) fn pid_file_path(&self) -> PathBuf {
-        self.pid_file.clone().unwrap_or_else(crate::daemon::default_pid_file)
+        self.pid_file
+            .clone()
+            .unwrap_or_else(crate::daemon::default_pid_file)
     }
 
     /// Effective log path: `--log-file`/`STTD_LOG_FILE` or `<tmp>/sttd.log`.
     pub(crate) fn log_file_path(&self) -> PathBuf {
-        self.log_file.clone().unwrap_or_else(crate::daemon::default_log_file)
+        self.log_file
+            .clone()
+            .unwrap_or_else(crate::daemon::default_log_file)
     }
 }
 
@@ -271,6 +315,9 @@ mod tests {
         );
         assert_eq!(cli.prompt, DEFAULT_PROMPT);
         assert_eq!(cli.language, crate::whisper::Language::Polish);
+        assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
+        assert_eq!(cli.threads, DEFAULT_THREADS);
+        assert_eq!(cli.gpu, DEFAULT_USE_GPU);
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
         assert_eq!(cli.min_density, DEFAULT_MIN_DENSITY);
         assert_eq!(cli.min_conf, DEFAULT_MIN_CONFIDENCE);
@@ -304,6 +351,12 @@ mod tests {
             "1",
             "--start-paused",
             "off",
+            "--beam-size",
+            "3",
+            "--threads",
+            "0",
+            "--gpu",
+            "off",
         ])
         .expect("flags must parse");
         assert_eq!(cli.denoiser, DenoiserKind::DeepFilter);
@@ -311,15 +364,17 @@ mod tests {
         assert!(!cli.copy);
         assert!(cli.debug_tokens);
         assert!(!cli.start_paused);
+        assert_eq!(cli.beam_size, 3);
+        assert_eq!(cli.threads, 0);
+        assert!(!cli.gpu);
     }
 
     #[test]
     fn cli_model_accepts_spec_and_path() {
-        let cli = Cli::try_parse_from(["sttd", "--model", "small"])
-            .expect("spec must parse");
+        let cli = Cli::try_parse_from(["sttd", "--model", "small"]).expect("spec must parse");
         assert_eq!(cli.model.as_deref(), Some("small"));
-        let cli = Cli::try_parse_from(["sttd", "--model", "models/custom.bin"])
-            .expect("path must parse");
+        let cli =
+            Cli::try_parse_from(["sttd", "--model", "models/custom.bin"]).expect("path must parse");
         assert_eq!(cli.model.as_deref(), Some("models/custom.bin"));
     }
 
@@ -350,8 +405,14 @@ mod tests {
             "0",
         ])
         .expect("daemon paths must parse");
-        assert_eq!(cli.pid_file.as_deref(), Some(std::path::Path::new("/tmp/custom.pid")));
-        assert_eq!(cli.log_file.as_deref(), Some(std::path::Path::new("/tmp/custom.log")));
+        assert_eq!(
+            cli.pid_file.as_deref(),
+            Some(std::path::Path::new("/tmp/custom.pid"))
+        );
+        assert_eq!(
+            cli.log_file.as_deref(),
+            Some(std::path::Path::new("/tmp/custom.log"))
+        );
         assert_eq!(cli.paused_unload_after, 0);
         // Defaults resolve into tmp when unset.
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
@@ -369,6 +430,15 @@ mod tests {
         let cli = Cli::try_parse_from(["sttd", "--language", "PL"]).expect("case-insensitive");
         assert_eq!(cli.language, Language::Polish);
         assert!(Cli::try_parse_from(["sttd", "--language", "de"]).is_err());
+    }
+
+    #[test]
+    fn cli_inference_tunables_reject_out_of_range() {
+        assert!(Cli::try_parse_from(["sttd", "--beam-size", "0"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--beam-size", "-1"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--threads", "-1"]).is_err());
+        let cli = Cli::try_parse_from(["sttd", "--threads", "0"]).expect("0 = auto");
+        assert_eq!(cli.threads, 0);
     }
 
     #[test]

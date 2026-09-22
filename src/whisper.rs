@@ -9,7 +9,8 @@ use crossbeam_channel::Receiver;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::config::{
-    CONDITION_FADE_SAMPLES, CONDITION_HP_CUTOFF_HZ, MAX_GAIN, WHISPER_MIN_SAMPLES, WHISPER_RATE,
+    CONDITION_FADE_SAMPLES, CONDITION_HP_CUTOFF_HZ, DEFAULT_THREADS, MAX_GAIN, WHISPER_MIN_SAMPLES,
+    WHISPER_RATE,
 };
 use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
@@ -63,11 +64,33 @@ impl std::fmt::Display for Language {
 /// policy (`dump_dir`, clipboard, paste) lives with the `Emitter`, not here.
 #[derive(Debug, Clone)]
 pub(crate) struct WhisperOptions {
+    pub(crate) model_spec: String,
     pub(crate) prompt: String,
     pub(crate) language: Language,
     pub(crate) gate: GateConfig,
     pub(crate) target_rms: f32,
     pub(crate) debug_tokens: bool,
+    pub(crate) beam_size: i32,
+    pub(crate) n_threads: i32,
+    pub(crate) use_gpu: bool,
+}
+
+/// Query `available_parallelism` for `--threads 0` (auto). Falls back to
+/// `DEFAULT_THREADS` when the query fails.
+pub(crate) fn auto_threads() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(DEFAULT_THREADS)
+}
+
+/// Resolve a `--threads` value: `0` means auto, anything else is used as-is.
+/// Pure over its inputs so tests don't touch the scheduler.
+pub(crate) fn resolve_n_threads(requested: i32, auto: i32) -> i32 {
+    if requested == 0 {
+        auto.max(1)
+    } else {
+        requested
+    }
 }
 
 pub(crate) fn spawn_whisper_worker(
@@ -168,6 +191,10 @@ fn whisper_init_and_run(
     let gate = opts.gate.clone();
     let target_rms = opts.target_rms;
     let debug_tokens = opts.debug_tokens;
+    let beam_size = opts.beam_size;
+    let n_threads = opts.n_threads;
+    let use_gpu = opts.use_gpu;
+    let model_spec = opts.model_spec.clone();
     let unload_after = Duration::from_secs(paused_unload_after_secs);
 
     let mut first_load = true;
@@ -185,7 +212,7 @@ fn whisper_init_and_run(
     // so fast pause/resume toggles collapse to whatever the flag reads at
     // the 1 s tick — a second load can never start mid-load.
     loop {
-        let ctx = match load_whisper_context(path_str, model_path) {
+        let ctx = match load_whisper_context(path_str, model_path, use_gpu) {
             Ok(ctx) => ctx,
             Err(e) => {
                 if first_load {
@@ -199,10 +226,7 @@ fn whisper_init_and_run(
                 continue;
             }
         };
-        let mut state = match ctx
-            .create_state()
-            .context("failed to create whisper state")
-        {
+        let mut state = match ctx.create_state().context("failed to create whisper state") {
             Ok(state) => state,
             Err(e) => {
                 if first_load {
@@ -216,12 +240,9 @@ fn whisper_init_and_run(
         };
         let token_beg = ctx.token_beg();
 
-        let model_name = ctx
-            .model_type_readable()
-            .unwrap_or_else(|_| "unknown".to_string());
         if first_load {
             log::info!(
-                "whisper ready (model={model_name}, lang={}, beam=5, threads=8, gpu=true)",
+                "whisper ready (model={model_spec}, lang={}, beam={beam_size}, threads={n_threads}, gpu={use_gpu})",
                 language.as_str()
             );
             // Init succeeded (model + state): signal ready so the main
@@ -231,7 +252,7 @@ fn whisper_init_and_run(
             let _ = ready.send(Ok(()));
             first_load = false;
         } else {
-            log::info!("whisper ready (model={model_name}, reloaded after pause)");
+            log::info!("whisper ready (model={model_spec}, reloaded after pause)");
         }
         // A pause that raced the (tens of seconds) load gets a full fresh
         // timeout rather than an instant unload.
@@ -252,6 +273,8 @@ fn whisper_init_and_run(
                 &gate,
                 target_rms,
                 debug_tokens,
+                beam_size,
+                n_threads,
                 emitter,
             );
         }
@@ -278,6 +301,8 @@ fn whisper_init_and_run(
                         &gate,
                         target_rms,
                         debug_tokens,
+                        beam_size,
+                        n_threads,
                         emitter,
                     );
                 }
@@ -339,15 +364,20 @@ fn whisper_init_and_run(
 /// Blocking model load with a per-second progress tick (large models take
 /// tens of seconds with no callback). Returns only the context; the caller
 /// creates its state in the same scope so both drop together on unload.
-fn load_whisper_context(path_str: &str, model_path: &Path) -> Result<WhisperContext> {
+fn load_whisper_context(
+    path_str: &str,
+    model_path: &Path,
+    use_gpu: bool,
+) -> Result<WhisperContext> {
     let mut ctx_params = WhisperContextParameters::default();
-    ctx_params.use_gpu = true;
+    ctx_params.use_gpu = use_gpu;
+    let backend = if use_gpu { "gpu requested" } else { "cpu" };
     match std::fs::metadata(model_path) {
         Ok(meta) => log::info!(
-            "loading whisper context ({:.1} MiB, gpu requested)...",
+            "loading whisper context ({:.1} MiB, {backend})...",
             meta.len() as f64 / 1_048_576.0
         ),
-        Err(_) => log::info!("loading whisper context (gpu requested)..."),
+        Err(_) => log::info!("loading whisper context ({backend})..."),
     }
     // `new_with_params` blocks for tens of seconds on a large model with no
     // callback; tick elapsed time so the wait doesn't look hung.
@@ -372,8 +402,8 @@ fn load_whisper_context(path_str: &str, model_path: &Path) -> Result<WhisperCont
             }
         })
     };
-    let ctx_result =
-        WhisperContext::new_with_params(path_str, ctx_params).context("failed to load whisper model");
+    let ctx_result = WhisperContext::new_with_params(path_str, ctx_params)
+        .context("failed to load whisper model");
     load_done.store(true, Ordering::Relaxed);
     let _ = ticker.join();
     ctx_result
@@ -392,6 +422,8 @@ fn transcribe_and_emit(
     gate: &crate::gate::GateConfig,
     target_rms: f32,
     debug_tokens: bool,
+    beam_size: i32,
+    n_threads: i32,
     emitter: &mut impl Emitter,
 ) {
     let tag = format!("utt_{utterance_no:06}");
@@ -406,6 +438,8 @@ fn transcribe_and_emit(
         prompt,
         language,
         debug_tokens,
+        beam_size,
+        n_threads,
     ) {
         Ok(t) => {
             let trimmed = t.text.trim();
@@ -594,6 +628,7 @@ pub(crate) fn average_text_confidence(
 /// (see `average_text_confidence`). `debug_tokens` dumps every token's
 /// id/text/p/plog/is-timestamp to stderr, for confirming that scoring on a
 /// real utterance (`STTD_DEBUG_TOKENS=1`).
+#[allow(clippy::too_many_arguments)]
 fn transcribe(
     state: &mut whisper_rs::WhisperState,
     token_beg: whisper_rs::WhisperToken,
@@ -601,6 +636,8 @@ fn transcribe(
     prompt: &str,
     language: Language,
     debug_tokens: bool,
+    beam_size: i32,
+    n_threads: i32,
 ) -> Result<Transcript> {
     // Pad sub-second utterances (e.g. 300-999 ms, which the acoustic gates are
     // happy to pass) so whisper processes them instead of warning "input is too
@@ -614,10 +651,10 @@ fn transcribe(
     };
 
     let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-        beam_size: 5,
+        beam_size,
         patience: -1.0,
     });
-    params.set_n_threads(8);
+    params.set_n_threads(n_threads);
     params.set_language(language.as_whisper_code());
     params.set_translate(false);
     // Leaked per call: whisper.cpp reads a fresh initial_prompt C-string on
@@ -685,7 +722,10 @@ fn transcribe(
         }
     }
     let confidence = average_text_confidence(&tokens, token_beg);
-    Ok(Transcript { text: out, confidence })
+    Ok(Transcript {
+        text: out,
+        confidence,
+    })
 }
 
 // Text-gate helpers (`fold_polish_diacritic`, `normalize_transcript`,
@@ -696,11 +736,11 @@ fn transcribe(
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-        DEFAULT_MIN_SPEECH_RMS, DEFAULT_TARGET_RMS, MAX_GAIN, MIN_SPEECH_FRAMES,
-        WHISPER_MIN_SAMPLES,
+        DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG,
+        DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_TARGET_RMS, DEFAULT_THREADS,
+        DEFAULT_USE_GPU, MAX_GAIN, MIN_SPEECH_FRAMES, WHISPER_MIN_SAMPLES,
     };
-    use crate::gate::{EvidenceStrength, GateConfig, is_hallucination, is_repetition};
+    use crate::gate::{is_hallucination, is_repetition, EvidenceStrength, GateConfig};
     use crate::utterance::Evidence;
 
     #[test]
@@ -875,7 +915,9 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
             .collect();
         let out = condition_utterance(&hum);
-        let rms = |v: &[f32]| (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt();
+        let rms = |v: &[f32]| {
+            (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt()
+        };
         let before = rms(&hum[2000..14_000]);
         let after = rms(&out[2000..14_000]);
         assert!(after < before * 0.7, "before={before} after={after}");
@@ -888,7 +930,9 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin() * 0.2)
             .collect();
         let out = condition_utterance(&tone);
-        let rms = |v: &[f32]| (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt();
+        let rms = |v: &[f32]| {
+            (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt()
+        };
         let before = rms(&tone[2000..14_000]);
         let after = rms(&out[2000..14_000]);
         let ratio = after / before;
@@ -982,7 +1026,11 @@ mod tests {
     fn unload_predicate_requires_pause_and_timeout() {
         use std::time::Duration;
         // Disabled.
-        assert!(!should_unload(true, Duration::from_secs(3600), Duration::ZERO));
+        assert!(!should_unload(
+            true,
+            Duration::from_secs(3600),
+            Duration::ZERO
+        ));
         // Unpaused silence never unloads.
         assert!(!should_unload(
             false,
@@ -1009,11 +1057,30 @@ mod tests {
     }
 
     #[test]
+    fn thread_count_zero_means_auto() {
+        assert_eq!(DEFAULT_THREADS, 8);
+        assert_eq!(resolve_n_threads(0, 16), 16);
+        assert_eq!(resolve_n_threads(8, 16), 8);
+        // Auto of 0/negative can never happen via `auto_threads`, but clamp
+        // defensively so whisper never gets 0 threads.
+        assert_eq!(resolve_n_threads(0, 0), 1);
+        assert!(auto_threads() >= 1);
+    }
+
+    #[test]
+    fn inference_defaults_match_compiled_constants() {
+        assert_eq!(DEFAULT_BEAM_SIZE, 5);
+        assert_eq!(DEFAULT_THREADS, 8);
+        assert!(DEFAULT_USE_GPU);
+    }
+
+    #[test]
     fn whisper_worker_signals_init_failure() {
         // Bad model path must propagate via the ready channel instead of
         // silently capturing into a dead queue.
         let (_tx, rx) = crossbeam_channel::unbounded();
         let opts = WhisperOptions {
+            model_spec: "bogus".to_string(),
             prompt: String::new(),
             language: Language::Polish,
             gate: GateConfig::new(
@@ -1024,6 +1091,9 @@ mod tests {
             ),
             target_rms: DEFAULT_TARGET_RMS,
             debug_tokens: false,
+            beam_size: DEFAULT_BEAM_SIZE,
+            n_threads: DEFAULT_THREADS,
+            use_gpu: false,
         };
         let bad = std::path::PathBuf::from("/nonexistent/ggml-bogus.bin");
         let (handle, ready) = spawn_whisper_worker(

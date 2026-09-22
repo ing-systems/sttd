@@ -128,10 +128,25 @@ pub(crate) const STRONG_RMS_FACTOR: f32 = 3.0;
 /// 180 s. Override with `STTD_PAUSED_UNLOAD_AFTER`; `0` disables unloading.
 pub(crate) const DEFAULT_PAUSED_UNLOAD_AFTER_SECS: u64 = 180;
 
+/// Beam width of whisper's beam-search decoder (`beam_size` in
+/// `SamplingStrategy::BeamSearch`). `1` is greedy (fastest,
+/// repetition-prone); larger explores more hypotheses (slower, diminishing
+/// returns). Default 5 (whisper.cpp default). Override with
+/// `STTD_BEAM_SIZE`.
+pub(crate) const DEFAULT_BEAM_SIZE: i32 = 5;
+/// Decoder thread count (`set_n_threads`). Default 8 (historical value);
+/// `0` means auto = `available_parallelism` at startup. Override with
+/// `STTD_THREADS`.
+pub(crate) const DEFAULT_THREADS: i32 = 8;
+/// Whether to load the model onto the GPU (`use_gpu`). Default true.
+/// Override with `STTD_GPU=0` / `--gpu off` for CPU-only machines.
+pub(crate) const DEFAULT_USE_GPU: bool = true;
+
 /// Whisper model auto-download. The URL is derived from the filename (see
 /// `ensure_available`), so `--model` as an explicit path can point at any
 /// ggml model published in this repo, not just the compiled-in default.
-pub(crate) const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
+pub(crate) const MODEL_BASE_URL: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 pub(crate) const DEFAULT_MODELS_DIR: &str = "models";
 pub(crate) const DEFAULT_MODEL_SPEC: &str = "large-v3-turbo-q8_0";
 
@@ -159,8 +174,16 @@ pub(crate) const MODEL_CATALOG: &[(&str, &str, &str)] = &[
     ("large-v3", "ggml-large-v3.bin", "2.9 GiB"),
     ("large-v3-q5_0", "ggml-large-v3-q5_0.bin", "1.1 GiB"),
     ("large-v3-turbo", "ggml-large-v3-turbo.bin", "1.5 GiB"),
-    ("large-v3-turbo-q5_0", "ggml-large-v3-turbo-q5_0.bin", "547 MiB"),
-    ("large-v3-turbo-q8_0", "ggml-large-v3-turbo-q8_0.bin", "834 MiB"),
+    (
+        "large-v3-turbo-q5_0",
+        "ggml-large-v3-turbo-q5_0.bin",
+        "547 MiB",
+    ),
+    (
+        "large-v3-turbo-q8_0",
+        "ggml-large-v3-turbo-q8_0.bin",
+        "834 MiB",
+    ),
 ];
 
 /// Filename for a catalog `spec` (e.g. `base-q5_1` ->
@@ -218,7 +241,36 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
     match s.trim().to_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(format!("expected 1/0, true/false, yes/no or on/off, got {s:?}")),
+        _ => Err(format!(
+            "expected 1/0, true/false, yes/no or on/off, got {s:?}"
+        )),
+    }
+}
+
+/// Parse `--beam-size`/`STTD_BEAM_SIZE`: must be >= 1.
+pub(crate) fn parse_beam_size(s: &str) -> Result<i32, String> {
+    let v: i32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected an integer >= 1, got {s:?}"))?;
+    if v >= 1 {
+        Ok(v)
+    } else {
+        Err(format!("expected an integer >= 1, got {s:?}"))
+    }
+}
+
+/// Parse `--threads`/`STTD_THREADS`: must be >= 0, where `0` means auto
+/// (`available_parallelism` at startup).
+pub(crate) fn parse_threads(s: &str) -> Result<i32, String> {
+    let v: i32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected an integer >= 0 (0 = auto), got {s:?}"))?;
+    if v >= 0 {
+        Ok(v)
+    } else {
+        Err(format!("expected an integer >= 0 (0 = auto), got {s:?}"))
     }
 }
 
@@ -245,6 +297,22 @@ mod tests {
         }
         assert!(parse_bool("bogus").is_err());
         assert!(parse_bool("").is_err());
+    }
+
+    #[test]
+    fn parse_inference_tunables_validate_range() {
+        assert_eq!(parse_beam_size("1"), Ok(1));
+        assert_eq!(parse_beam_size("5"), Ok(5));
+        assert!(parse_beam_size("0").is_err());
+        assert!(parse_beam_size("-2").is_err());
+        assert!(parse_beam_size("bogus").is_err());
+        assert_eq!(parse_threads("0"), Ok(0));
+        assert_eq!(parse_threads("8"), Ok(8));
+        assert!(parse_threads("-1").is_err());
+        assert!(parse_threads("bogus").is_err());
+        assert_eq!(DEFAULT_BEAM_SIZE, 5);
+        assert_eq!(DEFAULT_THREADS, 8);
+        assert!(DEFAULT_USE_GPU);
     }
 
     #[test]

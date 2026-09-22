@@ -21,7 +21,7 @@
 //! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper,
 //! carried alongside its acoustic evidence (speech-frame count, density, RMS) as an
 //! `Utterance` -> `crossbeam-channel` queue -> isolated `whisper-rs` inference
-//! thread (CUDA, large-v3-turbo-q8_0): conditioning (`condition_utterance`:
+//! thread (GPU/CPU and model per flags): conditioning (`condition_utterance`:
 //! DC removal, 60 Hz high-pass, 5 ms fades, peak safety) -> pre-inference
 //! gain toward `--target-rms`
 //! (`apply_gain`, quiet-but-real speech only, never attenuates) -> average
@@ -55,14 +55,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, StreamTrait};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use signal_hook::consts::{SIGHUP, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::iterator::Signals;
 
 mod cli;
 use cli::Cli;
 mod config;
-use config::{DEFAULT_MODELS_DIR, MODEL_CATALOG, model_file_for_spec};
+use config::{model_file_for_spec, DEFAULT_MODELS_DIR, MODEL_CATALOG};
 mod capture;
 use capture::*;
 mod daemon;
@@ -70,9 +70,9 @@ mod denoise;
 mod dsp;
 mod emit;
 use emit::SystemEmitter;
+mod frame;
 mod gate;
 mod signal;
-mod frame;
 use frame::*;
 mod utterance;
 use utterance::*;
@@ -243,7 +243,9 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let stream_config: cpal::StreamConfig = supported.into();
     log::info!(
         "hw config: {} Hz, {} ch, {:?}",
-        hw_rate, channels, sample_format
+        hw_rate,
+        channels,
+        sample_format
     );
 
     // Heavy but pre-capture: resolve/download the model before the stream
@@ -304,7 +306,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         }
     }
 
-    // ---- now the GPU part: load the model onto the GPU on its own thread.
+    // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
     // Capture is already running above and the drain loop below keeps
     // `raw_rx` bounded while it loads.
     let (whisper_handle, whisper_ready) = spawn_whisper_worker(
@@ -509,11 +511,15 @@ fn resolve_model_input(cli: &Cli) -> Result<std::path::PathBuf> {
 
 fn whisper_options(cli: &Cli) -> WhisperOptions {
     WhisperOptions {
+        model_spec: cli.model_input(),
         prompt: cli.prompt.clone(),
         language: cli.language,
         gate: gate_config(cli),
         target_rms: cli.target_rms,
         debug_tokens: cli.debug_tokens,
+        beam_size: cli.beam_size,
+        n_threads: resolve_n_threads(cli.threads, auto_threads()),
+        use_gpu: cli.gpu,
     }
 }
 
