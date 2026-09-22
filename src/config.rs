@@ -360,7 +360,7 @@ pub(crate) fn valid_model_specs() -> String {
             .chain(PARAKEET_CATALOG.iter().map(|(s, ..)| *s))
             .chain(std::iter::once("parakeet"))
             .chain(SHERPA_CATALOG.iter().map(|(s, ..)| *s))
-            .chain([SHERPA_PARAKEET_ALIAS])
+            .chain([SHERPA_PARAKEET_ALIAS, SHERPA_WHISPER_ALIAS])
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -371,7 +371,7 @@ pub(crate) fn valid_model_specs() -> String {
             .map(|(s, ..)| *s)
             .chain(std::iter::once("parakeet"))
             .chain(SHERPA_CATALOG.iter().map(|(s, ..)| *s))
-            .chain([SHERPA_PARAKEET_ALIAS])
+            .chain([SHERPA_PARAKEET_ALIAS, SHERPA_WHISPER_ALIAS])
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -431,11 +431,14 @@ pub(crate) fn parakeet_entry_for_spec(
     PARAKEET_CATALOG.iter().find(|(s, ..)| *s == spec)
 }
 
-/// Which sherpa-onnx model family a `SHERPA_CATALOG` entry holds. Both run
+/// Which sherpa-onnx model family a `SHERPA_CATALOG` entry holds. All run
 /// through `sherpa_onnx::OfflineRecognizer`; only the sub-config differs —
 /// transducer (encoder/decoder/joiner, `model_type = "nemo_transducer"`) vs
 /// Canary (encoder/decoder + src/tgt lang, `model_type` left empty, see
-/// `sherpa::build_offline_recognizer`). Canary has no catalog entry yet:
+/// `sherpa::build_offline_recognizer`) vs Whisper (encoder/decoder +
+/// language/task, `model_type` left empty — sherpa dispatches on the filled
+/// sub-config, see its `large-v3.html` CLI dump, `model_type=""`).
+/// Canary has no catalog entry yet:
 /// sherpa-onnx 1.13.8 hardcodes Canary langs to en/de/es/fr
 /// (`offline-canary-model-config.cc:Validate`), so Canary-1B-v2 can't serve
 /// Polish until a released crate carries upstream's relaxed validation (any
@@ -447,21 +450,27 @@ pub(crate) fn parakeet_entry_for_spec(
 pub(crate) enum SherpaKind {
     NemoTransducer,
     Canary,
+    Whisper,
 }
 
 /// Sherpa-onnx weights, published as loose ONNX files: the official
 /// `csukuangfj` Parakeet-TDT-v3 int8 export
-/// (`encoder.int8.onnx`/`decoder.int8.onnx`/`joiner.int8.onnx`/`tokens.txt`)
+/// (`encoder.int8.onnx`/`decoder.int8.onnx`/`joiner.int8.onnx`/`tokens.txt`),
+/// the official `csukuangfj` Whisper-large-v3-turbo int8 export
+/// (`turbo-encoder.int8.onnx`/`turbo-decoder.int8.onnx`/`turbo-tokens.txt`)
 /// and the community `Sarphix` Canary-1B-v2 int8 export
 /// (`encoder.int8.onnx`/`decoder.int8.onnx`/`tokens.txt`, CC-BY-4.0 like its
 /// `nvidia/canary-1b-v2` source). Lived under `models/sherpa-*` (never
 /// `models/parakeet-*`) so the two runtimes' files can't collide:
 /// `parakeet-rs` wants `encoder-model.int8.onnx` + `vocab.txt`, sherpa wants
-/// `encoder.int8.onnx` + `tokens.txt`. Sherpa-only (see the `sherpa` Cargo
-/// feature).
+/// `encoder.int8.onnx` + `tokens.txt` (or the `turbo-` equivalents for
+/// Whisper). Sherpa-only (see the `sherpa` Cargo feature).
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
 pub(crate) const SHERPA_PARAKEET_BASE_URL: &str =
     "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/";
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_WHISPER_BASE_URL: &str =
+    "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo/resolve/main/";
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
 pub(crate) const SHERPA_CANARY_BASE_URL: &str =
     "https://huggingface.co/Sarphix/canary-1b-v2-sherpa-onnx-int8/resolve/main/";
@@ -477,7 +486,8 @@ pub(crate) const SHERPA_VAD_FILE: &str = "silero_vad.onnx";
 
 /// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
 /// Parakeet-v3 int8 (~640 MiB, same weights as the `parakeet-rs` default in
-/// sherpa's container layout). Canary-1B-v2 int8 (~1.4 GiB) is deliberately
+/// sherpa's container layout) plus Whisper-large-v3-turbo int8 (~990 MiB).
+/// Canary-1B-v2 int8 (~1.4 GiB) is deliberately
 /// absent — see `SherpaKind`. Sherpa-only (see the `sherpa` Cargo feature).
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
 pub(crate) const SHERPA_CATALOG: &[(&str, &str, &[&str], &str, SherpaKind)] = &[
@@ -493,13 +503,28 @@ pub(crate) const SHERPA_CATALOG: &[(&str, &str, &[&str], &str, SherpaKind)] = &[
         "640 MiB",
         SherpaKind::NemoTransducer,
     ),
+    (
+        "sherpa-whisper-large-v3-turbo-int8",
+        "sherpa-whisper-large-v3-turbo-int8",
+        &[
+            "turbo-encoder.int8.onnx",
+            "turbo-decoder.int8.onnx",
+            "turbo-tokens.txt",
+        ],
+        "990 MiB",
+        SherpaKind::Whisper,
+    ),
 ];
 
-/// Short alias resolving to the int8 default above.
+/// Short alias resolving to the Parakeet int8 default above.
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
 pub(crate) const SHERPA_PARAKEET_ALIAS: &str = "sherpa-parakeet";
 
-/// Look up a `SHERPA_CATALOG` entry by spec, accepting the short alias.
+/// Short alias resolving to the Whisper-large-v3-turbo int8 default above.
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_WHISPER_ALIAS: &str = "sherpa-whisper";
+
+/// Look up a `SHERPA_CATALOG` entry by spec, accepting the short aliases.
 /// Sherpa-only (see the `sherpa` Cargo feature).
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
 pub(crate) fn sherpa_entry_for_spec(
@@ -508,14 +533,17 @@ pub(crate) fn sherpa_entry_for_spec(
 {
     let spec = if spec == SHERPA_PARAKEET_ALIAS {
         "sherpa-parakeet-tdt-0.6b-v3-int8"
+    } else if spec == SHERPA_WHISPER_ALIAS {
+        "sherpa-whisper-large-v3-turbo-int8"
     } else {
         spec
     };
     SHERPA_CATALOG.iter().find(|(s, ..)| *s == spec)
 }
 
-/// Default Canary source/target language (ISO code, e.g. `pl`): transcription
-/// keeps src == tgt; override with `--sherpa-lang`. Parakeet-TDT auto-detects
+/// Default Canary/Whisper language (ISO code, e.g. `pl`): transcription
+/// keeps src == tgt for Canary and forces that language for sherpa-whisper;
+/// override with `--sherpa-lang`. Parakeet-TDT auto-detects
 /// per utterance and ignores this. Sherpa-only (see the `sherpa` Cargo
 /// feature).
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
@@ -1036,12 +1064,12 @@ mod tests {
 
     #[test]
     fn sherpa_catalog_entries_are_self_consistent() {
-        assert_eq!(SHERPA_CATALOG.len(), 1);
+        assert_eq!(SHERPA_CATALOG.len(), 2);
         for (spec, dir, files, _size, _kind) in SHERPA_CATALOG {
             assert_eq!(*dir, *spec, "dir must equal spec for {spec}");
             assert!(!files.is_empty(), "{spec} must list at least one file");
             assert!(
-                files.contains(&"tokens.txt"),
+                files.iter().any(|f| f.ends_with("tokens.txt")),
                 "{spec} must download tokens.txt"
             );
             assert_eq!(sherpa_entry_for_spec(spec).map(|e| e.0), Some(*spec));
@@ -1052,6 +1080,12 @@ mod tests {
         let transducer = sherpa_entry_for_spec("sherpa-parakeet-tdt-0.6b-v3-int8").unwrap();
         assert!(transducer.2.contains(&"joiner.int8.onnx"));
         assert_eq!(transducer.4, SherpaKind::NemoTransducer);
+        // Whisper-turbo ships `turbo-`-prefixed encoder/decoder/tokens.
+        let whisper = sherpa_entry_for_spec("sherpa-whisper-large-v3-turbo-int8").unwrap();
+        assert!(whisper.2.contains(&"turbo-encoder.int8.onnx"));
+        assert!(whisper.2.contains(&"turbo-decoder.int8.onnx"));
+        assert!(whisper.2.contains(&"turbo-tokens.txt"));
+        assert_eq!(whisper.4, SherpaKind::Whisper);
     }
 
     #[test]
@@ -1059,6 +1093,10 @@ mod tests {
         assert_eq!(
             sherpa_entry_for_spec("sherpa-parakeet").map(|e| e.0),
             Some("sherpa-parakeet-tdt-0.6b-v3-int8")
+        );
+        assert_eq!(
+            sherpa_entry_for_spec("sherpa-whisper").map(|e| e.0),
+            Some("sherpa-whisper-large-v3-turbo-int8")
         );
         assert!(sherpa_entry_for_spec("sherpa-bogus").is_none());
         assert!(sherpa_entry_for_spec("sherpa-canary").is_none());

@@ -190,8 +190,8 @@ pub(crate) struct AsrOptions {
     pub(crate) logprob_thold: f32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
-    /// Canary src == tgt language (ISO code, `--sherpa-lang`); the
-    /// transducer auto-detects per utterance and ignores it. Sherpa-only
+    /// Canary src == tgt / sherpa-whisper language (ISO code, `--sherpa-lang`);
+    /// the transducer auto-detects per utterance and ignores it. Sherpa-only
     /// (see the `sherpa` Cargo feature).
     #[cfg(feature = "sherpa")]
     pub(crate) sherpa_lang: String,

@@ -64,7 +64,7 @@ pub(crate) struct Cli {
 
     /// Model spec (e.g. `parakeet`, `parakeet-tdt-0.6b-v3-int8`, or with the
     /// `whisper` Cargo feature also `small`, `large-v3-turbo-q8_0`, or with
-    /// the `sherpa` Cargo feature `sherpa-parakeet`)
+    /// the `sherpa` Cargo feature `sherpa-parakeet` / `sherpa-whisper`)
     /// or path to model weights (a Parakeet/sherpa model directory, or with
     /// `whisper` a ggml `.bin` file; auto-downloaded if missing). `STTD_MODEL`
     /// wins over the legacy `WHISPER_MODEL_PATH` fallback; CLI wins over both.
@@ -198,8 +198,9 @@ pub(crate) struct Cli {
     )]
     pub(crate) sherpa_mode: SherpaMode,
 
-    /// Canary source/target language (ISO code, `pl` = Polish): transcription
-    /// keeps both equal. Parakeet-TDT auto-detects per utterance and ignores
+    /// Canary source/target language and sherpa-whisper language (ISO code,
+    /// `pl` = Polish): Canary transcription keeps src == tgt, sherpa-whisper
+    /// forces that language. Parakeet-TDT auto-detects per utterance and ignores
     /// this. Applies to user-supplied Canary dirs; no Canary catalog model
     /// ships yet (see `SherpaKind`). Sherpa-only (requires the `sherpa` Cargo
     /// feature).

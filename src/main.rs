@@ -1258,12 +1258,12 @@ fn validate_sherpa_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
     if cli.language != crate::whisper::Language::Polish {
         log::warn!(
             "--language/STTD_LANGUAGE is not honored by sherpa models (Parakeet-TDT \
-             auto-detects per utterance; Canary uses --sherpa-lang)"
+             auto-detects per utterance; Canary and sherpa-whisper use --sherpa-lang)"
         );
     }
     log::info!(
         "sherpa auto-detects the spoken language per utterance (Parakeet-TDT) \
-         or uses --sherpa-lang (Canary, currently {})",
+         or uses --sherpa-lang (Canary and sherpa-whisper, currently {})",
         cli.sherpa_lang,
     );
     Ok(())
@@ -1662,6 +1662,14 @@ mod tests {
             selected_sherpa_spec_for_input("sherpa-parakeet"),
             Some("sherpa-parakeet-tdt-0.6b-v3-int8")
         );
+        assert_eq!(
+            selected_sherpa_spec_for_input("sherpa-whisper-large-v3-turbo-int8"),
+            Some("sherpa-whisper-large-v3-turbo-int8")
+        );
+        assert_eq!(
+            selected_sherpa_spec_for_input("sherpa-whisper"),
+            Some("sherpa-whisper-large-v3-turbo-int8")
+        );
         assert_eq!(selected_sherpa_spec_for_input("small"), None);
         assert_eq!(selected_sherpa_spec_for_input("parakeet"), None);
         assert_eq!(selected_sherpa_spec_for_input(""), None);
@@ -1682,6 +1690,11 @@ mod tests {
             .find(|l| l.contains("sherpa-parakeet-tdt-0.6b-v3-int8"))
             .expect("sherpa-parakeet row must exist");
         assert!(parakeet_row.starts_with("* "), "row={parakeet_row:?}");
+        let whisper_row = lines
+            .iter()
+            .find(|l| l.contains("sherpa-whisper-large-v3-turbo-int8"))
+            .expect("sherpa-whisper row must exist");
+        assert!(whisper_row.starts_with("  "), "row={whisper_row:?}");
     }
 
     #[cfg(all(feature = "sherpa", feature = "whisper"))]

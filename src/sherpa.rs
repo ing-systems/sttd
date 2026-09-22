@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Sherpa-onnx engine family: offline Nemo-transducer behind
+// Sherpa-onnx engine family: offline Nemo-transducer / Whisper behind
 // `asr::SpeechModel` (plus Canary wiring for user-supplied dirs — no
 // catalog model until sherpa relaxes its Canary lang validation, see
 // `SherpaKind`), plus VAD-driven simulated streaming where sherpa's
@@ -81,8 +81,9 @@ impl std::fmt::Display for SherpaMode {
 }
 
 /// A loaded sherpa `OfflineRecognizer`, implementing `asr::SpeechModel` for
-/// the offline mode. `kind` selects the sub-config (transducer vs Canary);
-/// `lang` is Canary's src == tgt (transducer auto-detects and ignores it).
+/// the offline mode. `kind` selects the sub-config (transducer vs Canary vs
+/// Whisper); `lang` is Canary's src == tgt and sherpa-whisper's language
+/// (transducer auto-detects and ignores it).
 pub(crate) struct SherpaOfflineModel {
     inner: sherpa_onnx::OfflineRecognizer,
     /// Retried for decode-path selection later (e.g. per-family padding);
@@ -107,6 +108,7 @@ impl SherpaOfflineModel {
         let name = match kind {
             SherpaKind::NemoTransducer => "sherpa-parakeet",
             SherpaKind::Canary => "sherpa-canary",
+            SherpaKind::Whisper => "sherpa-whisper",
         };
         log::info!("loading {name} model ({}, provider=cpu)...", dir.display());
         match with_loading_ticker("sherpa model", || {
@@ -129,7 +131,7 @@ impl SherpaOfflineModel {
     /// Decode already-conditioned 16 kHz mono audio through a fresh stream.
     fn decode(&self, pcm_16k: &[f32]) -> Result<String> {
         // Same floor as `parakeet-rs`: the TDT encoder's 8x subsampling needs
-        // frames to chew on; Canary gets the same pad harmlessly.
+        // frames to chew on; Canary and Whisper get the same pad harmlessly.
         let padded;
         let pcm = if pcm_16k.len() < PARAKEET_MIN_SAMPLES {
             padded = pad_with_dither(pcm_16k, PARAKEET_MIN_SAMPLES);
@@ -189,8 +191,9 @@ impl SpeechModel for SherpaOfflineModel {
 /// Pure `OfflineRecognizerConfig` builder (no recognizer created), so tests
 /// don't touch the native lib. Transducer fills encoder/decoder/joiner with
 /// `model_type = "nemo_transducer"`; Canary fills encoder/decoder + src/tgt
-/// lang with `model_type` empty (sherpa dispatches on the filled sub-config —
-/// see its `canary.html` CLI dump, `model_type=""`).
+/// lang with `model_type` empty; Whisper fills encoder/decoder + language/
+/// task with `model_type` empty (sherpa dispatches on the filled sub-config —
+/// see its `canary.html` / `large-v3.html` CLI dumps, `model_type=""`).
 pub(crate) fn offline_config(
     dir: &Path,
     kind: SherpaKind,
@@ -198,7 +201,10 @@ pub(crate) fn offline_config(
     num_threads: i32,
     provider: &str,
 ) -> sherpa_onnx::OfflineRecognizerConfig {
-    use sherpa_onnx::{OfflineCanaryModelConfig, OfflineRecognizerConfig, OfflineTransducerModelConfig};
+    use sherpa_onnx::{
+        OfflineCanaryModelConfig, OfflineRecognizerConfig, OfflineTransducerModelConfig,
+        OfflineWhisperModelConfig,
+    };
     let mut config = OfflineRecognizerConfig::default();
     let s = |name: &str| Some(dir.join(name).to_string_lossy().into_owned());
     match kind {
@@ -209,6 +215,7 @@ pub(crate) fn offline_config(
                 joiner: s("joiner.int8.onnx"),
             };
             config.model_config.model_type = Some("nemo_transducer".into());
+            config.model_config.tokens = s("tokens.txt");
         }
         SherpaKind::Canary => {
             config.model_config.canary = OfflineCanaryModelConfig {
@@ -218,9 +225,21 @@ pub(crate) fn offline_config(
                 tgt_lang: Some(lang.to_string()),
                 use_pnc: true,
             };
+            config.model_config.tokens = s("tokens.txt");
+        }
+        SherpaKind::Whisper => {
+            config.model_config.whisper = OfflineWhisperModelConfig {
+                encoder: s("turbo-encoder.int8.onnx"),
+                decoder: s("turbo-decoder.int8.onnx"),
+                language: Some(lang.to_string()),
+                task: Some("transcribe".into()),
+                tail_paddings: -1,
+                enable_token_timestamps: false,
+                enable_segment_timestamps: false,
+            };
+            config.model_config.tokens = s("turbo-tokens.txt");
         }
     }
-    config.model_config.tokens = s("tokens.txt");
     config.model_config.num_threads = num_threads;
     config.model_config.provider = Some(provider.to_string());
     config
@@ -862,6 +881,32 @@ mod tests {
         assert!(config.model_config.canary.use_pnc);
         assert_eq!(config.model_config.transducer.encoder, None);
         assert_eq!(config.model_config.provider.as_deref(), Some("cuda"));
+    }
+
+    #[test]
+    fn offline_config_selects_whisper_sub_config() {
+        let dir = Path::new("models/sherpa-whisper-large-v3-turbo-int8");
+        let config = offline_config(dir, SherpaKind::Whisper, "pl", 8, "cpu");
+        assert_eq!(
+            config.model_config.whisper.encoder,
+            Some("models/sherpa-whisper-large-v3-turbo-int8/turbo-encoder.int8.onnx".to_string())
+        );
+        assert_eq!(
+            config.model_config.whisper.decoder,
+            Some("models/sherpa-whisper-large-v3-turbo-int8/turbo-decoder.int8.onnx".to_string())
+        );
+        assert_eq!(config.model_config.whisper.language.as_deref(), Some("pl"));
+        assert_eq!(config.model_config.whisper.task.as_deref(), Some("transcribe"));
+        assert_eq!(
+            config.model_config.tokens,
+            Some("models/sherpa-whisper-large-v3-turbo-int8/turbo-tokens.txt".to_string())
+        );
+        assert_eq!(config.model_config.num_threads, 8);
+        assert_eq!(config.model_config.provider.as_deref(), Some("cpu"));
+        // Transducer/Canary sub-configs stay empty so sherpa dispatches to whisper.
+        assert_eq!(config.model_config.transducer.encoder, None);
+        assert_eq!(config.model_config.canary.encoder, None);
+        assert!(config.model_config.model_type.is_none());
     }
 
     #[test]

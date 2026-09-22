@@ -101,7 +101,7 @@ _Avoid_: output, sink, side effects (as a name)
 
 **Speech model**:
 The loaded, ready-to-run engine an utterance is handed to for transcription —
-whisper.cpp, Parakeet, or sherpa-onnx (offline Nemo-transducer/Canary), chosen
+whisper.cpp, Parakeet, or sherpa-onnx (offline Nemo-transducer/Canary/Whisper), chosen
 once at startup by the model spec and fixed for the process's lifetime. The
 offline three sit behind one seam so the worker loop,
 gates, metrics and prompt-context tail never branch on which is loaded; only
@@ -113,7 +113,8 @@ _Avoid_: model (bare, when the engine — as opposed to the weights — is meant
 **Model spec**:
 A `--model` value that names a catalog entry rather than a filesystem path —
 `large-v3-turbo-q8_0` for a whisper weight, `parakeet` or
-`parakeet-tdt-0.6b-v3-int8` for a Parakeet one, `sherpa-parakeet` for a
+`parakeet-tdt-0.6b-v3-int8` for a Parakeet one, `sherpa-parakeet` or
+`sherpa-whisper` for a
 sherpa-onnx one. Resolved to a location and,
 for a catalog spec, downloaded if missing; a bare path (`.bin` file or an
 existing directory) passes through untouched instead.

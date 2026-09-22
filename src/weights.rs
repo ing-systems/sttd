@@ -153,19 +153,31 @@ pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
     );
 }
 
-/// Guess a user-supplied sherpa directory's family: a joiner file means
-/// Nemo-transducer, otherwise Canary (encoder/decoder only). Sherpa-only
+/// Guess a user-supplied sherpa directory's family: `turbo-*.onnx` (or
+/// `turbo-tokens.txt`) means Whisper, a joiner file means Nemo-transducer,
+/// otherwise Canary (encoder/decoder only). Sherpa-only
 /// (see the `sherpa` Cargo feature).
 #[cfg(feature = "sherpa")]
 fn sherpa_kind_for_dir(dir: &Path) -> SherpaKind {
-    let has_joiner = std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries.flatten().any(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("joiner") && n.ends_with(".onnx"))
-        })
+    let (has_joiner, has_whisper) = std::fs::read_dir(dir).map_or((false, false), |entries| {
+        let mut joiner = false;
+        let mut whisper = false;
+        for e in entries.flatten() {
+            let Some(n) = e.file_name().to_str().map(|s| s.to_owned()) else {
+                continue;
+            };
+            if n.starts_with("joiner") && n.ends_with(".onnx") {
+                joiner = true;
+            }
+            if (n.starts_with("turbo-") && n.ends_with(".onnx")) || n == "turbo-tokens.txt" {
+                whisper = true;
+            }
+        }
+        (joiner, whisper)
     });
-    if has_joiner {
+    if has_whisper {
+        SherpaKind::Whisper
+    } else if has_joiner {
         SherpaKind::NemoTransducer
     } else {
         SherpaKind::Canary
@@ -283,7 +295,7 @@ fn ensure_sherpa_available(
     assets: &'static [&'static str],
     kind: SherpaKind,
 ) -> Result<()> {
-    use crate::config::{SHERPA_CANARY_BASE_URL, SHERPA_PARAKEET_BASE_URL};
+    use crate::config::{SHERPA_CANARY_BASE_URL, SHERPA_PARAKEET_BASE_URL, SHERPA_WHISPER_BASE_URL};
     if assets.is_empty() {
         if !dir.is_dir() {
             anyhow::bail!(
@@ -292,7 +304,7 @@ fn ensure_sherpa_available(
                 dir.display()
             );
         }
-        if !dir.join("tokens.txt").exists() {
+        if !dir.join("tokens.txt").exists() && !dir.join("turbo-tokens.txt").exists() {
             anyhow::bail!(
                 "{} is missing tokens.txt; not a valid sherpa model directory",
                 dir.display()
@@ -303,6 +315,7 @@ fn ensure_sherpa_available(
     let base = match kind {
         SherpaKind::NemoTransducer => SHERPA_PARAKEET_BASE_URL,
         SherpaKind::Canary => SHERPA_CANARY_BASE_URL,
+        SherpaKind::Whisper => SHERPA_WHISPER_BASE_URL,
     };
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     for file in assets {
@@ -629,13 +642,21 @@ mod tests {
     #[test]
     fn sherpa_specs_and_aliases_resolve_to_model_dir() {
         use crate::config::SherpaKind;
-        for (spec, dir, kind) in [
+        for (spec, dir, kind, tokens) in [
             (
                 "sherpa-parakeet-tdt-0.6b-v3-int8",
                 "models/sherpa-parakeet-tdt-0.6b-v3-int8",
                 SherpaKind::NemoTransducer,
+                "tokens.txt",
             ),
-            ("sherpa-parakeet", "models/sherpa-parakeet-tdt-0.6b-v3-int8", SherpaKind::NemoTransducer),
+            ("sherpa-parakeet", "models/sherpa-parakeet-tdt-0.6b-v3-int8", SherpaKind::NemoTransducer, "tokens.txt"),
+            (
+                "sherpa-whisper-large-v3-turbo-int8",
+                "models/sherpa-whisper-large-v3-turbo-int8",
+                SherpaKind::Whisper,
+                "turbo-tokens.txt",
+            ),
+            ("sherpa-whisper", "models/sherpa-whisper-large-v3-turbo-int8", SherpaKind::Whisper, "turbo-tokens.txt"),
         ] {
             let resolved = resolve_model(spec).expect("sherpa spec must resolve");
             let ModelRef::Sherpa {
@@ -648,7 +669,7 @@ mod tests {
             };
             assert_eq!(got_dir, PathBuf::from(dir));
             assert_eq!(got_kind, kind);
-            assert!(assets.contains(&"tokens.txt"));
+            assert!(assets.contains(&tokens), "spec={spec} assets={assets:?}");
         }
         // Canary-1B-v2 has no catalog entry (see `SherpaKind`): fails fast
         // before any download, instead of dying in sherpa's lang validation.
@@ -663,6 +684,8 @@ mod tests {
         for spec in [
             "sherpa-parakeet-tdt-0.6b-v3-int8",
             "sherpa-parakeet",
+            "sherpa-whisper-large-v3-turbo-int8",
+            "sherpa-whisper",
         ] {
             let err = resolve_model(spec).expect_err("sherpa spec must reject");
             assert!(err.to_string().contains("sherpa"), "msg={err}");
@@ -702,6 +725,18 @@ mod tests {
                 dir: tmp.clone(),
                 assets: &[],
                 kind: SherpaKind::NemoTransducer,
+            }
+        );
+        // turbo- files flip the guess to Whisper even with a joiner present.
+        std::fs::write(tmp.join("turbo-encoder.int8.onnx"), "x").unwrap();
+        std::fs::write(tmp.join("turbo-tokens.txt"), "x\n").unwrap();
+        let resolved = resolve_model(tmp.to_str().unwrap()).expect("dir path must resolve");
+        assert_eq!(
+            resolved,
+            ModelRef::Sherpa {
+                dir: tmp.clone(),
+                assets: &[],
+                kind: SherpaKind::Whisper,
             }
         );
         std::fs::remove_dir_all(&tmp).ok();
