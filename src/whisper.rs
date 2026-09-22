@@ -85,6 +85,11 @@ pub(crate) fn spawn_whisper_worker(
     let handle = std::thread::Builder::new()
         .name("whisper".into())
         .spawn(move || {
+            // Belt-and-braces: `main` already installs this in
+            // `init_logging`, but the worker is the actual whisper.cpp
+            // user, so ensure the redirect even for entry points/tests
+            // that skip `init_logging`. `Once`-guarded, no-op after first.
+            whisper_rs::install_whisper_log_trampoline();
             let mut emitter = emitter;
             if let Err(e) = whisper_loop(
                 &rx,

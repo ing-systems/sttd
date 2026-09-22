@@ -116,11 +116,13 @@ fn main() -> Result<()> {
 }
 
 /// Initialize `env_logger` with timestamps, defaulting to `info` when
-/// `RUST_LOG` is unset. Must run before any `log::*` call.
+/// `RUST_LOG` is unset. Must run before any `log::*` call. Also routes
+/// whisper.cpp/ggml output through the `log` crate instead of raw stderr.
 fn init_logging() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
+    whisper_rs::install_whisper_log_trampoline();
 }
 
 /// Print known whisper models (`MODEL_CATALOG`) as an aligned table with a
