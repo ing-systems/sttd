@@ -7,6 +7,12 @@ use resampler::{ResamplerFft, SampleRate};
 
 /// Downmix an interleaved multi-channel buffer to mono by averaging.
 pub(crate) fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
+    debug_assert!(channels > 0, "channels must be >= 1 (cpal guarantees this)");
+    debug_assert_eq!(
+        data.len() % channels.max(1),
+        0,
+        "interleaved buffer length must be a multiple of channels"
+    );
     if channels <= 1 {
         return data.to_vec();
     }
@@ -108,11 +114,14 @@ impl FftStream {
                 self.pending_in.extend_from_slice(input);
                 while self.pending_in.len() >= self.chunk_in {
                     self.scratch_in.copy_from_slice(&self.pending_in[..self.chunk_in]);
-                    // Cannot fail: scratch buffers are exactly chunk-sized,
-                    // the only error condition on mono input.
-                    inner
-                        .resample(&self.scratch_in, &mut self.scratch_out)
-                        .expect("FftStream scratch buffers are ResamplerFft chunk-sized");
+                    // Scratch buffers are exactly chunk-sized, the only error
+                    // condition on mono input. Never panic on the hot path:
+                    // skip the chunk and keep the pipeline running.
+                    if let Err(e) = inner.resample(&self.scratch_in, &mut self.scratch_out) {
+                        eprintln!("[sttd] resampler error: {e:?} (skipping chunk)");
+                        self.pending_in.drain(..self.chunk_in);
+                        continue;
+                    }
                     self.pending_out.extend_from_slice(&self.scratch_out);
                     self.pending_in.drain(..self.chunk_in);
                 }
@@ -131,13 +140,15 @@ impl FftStream {
             self.pending_in.resize(self.chunk_in, 0.0);
             let chunk: Vec<f32> = self.pending_in.drain(..).collect();
             // Same guarantee as in `feed`: exact chunk size, cannot fail.
+            // Never panic on shutdown either; drop the tail on error.
             self.scratch_in.copy_from_slice(&chunk);
-            self.inner
-                .as_mut()
-                .expect("checked is_some above")
-                .resample(&self.scratch_in, &mut self.scratch_out)
-                .expect("FftStream scratch buffers are ResamplerFft chunk-sized");
-            self.pending_out.extend_from_slice(&self.scratch_out);
+            if let Some(inner) = self.inner.as_mut() {
+                if let Err(e) = inner.resample(&self.scratch_in, &mut self.scratch_out) {
+                    eprintln!("[sttd] resampler flush error: {e:?} (dropping tail)");
+                } else {
+                    self.pending_out.extend_from_slice(&self.scratch_out);
+                }
+            }
         }
         self.drain_frames()
     }

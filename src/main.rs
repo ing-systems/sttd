@@ -111,15 +111,16 @@ fn print_available_models() {
 // ---------------------------------------------------------------------------
 
 fn run_microphone_mode(cli: &Cli) -> Result<()> {
-    // Cheap, fallible audio setup first (device pick, hw config, resampler,
-    // stream) — *before* loading the model onto the GPU. Spawning the whisper
+    // Cheap, fallible audio setup first (device pick, hw config) — *before*
+    // the heavy model resolve/download and GPU load. Spawning the whisper
     // worker starts an async CUDA context init on its own thread; if any of
     // this setup then failed via `?`, the process would tear down mid-init
     // and race whisper.cpp's CUDA cleanup (observed: "CUDA error: driver
-    // shutting down" abort on e.g. a mistyped --device). Loading the model
-    // only once we know the mic actually works avoids that race entirely,
-    // and doesn't cost anything: capture starts immediately after and audio
-    // simply queues up in `raw_rx` while the model loads in the background.
+    // shutting down" abort on e.g. a mistyped --device). Resolving (and
+    // downloading, ~800 MiB, minutes) before `play()` also keeps `raw_rx`
+    // from growing unbounded while the main loop hasn't started draining
+    // yet. GPU load itself still happens in the background after capture
+    // starts, so audio queues only briefly in `raw_rx` while it loads.
     let host = cpal::default_host();
     let device = select_input_device(&host, cli.device.as_deref())?;
     eprintln!(
@@ -139,31 +140,22 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         hw_rate, channels, sample_format
     );
 
+    // Heavy but pre-capture: resolve/download the model before the stream
+    // starts so the callback can't outrun the drain loop.
+    let model_path = resolve_model_input(cli)?;
+    eprintln!("[sttd] model: {}", model_path.display());
+
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
     // Raw mono captures (hw rate, f32 in [-1, 1]) from the cpal callback.
     // Unbounded + `send` (never blocks) keeps callback lock time minimal.
     let (raw_tx, raw_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = unbounded();
 
-    // ---- build + start the cpal input stream (callback does NOT unwrap) ---
-    let running = Arc::new(AtomicBool::new(true));
-    let stream = build_input_stream(&device, &stream_config, channels, sample_format, raw_tx)?;
-    stream.play().context("failed to start input stream")?;
-    eprintln!("[sttd] listening... Ctrl-C to stop");
-
-    // Ctrl-C sets the flag; the loop below flushes trailing speech first.
-    {
-        let running = Arc::clone(&running);
-        if let Err(e) = install_ctrlc_handler(move || running.store(false, Ordering::SeqCst)) {
-            eprintln!("[sttd] warning: {e:?} (Ctrl-C will terminate immediately)");
-        }
-    }
-
     // `FrameProcessor` owns all resampling (a shared hw -> 16k hop by
     // default, or hw -> 48k -> denoise -> 48k -> 16k for the VAD branch plus
     // hw -> 16k for whisper with `--denoiser deepfilter`); building it is
-    // cheap, fallible setup like everything above, so it happens here too —
-    // before the model load below.
+    // fallible setup like everything above (including DeepFilter init), so
+    // it happens here too — before capture starts.
     let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
     let mut fp = FrameProcessor::new(
         hw_rate,
@@ -174,14 +166,46 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     )?;
     let input_frames = fp.required_input_frames();
 
-    // ---- now the heavy part: resolve/download the model and load it onto
-    // the GPU on its own thread. Capture is already running above.
-    let model_path = resolve_model_input(cli)?;
-    eprintln!("[sttd] model: {}", model_path.display());
-    let whisper_handle = spawn_whisper_worker(whisper_rx, model_path, whisper_options(cli));
+    // ---- build + start the cpal input stream (callback does NOT unwrap) ---
+    let running = Arc::new(AtomicBool::new(true));
+    let stream = build_input_stream(&device, &stream_config, channels, sample_format, raw_tx)?;
+    stream.play().context("failed to start input stream")?;
+    eprintln!("[sttd] listening... Ctrl-C to stop");
+
+    // Ctrl-C sets the flag; the loop below flushes trailing speech first.
+    {
+        let running = Arc::clone(&running);
+        if let Err(e) = install_ctrlc_handler(move || running.store(false, Ordering::Release)) {
+            eprintln!("[sttd] warning: {e:?} (Ctrl-C will terminate immediately)");
+        }
+    }
+
+    // ---- now the GPU part: load the model onto the GPU on its own thread.
+    // Capture is already running above and the drain loop below keeps
+    // `raw_rx` bounded while it loads.
+    let (whisper_handle, whisper_ready) =
+        spawn_whisper_worker(whisper_rx, model_path, whisper_options(cli));
+    let mut whisper_ready_ok = false;
 
     // ---- main processing loop (NOT the audio callback) --------------------
-    while running.load(Ordering::SeqCst) {
+    while running.load(Ordering::Acquire) {
+        // Fail fast if the whisper worker died during init instead of
+        // capturing deaf: ready Err / disconnect, or early thread exit.
+        match whisper_ready.try_recv() {
+            Ok(Ok(())) => whisper_ready_ok = true,
+            Ok(Err(e)) => anyhow::bail!("whisper worker failed to start: {e}"),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) if !whisper_ready_ok => {
+                anyhow::bail!("whisper worker exited before signaling ready")
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("whisper worker died")
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if whisper_handle.is_finished() && !whisper_ready_ok {
+                    anyhow::bail!("whisper worker exited before signaling ready");
+                }
+            }
+        }
         // Drain everything the callback delivered since last iteration.
         let mut got_audio = false;
         while let Ok(chunk) = raw_rx.try_recv() {
@@ -208,7 +232,9 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // above used to.
     fp.flush_trailing_speech();
     drop(fp);
-    whisper_handle.join().ok();
+    whisper_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("whisper worker panicked"))?;
     eprintln!("[sttd] stopped");
     Ok(())
 }
@@ -226,9 +252,9 @@ fn install_ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
 
 fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     // Same ordering rationale as run_microphone_mode: do the cheap, fallible
-    // setup (read + validate the WAV, build the resampler) before loading the
-    // model onto the GPU, so a bad file fails fast instead of racing
-    // whisper.cpp's CUDA teardown.
+    // setup (read + validate the WAV, resolve the model path) before the
+    // heavy work (denoiser init, GPU load), so a bad file/spec fails fast
+    // instead of racing whisper.cpp's CUDA teardown.
     let wav = read_wav_mono_f32(path)?;
     eprintln!(
         "[sttd] file: {} ({} Hz, {} samples, {:.1}s)",
@@ -237,6 +263,9 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         wav.samples.len(),
         wav.samples.len() as f64 / wav.sample_rate as f64
     );
+
+    let model_path = resolve_model_input(cli)?;
+    eprintln!("[sttd] model: {}", model_path.display());
 
     let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
     let mut fp = FrameProcessor::new(
@@ -248,9 +277,20 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     )?;
     let input_frames = fp.required_input_frames();
 
-    let model_path = resolve_model_input(cli)?;
-    eprintln!("[sttd] model: {}", model_path.display());
-    let whisper_handle = spawn_whisper_worker(whisper_rx, model_path, whisper_options(cli));
+    let (whisper_handle, whisper_ready) =
+        spawn_whisper_worker(whisper_rx, model_path, whisper_options(cli));
+    // Fail fast on model-load/dump-dir errors before processing the file:
+    // no realtime capture to keep bounded here, so blocking wait is fine.
+    match whisper_ready.recv_timeout(Duration::from_secs(600)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => anyhow::bail!("whisper worker failed to start: {e}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("timed out waiting for whisper worker to start")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("whisper worker exited before signaling ready")
+        }
+    }
 
     let mut offset = 0usize;
     while offset + input_frames <= wav.samples.len() {
@@ -263,7 +303,9 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
 
     drop(fp);
     drop(whisper_tx);
-    whisper_handle.join().ok();
+    whisper_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("whisper worker panicked"))?;
     Ok(())
 }
 

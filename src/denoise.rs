@@ -80,15 +80,28 @@ impl Denoiser {
 
     /// Denoise one `FRAME_48K`-sample frame (f32, [-1, 1]) into `clean`.
     /// `noisy` and `clean` must both be exactly `FRAME_48K` samples.
+    /// Never panics: length mismatches fall back to passthrough so a bad
+    /// caller can't take down the audio pipeline.
     pub(crate) fn denoise_frame(&mut self, noisy: &[f32], clean: &mut [f32]) {
         debug_assert_eq!(noisy.len(), FRAME_48K);
         debug_assert_eq!(clean.len(), FRAME_48K);
+        if noisy.len() != FRAME_48K || clean.len() != FRAME_48K {
+            eprintln!("[sttd] deepfilter frame length mismatch (passing through)");
+            let n = noisy.len().min(clean.len());
+            clean[..n].copy_from_slice(&noisy[..n]);
+            return;
+        }
         match self {
             Denoiser::DeepFilter(tract) => {
-                let noisy_view = ArrayView2::from_shape((1, FRAME_48K), noisy)
-                    .expect("noisy frame is exactly FRAME_48K samples");
-                let mut enh_view = ArrayViewMut2::from_shape((1, FRAME_48K), clean)
-                    .expect("clean frame is exactly FRAME_48K samples");
+                let Ok(noisy_view) = ArrayView2::from_shape((1, FRAME_48K), noisy) else {
+                    eprintln!("[sttd] deepfilter noisy view failed (passing through)");
+                    clean.copy_from_slice(noisy);
+                    return;
+                };
+                let Ok(mut enh_view) = ArrayViewMut2::from_shape((1, FRAME_48K), clean) else {
+                    eprintln!("[sttd] deepfilter clean view failed (passing through)");
+                    return;
+                };
                 if let Err(e) = tract.process(noisy_view, enh_view.view_mut()) {
                     // Hand the VAD branch the raw frame rather than lose
                     // frame-count sync with the rest of the pipeline.

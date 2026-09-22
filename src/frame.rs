@@ -22,11 +22,12 @@ pub(crate) struct FrameProcessor {
     vad_path: VadPath,
 
     /// Completed 16 kHz frames waiting to be paired. In `Direct` mode both
-    /// queues grow in lockstep (one shared resampler feeds them together);
-    /// in `Denoised` mode the two `FftStream`s complete on different
-    /// cadences, so output frames pair up by order below instead of by call.
-    pending_vad: VecDeque<Vec<f32>>,
-    pending_whisper: VecDeque<Vec<f32>>,
+    /// queues share ownership of each frame via `Arc` (one shared resampler
+    /// feeds them together); in `Denoised` mode the two `FftStream`s complete
+    /// on different cadences, so output frames pair up by order below instead
+    /// of by call.
+    pending_vad: VecDeque<std::sync::Arc<[f32]>>,
+    pending_whisper: VecDeque<std::sync::Arc<[f32]>>,
 
     vad: SpeechDetector,
 
@@ -138,8 +139,9 @@ impl FrameProcessor {
             // ---- direct: one shared hop feeds both queues together --------
             VadPath::Direct { resampler } => {
                 for frame16 in resampler.feed(frame_hw_raw) {
-                    self.pending_whisper.push_back(frame16.clone());
-                    self.pending_vad.push_back(frame16);
+                    let shared: std::sync::Arc<[f32]> = frame16.into();
+                    self.pending_whisper.push_back(std::sync::Arc::clone(&shared));
+                    self.pending_vad.push_back(shared);
                 }
             }
             // ---- denoised: 48 kHz detour for VAD, direct hop for whisper --
@@ -153,13 +155,21 @@ impl FrameProcessor {
                 // ---- hw -> 48 kHz -> denoise -> 16 kHz (VAD branch) -------
                 for frame48 in resampler_hw48.feed(frame_hw_raw) {
                     denoiser.denoise_frame(&frame48, clean48_vad);
-                    self.pending_vad
-                        .extend(resampler_vad.feed(clean48_vad));
+                    self.pending_vad.extend(
+                        resampler_vad
+                            .feed(clean48_vad)
+                            .into_iter()
+                            .map(std::sync::Arc::<[f32]>::from),
+                    );
                 }
 
                 // ---- whisper branch: raw (no denoise) ---------------------
-                self.pending_whisper
-                    .extend(resampler_whisper.feed(frame_hw_raw));
+                self.pending_whisper.extend(
+                    resampler_whisper
+                        .feed(frame_hw_raw)
+                        .into_iter()
+                        .map(std::sync::Arc::<[f32]>::from),
+                );
             }
         }
 
@@ -203,8 +213,9 @@ impl FrameProcessor {
         match &mut self.vad_path {
             VadPath::Direct { resampler } => {
                 for frame16 in resampler.flush() {
-                    self.pending_whisper.push_back(frame16.clone());
-                    self.pending_vad.push_back(frame16);
+                    let shared: std::sync::Arc<[f32]> = frame16.into();
+                    self.pending_whisper.push_back(std::sync::Arc::clone(&shared));
+                    self.pending_vad.push_back(shared);
                 }
             }
             VadPath::Denoised {
@@ -216,12 +227,25 @@ impl FrameProcessor {
             } => {
                 for frame48 in resampler_hw48.flush() {
                     denoiser.denoise_frame(&frame48, clean48_vad);
-                    self.pending_vad
-                        .extend(resampler_vad.feed(clean48_vad));
+                    self.pending_vad.extend(
+                        resampler_vad
+                            .feed(clean48_vad)
+                            .into_iter()
+                            .map(std::sync::Arc::<[f32]>::from),
+                    );
                 }
-                self.pending_vad.extend(resampler_vad.flush());
-                self.pending_whisper
-                    .extend(resampler_whisper.flush());
+                self.pending_vad.extend(
+                    resampler_vad
+                        .flush()
+                        .into_iter()
+                        .map(std::sync::Arc::<[f32]>::from),
+                );
+                self.pending_whisper.extend(
+                    resampler_whisper
+                        .flush()
+                        .into_iter()
+                        .map(std::sync::Arc::<[f32]>::from),
+                );
             }
         }
         self.drain_paired_frames();

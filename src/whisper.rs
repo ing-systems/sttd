@@ -30,15 +30,20 @@ pub(crate) fn spawn_whisper_worker(
     rx: Receiver<Utterance>,
     model_path: PathBuf,
     opts: WhisperOptions,
-) -> JoinHandle<()> {
-    std::thread::Builder::new()
+) -> (
+    JoinHandle<()>,
+    std::sync::mpsc::Receiver<Result<(), String>>,
+) {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
         .name("whisper".into())
         .spawn(move || {
-            if let Err(e) = whisper_loop(&rx, &model_path, &opts) {
+            if let Err(e) = whisper_loop(&rx, &model_path, &opts, ready_tx) {
                 eprintln!("[sttd] whisper worker failed: {e:?}");
             }
         })
-        .expect("failed to spawn whisper thread")
+        .expect("failed to spawn whisper thread");
+    (handle, ready_rx)
 }
 
 /// How much trust an utterance's acoustics have already earned, which selects
@@ -105,11 +110,12 @@ pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     let mut child = Command::new("wl-copy")
         .stdin(Stdio::piped())
         .spawn()?;
-    child
+    let mut stdin = child
         .stdin
-        .as_mut()
-        .expect("wl-copy spawned without piped stdin")
-        .write_all(text.as_bytes())?;
+        .take()
+        .ok_or_else(|| std::io::Error::other("wl-copy stdin unavailable"))?;
+    stdin.write_all(text.as_bytes())?;
+    drop(stdin);
     let status = child.wait()?;
     if status.success() {
         Ok(())
@@ -140,7 +146,29 @@ pub(crate) fn paste_at_cursor() -> std::io::Result<()> {
     }
 }
 
-fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path, opts: &WhisperOptions) -> Result<()> {
+fn whisper_loop(
+    rx: &Receiver<Utterance>,
+    model_path: &Path,
+    opts: &WhisperOptions,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<()> {
+    // Run init; report the outcome once via `ready` so the main thread can
+    // fail fast instead of capturing into a dead queue.
+    match whisper_init_and_run(rx, model_path, opts, &ready) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = ready.send(Err(e.to_string()));
+            Err(e)
+        }
+    }
+}
+
+fn whisper_init_and_run(
+    rx: &Receiver<Utterance>,
+    model_path: &Path,
+    opts: &WhisperOptions,
+    ready: &std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<()> {
     let path_str = model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
@@ -175,6 +203,9 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path, opts: &WhisperOptio
             .with_context(|| format!("failed to create {}", dir.display()))?;
         eprintln!("[sttd] dumping utterances to {}", dir.display());
     }
+    // Init succeeded (model + state + dump dir): signal ready so the main
+    // thread knows captures aren't going into a dead queue.
+    let _ = ready.send(Ok(()));
     let copy_enabled = opts.copy_enabled;
     // Becomes `false` permanently after the first "binary not found" so a
     // machine without wl-clipboard installed logs one warning instead of
@@ -214,7 +245,7 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path, opts: &WhisperOptio
             MAX_GAIN,
         );
 
-        match transcribe(&mut state, token_beg, &gained, &prompt, debug_tokens) {
+        match transcribe(&mut state, token_beg, gained.as_ref(), &prompt, debug_tokens) {
             Ok(t) => {
                 let trimmed = t.text.trim();
                 if trimmed.is_empty() {
@@ -303,19 +334,25 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path, opts: &WhisperOptio
 /// gates, so there's no silence here to accidentally boost. Caps at
 /// `max_gain`, and backs off further if that gain would clip the loudest
 /// sample past 0.99. `target_rms <= 0.0` or `rms <= 0.0` disables gain.
-pub(crate) fn apply_gain(pcm: &[f32], rms: f32, target_rms: f32, max_gain: f32) -> Vec<f32> {
+/// Returns borrowed when no gain is needed so the loud common case avoids a copy.
+pub(crate) fn apply_gain<'a>(
+    pcm: &'a [f32],
+    rms: f32,
+    target_rms: f32,
+    max_gain: f32,
+) -> std::borrow::Cow<'a, [f32]> {
     if target_rms <= 0.0 || rms <= 0.0 {
-        return pcm.to_vec();
+        return std::borrow::Cow::Borrowed(pcm);
     }
     let mut gain = (target_rms / rms).clamp(1.0, max_gain);
     if gain <= 1.0 {
-        return pcm.to_vec();
+        return std::borrow::Cow::Borrowed(pcm);
     }
     let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
     if peak > 0.0 {
         gain = gain.min(0.99 / peak);
     }
-    pcm.iter().map(|&s| s * gain).collect()
+    std::borrow::Cow::Owned(pcm.iter().map(|&s| s * gain).collect())
 }
 
 /// Pad sub-second audio with quiet dithered noise instead of exact digital
@@ -636,7 +673,8 @@ mod tests {
     fn apply_gain_disabled_by_zero_target() {
         let pcm = vec![0.01f32; 100];
         let out = apply_gain(&pcm, 0.01, 0.0, MAX_GAIN);
-        assert_eq!(out, pcm);
+        assert_eq!(out.as_ref(), pcm.as_slice());
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
@@ -646,7 +684,21 @@ mod tests {
         // speech, never touches an already-strong signal.
         let pcm = vec![0.2f32; 100];
         let out = apply_gain(&pcm, 0.2, DEFAULT_TARGET_RMS, MAX_GAIN);
-        assert_eq!(out, pcm);
+        assert_eq!(out.as_ref(), pcm.as_slice());
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn apply_gain_borrows_when_no_gain_needed() {
+        // Loud common case must avoid a copy: gain <= 1.0 returns borrowed.
+        let pcm = vec![0.2f32; 100];
+        let out = apply_gain(&pcm, 0.2, DEFAULT_TARGET_RMS, MAX_GAIN);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), pcm.as_slice());
+        // Quiet case that needs gain returns owned.
+        let quiet = vec![0.001f32; 100];
+        let out_owned = apply_gain(&quiet, 0.001, DEFAULT_TARGET_RMS, MAX_GAIN);
+        assert!(matches!(out_owned, std::borrow::Cow::Owned(_)));
     }
 
     #[test]
@@ -691,5 +743,34 @@ mod tests {
         assert!(!is_hallucination(
             "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
         ));
+    }
+
+    #[test]
+    fn whisper_worker_signals_init_failure() {
+        // Bad model path must propagate via the ready channel instead of
+        // silently capturing into a dead queue.
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let opts = WhisperOptions {
+            prompt: String::new(),
+            min_confidence: DEFAULT_MIN_CONFIDENCE,
+            min_confidence_strong: DEFAULT_MIN_CONFIDENCE_STRONG,
+            min_speech_rms: DEFAULT_MIN_SPEECH_RMS,
+            target_rms: DEFAULT_TARGET_RMS,
+            debug_tokens: false,
+            dump_dir: None,
+            copy_enabled: false,
+            paste_enabled: false,
+        };
+        let bad = std::path::PathBuf::from("/nonexistent/ggml-bogus.bin");
+        let (handle, ready) = spawn_whisper_worker(rx, bad, opts);
+        match ready.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(Ok(())) => panic!("bad model path must not signal ready"),
+            Ok(Err(e)) => assert!(
+                e.contains("failed to load whisper model"),
+                "unexpected error: {e}"
+            ),
+            Err(e) => panic!("ready channel must send once, got {e:?}"),
+        }
+        handle.join().expect("worker thread must exit");
     }
 }
