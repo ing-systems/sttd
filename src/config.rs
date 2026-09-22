@@ -2,9 +2,12 @@
 // Constants / config
 // ---------------------------------------------------------------------------
 
-/// Sample rate required by `nnnoiseless` (RNNoise).
+/// Sample rate required by the VAD branch's denoiser (DeepFilterNet3,
+/// opt-in via `STTD_DENOISER=deepfilter`; see `denoise`). Only the denoised
+/// VAD path uses this rate — the default bypass path resamples straight
+/// from the hw rate to 16 kHz with no 48 kHz intermediate.
 pub(crate) const DENOISE_RATE: u32 = 48_000;
-/// Samples per 10 ms frame at 48 kHz (`DenoiseState::FRAME_SIZE`).
+/// Samples per 10 ms frame at 48 kHz (DeepFilterNet3's `hop_size`).
 pub(crate) const FRAME_48K: usize = 480;
 /// Sample rate required by whisper + VAD.
 pub(crate) const WHISPER_RATE: u32 = 16_000;
@@ -67,6 +70,15 @@ pub(crate) const DEFAULT_TARGET_RMS: f32 = 0.05;
 /// silent utterance that slipped past `STTD_MIN_RMS` doesn't get blown up
 /// into clipped noise.
 pub(crate) const MAX_GAIN: f32 = 8.0;
+/// Cutoff of the one-pole high-pass in `condition_utterance`: 60 Hz keeps
+/// Polish speech intact (male F0 starts ~85 Hz, nasal murmur ~250 Hz+,
+/// sibilants at 4-8 kHz) while attenuating 50 Hz mains hum, a confirmed
+/// hallucination trigger. Gentle 6 dB/oct: at 150 Hz the loss is ~0.5 dB.
+pub(crate) const CONDITION_HP_CUTOFF_HZ: f32 = 60.0;
+/// Linear fade applied to each end of an utterance by `condition_utterance`:
+/// 5 ms at 16 kHz. Lands in pre-roll/tail silence, killing trim/resampler
+/// clicks that whisper can decode as a token.
+pub(crate) const CONDITION_FADE_SAMPLES: usize = 80;
 /// Minimum average whisper token probability for a transcript to be kept,
 /// used when the utterance's *acoustic* evidence (see `Evidence`) is weak.
 /// whisper.cpp declares `no_speech_thold` but never reads it (`whisper.h`:
@@ -83,6 +95,27 @@ pub(crate) const DEFAULT_MIN_CONFIDENCE: f32 = 0.6;
 /// a single scalar threshold can't separate the two cases; VAD/RMS evidence
 /// can. Override with `STTD_MIN_CONF_STRONG`.
 pub(crate) const DEFAULT_MIN_CONFIDENCE_STRONG: f32 = 0.35;
+/// Minimum share of an utterance's transmitted frames that must have been
+/// VAD-flagged as speech (speech frames / post-trim transmitted frames, see
+/// `UtteranceBuffer::close`). Catches utterances that clear
+/// `MIN_SPEECH_FRAMES` on scattered VAD flicker yet are mostly silence by the
+/// time they would reach the model — the shape a boilerplate hallucination is
+/// made of. Density is judged post-trim (what whisper would actually receive,
+/// i.e. up to `samples_at_last_speech + TAIL_KEEP_SAMPLES`), so a short real
+/// word with a full silence hangover still passes; utterances longer than
+/// `DENSITY_LONG_EXEMPT_SAMPLES` skip the gate since genuine pauses lower
+/// their density. `0` disables the gate. Override with `STTD_MIN_DENSITY`.
+pub(crate) const DEFAULT_MIN_DENSITY: f32 = 0.25;
+/// Transmitted audio longer than this skips the speech-density gate: past ~3 s real
+/// pauses and turn-taking drive density down without implying silence, and
+/// the downstream transcript gates (`confidence_floor`, `is_hallucination`,
+/// `is_repetition`) still apply.
+pub(crate) const DENSITY_LONG_EXEMPT_SAMPLES: usize = WHISPER_RATE as usize * 3;
+/// Minimum earshot score (see `vad`) for a 16 ms window to count as speech.
+/// earshot returns a score in `[0, 1]`; upstream suggests 0.5 as the general
+/// voice threshold. Override with `STTD_VAD_THRESHOLD` while tuning against
+/// real mic noise.
+pub(crate) const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
 /// `speech_frames` (see `Evidence`) required to count as "strong" acoustic
 /// evidence: 500 ms of VAD-flagged speech, well past `MIN_SPEECH_FRAMES`.
 pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
@@ -91,19 +124,67 @@ pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
 pub(crate) const STRONG_RMS_FACTOR: f32 = 3.0;
 
 /// Whisper model auto-download. The URL is derived from the filename (see
-/// `ensure_available`), so `WHISPER_MODEL_PATH` can point at any
+/// `ensure_available`), so `--model` as an explicit path can point at any
 /// ggml model published in this repo, not just the compiled-in default.
 pub(crate) const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-pub(crate) const DEFAULT_MODEL_PATH: &str = "models/ggml-large-v3-turbo.bin";
+pub(crate) const DEFAULT_MODELS_DIR: &str = "models";
+pub(crate) const DEFAULT_MODEL_SPEC: &str = "large-v3-turbo-q8_0";
 
-/// Default `initial_prompt`: primes Polish orthography/diacritics only.
-/// Used to carry a long list of IT vocabulary (Kubernetes, Docker, ...), but
-/// whisper.cpp feeds `initial_prompt` into the decoder as prior context
-/// (`prompt_past`), and on low/no-signal audio the model falls back on that
-/// prior instead of the (absent) acoustic evidence — i.e. it would recite
-/// from the prompt itself. Override with `STTD_PROMPT` to opt back into a
-/// domain vocabulary at the cost of that risk.
-pub(crate) const DEFAULT_PROMPT: &str = "Rozmowa techniczna po polsku.";
+/// All `--model` symbolic specs (Polish-relevant, no `.en` variants),
+/// with their `ggml-*.bin` filename and upstream download size.
+/// `large-v1` has no quantized build upstream; `tiny`/`base`/`small` use
+/// `q5_1` while `medium`/`large-v2`/`large-v3`/`large-v3-turbo` use `q5_0`.
+pub(crate) const MODEL_CATALOG: &[(&str, &str, &str)] = &[
+    ("tiny", "ggml-tiny.bin", "75 MiB"),
+    ("tiny-q5_1", "ggml-tiny-q5_1.bin", "31 MiB"),
+    ("tiny-q8_0", "ggml-tiny-q8_0.bin", "42 MiB"),
+    ("base", "ggml-base.bin", "142 MiB"),
+    ("base-q5_1", "ggml-base-q5_1.bin", "57 MiB"),
+    ("base-q8_0", "ggml-base-q8_0.bin", "78 MiB"),
+    ("small", "ggml-small.bin", "466 MiB"),
+    ("small-q5_1", "ggml-small-q5_1.bin", "181 MiB"),
+    ("small-q8_0", "ggml-small-q8_0.bin", "252 MiB"),
+    ("medium", "ggml-medium.bin", "1.5 GiB"),
+    ("medium-q5_0", "ggml-medium-q5_0.bin", "514 MiB"),
+    ("medium-q8_0", "ggml-medium-q8_0.bin", "785 MiB"),
+    ("large-v1", "ggml-large-v1.bin", "2.9 GiB"),
+    ("large-v2", "ggml-large-v2.bin", "2.9 GiB"),
+    ("large-v2-q5_0", "ggml-large-v2-q5_0.bin", "1.1 GiB"),
+    ("large-v2-q8_0", "ggml-large-v2-q8_0.bin", "1.5 GiB"),
+    ("large-v3", "ggml-large-v3.bin", "2.9 GiB"),
+    ("large-v3-q5_0", "ggml-large-v3-q5_0.bin", "1.1 GiB"),
+    ("large-v3-turbo", "ggml-large-v3-turbo.bin", "1.5 GiB"),
+    ("large-v3-turbo-q5_0", "ggml-large-v3-turbo-q5_0.bin", "547 MiB"),
+    ("large-v3-turbo-q8_0", "ggml-large-v3-turbo-q8_0.bin", "834 MiB"),
+];
+
+/// Filename for a catalog `spec` (e.g. `base-q5_1` ->
+/// `ggml-base-q5_1.bin`), or `None` when the spec is unknown.
+pub(crate) fn model_file_for_spec(spec: &str) -> Option<&'static str> {
+    MODEL_CATALOG
+        .iter()
+        .find(|(s, _, _)| *s == spec)
+        .map(|(_, f, _)| *f)
+}
+
+/// Comma-separated valid specs for `--model` error messages.
+pub(crate) fn valid_model_specs() -> String {
+    MODEL_CATALOG
+        .iter()
+        .map(|(s, _, _)| *s)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Default `initial_prompt`: primes Polish orthography/diacritics and English
+/// IT vocabulary, without a long keyword list. It used to carry many domain
+/// words (Kubernetes, Docker, ...), but whisper.cpp feeds `initial_prompt`
+/// into the decoder as prior context (`prompt_past`), and on low/no-signal
+/// audio the model falls back on that prior instead of the (absent) acoustic
+/// evidence — i.e. it would recite from the prompt itself. Override with
+/// `STTD_PROMPT` to opt back into a domain vocabulary at the cost of that risk.
+pub(crate) const DEFAULT_PROMPT: &str =
+    "Technical conversation in Polish and English. Rozmowa techniczna po polsku i angielsku.";
 
 /// Transcripts that are near-exact matches for common Whisper hallucinations
 /// on silence/low-energy audio (subtitle-credit boilerplate picked up from
@@ -118,28 +199,48 @@ pub(crate) const HALLUCINATION_PATTERNS: &[&str] = &[
     "subtitles by",
     "dziekuje za obejrzenie",
     "dziekuje za uwage",
+    "wszelkie prawa",
+    "wszelkie prawa zastrzezone",
     "zapraszam do subskrypcji",
     "zapraszam do subskrypcji kanalu",
 ];
 
-/// Read an f32 override from an env var, falling back to `default` if the
-/// var is unset or fails to parse (logging a warning in the latter case, so
-/// a typo'd override doesn't silently revert to the default).
-pub(crate) fn f32_from_env(key: &str, default: f32) -> f32 {
-    match std::env::var(key) {
-        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
-            eprintln!(
-                "[sttd] warning: {key}={v:?} is not a valid number, using default {default}"
-            );
-            default
-        }),
-        Err(_) => default,
+/// Parse a bool CLI/env value. Accepts `1/0`, `true/false`, `yes/no`,
+/// `on/off` (case-insensitive, surrounding whitespace ignored). Used as the
+/// clap `value_parser` for every bool flag so `--copy no`, `STTD_COPY=0`
+/// and `STTD_COPY=off` all agree.
+pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
+    match s.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("expected 1/0, true/false, yes/no or on/off, got {s:?}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_bool_accepts_common_spellings() {
+        for (val, expected) in [
+            ("1", true),
+            ("0", false),
+            ("true", true),
+            ("false", false),
+            ("TRUE", true),
+            ("False", false),
+            ("yes", true),
+            ("no", false),
+            ("on", true),
+            ("off", false),
+            ("  Yes  ", true),
+        ] {
+            assert_eq!(parse_bool(val), Ok(expected), "val={val:?}");
+        }
+        assert!(parse_bool("bogus").is_err());
+        assert!(parse_bool("").is_err());
+    }
 
     #[test]
     fn silence_threshold_is_800ms() {
@@ -158,5 +259,27 @@ mod tests {
             n_len_org >= 100,
             "WHISPER_MIN_SAMPLES={WHISPER_MIN_SAMPLES} only yields {n_len_org} 10ms mel frames, whisper.cpp requires >= 100"
         );
+    }
+
+    #[test]
+    fn model_catalog_has_default_and_no_english_variants() {
+        assert_eq!(DEFAULT_MODEL_SPEC, "large-v3-turbo-q8_0");
+        assert_eq!(DEFAULT_MODELS_DIR, "models");
+        assert_eq!(MODEL_CATALOG.len(), 21);
+        for (spec, file, _) in MODEL_CATALOG {
+            assert!(
+                !spec.contains(".en"),
+                "English-only variant must not be listed: {spec}"
+            );
+            assert_eq!(*file, format!("ggml-{spec}.bin"));
+            assert_eq!(model_file_for_spec(spec), Some(*file));
+        }
+        assert_eq!(
+            model_file_for_spec(DEFAULT_MODEL_SPEC),
+            Some("ggml-large-v3-turbo-q8_0.bin")
+        );
+        assert!(model_file_for_spec("tiny-q5_0").is_none());
+        assert!(model_file_for_spec("medium-q5_1").is_none());
+        assert!(model_file_for_spec("bogus").is_none());
     }
 }

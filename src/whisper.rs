@@ -6,22 +6,89 @@ use crossbeam_channel::Receiver;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::config::{
-    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
-    DEFAULT_PROMPT, DEFAULT_TARGET_RMS, HALLUCINATION_PATTERNS, MAX_GAIN, STRONG_RMS_FACTOR,
-    STRONG_SPEECH_FRAMES, WHISPER_MIN_SAMPLES, WHISPER_RATE, f32_from_env,
+    CONDITION_FADE_SAMPLES, CONDITION_HP_CUTOFF_HZ, HALLUCINATION_PATTERNS, MAX_GAIN,
+    STRONG_RMS_FACTOR, STRONG_SPEECH_FRAMES, WHISPER_MIN_SAMPLES, WHISPER_RATE,
 };
 use crate::utterance::{Evidence, Utterance};
 use crate::wav::write_wav_mono16;
 
-pub(crate) fn spawn_whisper_worker(rx: Receiver<Utterance>, model_path: PathBuf) -> JoinHandle<()> {
-    std::thread::Builder::new()
+/// Whisper decoding language, chosen once at startup via `STTD_LANGUAGE`
+/// and fixed for the process's lifetime. One inference decodes in exactly
+/// one language — but different utterances may use different languages when
+/// `Auto` lets whisper.cpp detect it per utterance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Language {
+    /// Force Polish decoding (`set_language(Some("pl"))`).
+    #[value(name = "pl")]
+    Polish,
+    /// Force English decoding (`set_language(Some("en"))`).
+    #[value(name = "en")]
+    English,
+    /// Per-utterance auto-detection (`set_language(None)`).
+    #[value(name = "auto")]
+    Auto,
+}
+
+impl Language {
+    /// Whisper language code for `FullParams::set_language`, or `None` for
+    /// auto-detection.
+    pub(crate) fn as_whisper_code(self) -> Option<&'static str> {
+        match self {
+            Self::Polish => Some("pl"),
+            Self::English => Some("en"),
+            Self::Auto => None,
+        }
+    }
+
+    /// Stable short spelling for log lines.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Polish => "pl",
+            Self::English => "en",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Tunables the whisper worker needs, resolved once from `Cli`.
+#[derive(Debug, Clone)]
+pub(crate) struct WhisperOptions {
+    pub(crate) prompt: String,
+    pub(crate) language: Language,
+    pub(crate) min_confidence: f32,
+    pub(crate) min_confidence_strong: f32,
+    pub(crate) min_speech_rms: f32,
+    pub(crate) target_rms: f32,
+    pub(crate) debug_tokens: bool,
+    pub(crate) dump_dir: Option<PathBuf>,
+    pub(crate) copy_enabled: bool,
+    pub(crate) paste_enabled: bool,
+}
+
+pub(crate) fn spawn_whisper_worker(
+    rx: Receiver<Utterance>,
+    model_path: PathBuf,
+    opts: WhisperOptions,
+) -> (
+    JoinHandle<()>,
+    std::sync::mpsc::Receiver<Result<(), String>>,
+) {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
         .name("whisper".into())
         .spawn(move || {
-            if let Err(e) = whisper_loop(&rx, &model_path) {
+            if let Err(e) = whisper_loop(&rx, &model_path, &opts, ready_tx) {
                 eprintln!("[sttd] whisper worker failed: {e:?}");
             }
         })
-        .expect("failed to spawn whisper thread")
+        .expect("failed to spawn whisper thread");
+    (handle, ready_rx)
 }
 
 /// How much trust an utterance's acoustics have already earned, which selects
@@ -77,7 +144,103 @@ fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
     }
 }
 
-fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
+/// Whether the current session is Wayland, where clipboard (`wl-copy`) + paste
+/// (`ydotool key` Ctrl+V) is supported. Pure over its inputs so tests don't touch the process
+/// environment (see `is_wayland_session_env` for the env-reading wrapper).
+/// `WAYLAND_DISPLAY` set wins over `DISPLAY` (XWayland sets both), so an
+/// X.org session is `XDG_SESSION_TYPE=x11` with `WAYLAND_DISPLAY` empty.
+pub(crate) fn is_wayland_session(
+    xdg_session_type: Option<&str>,
+    wayland_display: Option<&str>,
+) -> bool {
+    if wayland_display.is_some_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    xdg_session_type.is_some_and(|v| v.trim().eq_ignore_ascii_case("wayland"))
+}
+
+/// Env-reading wrapper around [`is_wayland_session`].
+pub(crate) fn is_wayland_session_env() -> bool {
+    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+    is_wayland_session(session_type.as_deref(), wayland_display.as_deref())
+}
+
+/// Copy `text` to the Wayland clipboard via `wl-copy` (from wl-clipboard).
+/// Pipes the trimmed transcript over `wl-copy`'s stdin with no trailing
+/// newline, so it is pasted verbatim (UTF-8, including Polish diacritics) by
+/// the subsequent paste step. Passes `--sensitive` (`x-kde-passwordManagerHint=secret`)
+/// so Klipper skips clipboard history while paste still works.
+/// Returns the `io::Error` unwrapped (not `anyhow`)
+/// so the caller can match `NotFound` and disable itself with a single warning
+/// on machines without wl-clipboard.
+pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("wl-copy")
+        .arg("--sensitive")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("wl-copy stdin unavailable"))?;
+    stdin.write_all(text.as_bytes())?;
+    drop(stdin);
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "wl-copy exited with {status}"
+        )))
+    }
+}
+
+/// Paste the clipboard at the current cursor position via `ydotool`
+/// (requires the `ydotoold` daemon). Synthesizes a single Ctrl+V
+/// (`29:1 47:1 47:0 29:0`, i.e. LEFTCTRL down, V down/up, LEFTCTRL up) instead
+/// of typing the transcript key-by-key: a fixed 4-event sequence, so it is
+/// fast and preserves non-ASCII text already on the clipboard. Returns
+/// `io::Error` unwrapped so the caller can match `NotFound` and disable
+/// itself with a single warning on machines without `ydotool`.
+pub(crate) fn paste_via_ydotool() -> std::io::Result<()> {
+    use std::process::Command;
+    let status = Command::new("ydotool")
+        .args(["key", "29:1", "47:1", "47:0", "29:0"])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "ydotool exited with {status}"
+        )))
+    }
+}
+
+fn whisper_loop(
+    rx: &Receiver<Utterance>,
+    model_path: &Path,
+    opts: &WhisperOptions,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<()> {
+    // Run init; report the outcome once via `ready` so the main thread can
+    // fail fast instead of capturing into a dead queue.
+    match whisper_init_and_run(rx, model_path, opts, &ready) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = ready.send(Err(e.to_string()));
+            Err(e)
+        }
+    }
+}
+
+fn whisper_init_and_run(
+    rx: &Receiver<Utterance>,
+    model_path: &Path,
+    opts: &WhisperOptions,
+    ready: &std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<()> {
     let path_str = model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
@@ -95,24 +258,61 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
     let model_name = ctx
         .model_type_readable()
         .unwrap_or_else(|_| "unknown".to_string());
-    eprintln!("[sttd] whisper ready (model={model_name}, pl, beam=5, threads=8, gpu=true)");
+    eprintln!(
+        "[sttd] whisper ready (model={model_name}, lang={}, beam=5, threads=8, gpu=true)",
+        opts.language.as_str()
+    );
 
-    let prompt = std::env::var("STTD_PROMPT").unwrap_or_else(|_| DEFAULT_PROMPT.to_string());
-    let min_confidence = f32_from_env("STTD_MIN_CONF", DEFAULT_MIN_CONFIDENCE);
-    let min_confidence_strong = f32_from_env("STTD_MIN_CONF_STRONG", DEFAULT_MIN_CONFIDENCE_STRONG);
-    // Same override `FrameProcessor::new` reads for the acoustic gate,
-    // re-read here rather than threaded through the channel: it's one env
-    // lookup and keeps `Utterance` free of config, only evidence.
-    let min_speech_rms = f32_from_env("STTD_MIN_RMS", DEFAULT_MIN_SPEECH_RMS);
-    let target_rms = f32_from_env("STTD_TARGET_RMS", DEFAULT_TARGET_RMS);
-    let debug_tokens = std::env::var("STTD_DEBUG_TOKENS")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let dump_dir = std::env::var_os("STTD_DUMP_DIR").map(PathBuf::from);
+    let prompt = opts.prompt.clone();
+    let language = opts.language;
+    let min_confidence = opts.min_confidence;
+    let min_confidence_strong = opts.min_confidence_strong;
+    // Same value `FrameProcessor::new` receives for the acoustic gate,
+    // passed via `WhisperOptions` rather than threaded through the channel:
+    // keeps `Utterance` free of config, only evidence.
+    let min_speech_rms = opts.min_speech_rms;
+    let target_rms = opts.target_rms;
+    let debug_tokens = opts.debug_tokens;
+    let dump_dir = opts.dump_dir.clone();
     if let Some(dir) = &dump_dir {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
         eprintln!("[sttd] dumping utterances to {}", dir.display());
+    }
+    // Init succeeded (model + state + dump dir): signal ready so the main
+    // thread knows captures aren't going into a dead queue.
+    let _ = ready.send(Ok(()));
+    let copy_enabled = opts.copy_enabled;
+    let paste_enabled = opts.paste_enabled;
+    // Clipboard (`wl-copy`) carries the transcript verbatim (UTF-8, so Polish
+    // diacritics survive), then a single Ctrl+V via `ydotool key` pastes it.
+    // Both flags still gate the action (AND semantics preserve the old
+    // behavior where `--copy=false` disabled everything and `--paste=false`
+    // disabled insertion). Each becomes `false` permanently after "binary not
+    // found" so a machine without the binary logs one warning instead of one
+    // per utterance; daemon-down failures keep retrying since `ydotoold` may
+    // start later.
+    let mut clipboard_available = copy_enabled;
+    let mut paste_available = paste_enabled;
+    if !copy_enabled {
+        eprintln!("[sttd] clipboard copy disabled (--copy=false)");
+    }
+    if !paste_enabled {
+        eprintln!("[sttd] auto-paste disabled (--paste=false)");
+    } else if !copy_enabled {
+        eprintln!(
+            "[sttd] warning: --paste is enabled but --copy=false, paste will be skipped (nothing fresh to paste)"
+        );
+    }
+    // Both `wl-copy` and the paste target only make sense on Wayland; on X.org
+    // (or headless/`--file` without a Wayland socket) disable once with a
+    // warning rather than failing every utterance.
+    if (clipboard_available || paste_available) && !is_wayland_session_env() {
+        eprintln!(
+            "[sttd] warning: auto-paste is enabled but this is not a Wayland session (no WAYLAND_DISPLAY, XDG_SESSION_TYPE!=wayland); disabling clipboard + ydotool paste"
+        );
+        clipboard_available = false;
+        paste_available = false;
     }
 
     let mut utterance_no: u64 = 0;
@@ -130,14 +330,17 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
             }
         }
 
-        let gained = apply_gain(
-            &utterance.pcm,
-            utterance.evidence.rms,
-            target_rms,
-            MAX_GAIN,
-        );
+        let conditioned = condition_utterance(&utterance.pcm);
+        let gained = apply_gain(&conditioned, utterance.evidence.rms, target_rms, MAX_GAIN);
 
-        match transcribe(&mut state, token_beg, &gained, &prompt, debug_tokens) {
+        match transcribe(
+            &mut state,
+            token_beg,
+            gained.as_ref(),
+            &prompt,
+            language,
+            debug_tokens,
+        ) {
             Ok(t) => {
                 let trimmed = t.text.trim();
                 if trimmed.is_empty() {
@@ -152,8 +355,10 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
                 );
                 eprintln!(
                     "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={floor:.3} \
-                     ({strength} evidence)",
-                    t.confidence.prob, t.confidence.logprob
+                     ({strength} evidence, density={:.3})",
+                    t.confidence.prob,
+                    t.confidence.logprob,
+                    utterance.evidence.density()
                 );
                 if t.confidence.prob < floor {
                     eprintln!("[sttd] {tag}: dropped low-confidence transcript: {trimmed:?}");
@@ -176,7 +381,45 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
                     );
                     continue;
                 }
+                if is_repetition(trimmed) {
+                    eprintln!("[sttd] {tag}: dropped repetition-loop decode: {trimmed:?}");
+                    dump_drop_reason(
+                        &dump_dir,
+                        &tag,
+                        &format!("DROPPED(repetition): {trimmed}"),
+                    );
+                    continue;
+                }
                 println!("{trimmed}");
+                // Track whether this utterance actually refreshed the
+                // clipboard: paste synthesizes Ctrl+V, so it must only run
+                // on fresh content, never on stale clipboard or a failed
+                // copy.
+                let mut copied = false;
+                if clipboard_available {
+                    match copy_to_clipboard(trimmed) {
+                        Ok(()) => copied = true,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            eprintln!(
+                                "[sttd] warning: --copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
+                            );
+                            clipboard_available = false;
+                        }
+                        Err(e) => eprintln!("[sttd] {tag}: clipboard copy failed: {e:?}"),
+                    }
+                }
+                if paste_available && copied {
+                    match paste_via_ydotool() {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            eprintln!(
+                                "[sttd] warning: --paste is enabled but `ydotool` was not found on PATH; disabling auto-paste"
+                            );
+                            paste_available = false;
+                        }
+                        Err(e) => eprintln!("[sttd] {tag}: auto-paste failed (is ydotoold running?): {e:?}"),
+                    }
+                }
                 if let Some(dir) = &dump_dir {
                     let txt_path = dir.join(format!("{tag}.txt"));
                     if let Err(e) = std::fs::write(&txt_path, trimmed) {
@@ -190,6 +433,60 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Condition an utterance for whisper: DC removal, gentle one-pole
+/// high-pass at `CONDITION_HP_CUTOFF_HZ`, short linear fades at both ends,
+/// and peak safety to 0.99. Runs before `apply_gain` so the gain stage sees
+/// hum-free, click-free audio.
+///
+/// Kept deliberately light because the whisper branch is raw by design (see
+/// `Whisper branch` in `CONTEXT.md`): 60 Hz / 6 dB-oct costs ~0.5 dB at
+/// 150 Hz and nothing in the 4-8 kHz sibilant band, and the 5 ms fades land
+/// in pre-roll/tail silence rather than speech.
+pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
+    if pcm.is_empty() {
+        return Vec::new();
+    }
+    // DC removal: subtract the mean so soundcard offset can't bias the
+    // high-pass startup transient or the gain stage.
+    let mean = pcm.iter().fold(0.0f64, |m, &s| m + s as f64) / pcm.len() as f64;
+    let mut out: Vec<f32> = pcm.iter().map(|&s| s - mean as f32).collect();
+
+    // One-pole high-pass: y[n] = x[n] - x[n-1] + a * y[n-1],
+    // a = exp(-2*pi*fc/fs). Zero-state start is fine post-DC-removal: the
+    // first samples are pre-roll silence near zero.
+    let a = (-2.0 * std::f32::consts::PI * CONDITION_HP_CUTOFF_HZ / WHISPER_RATE as f32).exp();
+    let mut x_prev = out[0];
+    let mut y_prev = 0.0f32;
+    for s in out.iter_mut() {
+        let x = *s;
+        let y = x - x_prev + a * y_prev;
+        x_prev = x;
+        y_prev = y;
+        *s = y;
+    }
+
+    // Linear fades at both ends; shortened for very short utterances so the
+    // ramps never overlap.
+    let fade = CONDITION_FADE_SAMPLES.min(out.len() / 2);
+    for i in 0..fade {
+        let ramp = (i + 1) as f32 / (fade + 1) as f32;
+        out[i] *= ramp;
+        let j = out.len() - 1 - i;
+        out[j] *= ramp;
+    }
+
+    // Peak safety: resampler overshoot can exceed 1.0; keep headroom so
+    // `apply_gain` isn't blocked by a single hot sample.
+    let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak > 0.99 {
+        let scale = 0.99 / peak;
+        for s in out.iter_mut() {
+            *s *= scale;
+        }
+    }
+    out
+}
+
 /// Apply gain toward `target_rms`, computed from the speech-only `rms`
 /// `UtteranceBuffer::close` already measured (not recomputed over `pcm`, which
 /// includes the padded silence tail). Only ever amplifies (gain >= 1.0) and
@@ -197,19 +494,25 @@ fn whisper_loop(rx: &Receiver<Utterance>, model_path: &Path) -> Result<()> {
 /// gates, so there's no silence here to accidentally boost. Caps at
 /// `max_gain`, and backs off further if that gain would clip the loudest
 /// sample past 0.99. `target_rms <= 0.0` or `rms <= 0.0` disables gain.
-pub(crate) fn apply_gain(pcm: &[f32], rms: f32, target_rms: f32, max_gain: f32) -> Vec<f32> {
+/// Returns borrowed when no gain is needed so the loud common case avoids a copy.
+pub(crate) fn apply_gain<'a>(
+    pcm: &'a [f32],
+    rms: f32,
+    target_rms: f32,
+    max_gain: f32,
+) -> std::borrow::Cow<'a, [f32]> {
     if target_rms <= 0.0 || rms <= 0.0 {
-        return pcm.to_vec();
+        return std::borrow::Cow::Borrowed(pcm);
     }
     let mut gain = (target_rms / rms).clamp(1.0, max_gain);
     if gain <= 1.0 {
-        return pcm.to_vec();
+        return std::borrow::Cow::Borrowed(pcm);
     }
     let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
     if peak > 0.0 {
         gain = gain.min(0.99 / peak);
     }
-    pcm.iter().map(|&s| s * gain).collect()
+    std::borrow::Cow::Owned(pcm.iter().map(|&s| s * gain).collect())
 }
 
 /// Pad sub-second audio with quiet dithered noise instead of exact digital
@@ -300,6 +603,7 @@ fn transcribe(
     token_beg: whisper_rs::WhisperToken,
     pcm_16k: &[f32],
     prompt: &str,
+    language: Language,
     debug_tokens: bool,
 ) -> Result<Transcript> {
     // Pad sub-second utterances (e.g. 300-999 ms, which the acoustic gates are
@@ -318,7 +622,7 @@ fn transcribe(
         patience: -1.0,
     });
     params.set_n_threads(8);
-    params.set_language(Some("pl"));
+    params.set_language(language.as_whisper_code());
     params.set_translate(false);
     // Leaked per call: whisper.cpp reads a fresh initial_prompt C-string on
     // every whisper_full and whisper-rs's FullParams has no Drop to free it
@@ -408,10 +712,10 @@ pub(crate) fn fold_polish_diacritic(c: char) -> char {
     }
 }
 
-/// Whether `text` (a full transcript) is a known Whisper hallucination on
-/// silence/noise, checked as an exact match after normalization so genuine
-/// sentences that merely contain e.g. "dziękuję" are never caught.
-pub(crate) fn is_hallucination(text: &str) -> bool {
+/// Lowercase, fold Polish diacritics, turn punctuation into spaces and
+/// collapse whitespace. Shared by [`is_hallucination`] and
+/// [`is_repetition`] so both gates judge the same spelling.
+pub(crate) fn normalize_transcript(text: &str) -> String {
     // Punctuation becomes a space (not dropped): "Amara.org" must normalize
     // to "amara org" to match the pattern list, not "amaraorg". Diacritics
     // are folded (see `fold_polish_diacritic`) before the alphanumeric check,
@@ -423,7 +727,33 @@ pub(crate) fn is_hallucination(text: &str) -> bool {
         .map(fold_polish_diacritic)
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
-    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `text` (a full transcript) is a Whisper repetition-loop decode:
+/// the same 1-2 words on repeat (e.g. the observed
+/// "Współpraca w Współpraca w ..." emitted for a 300 ms noise burst with
+/// `avg_p=0.741`, well clear of either confidence floor). Judged on
+/// [`normalize_transcript`] words: 6+ words with at most half of them
+/// unique. Short emphases ("nie nie nie", 3 words) stay exempt; genuine
+/// 6-word sentences never approach a 0.5 uniqueness ratio.
+pub(crate) fn is_repetition(text: &str) -> bool {
+    let normalized = normalize_transcript(text);
+    let words: Vec<&str> = normalized.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.len() < 6 {
+        return false;
+    }
+    let mut unique = words.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    unique.len() * 2 <= words.len()
+}
+
+/// Whether `text` (a full transcript) is a known Whisper hallucination on
+/// silence/noise, checked as an exact match after normalization so genuine
+/// sentences that merely contain e.g. "dziękuję" are never caught.
+pub(crate) fn is_hallucination(text: &str) -> bool {
+    let normalized = normalize_transcript(text);
     if normalized.is_empty() {
         return true; // pure punctuation, e.g. "..."
     }
@@ -437,6 +767,16 @@ mod tests {
         DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
         DEFAULT_TARGET_RMS, MAX_GAIN, MIN_SPEECH_FRAMES, WHISPER_MIN_SAMPLES,
     };
+
+    #[test]
+    fn language_maps_to_whisper_code() {
+        assert_eq!(Language::Polish.as_whisper_code(), Some("pl"));
+        assert_eq!(Language::English.as_whisper_code(), Some("en"));
+        assert_eq!(Language::Auto.as_whisper_code(), None);
+        assert_eq!(Language::Polish.as_str(), "pl");
+        assert_eq!(Language::English.as_str(), "en");
+        assert_eq!(Language::Auto.as_str(), "auto");
+    }
 
     #[test]
     fn confidence_ignores_timestamp_tokens() {
@@ -469,6 +809,7 @@ mod tests {
         // close to correct (one misheard word), not a hallucination.
         let evidence = Evidence {
             speech_frames: 137,
+            total_frames: 200,
             rms: 0.01178,
         };
         let (floor, strength) = confidence_floor(
@@ -494,6 +835,7 @@ mod tests {
         // case above lets through.
         let evidence = Evidence {
             speech_frames: MIN_SPEECH_FRAMES,
+            total_frames: 131,
             rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
         };
         let (floor, strength) = confidence_floor(
@@ -530,7 +872,8 @@ mod tests {
     fn apply_gain_disabled_by_zero_target() {
         let pcm = vec![0.01f32; 100];
         let out = apply_gain(&pcm, 0.01, 0.0, MAX_GAIN);
-        assert_eq!(out, pcm);
+        assert_eq!(out.as_ref(), pcm.as_slice());
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
@@ -540,7 +883,21 @@ mod tests {
         // speech, never touches an already-strong signal.
         let pcm = vec![0.2f32; 100];
         let out = apply_gain(&pcm, 0.2, DEFAULT_TARGET_RMS, MAX_GAIN);
-        assert_eq!(out, pcm);
+        assert_eq!(out.as_ref(), pcm.as_slice());
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn apply_gain_borrows_when_no_gain_needed() {
+        // Loud common case must avoid a copy: gain <= 1.0 returns borrowed.
+        let pcm = vec![0.2f32; 100];
+        let out = apply_gain(&pcm, 0.2, DEFAULT_TARGET_RMS, MAX_GAIN);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), pcm.as_slice());
+        // Quiet case that needs gain returns owned.
+        let quiet = vec![0.001f32; 100];
+        let out_owned = apply_gain(&quiet, 0.001, DEFAULT_TARGET_RMS, MAX_GAIN);
+        assert!(matches!(out_owned, std::borrow::Cow::Owned(_)));
     }
 
     #[test]
@@ -563,11 +920,76 @@ mod tests {
     }
 
     #[test]
+    fn condition_removes_dc_offset() {
+        // Soundcard offset must not reach whisper: a constant 0.1 offset
+        // carries no speech and would bias gain.
+        let pcm = vec![0.1f32; 1600];
+        let out = condition_utterance(&pcm);
+        assert_eq!(out.len(), pcm.len());
+        let mean = out.iter().fold(0.0f64, |m, &s| m + s as f64) / out.len() as f64;
+        assert!(mean.abs() < 1e-5, "mean={mean}");
+    }
+
+    #[test]
+    fn condition_attenuates_50hz_hum() {
+        // 50 Hz hum at 16 kHz: compare RMS before/after over the steady
+        // middle (past the HP startup transient and fades).
+        let hum: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
+            .collect();
+        let out = condition_utterance(&hum);
+        let rms = |v: &[f32]| (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt();
+        let before = rms(&hum[2000..14_000]);
+        let after = rms(&out[2000..14_000]);
+        assert!(after < before * 0.7, "before={before} after={after}");
+    }
+
+    #[test]
+    fn condition_keeps_speech_band_intact() {
+        // 1 kHz tone (speech band) must pass nearly untouched in the middle.
+        let tone: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin() * 0.2)
+            .collect();
+        let out = condition_utterance(&tone);
+        let rms = |v: &[f32]| (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt();
+        let before = rms(&tone[2000..14_000]);
+        let after = rms(&out[2000..14_000]);
+        let ratio = after / before;
+        assert!((0.9..=1.1).contains(&ratio), "ratio={ratio}");
+    }
+
+    #[test]
+    fn condition_fades_edges_and_caps_peak() {
+        // Flat loud input: fades pull both ends to near zero, peak safety
+        // caps the middle at 0.99.
+        let pcm = vec![2.0f32; 1600];
+        let out = condition_utterance(&pcm);
+        assert_eq!(out.len(), pcm.len());
+        assert!(out[0].abs() < 0.05, "first={}", out[0]);
+        assert!(out[out.len() - 1].abs() < 0.05, "last={}", out[out.len() - 1]);
+        assert!(out.iter().all(|&s| s.abs() <= 0.99 + 1e-6));
+        // Short input: fades shorten instead of overlapping.
+        let short = vec![0.5f32; 10];
+        let out_short = condition_utterance(&short);
+        assert_eq!(out_short.len(), short.len());
+    }
+
+    #[test]
+    fn condition_empty_stays_empty() {
+        assert!(condition_utterance(&[]).is_empty());
+    }
+
+    #[test]
     fn hallucination_filter_catches_known_boilerplate() {
         assert!(is_hallucination("Napisy stworzone przez społeczność Amara.org"));
         assert!(is_hallucination("  napisy  "));
         assert!(is_hallucination("..."));
         assert!(is_hallucination(""));
+        // Observed forced-input decodes: white noise (rms=0.008) at
+        // avg_p=0.890 and 50 Hz hum at avg_p=0.993 — both clear either
+        // confidence floor, so the pattern list is the only gate.
+        assert!(is_hallucination("Wszelkie prawa."));
+        assert!(is_hallucination("Wszelkie prawa zastrzeżone."));
     }
 
     #[test]
@@ -580,10 +1002,76 @@ mod tests {
     }
 
     #[test]
+    fn repetition_filter_catches_decode_loops() {
+        // Observed production-shape leak: 300 ms noise burst -> 26 speech
+        // frames -> "Współpraca w ..." at avg_p=0.741, clear of the 0.6
+        // weak floor and absent from the boilerplate list.
+        assert!(is_repetition(
+            "Współpraca w Współpraca w Współpraca w Współpraca w Współpraca."
+        ));
+        assert!(is_repetition("tak tak tak tak tak tak"));
+    }
+
+    #[test]
+    fn repetition_filter_leaves_real_speech_alone() {
+        assert!(!is_repetition("Zrób commit i wypchnij zmiany do repozytorium."));
+        assert!(!is_repetition(
+            "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
+        ));
+        // Short emphasis is exempt (< 6 words).
+        assert!(!is_repetition("nie nie nie"));
+        assert!(!is_repetition("tak"));
+    }
+
+    #[test]
     fn hallucination_filter_leaves_real_sentences_alone() {
         assert!(!is_hallucination("Zrób commit i wypchnij zmiany do repozytorium."));
         assert!(!is_hallucination(
             "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
         ));
+    }
+
+    #[test]
+    fn wayland_session_detection_prefers_wayland_display() {
+        // Plain Wayland, X11-only, XWayland (both DISPLAY and
+        // WAYLAND_DISPLAY set counts as Wayland), and headless.
+        assert!(is_wayland_session(Some("wayland"), Some("wayland-0")));
+        assert!(is_wayland_session(Some("wayland"), None));
+        assert!(is_wayland_session(None, Some("wayland-0")));
+        assert!(is_wayland_session(Some("WAYLAND"), None));
+        assert!(!is_wayland_session(Some("x11"), None));
+        assert!(!is_wayland_session(Some("x11"), Some("")));
+        assert!(!is_wayland_session(None, None));
+        assert!(!is_wayland_session(Some(""), Some("  ")));
+    }
+
+    #[test]
+    fn whisper_worker_signals_init_failure() {
+        // Bad model path must propagate via the ready channel instead of
+        // silently capturing into a dead queue.
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let opts = WhisperOptions {
+            prompt: String::new(),
+            language: Language::Polish,
+            min_confidence: DEFAULT_MIN_CONFIDENCE,
+            min_confidence_strong: DEFAULT_MIN_CONFIDENCE_STRONG,
+            min_speech_rms: DEFAULT_MIN_SPEECH_RMS,
+            target_rms: DEFAULT_TARGET_RMS,
+            debug_tokens: false,
+            dump_dir: None,
+            copy_enabled: false,
+            paste_enabled: false,
+        };
+        let bad = std::path::PathBuf::from("/nonexistent/ggml-bogus.bin");
+        let (handle, ready) = spawn_whisper_worker(rx, bad, opts);
+        match ready.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(Ok(())) => panic!("bad model path must not signal ready"),
+            Ok(Err(e)) => assert!(
+                e.contains("failed to load whisper model"),
+                "unexpected error: {e}"
+            ),
+            Err(e) => panic!("ready channel must send once, got {e:?}"),
+        }
+        handle.join().expect("worker thread must exit");
     }
 }

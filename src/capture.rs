@@ -24,11 +24,14 @@ pub(crate) fn print_input_devices() -> Result<()> {
     Ok(())
 }
 
-/// Pick the input device: `STTD_DEVICE` (substring match, case-insensitive)
+/// Pick the input device: `device` (substring match, case-insensitive)
 /// if set, otherwise the system default. Without this the tool is stuck on
 /// whatever the OS considers the default mic (e.g. a webcam capsule).
-pub(crate) fn select_input_device(host: &cpal::Host) -> Result<cpal::Device> {
-    if let Ok(wanted) = std::env::var("STTD_DEVICE") {
+pub(crate) fn select_input_device(
+    host: &cpal::Host,
+    wanted: Option<&str>,
+) -> Result<cpal::Device> {
+    if let Some(wanted) = wanted {
         let wanted_lower = wanted.to_lowercase();
         let mut devices = host
             .input_devices()
@@ -39,7 +42,7 @@ pub(crate) fn select_input_device(host: &cpal::Host) -> Result<cpal::Device> {
                 .unwrap_or(false)
         });
         return found
-            .with_context(|| format!("STTD_DEVICE={wanted:?} matched no input device (see --list-devices)"));
+            .with_context(|| format!("--device/STTD_DEVICE={wanted:?} matched no input device (see --list-devices)"));
     }
     host.default_input_device()
         .context("no default input device available")
