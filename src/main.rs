@@ -60,6 +60,8 @@ mod capture;
 use capture::*;
 mod denoise;
 mod dsp;
+mod emit;
+use emit::SystemEmitter;
 mod gate;
 mod signal;
 mod frame;
@@ -205,8 +207,12 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // ---- now the GPU part: load the model onto the GPU on its own thread.
     // Capture is already running above and the drain loop below keeps
     // `raw_rx` bounded while it loads.
-    let (whisper_handle, whisper_ready) =
-        spawn_whisper_worker(whisper_rx, model_path, whisper_options(cli));
+    let (whisper_handle, whisper_ready) = spawn_whisper_worker(
+        whisper_rx,
+        model_path,
+        whisper_options(cli),
+        make_emitter(cli)?,
+    );
     let mut whisper_ready_ok = false;
 
     // ---- main processing loop (NOT the audio callback) --------------------
@@ -343,8 +349,12 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     )?;
     let input_frames = fp.required_input_frames();
 
-    let (whisper_handle, whisper_ready) =
-        spawn_whisper_worker(whisper_rx, model_path, whisper_options(cli));
+    let (whisper_handle, whisper_ready) = spawn_whisper_worker(
+        whisper_rx,
+        model_path,
+        whisper_options(cli),
+        make_emitter(cli)?,
+    );
     // Fail fast on model-load/dump-dir errors before processing the file:
     // no realtime capture to keep bounded here, so blocking wait is fine.
     match whisper_ready.recv_timeout(Duration::from_secs(600)) {
@@ -391,10 +401,14 @@ fn whisper_options(cli: &Cli) -> WhisperOptions {
         gate: gate_config(cli),
         target_rms: cli.target_rms,
         debug_tokens: cli.debug_tokens,
-        dump_dir: cli.dump_dir.clone(),
-        copy_enabled: cli.copy,
-        paste_enabled: cli.paste,
     }
+}
+
+/// Emission policy (dump dir, clipboard, paste), resolved once from `Cli`.
+/// Runs on the main thread before the worker spawns, so a bad dump dir fails
+/// fast like the model load it precedes.
+fn make_emitter(cli: &Cli) -> Result<SystemEmitter> {
+    SystemEmitter::new(cli.dump_dir.clone(), cli.copy, cli.paste)
 }
 
 /// Thresholds for deciding-not-to-emit, resolved once from `Cli` and shared

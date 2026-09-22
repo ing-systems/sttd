@@ -8,9 +8,9 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use crate::config::{
     CONDITION_FADE_SAMPLES, CONDITION_HP_CUTOFF_HZ, MAX_GAIN, WHISPER_MIN_SAMPLES, WHISPER_RATE,
 };
-use crate::gate::{GateConfig, TranscriptDropKind, TranscriptVerdict};
+use crate::emit::{Emission, Emitter};
+use crate::gate::GateConfig;
 use crate::utterance::Utterance;
-use crate::wav::write_wav_mono16;
 
 /// Whisper decoding language, chosen once at startup via `STTD_LANGUAGE`
 /// and fixed for the process's lifetime. One inference decodes in exactly
@@ -56,7 +56,8 @@ impl std::fmt::Display for Language {
     }
 }
 
-/// Tunables the whisper worker needs, resolved once from `Cli`.
+/// Tunables the whisper worker needs, resolved once from `Cli`. Emission
+/// policy (`dump_dir`, clipboard, paste) lives with the `Emitter`, not here.
 #[derive(Debug, Clone)]
 pub(crate) struct WhisperOptions {
     pub(crate) prompt: String,
@@ -64,15 +65,13 @@ pub(crate) struct WhisperOptions {
     pub(crate) gate: GateConfig,
     pub(crate) target_rms: f32,
     pub(crate) debug_tokens: bool,
-    pub(crate) dump_dir: Option<PathBuf>,
-    pub(crate) copy_enabled: bool,
-    pub(crate) paste_enabled: bool,
 }
 
 pub(crate) fn spawn_whisper_worker(
     rx: Receiver<Utterance>,
     model_path: PathBuf,
     opts: WhisperOptions,
+    emitter: impl Emitter + Send + 'static,
 ) -> (
     JoinHandle<()>,
     std::sync::mpsc::Receiver<Result<(), String>>,
@@ -81,7 +80,8 @@ pub(crate) fn spawn_whisper_worker(
     let handle = std::thread::Builder::new()
         .name("whisper".into())
         .spawn(move || {
-            if let Err(e) = whisper_loop(&rx, &model_path, &opts, ready_tx) {
+            let mut emitter = emitter;
+            if let Err(e) = whisper_loop(&rx, &model_path, &opts, ready_tx, &mut emitter) {
                 eprintln!("[sttd] whisper worker failed: {e:?}");
             }
         })
@@ -93,98 +93,16 @@ pub(crate) fn spawn_whisper_worker(
 /// dropped rather than printed, so `STTD_DUMP_DIR` output stays correlatable
 /// with the stderr log: previously a dropped utterance left only a WAV with
 /// no indication of what became of it or why.
-fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
-    if let Some(dir) = dump_dir {
-        let txt_path = dir.join(format!("{tag}.txt"));
-        if let Err(e) = std::fs::write(&txt_path, reason) {
-            eprintln!("[sttd] failed to write {}: {e:?}", txt_path.display());
-        }
-    }
-}
-
-/// Whether the current session is Wayland, where clipboard (`wl-copy`) + paste
-/// (`ydotool key` Ctrl+V) is supported. Pure over its inputs so tests don't touch the process
-/// environment (see `is_wayland_session_env` for the env-reading wrapper).
-/// `WAYLAND_DISPLAY` set wins over `DISPLAY` (XWayland sets both), so an
-/// X.org session is `XDG_SESSION_TYPE=x11` with `WAYLAND_DISPLAY` empty.
-pub(crate) fn is_wayland_session(
-    xdg_session_type: Option<&str>,
-    wayland_display: Option<&str>,
-) -> bool {
-    if wayland_display.is_some_and(|v| !v.trim().is_empty()) {
-        return true;
-    }
-    xdg_session_type.is_some_and(|v| v.trim().eq_ignore_ascii_case("wayland"))
-}
-
-/// Env-reading wrapper around [`is_wayland_session`].
-pub(crate) fn is_wayland_session_env() -> bool {
-    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
-    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
-    is_wayland_session(session_type.as_deref(), wayland_display.as_deref())
-}
-
-/// Copy `text` to the Wayland clipboard via `wl-copy` (from wl-clipboard).
-/// Pipes the trimmed transcript over `wl-copy`'s stdin with no trailing
-/// newline, so it is pasted verbatim (UTF-8, including Polish diacritics) by
-/// the subsequent paste step. Passes `--sensitive` (`x-kde-passwordManagerHint=secret`)
-/// so Klipper skips clipboard history while paste still works.
-/// Returns the `io::Error` unwrapped (not `anyhow`)
-/// so the caller can match `NotFound` and disable itself with a single warning
-/// on machines without wl-clipboard.
-pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("wl-copy")
-        .arg("--sensitive")
-        .stdin(Stdio::piped())
-        .spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("wl-copy stdin unavailable"))?;
-    stdin.write_all(text.as_bytes())?;
-    drop(stdin);
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "wl-copy exited with {status}"
-        )))
-    }
-}
-
-/// Paste the clipboard at the current cursor position via `ydotool`
-/// (requires the `ydotoold` daemon). Synthesizes a single Ctrl+V
-/// (`29:1 47:1 47:0 29:0`, i.e. LEFTCTRL down, V down/up, LEFTCTRL up) instead
-/// of typing the transcript key-by-key: a fixed 4-event sequence, so it is
-/// fast and preserves non-ASCII text already on the clipboard. Returns
-/// `io::Error` unwrapped so the caller can match `NotFound` and disable
-/// itself with a single warning on machines without `ydotool`.
-pub(crate) fn paste_via_ydotool() -> std::io::Result<()> {
-    use std::process::Command;
-    let status = Command::new("ydotool")
-        .args(["key", "29:1", "47:1", "47:0", "29:0"])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "ydotool exited with {status}"
-        )))
-    }
-}
-
 fn whisper_loop(
     rx: &Receiver<Utterance>,
     model_path: &Path,
     opts: &WhisperOptions,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
+    emitter: &mut impl Emitter,
 ) -> Result<()> {
     // Run init; report the outcome once via `ready` so the main thread can
     // fail fast instead of capturing into a dead queue.
-    match whisper_init_and_run(rx, model_path, opts, &ready) {
+    match whisper_init_and_run(rx, model_path, opts, &ready, emitter) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = ready.send(Err(e.to_string()));
@@ -198,6 +116,7 @@ fn whisper_init_and_run(
     model_path: &Path,
     opts: &WhisperOptions,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
+    emitter: &mut impl Emitter,
 ) -> Result<()> {
     let path_str = model_path
         .to_str()
@@ -226,47 +145,11 @@ fn whisper_init_and_run(
     let gate = opts.gate.clone();
     let target_rms = opts.target_rms;
     let debug_tokens = opts.debug_tokens;
-    let dump_dir = opts.dump_dir.clone();
-    if let Some(dir) = &dump_dir {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-        eprintln!("[sttd] dumping utterances to {}", dir.display());
-    }
-    // Init succeeded (model + state + dump dir): signal ready so the main
-    // thread knows captures aren't going into a dead queue.
+    // Init succeeded (model + state): signal ready so the main thread knows
+    // captures aren't going into a dead queue. Emission policy (dump dir,
+    // clipboard, paste) already resolved on the main thread inside
+    // `SystemEmitter::new`, before the worker spawned.
     let _ = ready.send(Ok(()));
-    let copy_enabled = opts.copy_enabled;
-    let paste_enabled = opts.paste_enabled;
-    // Clipboard (`wl-copy`) carries the transcript verbatim (UTF-8, so Polish
-    // diacritics survive), then a single Ctrl+V via `ydotool key` pastes it.
-    // Both flags still gate the action (AND semantics preserve the old
-    // behavior where `--copy=false` disabled everything and `--paste=false`
-    // disabled insertion). Each becomes `false` permanently after "binary not
-    // found" so a machine without the binary logs one warning instead of one
-    // per utterance; daemon-down failures keep retrying since `ydotoold` may
-    // start later.
-    let mut clipboard_available = copy_enabled;
-    let mut paste_available = paste_enabled;
-    if !copy_enabled {
-        eprintln!("[sttd] clipboard copy disabled (--copy=false)");
-    }
-    if !paste_enabled {
-        eprintln!("[sttd] auto-paste disabled (--paste=false)");
-    } else if !copy_enabled {
-        eprintln!(
-            "[sttd] warning: --paste is enabled but --copy=false, paste will be skipped (nothing fresh to paste)"
-        );
-    }
-    // Both `wl-copy` and the paste target only make sense on Wayland; on X.org
-    // (or headless/`--file` without a Wayland socket) disable once with a
-    // warning rather than failing every utterance.
-    if (clipboard_available || paste_available) && !is_wayland_session_env() {
-        eprintln!(
-            "[sttd] warning: auto-paste is enabled but this is not a Wayland session (no WAYLAND_DISPLAY, XDG_SESSION_TYPE!=wayland); disabling clipboard + ydotool paste"
-        );
-        clipboard_available = false;
-        paste_available = false;
-    }
 
     let mut utterance_no: u64 = 0;
     for utterance in rx.iter() {
@@ -275,13 +158,6 @@ fn whisper_init_and_run(
         }
         utterance_no += 1;
         let tag = format!("utt_{utterance_no:06}");
-
-        if let Some(dir) = &dump_dir {
-            let wav_path = dir.join(format!("{tag}.wav"));
-            if let Err(e) = write_wav_mono16(&wav_path, &utterance.pcm, WHISPER_RATE) {
-                eprintln!("[sttd] failed to dump {}: {e:?}", wav_path.display());
-            }
-        }
 
         let conditioned = condition_utterance(&utterance.pcm);
         let gained = apply_gain(&conditioned, utterance.evidence.rms, target_rms, MAX_GAIN);
@@ -302,83 +178,15 @@ fn whisper_init_and_run(
                     trimmed,
                     t.confidence.prob,
                 );
-                match verdict {
-                    TranscriptVerdict::DropEmpty => {
-                        dump_drop_reason(&dump_dir, &tag, "DROPPED(empty)");
-                        continue;
-                    }
-                    TranscriptVerdict::Emit { floor, strength } => {
-                        eprintln!(
-                            "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={floor:.3} \
-                             ({strength} evidence, density={:.3})",
-                            t.confidence.prob,
-                            t.confidence.logprob,
-                            utterance.evidence.density()
-                        );
-                        println!("{trimmed}");
-                    }
-                    TranscriptVerdict::Drop { kind, floor, strength } => {
-                        eprintln!(
-                            "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={floor:.3} \
-                             ({strength} evidence, density={:.3})",
-                            t.confidence.prob,
-                            t.confidence.logprob,
-                            utterance.evidence.density()
-                        );
-                        match kind {
-                            TranscriptDropKind::LowConfidence => {
-                                eprintln!("[sttd] {tag}: dropped low-confidence transcript: {trimmed:?}");
-                            }
-                            TranscriptDropKind::Hallucination => {
-                                eprintln!("[sttd] {tag}: dropped likely hallucination: {trimmed:?}");
-                            }
-                            TranscriptDropKind::Repetition => {
-                                eprintln!("[sttd] {tag}: dropped repetition-loop decode: {trimmed:?}");
-                            }
-                        }
-                        dump_drop_reason(
-                            &dump_dir,
-                            &tag,
-                            &verdict.dump_reason(trimmed, t.confidence.prob),
-                        );
-                        continue;
-                    }
-                }
-                // Track whether this utterance actually refreshed the
-                // clipboard: paste synthesizes Ctrl+V, so it must only run
-                // on fresh content, never on stale clipboard or a failed
-                // copy.
-                let mut copied = false;
-                if clipboard_available {
-                    match copy_to_clipboard(trimmed) {
-                        Ok(()) => copied = true,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            eprintln!(
-                                "[sttd] warning: --copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
-                            );
-                            clipboard_available = false;
-                        }
-                        Err(e) => eprintln!("[sttd] {tag}: clipboard copy failed: {e:?}"),
-                    }
-                }
-                if paste_available && copied {
-                    match paste_via_ydotool() {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            eprintln!(
-                                "[sttd] warning: --paste is enabled but `ydotool` was not found on PATH; disabling auto-paste"
-                            );
-                            paste_available = false;
-                        }
-                        Err(e) => eprintln!("[sttd] {tag}: auto-paste failed (is ydotoold running?): {e:?}"),
-                    }
-                }
-                if let Some(dir) = &dump_dir {
-                    let txt_path = dir.join(format!("{tag}.txt"));
-                    if let Err(e) = std::fs::write(&txt_path, trimmed) {
-                        eprintln!("[sttd] failed to write {}: {e:?}", txt_path.display());
-                    }
-                }
+                emitter.emit(Emission {
+                    tag: &tag,
+                    pcm: &utterance.pcm,
+                    text: trimmed,
+                    verdict,
+                    prob: t.confidence.prob,
+                    logprob: t.confidence.logprob,
+                    evidence: &utterance.evidence,
+                });
             }
             Err(e) => eprintln!("[sttd] {tag}: transcription failed: {e:?}"),
         }
@@ -926,20 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn wayland_session_detection_prefers_wayland_display() {
-        // Plain Wayland, X11-only, XWayland (both DISPLAY and
-        // WAYLAND_DISPLAY set counts as Wayland), and headless.
-        assert!(is_wayland_session(Some("wayland"), Some("wayland-0")));
-        assert!(is_wayland_session(Some("wayland"), None));
-        assert!(is_wayland_session(None, Some("wayland-0")));
-        assert!(is_wayland_session(Some("WAYLAND"), None));
-        assert!(!is_wayland_session(Some("x11"), None));
-        assert!(!is_wayland_session(Some("x11"), Some("")));
-        assert!(!is_wayland_session(None, None));
-        assert!(!is_wayland_session(Some(""), Some("  ")));
-    }
-
-    #[test]
     fn whisper_worker_signals_init_failure() {
         // Bad model path must propagate via the ready channel instead of
         // silently capturing into a dead queue.
@@ -955,12 +749,10 @@ mod tests {
             ),
             target_rms: DEFAULT_TARGET_RMS,
             debug_tokens: false,
-            dump_dir: None,
-            copy_enabled: false,
-            paste_enabled: false,
         };
         let bad = std::path::PathBuf::from("/nonexistent/ggml-bogus.bin");
-        let (handle, ready) = spawn_whisper_worker(rx, bad, opts);
+        let (handle, ready) =
+            spawn_whisper_worker(rx, bad, opts, crate::emit::RecordingEmitter::new());
         match ready.recv_timeout(std::time::Duration::from_secs(120)) {
             Ok(Ok(())) => panic!("bad model path must not signal ready"),
             Ok(Err(e)) => assert!(
