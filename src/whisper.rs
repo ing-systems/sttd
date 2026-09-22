@@ -6,10 +6,10 @@ use crossbeam_channel::Receiver;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::config::{
-    CONDITION_FADE_SAMPLES, CONDITION_HP_CUTOFF_HZ, HALLUCINATION_PATTERNS, MAX_GAIN,
-    STRONG_RMS_FACTOR, STRONG_SPEECH_FRAMES, WHISPER_MIN_SAMPLES, WHISPER_RATE,
+    CONDITION_FADE_SAMPLES, CONDITION_HP_CUTOFF_HZ, MAX_GAIN, WHISPER_MIN_SAMPLES, WHISPER_RATE,
 };
-use crate::utterance::{Evidence, Utterance};
+use crate::gate::{GateConfig, TranscriptDropKind, TranscriptVerdict};
+use crate::utterance::Utterance;
 use crate::wav::write_wav_mono16;
 
 /// Whisper decoding language, chosen once at startup via `STTD_LANGUAGE`
@@ -61,9 +61,7 @@ impl std::fmt::Display for Language {
 pub(crate) struct WhisperOptions {
     pub(crate) prompt: String,
     pub(crate) language: Language,
-    pub(crate) min_confidence: f32,
-    pub(crate) min_confidence_strong: f32,
-    pub(crate) min_speech_rms: f32,
+    pub(crate) gate: GateConfig,
     pub(crate) target_rms: f32,
     pub(crate) debug_tokens: bool,
     pub(crate) dump_dir: Option<PathBuf>,
@@ -89,46 +87,6 @@ pub(crate) fn spawn_whisper_worker(
         })
         .expect("failed to spawn whisper thread");
     (handle, ready_rx)
-}
-
-/// How much trust an utterance's acoustics have already earned, which selects
-/// the confidence floor its transcript then has to clear.
-#[derive(PartialEq, Eq, Debug)]
-pub(crate) enum EvidenceStrength {
-    Weak,
-    Strong,
-}
-
-impl std::fmt::Display for EvidenceStrength {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // These spellings go straight into the log lines below, so they are
-        // fixed.
-        f.write_str(match self {
-            Self::Weak => "weak",
-            Self::Strong => "strong",
-        })
-    }
-}
-
-/// Confidence floor for this utterance's transcript, paired with the
-/// `EvidenceStrength` that selected it. The confidence gate exists to catch
-/// hallucinations on silence/noise; where the acoustics already testify to
-/// real speech, it has nothing to add, and applying the strict floor anyway
-/// discards the only transcript we have. It doesn't disappear entirely: the
-/// relaxed floor still catches a repetition-loop decode (avg_p ~0.1), which
-/// isn't a transcript of anything.
-pub(crate) fn confidence_floor(
-    evidence: &Evidence,
-    min_rms: f32,
-    weak_floor: f32,
-    strong_floor: f32,
-) -> (f32, EvidenceStrength) {
-    if evidence.speech_frames >= STRONG_SPEECH_FRAMES && evidence.rms >= min_rms * STRONG_RMS_FACTOR
-    {
-        (strong_floor, EvidenceStrength::Strong)
-    } else {
-        (weak_floor, EvidenceStrength::Weak)
-    }
 }
 
 /// Write `reason` as `<dump_dir>/<tag>.txt` for an utterance that was
@@ -265,12 +223,7 @@ fn whisper_init_and_run(
 
     let prompt = opts.prompt.clone();
     let language = opts.language;
-    let min_confidence = opts.min_confidence;
-    let min_confidence_strong = opts.min_confidence_strong;
-    // Same value `FrameProcessor::new` receives for the acoustic gate,
-    // passed via `WhisperOptions` rather than threaded through the channel:
-    // keeps `Utterance` free of config, only evidence.
-    let min_speech_rms = opts.min_speech_rms;
+    let gate = opts.gate.clone();
     let target_rms = opts.target_rms;
     let debug_tokens = opts.debug_tokens;
     let dump_dir = opts.dump_dir.clone();
@@ -343,54 +296,54 @@ fn whisper_init_and_run(
         ) {
             Ok(t) => {
                 let trimmed = t.text.trim();
-                if trimmed.is_empty() {
-                    dump_drop_reason(&dump_dir, &tag, "DROPPED(empty)");
-                    continue;
-                }
-                let (floor, strength) = confidence_floor(
-                    &utterance.evidence,
-                    min_speech_rms,
-                    min_confidence,
-                    min_confidence_strong,
-                );
-                eprintln!(
-                    "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={floor:.3} \
-                     ({strength} evidence, density={:.3})",
+                let verdict = gate.decide_transcript(
+                    utterance.evidence.speech_frames,
+                    utterance.evidence.rms,
+                    trimmed,
                     t.confidence.prob,
-                    t.confidence.logprob,
-                    utterance.evidence.density()
                 );
-                if t.confidence.prob < floor {
-                    eprintln!("[sttd] {tag}: dropped low-confidence transcript: {trimmed:?}");
-                    dump_drop_reason(
-                        &dump_dir,
-                        &tag,
-                        &format!(
-                            "DROPPED(low-conf avg_p={:.3} < {floor:.3}, {strength}): {trimmed}",
-                            t.confidence.prob
-                        ),
-                    );
-                    continue;
+                match verdict {
+                    TranscriptVerdict::DropEmpty => {
+                        dump_drop_reason(&dump_dir, &tag, "DROPPED(empty)");
+                        continue;
+                    }
+                    TranscriptVerdict::Emit { floor, strength } => {
+                        eprintln!(
+                            "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={floor:.3} \
+                             ({strength} evidence, density={:.3})",
+                            t.confidence.prob,
+                            t.confidence.logprob,
+                            utterance.evidence.density()
+                        );
+                        println!("{trimmed}");
+                    }
+                    TranscriptVerdict::Drop { kind, floor, strength } => {
+                        eprintln!(
+                            "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={floor:.3} \
+                             ({strength} evidence, density={:.3})",
+                            t.confidence.prob,
+                            t.confidence.logprob,
+                            utterance.evidence.density()
+                        );
+                        match kind {
+                            TranscriptDropKind::LowConfidence => {
+                                eprintln!("[sttd] {tag}: dropped low-confidence transcript: {trimmed:?}");
+                            }
+                            TranscriptDropKind::Hallucination => {
+                                eprintln!("[sttd] {tag}: dropped likely hallucination: {trimmed:?}");
+                            }
+                            TranscriptDropKind::Repetition => {
+                                eprintln!("[sttd] {tag}: dropped repetition-loop decode: {trimmed:?}");
+                            }
+                        }
+                        dump_drop_reason(
+                            &dump_dir,
+                            &tag,
+                            &verdict.dump_reason(trimmed, t.confidence.prob),
+                        );
+                        continue;
+                    }
                 }
-                if is_hallucination(trimmed) {
-                    eprintln!("[sttd] {tag}: dropped likely hallucination: {trimmed:?}");
-                    dump_drop_reason(
-                        &dump_dir,
-                        &tag,
-                        &format!("DROPPED(hallucination): {trimmed}"),
-                    );
-                    continue;
-                }
-                if is_repetition(trimmed) {
-                    eprintln!("[sttd] {tag}: dropped repetition-loop decode: {trimmed:?}");
-                    dump_drop_reason(
-                        &dump_dir,
-                        &tag,
-                        &format!("DROPPED(repetition): {trimmed}"),
-                    );
-                    continue;
-                }
-                println!("{trimmed}");
                 // Track whether this utterance actually refreshed the
                 // clipboard: paste synthesizes Ctrl+V, so it must only run
                 // on fresh content, never on stale clipboard or a failed
@@ -692,81 +645,20 @@ fn transcribe(
     Ok(Transcript { text: out, confidence })
 }
 
-/// Fold a single Polish diacritic to its ASCII base letter; every other char is
-/// returned unchanged. Applied before comparing against
-/// `HALLUCINATION_PATTERNS` (themselves written without diacritics) so a
-/// transcript like "Dziękuje za uwagę" — a plausible ASR misspelling of
-/// "Dziękuję za uwagę" — still matches instead of sliding past on a single
-/// ogonek.
-pub(crate) fn fold_polish_diacritic(c: char) -> char {
-    match c {
-        'ą' => 'a',
-        'ć' => 'c',
-        'ę' => 'e',
-        'ł' => 'l',
-        'ń' => 'n',
-        'ó' => 'o',
-        'ś' => 's',
-        'ź' | 'ż' => 'z',
-        _ => c,
-    }
-}
-
-/// Lowercase, fold Polish diacritics, turn punctuation into spaces and
-/// collapse whitespace. Shared by [`is_hallucination`] and
-/// [`is_repetition`] so both gates judge the same spelling.
-pub(crate) fn normalize_transcript(text: &str) -> String {
-    // Punctuation becomes a space (not dropped): "Amara.org" must normalize
-    // to "amara org" to match the pattern list, not "amaraorg". Diacritics
-    // are folded (see `fold_polish_diacritic`) before the alphanumeric check,
-    // not after, since they're themselves alphanumeric and would otherwise
-    // survive untouched.
-    let normalized: String = text
-        .to_lowercase()
-        .chars()
-        .map(fold_polish_diacritic)
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect();
-    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Whether `text` (a full transcript) is a Whisper repetition-loop decode:
-/// the same 1-2 words on repeat (e.g. the observed
-/// "Współpraca w Współpraca w ..." emitted for a 300 ms noise burst with
-/// `avg_p=0.741`, well clear of either confidence floor). Judged on
-/// [`normalize_transcript`] words: 6+ words with at most half of them
-/// unique. Short emphases ("nie nie nie", 3 words) stay exempt; genuine
-/// 6-word sentences never approach a 0.5 uniqueness ratio.
-pub(crate) fn is_repetition(text: &str) -> bool {
-    let normalized = normalize_transcript(text);
-    let words: Vec<&str> = normalized.split(' ').filter(|w| !w.is_empty()).collect();
-    if words.len() < 6 {
-        return false;
-    }
-    let mut unique = words.to_vec();
-    unique.sort_unstable();
-    unique.dedup();
-    unique.len() * 2 <= words.len()
-}
-
-/// Whether `text` (a full transcript) is a known Whisper hallucination on
-/// silence/noise, checked as an exact match after normalization so genuine
-/// sentences that merely contain e.g. "dziękuję" are never caught.
-pub(crate) fn is_hallucination(text: &str) -> bool {
-    let normalized = normalize_transcript(text);
-    if normalized.is_empty() {
-        return true; // pure punctuation, e.g. "..."
-    }
-    HALLUCINATION_PATTERNS.contains(&normalized.as_str())
-}
+// Text-gate helpers (`fold_polish_diacritic`, `normalize_transcript`,
+// `is_hallucination`, `is_repetition`) live in `crate::gate` and are
+// re-exported above; the transcript decision owns their ordering.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
-        DEFAULT_TARGET_RMS, MAX_GAIN, MIN_SPEECH_FRAMES, WHISPER_MIN_SAMPLES,
+        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
+        DEFAULT_MIN_SPEECH_RMS, DEFAULT_TARGET_RMS, MAX_GAIN, MIN_SPEECH_FRAMES,
+        WHISPER_MIN_SAMPLES,
     };
+    use crate::gate::{EvidenceStrength, GateConfig, is_hallucination, is_repetition};
+    use crate::utterance::Evidence;
 
     #[test]
     fn language_maps_to_whisper_code() {
@@ -812,12 +704,13 @@ mod tests {
             total_frames: 200,
             rms: 0.01178,
         };
-        let (floor, strength) = confidence_floor(
-            &evidence,
+        let gate = GateConfig::new(
             DEFAULT_MIN_SPEECH_RMS,
+            DEFAULT_MIN_DENSITY,
             DEFAULT_MIN_CONFIDENCE,
             DEFAULT_MIN_CONFIDENCE_STRONG,
         );
+        let (floor, strength) = gate.floor_for(evidence.speech_frames, evidence.rms);
         assert_eq!(strength, EvidenceStrength::Strong);
         assert_eq!(floor, DEFAULT_MIN_CONFIDENCE_STRONG);
         assert!(
@@ -838,12 +731,13 @@ mod tests {
             total_frames: 131,
             rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
         };
-        let (floor, strength) = confidence_floor(
-            &evidence,
+        let gate = GateConfig::new(
             DEFAULT_MIN_SPEECH_RMS,
+            DEFAULT_MIN_DENSITY,
             DEFAULT_MIN_CONFIDENCE,
             DEFAULT_MIN_CONFIDENCE_STRONG,
         );
+        let (floor, strength) = gate.floor_for(evidence.speech_frames, evidence.rms);
         assert_eq!(strength, EvidenceStrength::Weak);
         assert_eq!(floor, DEFAULT_MIN_CONFIDENCE);
         assert!(
@@ -1053,9 +947,12 @@ mod tests {
         let opts = WhisperOptions {
             prompt: String::new(),
             language: Language::Polish,
-            min_confidence: DEFAULT_MIN_CONFIDENCE,
-            min_confidence_strong: DEFAULT_MIN_CONFIDENCE_STRONG,
-            min_speech_rms: DEFAULT_MIN_SPEECH_RMS,
+            gate: GateConfig::new(
+                DEFAULT_MIN_SPEECH_RMS,
+                DEFAULT_MIN_DENSITY,
+                DEFAULT_MIN_CONFIDENCE,
+                DEFAULT_MIN_CONFIDENCE_STRONG,
+            ),
             target_rms: DEFAULT_TARGET_RMS,
             debug_tokens: false,
             dump_dir: None,

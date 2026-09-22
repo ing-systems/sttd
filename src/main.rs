@@ -60,6 +60,8 @@ mod capture;
 use capture::*;
 mod denoise;
 mod dsp;
+mod gate;
+mod signal;
 mod frame;
 use frame::*;
 mod utterance;
@@ -167,8 +169,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         whisper_tx,
         cli.denoiser,
         cli.vad_threshold,
-        cli.min_rms,
-        cli.min_density,
+        gate_config(cli),
     )?;
     let input_frames = fp.required_input_frames();
 
@@ -338,8 +339,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         whisper_tx.clone(),
         cli.denoiser,
         cli.vad_threshold,
-        cli.min_rms,
-        cli.min_density,
+        gate_config(cli),
     )?;
     let input_frames = fp.required_input_frames();
 
@@ -388,13 +388,23 @@ fn whisper_options(cli: &Cli) -> WhisperOptions {
     WhisperOptions {
         prompt: cli.prompt.clone(),
         language: cli.language,
-        min_confidence: cli.min_conf,
-        min_confidence_strong: cli.min_conf_strong,
-        min_speech_rms: cli.min_rms,
+        gate: gate_config(cli),
         target_rms: cli.target_rms,
         debug_tokens: cli.debug_tokens,
         dump_dir: cli.dump_dir.clone(),
         copy_enabled: cli.copy,
         paste_enabled: cli.paste,
     }
+}
+
+/// Thresholds for deciding-not-to-emit, resolved once from `Cli` and shared
+/// by the acoustic path (`FrameProcessor`) and the transcript path
+/// (`WhisperOptions`). Keeps `Utterance` free of config, only evidence.
+fn gate_config(cli: &Cli) -> gate::GateConfig {
+    gate::GateConfig::new(
+        cli.min_rms,
+        cli.min_density,
+        cli.min_conf,
+        cli.min_conf_strong,
+    )
 }
