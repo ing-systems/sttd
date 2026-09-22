@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use earshot::Detector;
 
 // ---------------------------------------------------------------------------
@@ -10,6 +12,16 @@ use earshot::Detector;
 /// Samples earshot requires per prediction, at `WHISPER_RATE` (16 kHz): 16 ms.
 const EARSHOT_WINDOW: usize = 256;
 
+/// Window decisions the median rides over: the output flips only when at
+/// least 2 of the last 3 raw windows agree, so a single flicker window (a
+/// click, a breath, one RNN wobble) can never flip the frame verdict on its
+/// own. Costs ~1 window (16 ms) of entry/exit latency each way, absorbed by
+/// pre-roll and silence hangover the same way the prediction window itself
+/// is. Fixed at 3: 5 would add another 32 ms and risk shaving short words
+/// for little extra flicker rejection once hysteresis already handles the
+/// near-threshold chatter.
+const MEDIAN_WINDOWS: usize = 3;
+
 /// Turns the VAD branch's 16 kHz stream into a per-10ms-frame speech verdict.
 ///
 /// earshot only predicts on exactly `EARSHOT_WINDOW` (256) samples, while the
@@ -17,22 +29,34 @@ const EARSHOT_WINDOW: usize = 256;
 /// incoming samples are staged until a full window is available. 8 frames
 /// (1280 samples) yield exactly 5 windows, landing on frames 2, 4, 5, 7, 8 of
 /// each group of 8; a frame that doesn't complete a window re-reports the
-/// last verdict instead of guessing. The longest such re-report run is one
-/// frame, so a single positive window still marks at most 2 consecutive
-/// frames as speech — `ONSET_SPEECH_FRAMES` (3) still requires evidence from
-/// more than one independent prediction.
+/// last verdict instead of guessing. Each window's score passes through
+/// hysteresis first (enter at `enter`, hold until below `exit`), then through
+/// a majority vote over the last `MEDIAN_WINDOWS` raw window decisions: a
+/// single positive window marks no frame as speech at all, so
+/// `ONSET_SPEECH_FRAMES` (3) always needs evidence from at least two
+/// independent predictions, and a single dropout window inside speech never
+/// breaks the latch either.
 ///
-/// Adds at most `EARSHOT_WINDOW`'s worth of latency (16 ms) before a verdict
-/// reflects newly arrived audio, absorbed by pre-roll and silence hangover
-/// the same way the denoiser's own lookahead is.
+/// Adds at most two `EARSHOT_WINDOW`s of latency (one prediction window plus
+/// one median step, about 32 ms) before a verdict reflects newly arrived
+/// audio, absorbed by pre-roll and silence hangover the same way the
+/// denoiser's own lookahead is.
 pub(crate) struct SpeechDetector {
     detector: Box<Detector>,
     /// 16 kHz samples not yet consumed by a full `EARSHOT_WINDOW`.
     staging: Vec<f32>,
     threshold: f32,
-    /// Hysteresis state: in-speech or not. Re-reported for frames that
-    /// didn't themselves complete a window. Starts `false`.
+    /// Smoothed output: majority of `window_history`. Re-reported for frames
+    /// that didn't themselves complete a window. Starts `false`.
     in_speech: bool,
+    /// Raw per-window hysteresis state (input to the median, not the
+    /// output). Split from `in_speech` so the median can't feed back into
+    /// the thresholds.
+    raw_speech: bool,
+    /// Last `MEDIAN_WINDOWS` raw window decisions, oldest-first. Pre-filled
+    /// with `false` (silence) so the very first windows get flicker
+    /// protection too, and reset to the same on pause.
+    window_history: VecDeque<bool>,
     /// Last earshot score, for hysteresis across windows.
     last_score: f32,
     /// Warm background estimate: survives `reset()` on purpose (see below).
@@ -47,6 +71,8 @@ impl SpeechDetector {
             staging: Vec::with_capacity(EARSHOT_WINDOW),
             threshold,
             in_speech: false,
+            raw_speech: false,
+            window_history: VecDeque::from(vec![false; MEDIAN_WINDOWS]),
             last_score: 0.0,
             noise: crate::noise::NoiseTracker::new(),
             adapt,
@@ -60,10 +86,12 @@ impl SpeechDetector {
     }
 
     /// Feed one 10 ms VAD-branch frame (16 kHz, `[-1, 1]`); returns the
-    /// current speech verdict with hysteresis: entering speech needs
-    /// `score >= enter` (base lifted by background), staying in speech only
-    /// needs `score >= exit` (enter minus hysteresis). Non-speech frames
-    /// keep the background estimate warm; speech frames freeze it.
+    /// current speech verdict with hysteresis plus median smoothing: entering
+    /// raw speech needs `score >= enter` (base lifted by background), staying
+    /// in raw speech only needs `score >= exit` (enter minus hysteresis), and
+    /// the reported verdict is the majority of the last `MEDIAN_WINDOWS` raw
+    /// decisions. Non-speech frames keep the background estimate warm; speech
+    /// frames freeze it.
     pub(crate) fn verdict(&mut self, frame_16k: &[f32]) -> bool {
         self.staging.extend_from_slice(frame_16k);
 
@@ -82,13 +110,12 @@ impl SpeechDetector {
             } else {
                 (self.threshold, self.threshold)
             };
-            if self.in_speech {
-                if score < exit {
-                    self.in_speech = false;
-                }
-            } else if score >= enter {
-                self.in_speech = true;
-            }
+            let raw = if self.raw_speech {
+                score >= exit
+            } else {
+                score >= enter
+            };
+            self.push_window(raw);
             consumed += EARSHOT_WINDOW;
         }
         self.staging.drain(..consumed);
@@ -106,6 +133,20 @@ impl SpeechDetector {
         self.in_speech
     }
 
+    /// Fold one raw window decision into the median: update the hysteresis
+    /// state, push it onto the history (capped at `MEDIAN_WINDOWS`), and
+    /// recompute the reported verdict as the majority. Split from `verdict`
+    /// so tests can drive flicker sequences without a live earshot signal.
+    fn push_window(&mut self, raw: bool) {
+        self.raw_speech = raw;
+        self.window_history.push_back(raw);
+        while self.window_history.len() > MEDIAN_WINDOWS {
+            self.window_history.pop_front();
+        }
+        let trues = self.window_history.iter().filter(|&&b| b).count();
+        self.in_speech = trues * 2 > self.window_history.len();
+    }
+
     /// Observe-only background update for pause: RMS -> noise floor, no
     /// earshot, no utterance, no latch change. Cheap (no neural pass) so a
     /// 10 s pause on fan noise actually teaches the threshold instead of
@@ -114,15 +155,18 @@ impl SpeechDetector {
         self.noise.update_background(frame_16k);
     }
 
-    /// Drop staged partial-window samples, the hysteresis latch, and the
-    /// earshot detector's internal state (ring buffer + feature context +
-    /// RNN state) for a pause transition, so resume starts from silence,
-    /// not pre-pause audio. The noise floor is deliberately kept: it is the
-    /// warm background Faza 2 learns from.
+    /// Drop staged partial-window samples, the hysteresis latch, the median
+    /// history, and the earshot detector's internal state (ring buffer +
+    /// feature context + RNN state) for a pause transition, so resume starts
+    /// from silence, not pre-pause audio. The noise floor is deliberately
+    /// kept: it is the warm background Faza 2 learns from.
     pub(crate) fn reset(&mut self) {
         self.detector.reset();
         self.staging.clear();
         self.in_speech = false;
+        self.raw_speech = false;
+        self.window_history.clear();
+        self.window_history.extend(vec![false; MEDIAN_WINDOWS]);
         self.last_score = 0.0;
     }
 }
@@ -219,8 +263,53 @@ mod tests {
         // One frame stages 160 samples without completing a window.
         vad.verdict(&frame);
         assert!(!vad.staging.is_empty());
+        vad.push_window(true);
+        vad.push_window(true);
+        assert!(vad.in_speech);
         vad.reset();
         assert!(vad.staging.is_empty());
         assert!(!vad.in_speech);
+        assert!(!vad.raw_speech);
+        assert!(vad.window_history.iter().all(|&b| !b));
+        assert_eq!(vad.window_history.len(), MEDIAN_WINDOWS);
+    }
+
+    #[test]
+    fn median_kills_single_window_flicker() {
+        // A lone positive window (click, breath, one RNN wobble) must not
+        // flip the verdict: 1-of-3 is not a majority.
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
+        vad.push_window(true);
+        assert!(!vad.in_speech, "single spike must not open");
+        // A second consecutive positive reaches 2-of-3: real onset.
+        vad.push_window(true);
+        assert!(vad.in_speech, "two consecutive windows must open");
+    }
+
+    #[test]
+    fn median_rides_through_single_dropout() {
+        // Steady speech stays latched through one dropout window: 2-of-3
+        // still holds.
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
+        vad.push_window(true);
+        vad.push_window(true);
+        assert!(vad.in_speech);
+        vad.push_window(true);
+        assert!(vad.in_speech);
+        vad.push_window(false);
+        assert!(vad.in_speech, "single dropout must not break the latch");
+        // Two dropouts in a row reach 1-of-3: speech really ended.
+        vad.push_window(false);
+        assert!(!vad.in_speech, "two consecutive dropouts must close");
+    }
+
+    #[test]
+    fn median_history_starts_silenced() {
+        // Fresh (and reset) detectors pre-fill with `false`, so even the
+        // very first window gets flicker protection.
+        let vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
+        assert_eq!(vad.window_history.len(), MEDIAN_WINDOWS);
+        assert!(vad.window_history.iter().all(|&b| !b));
+        assert_eq!(MEDIAN_WINDOWS, 3);
     }
 }
