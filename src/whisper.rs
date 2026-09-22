@@ -72,6 +72,10 @@ pub(crate) struct WhisperOptions {
     pub(crate) target_rms: f32,
     pub(crate) debug_tokens: bool,
     pub(crate) beam_size: i32,
+    pub(crate) temperature: f32,
+    pub(crate) temperature_inc: f32,
+    pub(crate) entropy_thold: f32,
+    pub(crate) logprob_thold: f32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
     /// Shed oldest-first past `WHISPER_SHED_KEEP` (microphone mode). File
@@ -246,6 +250,10 @@ fn whisper_init_and_run(
     let target_rms = opts.target_rms;
     let debug_tokens = opts.debug_tokens;
     let beam_size = opts.beam_size;
+    let temperature = opts.temperature;
+    let temperature_inc = opts.temperature_inc;
+    let entropy_thold = opts.entropy_thold;
+    let logprob_thold = opts.logprob_thold;
     let n_threads = opts.n_threads;
     let use_gpu = opts.use_gpu;
     let model_spec = opts.model_spec.clone();
@@ -301,7 +309,7 @@ fn whisper_init_and_run(
 
         if first_load {
             log::info!(
-                "whisper ready (model={model_spec}, lang={}, beam={beam_size}, threads={n_threads}, gpu={use_gpu})",
+                "whisper ready (model={model_spec}, lang={}, beam={beam_size}, temp={temperature}/{temperature_inc}, entropy_thold={entropy_thold}, logprob_thold={logprob_thold}, threads={n_threads}, gpu={use_gpu})",
                 language.as_str()
             );
             // Init succeeded (model + state): signal ready so the main
@@ -346,6 +354,10 @@ fn whisper_init_and_run(
                 target_rms,
                 debug_tokens,
                 beam_size,
+                temperature,
+                temperature_inc,
+                entropy_thold,
+                logprob_thold,
                 n_threads,
                 running,
                 emitter,
@@ -411,6 +423,10 @@ fn whisper_init_and_run(
                         target_rms,
                         debug_tokens,
                         beam_size,
+                        temperature,
+                        temperature_inc,
+                        entropy_thold,
+                        logprob_thold,
                         n_threads,
                         running,
                         emitter,
@@ -559,6 +575,11 @@ pub(crate) fn build_effective_prompt(base: &str, context_tail: &str) -> String {
 /// Append an emitted transcript to the prompt-context tail, keeping only the
 /// last `max_chars` chars on a char boundary. `0` disables (clears, so a
 /// runtime toggle can't leave stale context). Empty text is a no-op.
+///
+/// The cut then snaps forward to the next sentence boundary (`.`, `!`,
+/// `?`, `…`), falling back to the next word boundary: whisper.cpp feeds
+/// `initial_prompt` as prior context, and a tail starting mid-word invites
+/// the decoder to continue the fragment instead of the conversation.
 pub(crate) fn push_prompt_context(tail: &mut String, emitted_text: &str, max_chars: usize) {
     if max_chars == 0 {
         tail.clear();
@@ -575,13 +596,79 @@ pub(crate) fn push_prompt_context(tail: &mut String, emitted_text: &str, max_cha
     // Truncate to the last `max_chars` chars without splitting UTF-8.
     if tail.chars().count() > max_chars {
         let skip = tail.chars().count() - max_chars;
-        let byte_idx = tail
+        let mut byte_idx = tail
             .char_indices()
             .nth(skip)
             .map(|(i, _)| i)
             .unwrap_or(tail.len());
+        byte_idx = snap_tail_cut_forward(tail, byte_idx);
         tail.drain(..byte_idx);
     }
+}
+
+/// Move a truncation cut forward to the next sentence boundary (first
+/// `.`, `!`, `?` or `…` at or after `cut`), skipping past following
+/// closing punctuation and whitespace so the tail starts clean. Falls back
+/// to the next word boundary, but only when `cut` lands mid-word — a cut
+/// already at a word start stays put. Final fallback is the char cut
+/// itself. Always lands on a char boundary; never moves past the end.
+fn snap_tail_cut_forward(tail: &str, cut: usize) -> usize {
+    let cut = cut.min(tail.len());
+    // Never start the tail with whitespace.
+    let mut cut = cut;
+    while tail[cut..].starts_with(|c: char| c.is_whitespace()) {
+        cut += 1;
+    }
+    if cut >= tail.len() {
+        return tail.len().min(cut);
+    }
+    let after: Vec<(usize, char)> = tail[cut..].char_indices().collect();
+    // Sentence end first: keep the terminator behind, start after it.
+    for (rel, c) in &after {
+        if matches!(c, '.' | '!' | '?' | '…') {
+            let mut idx = cut + rel + c.len_utf8();
+            // Skip closing quotes/brackets and whitespace after the stop.
+            for (_, c2) in tail[idx..].char_indices() {
+                if matches!(c2, '"' | '\'' | '”' | '’' | ')' | ']' | '}') || c2.is_whitespace()
+                {
+                    idx += c2.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if idx < tail.len() {
+                return idx;
+            }
+            break;
+        }
+    }
+    // No sentence stop ahead (or nothing after it): advance only when
+    // mid-word, i.e. the char before the cut is not whitespace.
+    let at_word_start = cut == 0
+        || tail[..cut]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_whitespace());
+    if at_word_start {
+        return cut;
+    }
+    for (rel, c) in &after {
+        if c.is_whitespace() {
+            let mut idx = cut + rel;
+            for (_, c2) in tail[idx..].char_indices() {
+                if c2.is_whitespace() {
+                    idx += c2.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if idx < tail.len() {
+                return idx;
+            }
+            break;
+        }
+    }
+    cut
 }
 
 /// One utterance through conditioning, gain, inference, gate and emission.
@@ -602,6 +689,10 @@ fn transcribe_and_emit(
     target_rms: f32,
     debug_tokens: bool,
     beam_size: i32,
+    temperature: f32,
+    temperature_inc: f32,
+    entropy_thold: f32,
+    logprob_thold: f32,
     n_threads: i32,
     running: &Arc<AtomicBool>,
     emitter: &mut impl Emitter,
@@ -609,8 +700,7 @@ fn transcribe_and_emit(
     let tag = format!("utt_{utterance_no:06}");
 
     let conditioned = condition_utterance(&utterance.pcm);
-    let rms_for_gain =
-        conditioned_speech_rms(&utterance.pcm, &conditioned, utterance.evidence.rms);
+    let rms_for_gain = conditioned_speech_rms(&utterance.pcm, &conditioned, utterance.evidence.rms);
     let gained = apply_gain(&conditioned, rms_for_gain, target_rms, MAX_GAIN);
     let effective_prompt = build_effective_prompt(base_prompt, prompt_tail);
 
@@ -622,6 +712,10 @@ fn transcribe_and_emit(
         language,
         debug_tokens,
         beam_size,
+        temperature,
+        temperature_inc,
+        entropy_thold,
+        logprob_thold,
         n_threads,
         running,
     ) {
@@ -633,10 +727,7 @@ fn transcribe_and_emit(
                 trimmed,
                 t.confidence.prob,
             );
-            let emitted = matches!(
-                verdict,
-                crate::gate::TranscriptVerdict::Emit { .. }
-            );
+            let emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit { .. });
             if emitted {
                 push_prompt_context(prompt_tail, trimmed, prompt_context_chars);
             }
@@ -881,6 +972,10 @@ fn transcribe(
     language: Language,
     debug_tokens: bool,
     beam_size: i32,
+    temperature: f32,
+    temperature_inc: f32,
+    entropy_thold: f32,
+    logprob_thold: f32,
     n_threads: i32,
     running: &Arc<AtomicBool>,
 ) -> Result<Transcript> {
@@ -909,18 +1004,26 @@ fn transcribe(
     params.set_initial_prompt(prompt);
     params.set_suppress_blank(true);
     params.set_suppress_non_speech_tokens(true);
-    params.set_temperature(0.0);
-    // Fallback ladder [0.0, 0.2, .., 1.0]: rescues genuinely hard speech
-    // from a repetition loop. It is *not* a rejection mechanism — whisper.cpp
-    // only re-tries at a non-final temperature when `avg_logprobs <
-    // logprob_thold`; at the final temperature (here, 1.0) the result is
-    // accepted unconditionally (`whisper.cpp`: `if (it != temperatures.size()
-    // - 1) { ... success = false ... }`). Confidence rejection is done by
-    // the caller instead, via `full_get_token_prob` (see this function's
-    // doc comment).
-    params.set_temperature_inc(0.2);
-    params.set_entropy_thold(2.4);
-    params.set_logprob_thold(-1.0);
+    params.set_temperature(temperature);
+    // Fallback ladder [temperature, +inc, .., 1.0]: rescues genuinely hard
+    // speech from a repetition loop. `temperature_inc <= 0.0` disables the
+    // ladder (single-temp decode). It is *not* a rejection mechanism —
+    // whisper.cpp only re-tries at a non-final temperature when
+    // `avg_logprobs < logprob_thold` or entropy exceeds `entropy_thold`;
+    // at the final temperature the result is accepted unconditionally
+    // (`whisper.cpp`: `if (it != temperatures.size() - 1) { ... success =
+    // false ... }`). Confidence rejection is done by the caller instead,
+    // via `full_get_token_prob` (see this function's doc comment).
+    // NOTE on `no_speech`: whisper.cpp declares `no_speech_thold` but the
+    // decoder never reads it (`whisper.h`: `float no_speech_thold; // TODO:
+    // not implemented`), and whisper-rs 0.13 exposes no per-segment
+    // no-speech probability getter — so there is no no-speech gate to tune
+    // here. Silence rejection stays with the acoustic gates
+    // (`MIN_SPEECH_FRAMES`, density, `min_rms`) plus the transcript gates
+    // (confidence, hallucination, repetition).
+    params.set_temperature_inc(temperature_inc);
+    params.set_entropy_thold(entropy_thold);
+    params.set_logprob_thold(logprob_thold);
     // No `set_no_speech_thold` call: whisper.cpp declares the field but the
     // decoder never reads it (`whisper.h`: `float no_speech_thold; // TODO:
     // not implemented`) — setting it is a no-op, not a safety net.
@@ -999,8 +1102,9 @@ fn transcribe(
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG,
-        DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_TARGET_RMS, DEFAULT_THREADS,
+        DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_LOGPROB_THOLD, DEFAULT_MIN_CONFIDENCE,
+        DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS,
+        DEFAULT_TARGET_RMS, DEFAULT_TEMPERATURE, DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS,
         DEFAULT_USE_GPU, MAX_GAIN, MIN_SPEECH_FRAMES, WHISPER_MIN_SAMPLES,
     };
     use crate::gate::{is_hallucination, is_repetition, EvidenceStrength, GateConfig};
@@ -1102,6 +1206,40 @@ mod tests {
         assert!(tail.is_empty());
         push_prompt_context(&mut tail, "   ", 150);
         assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn prompt_context_snaps_to_sentence_boundary() {
+        // Cut mid-sentence advances past the next stop: no headless
+        // fragment stays as decoder prior.
+        let mut tail = String::new();
+        push_prompt_context(
+            &mut tail,
+            "Pierwsze zdanie. Drugie zdanie. Trzecie zdanie.",
+            20,
+        );
+        assert_eq!(tail, "Trzecie zdanie.", "tail={tail:?}");
+
+        // Question/exclamation stops count too.
+        let mut tail = String::new();
+        push_prompt_context(&mut tail, "Co słychać? Dobrze słychać! Dalej raz.", 22);
+        assert_eq!(tail, "Dalej raz.", "tail={tail:?}");
+
+        // No stop ahead: falls back to the next word boundary, never
+        // mid-word.
+        let mut tail = String::new();
+        push_prompt_context(&mut tail, "aaabbb ccc ddd", 9);
+        assert_eq!(tail, "ccc ddd", "tail={tail:?}");
+
+        // Cut already at a word start without a stop ahead stays put.
+        let mut tail = String::new();
+        push_prompt_context(&mut tail, "aaa bbb ccc", 7);
+        assert_eq!(tail, "bbb ccc", "tail={tail:?}");
+
+        // Fits without truncation: untouched, even mid-sentence.
+        let mut tail = String::new();
+        push_prompt_context(&mut tail, "Niepełne zdanie bez kropki", 150);
+        assert_eq!(tail, "Niepełne zdanie bez kropki");
     }
 
     #[test]
@@ -1272,9 +1410,7 @@ mod tests {
         // most of it: the speech estimate for gain must shrink accordingly,
         // otherwise quiet hum would steal gain meant for speech.
         let hum_dc: Vec<f32> = (0..16_000)
-            .map(|i| {
-                0.1 + (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2
-            })
+            .map(|i| 0.1 + (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
             .collect();
         let conditioned = condition_utterance(&hum_dc);
         let speech_rms = 0.15;
@@ -1312,7 +1448,10 @@ mod tests {
             conditioned_speech_rms(&vec![0.0; 160], &vec![0.0; 160], 0.01),
             0.01
         );
-        assert_eq!(conditioned_speech_rms(&vec![0.1; 160], &vec![0.1; 160], 0.0), 0.0);
+        assert_eq!(
+            conditioned_speech_rms(&vec![0.1; 160], &vec![0.1; 160], 0.0),
+            0.0
+        );
     }
 
     #[test]
@@ -1417,18 +1556,8 @@ mod tests {
             Duration::from_secs(180)
         ));
         // Zero timeout with auto-unload enabled unloads immediately on pause.
-        assert!(should_unload(
-            true,
-            true,
-            Duration::ZERO,
-            Duration::ZERO
-        ));
-        assert!(!should_unload(
-            true,
-            false,
-            Duration::ZERO,
-            Duration::ZERO
-        ));
+        assert!(should_unload(true, true, Duration::ZERO, Duration::ZERO));
+        assert!(!should_unload(true, false, Duration::ZERO, Duration::ZERO));
     }
 
     #[test]
@@ -1456,6 +1585,10 @@ mod tests {
     #[test]
     fn inference_defaults_match_compiled_constants() {
         assert_eq!(DEFAULT_BEAM_SIZE, 5);
+        assert_eq!(DEFAULT_TEMPERATURE, 0.0);
+        assert_eq!(DEFAULT_TEMPERATURE_INC, 0.2);
+        assert_eq!(DEFAULT_ENTROPY_THOLD, 2.4);
+        assert_eq!(DEFAULT_LOGPROB_THOLD, -1.0);
         assert_eq!(DEFAULT_THREADS, 8);
         assert!(DEFAULT_USE_GPU);
     }
@@ -1479,6 +1612,10 @@ mod tests {
             target_rms: DEFAULT_TARGET_RMS,
             debug_tokens: false,
             beam_size: DEFAULT_BEAM_SIZE,
+            temperature: DEFAULT_TEMPERATURE,
+            temperature_inc: DEFAULT_TEMPERATURE_INC,
+            entropy_thold: DEFAULT_ENTROPY_THOLD,
+            logprob_thold: DEFAULT_LOGPROB_THOLD,
             n_threads: DEFAULT_THREADS,
             use_gpu: false,
             shed_stale: false,

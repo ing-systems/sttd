@@ -3,11 +3,14 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::config::{
-    parse_beam_size, parse_bool, parse_context_chars, parse_hangover_ms, parse_threads,
-    DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_BEAM_SIZE, DEFAULT_HANGOVER_MS,
-    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS,
-    DEFAULT_TARGET_RMS, DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
+    parse_beam_size, parse_bool, parse_context_chars, parse_entropy_thold, parse_hangover_ms,
+    parse_logprob_thold, parse_temperature, parse_temperature_inc, parse_threads,
+    DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD,
+    DEFAULT_HANGOVER_MS, DEFAULT_LOGPROB_THOLD, DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC,
+    DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TARGET_RMS, DEFAULT_TEMPERATURE,
+    DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT,
+    DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
@@ -99,6 +102,23 @@ pub(crate) struct Cli {
     /// Beam width of whisper's beam-search decoder (`1` = greedy).
     #[arg(long, env = "STTD_BEAM_SIZE", default_value_t = DEFAULT_BEAM_SIZE, value_parser = parse_beam_size, value_name = "N", help_heading = "Model")]
     pub(crate) beam_size: i32,
+
+    /// Initial decoding temperature (`0.0` = greedy, deterministic).
+    #[arg(long, env = "STTD_TEMPERATURE", default_value_t = DEFAULT_TEMPERATURE, value_parser = parse_temperature, value_name = "T", help_heading = "Model")]
+    pub(crate) temperature: f32,
+
+    /// Temperature increment for the fallback ladder (`0.0` = single-temp,
+    /// no re-tries; `0.2` = the historical `[temp, .., 1.0]` ladder).
+    #[arg(long, env = "STTD_TEMPERATURE_INC", default_value_t = DEFAULT_TEMPERATURE_INC, value_parser = parse_temperature_inc, value_name = "DT", help_heading = "Model")]
+    pub(crate) temperature_inc: f32,
+
+    /// Entropy threshold for the fallback ladder (higher = fewer re-tries).
+    #[arg(long, env = "STTD_ENTROPY_THOLD", default_value_t = DEFAULT_ENTROPY_THOLD, value_parser = parse_entropy_thold, value_name = "E", help_heading = "Model")]
+    pub(crate) entropy_thold: f32,
+
+    /// Logprob threshold for the fallback ladder (more negative = fewer re-tries).
+    #[arg(long, env = "STTD_LOGPROB_THOLD", default_value_t = DEFAULT_LOGPROB_THOLD, value_parser = parse_logprob_thold, value_name = "LP", help_heading = "Model", allow_negative_numbers = true)]
+    pub(crate) logprob_thold: f32,
 
     /// Decoder thread count; `0` = auto (`available_parallelism`).
     #[arg(long, env = "STTD_THREADS", default_value_t = DEFAULT_THREADS, value_parser = parse_threads, value_name = "N", help_heading = "Model")]
@@ -403,6 +423,10 @@ mod tests {
         assert_eq!(cli.channel, ChannelSel::Mix);
         assert_eq!(cli.language, crate::whisper::Language::Auto);
         assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
+        assert_eq!(cli.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(cli.temperature_inc, DEFAULT_TEMPERATURE_INC);
+        assert_eq!(cli.entropy_thold, DEFAULT_ENTROPY_THOLD);
+        assert_eq!(cli.logprob_thold, DEFAULT_LOGPROB_THOLD);
         assert_eq!(cli.threads, DEFAULT_THREADS);
         assert_eq!(cli.gpu, DEFAULT_USE_GPU);
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
@@ -493,6 +517,32 @@ mod tests {
         assert_eq!(cli.beam_size, 3);
         assert_eq!(cli.threads, 0);
         assert!(!cli.gpu);
+    }
+
+    #[test]
+    fn cli_decoder_tunables_override_and_reject() {
+        let cli = Cli::try_parse_from([
+            "sttd",
+            "--temperature",
+            "0.2",
+            "--temperature-inc",
+            "0.0",
+            "--entropy-thold",
+            "3.0",
+            "--logprob-thold",
+            "-0.5",
+        ])
+        .expect("decoder tunables must parse");
+        assert!((cli.temperature - 0.2).abs() < 1e-6);
+        assert!((cli.temperature_inc - 0.0).abs() < 1e-6);
+        assert!((cli.entropy_thold - 3.0).abs() < 1e-6);
+        assert!((cli.logprob_thold + 0.5).abs() < 1e-6);
+        assert!(Cli::try_parse_from(["sttd", "--temperature", "2.1"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--temperature", "-0.1"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--temperature-inc", "1.1"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--entropy-thold", "-1.0"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--logprob-thold", "0.1"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--logprob-thold", "-10.1"]).is_err());
     }
 
     #[cfg(not(feature = "denoise"))]

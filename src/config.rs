@@ -205,6 +205,29 @@ pub(crate) const DEFAULT_AUTO_UNLOAD_AFTER_SECS: u64 = 180;
 /// returns). Default 5 (whisper.cpp default). Override with
 /// `STTD_BEAM_SIZE`.
 pub(crate) const DEFAULT_BEAM_SIZE: i32 = 5;
+/// Initial decoding temperature (`set_temperature`). `0.0` is greedy
+/// (deterministic, fastest); higher samples more diversely. Default 0.0
+/// (whisper.cpp default). Override with `STTD_TEMPERATURE`.
+pub(crate) const DEFAULT_TEMPERATURE: f32 = 0.0;
+/// Temperature increment for whisper.cpp's fallback ladder
+/// (`set_temperature_inc`): on `entropy/logprob` fallback the decoder
+/// re-tries at `temperature + temperature_inc`, `+ 2*inc`, ... up to 1.0.
+/// `0.0` disables the ladder (single-temp decode). Default 0.2, i.e. the
+/// historical `[0.0, 0.2, .., 1.0]` ladder. Override with
+/// `STTD_TEMPERATURE_INC`.
+pub(crate) const DEFAULT_TEMPERATURE_INC: f32 = 0.2;
+/// Entropy threshold for the fallback ladder (`set_entropy_thold`,
+/// whisper.cpp default 2.4): a decode with entropy above this re-tries at
+/// the next ladder temperature. Higher = fewer re-tries (faster, stickier);
+/// lower = more re-tries (slower, rescues repetition loops). Override with
+/// `STTD_ENTROPY_THOLD`.
+pub(crate) const DEFAULT_ENTROPY_THOLD: f32 = 2.4;
+/// Log-probability threshold for the fallback ladder (`set_logprob_thold`,
+/// whisper.cpp default -1.0): a decode with average logprob below this
+/// re-tries at the next ladder temperature. Less negative (e.g. -0.5) =
+/// more re-tries; `-10.0` effectively disables the logprob arm. Override
+/// with `STTD_LOGPROB_THOLD`.
+pub(crate) const DEFAULT_LOGPROB_THOLD: f32 = -1.0;
 /// Decoder thread count (`set_n_threads`). Default 8 (historical value);
 /// `0` means auto = `available_parallelism` at startup. Override with
 /// `STTD_THREADS`.
@@ -355,6 +378,59 @@ pub(crate) fn parse_beam_size(s: &str) -> Result<i32, String> {
     }
 }
 
+/// Parse `--temperature`/`STTD_TEMPERATURE`: 0.0..=2.0 (`0.0` = greedy).
+pub(crate) fn parse_temperature(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number 0.0..=2.0, got {s:?}"))?;
+    if (0.0..=2.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("expected a number 0.0..=2.0, got {s:?}"))
+    }
+}
+
+/// Parse `--temperature-inc`/`STTD_TEMPERATURE_INC`: 0.0..=1.0
+/// (`0.0` = single-temp decode, no fallback ladder).
+pub(crate) fn parse_temperature_inc(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number 0.0..=1.0, got {s:?}"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("expected a number 0.0..=1.0, got {s:?}"))
+    }
+}
+
+/// Parse `--entropy-thold`/`STTD_ENTROPY_THOLD`: 0.0..=10.0.
+pub(crate) fn parse_entropy_thold(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number 0.0..=10.0, got {s:?}"))?;
+    if (0.0..=10.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("expected a number 0.0..=10.0, got {s:?}"))
+    }
+}
+
+/// Parse `--logprob-thold`/`STTD_LOGPROB_THOLD`: -10.0..=0.0.
+pub(crate) fn parse_logprob_thold(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number -10.0..=0.0, got {s:?}"))?;
+    if (-10.0..=0.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("expected a number -10.0..=0.0, got {s:?}"))
+    }
+}
+
 /// Parse `--threads`/`STTD_THREADS`: must be >= 0, where `0` means auto
 /// (`available_parallelism` at startup).
 pub(crate) fn parse_threads(s: &str) -> Result<i32, String> {
@@ -447,6 +523,32 @@ mod tests {
         assert_eq!(DEFAULT_BEAM_SIZE, 5);
         assert_eq!(DEFAULT_THREADS, 8);
         assert!(DEFAULT_USE_GPU);
+    }
+
+    #[test]
+    fn parse_decoder_tunables_validate_range() {
+        assert_eq!(parse_temperature("0.0"), Ok(0.0));
+        assert_eq!(parse_temperature("0.2"), Ok(0.2));
+        assert_eq!(parse_temperature("2.0"), Ok(2.0));
+        assert!(parse_temperature("-0.1").is_err());
+        assert!(parse_temperature("2.1").is_err());
+        assert!(parse_temperature("bogus").is_err());
+        assert_eq!(parse_temperature_inc("0.0"), Ok(0.0));
+        assert_eq!(parse_temperature_inc("0.2"), Ok(0.2));
+        assert!(parse_temperature_inc("-0.1").is_err());
+        assert!(parse_temperature_inc("1.1").is_err());
+        assert_eq!(parse_entropy_thold("2.4"), Ok(2.4));
+        assert!(parse_entropy_thold("-0.1").is_err());
+        assert!(parse_entropy_thold("10.1").is_err());
+        assert_eq!(parse_logprob_thold("-1.0"), Ok(-1.0));
+        assert!(parse_logprob_thold("0.1").is_err());
+        assert!(parse_logprob_thold("-10.1").is_err());
+        assert!(parse_logprob_thold("bogus").is_err());
+        // Defaults preserve the historical hardcoded ladder.
+        assert_eq!(DEFAULT_TEMPERATURE, 0.0);
+        assert_eq!(DEFAULT_TEMPERATURE_INC, 0.2);
+        assert_eq!(DEFAULT_ENTROPY_THOLD, 2.4);
+        assert_eq!(DEFAULT_LOGPROB_THOLD, -1.0);
     }
 
     #[test]
