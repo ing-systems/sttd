@@ -201,9 +201,9 @@ pub(crate) struct Cli {
     /// Canary source/target language and sherpa-whisper language (ISO code,
     /// `pl` = Polish): Canary transcription keeps src == tgt, sherpa-whisper
     /// forces that language. Parakeet-TDT auto-detects per utterance and ignores
-    /// this. Applies to user-supplied Canary dirs; no Canary catalog model
-    /// ships yet (see `SherpaKind`). Sherpa-only (requires the `sherpa` Cargo
-    /// feature).
+    /// this. Note: Canary langs outside en/de/es/fr (e.g. `pl`) need a native
+    /// lib newer than sherpa-onnx 1.13.8 (see `SherpaKind`). Sherpa-only
+    /// (requires the `sherpa` Cargo feature).
     #[cfg(feature = "sherpa")]
     #[arg(long, env = "STTD_SHERPA_LANG", default_value = DEFAULT_SHERPA_LANG, help_heading = "Model")]
     pub(crate) sherpa_lang: String,

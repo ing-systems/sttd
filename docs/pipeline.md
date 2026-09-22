@@ -78,8 +78,10 @@ Three engine families exist, picked once at startup by `--model`/`STTD_MODEL` an
 for the process's lifetime: whisper.cpp (`src/whisper.rs`, optional), NVIDIA
 Parakeet-TDT-0.6B-v3 via `parakeet-rs` (`src/parakeet.rs`, default), and sherpa-onnx
 (`src/sherpa.rs`, only with the `sherpa` Cargo feature: offline Nemo-transducer
-`sherpa-parakeet-tdt-0.6b-v3-int8`; Canary wiring exists but ships no catalog
-model — sherpa-onnx 1.13.8 hardcodes Canary langs to en/de/es/fr, see `SherpaKind`).
+`sherpa-parakeet-tdt-0.6b-v3-int8`, sherpa-whisper
+`sherpa-whisper-large-v3-turbo-int8`, Canary-1B-v2
+`sherpa-canary-1b-v2-int8` — Polish Canary needs a native lib newer than
+sherpa-onnx 1.13.8, see `SherpaKind`).
 The first two plus sherpa-offline implement `asr::SpeechModel` (`src/asr.rs:48`);
 everything engine-agnostic — the worker loop, gates, metrics, prompt-context
 tail, audio conditioning — lives in `src/asr.rs` and never branches on which
@@ -171,8 +173,12 @@ engine is loaded.
   (int8 Parakeet-TDT-v3 via parakeet-rs, 2-spec `PARAKEET_CATALOG` with an
   `fp32` sibling); whisper's 21-spec catalog is `MODEL_CATALOG` in
   `src/config.rs:288` (only with the `whisper` Cargo feature); sherpa's
-  catalog (`sherpa-parakeet-tdt-0.6b-v3-int8`, plus the `sherpa-parakeet`
-  alias) is `SHERPA_CATALOG` (only with the `sherpa` Cargo feature).
+  catalog (`sherpa-parakeet-tdt-0.6b-v3-int8`, `sherpa-whisper-large-v3-turbo-int8`
+  and `sherpa-canary-1b-v2-int8`, plus the `sherpa-parakeet` / `sherpa-whisper`
+  / `sherpa-canary` aliases) is `SHERPA_CATALOG` (only with the `sherpa` Cargo
+  feature). Canary-1B-v2 is the community Sarphix int8 export of
+  `nvidia/canary-1b-v2` (25 languages incl. Polish); Polish decode needs a
+  native lib newer than sherpa-onnx 1.13.8 (see `SherpaKind`).
 
 ## 7. Emission
 

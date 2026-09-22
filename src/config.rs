@@ -360,7 +360,7 @@ pub(crate) fn valid_model_specs() -> String {
             .chain(PARAKEET_CATALOG.iter().map(|(s, ..)| *s))
             .chain(std::iter::once("parakeet"))
             .chain(SHERPA_CATALOG.iter().map(|(s, ..)| *s))
-            .chain([SHERPA_PARAKEET_ALIAS, SHERPA_WHISPER_ALIAS])
+            .chain([SHERPA_PARAKEET_ALIAS, SHERPA_WHISPER_ALIAS, SHERPA_CANARY_ALIAS])
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -371,7 +371,7 @@ pub(crate) fn valid_model_specs() -> String {
             .map(|(s, ..)| *s)
             .chain(std::iter::once("parakeet"))
             .chain(SHERPA_CATALOG.iter().map(|(s, ..)| *s))
-            .chain([SHERPA_PARAKEET_ALIAS, SHERPA_WHISPER_ALIAS])
+            .chain([SHERPA_PARAKEET_ALIAS, SHERPA_WHISPER_ALIAS, SHERPA_CANARY_ALIAS])
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -438,13 +438,15 @@ pub(crate) fn parakeet_entry_for_spec(
 /// `sherpa::build_offline_recognizer`) vs Whisper (encoder/decoder +
 /// language/task, `model_type` left empty — sherpa dispatches on the filled
 /// sub-config, see its `large-v3.html` CLI dump, `model_type=""`).
-/// Canary has no catalog entry yet:
-/// sherpa-onnx 1.13.8 hardcodes Canary langs to en/de/es/fr
-/// (`offline-canary-model-config.cc:Validate`), so Canary-1B-v2 can't serve
-/// Polish until a released crate carries upstream's relaxed validation (any
-/// 2-letter code from `tokens.txt`, already on master) — the wiring stays
-/// for user-supplied dirs and that day. Sherpa-only (see the `sherpa` Cargo
-/// feature).
+/// Canary has a catalog entry (`sherpa-canary-1b-v2-int8`, community
+/// `Sarphix` int8 export of `nvidia/canary-1b-v2`, CC-BY-4.0), but Polish
+/// decode needs a native lib newer than 1.13.8: sherpa-onnx 1.13.8 hardcodes
+/// Canary langs to en/de/es/fr (`offline-canary-model-config.cc:Validate`),
+/// and only upstream PR #3962 (2026-09-20, after the v1.13.8 tag — no
+/// crates.io release carries it yet) derives lang2id from the model vocab.
+/// Until the `sherpa-onnx` crate is bumped past that fix, `pl` fails inside
+/// the native lib while en/de/es/fr load; the wiring stays so Polish lights
+/// up with the bump. Sherpa-only (see the `sherpa` Cargo feature).
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SherpaKind {
@@ -486,9 +488,10 @@ pub(crate) const SHERPA_VAD_FILE: &str = "silero_vad.onnx";
 
 /// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
 /// Parakeet-v3 int8 (~640 MiB, same weights as the `parakeet-rs` default in
-/// sherpa's container layout) plus Whisper-large-v3-turbo int8 (~990 MiB).
-/// Canary-1B-v2 int8 (~1.4 GiB) is deliberately
-/// absent — see `SherpaKind`. Sherpa-only (see the `sherpa` Cargo feature).
+/// sherpa's container layout), Whisper-large-v3-turbo int8 (~990 MiB), and
+/// Canary-1B-v2 int8 (~1.4 GiB, community `Sarphix` export of
+/// `nvidia/canary-1b-v2` — Polish needs a native lib newer than 1.13.8, see
+/// `SherpaKind`). Sherpa-only (see the `sherpa` Cargo feature).
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
 pub(crate) const SHERPA_CATALOG: &[(&str, &str, &[&str], &str, SherpaKind)] = &[
     (
@@ -514,6 +517,13 @@ pub(crate) const SHERPA_CATALOG: &[(&str, &str, &[&str], &str, SherpaKind)] = &[
         "990 MiB",
         SherpaKind::Whisper,
     ),
+    (
+        "sherpa-canary-1b-v2-int8",
+        "sherpa-canary-1b-v2-int8",
+        &["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"],
+        "1.4 GiB",
+        SherpaKind::Canary,
+    ),
 ];
 
 /// Short alias resolving to the Parakeet int8 default above.
@@ -523,6 +533,10 @@ pub(crate) const SHERPA_PARAKEET_ALIAS: &str = "sherpa-parakeet";
 /// Short alias resolving to the Whisper-large-v3-turbo int8 default above.
 #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
 pub(crate) const SHERPA_WHISPER_ALIAS: &str = "sherpa-whisper";
+
+/// Short alias resolving to the Canary-1B-v2 int8 default above.
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_CANARY_ALIAS: &str = "sherpa-canary";
 
 /// Look up a `SHERPA_CATALOG` entry by spec, accepting the short aliases.
 /// Sherpa-only (see the `sherpa` Cargo feature).
@@ -535,6 +549,8 @@ pub(crate) fn sherpa_entry_for_spec(
         "sherpa-parakeet-tdt-0.6b-v3-int8"
     } else if spec == SHERPA_WHISPER_ALIAS {
         "sherpa-whisper-large-v3-turbo-int8"
+    } else if spec == SHERPA_CANARY_ALIAS {
+        "sherpa-canary-1b-v2-int8"
     } else {
         spec
     };
@@ -1064,7 +1080,7 @@ mod tests {
 
     #[test]
     fn sherpa_catalog_entries_are_self_consistent() {
-        assert_eq!(SHERPA_CATALOG.len(), 2);
+        assert_eq!(SHERPA_CATALOG.len(), 3);
         for (spec, dir, files, _size, _kind) in SHERPA_CATALOG {
             assert_eq!(*dir, *spec, "dir must equal spec for {spec}");
             assert!(!files.is_empty(), "{spec} must list at least one file");
@@ -1074,9 +1090,8 @@ mod tests {
             );
             assert_eq!(sherpa_entry_for_spec(spec).map(|e| e.0), Some(*spec));
         }
-        // Transducer ships a joiner (Canary wiring stays for user-supplied
-        // dirs and the day upstream relaxes its lang validation — see
-        // `SherpaKind`).
+        // Transducer ships a joiner; Canary ships encoder/decoder only (no
+        // joiner — attention encoder-decoder, see the `Sarphix` conversion).
         let transducer = sherpa_entry_for_spec("sherpa-parakeet-tdt-0.6b-v3-int8").unwrap();
         assert!(transducer.2.contains(&"joiner.int8.onnx"));
         assert_eq!(transducer.4, SherpaKind::NemoTransducer);
@@ -1086,6 +1101,14 @@ mod tests {
         assert!(whisper.2.contains(&"turbo-decoder.int8.onnx"));
         assert!(whisper.2.contains(&"turbo-tokens.txt"));
         assert_eq!(whisper.4, SherpaKind::Whisper);
+        // Canary-1B-v2 ships plain encoder/decoder + tokens (same layout as
+        // the official 180m-flash release).
+        let canary = sherpa_entry_for_spec("sherpa-canary-1b-v2-int8").unwrap();
+        assert!(canary.2.contains(&"encoder.int8.onnx"));
+        assert!(canary.2.contains(&"decoder.int8.onnx"));
+        assert!(canary.2.contains(&"tokens.txt"));
+        assert!(!canary.2.iter().any(|f| f.contains("joiner")));
+        assert_eq!(canary.4, SherpaKind::Canary);
     }
 
     #[test]
@@ -1098,8 +1121,11 @@ mod tests {
             sherpa_entry_for_spec("sherpa-whisper").map(|e| e.0),
             Some("sherpa-whisper-large-v3-turbo-int8")
         );
+        assert_eq!(
+            sherpa_entry_for_spec("sherpa-canary").map(|e| e.0),
+            Some("sherpa-canary-1b-v2-int8")
+        );
         assert!(sherpa_entry_for_spec("sherpa-bogus").is_none());
-        assert!(sherpa_entry_for_spec("sherpa-canary").is_none());
         assert_eq!(DEFAULT_SHERPA_LANG, "pl");
     }
 

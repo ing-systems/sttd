@@ -1,9 +1,9 @@
 // ---------------------------------------------------------------------------
-// Sherpa-onnx engine family: offline Nemo-transducer / Whisper behind
-// `asr::SpeechModel` (plus Canary wiring for user-supplied dirs — no
-// catalog model until sherpa relaxes its Canary lang validation, see
-// `SherpaKind`), plus VAD-driven simulated streaming where sherpa's
-// Silero VAD owns the cuts.
+// Sherpa-onnx engine family: offline Nemo-transducer / Canary / Whisper behind
+// `asr::SpeechModel` (Canary serves `sherpa-canary-1b-v2-int8`, the community
+// Sarphix int8 export of `nvidia/canary-1b-v2`; Polish needs a native lib
+// newer than 1.13.8, see `SherpaKind`), plus VAD-driven simulated streaming
+// where sherpa's Silero VAD owns the cuts.
 // ---------------------------------------------------------------------------
 //
 // Two modes share the weights (`weights::ModelRef::Sherpa`) but not the
@@ -124,7 +124,22 @@ impl SherpaOfflineModel {
                     opts.model_spec, opts.sherpa_lang, opts.n_threads,
                 ),
             }),
-            Err(e) => anyhow::bail!("failed to load sherpa model: {e:#}"),
+            Err(e) => {
+                // Canary-1B-v2 covers 25 languages, but the 1.13.8 native lib
+                // rejects anything outside en/de/es/fr in `Validate()` — Polish
+                // needs upstream PR #3962 (no crates.io release carries it yet).
+                // Surface the native version so the failure is actionable.
+                if kind == SherpaKind::Canary {
+                    anyhow::bail!(
+                        "failed to load sherpa model (native v{}): {e:#} \
+                         (Canary note: sherpa-onnx <= 1.13.8 only accepts \
+                         en/de/es/fr; '{}' needs a newer native lib)",
+                        sherpa_onnx::version(),
+                        opts.sherpa_lang,
+                    )
+                }
+                anyhow::bail!("failed to load sherpa model: {e:#}")
+            }
         }
     }
 

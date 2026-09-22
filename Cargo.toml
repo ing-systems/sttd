@@ -57,12 +57,12 @@ whisper = ["dep:whisper-rs"]
 # stays the safe default and the loader falls back to it if CUDA fails.
 parakeet-cuda = ["parakeet-rs/cuda"]
 # Sherpa-onnx engine family (see src/sherpa.rs): offline Nemo-transducer
-# (Parakeet-TDT-v3) plus VAD-driven simulated streaming where sherpa's
+# (Parakeet-TDT-v3), Canary-1B-v2 (Sarphix int8 export of nvidia/canary-1b-v2,
+# `sherpa-canary-1b-v2-int8` — Polish needs a native lib newer than 1.13.8,
+# see `SherpaKind`) plus VAD-driven simulated streaming where sherpa's
 # Silero VAD owns the cuts. Off by default: pulls the prebuilt sherpa-onnx
-# native lib at compile time and ~640 MiB of weights at first run. Coexists
-# with `parakeet-rs` (untouched default). (Canary wiring exists in code but
-# ships no catalog model — sherpa-onnx 1.13.8 hardcodes Canary langs to
-# en/de/es/fr; see `SherpaKind`.)
+# native lib at compile time and ~640 MiB–1.4 GiB of weights at first run.
+# Coexists with `parakeet-rs` (untouched default).
 sherpa = ["dep:sherpa-onnx"]
 
 [profile.release]

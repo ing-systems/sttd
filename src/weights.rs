@@ -657,6 +657,13 @@ mod tests {
                 "turbo-tokens.txt",
             ),
             ("sherpa-whisper", "models/sherpa-whisper-large-v3-turbo-int8", SherpaKind::Whisper, "turbo-tokens.txt"),
+            (
+                "sherpa-canary-1b-v2-int8",
+                "models/sherpa-canary-1b-v2-int8",
+                SherpaKind::Canary,
+                "tokens.txt",
+            ),
+            ("sherpa-canary", "models/sherpa-canary-1b-v2-int8", SherpaKind::Canary, "tokens.txt"),
         ] {
             let resolved = resolve_model(spec).expect("sherpa spec must resolve");
             let ModelRef::Sherpa {
@@ -671,10 +678,9 @@ mod tests {
             assert_eq!(got_kind, kind);
             assert!(assets.contains(&tokens), "spec={spec} assets={assets:?}");
         }
-        // Canary-1B-v2 has no catalog entry (see `SherpaKind`): fails fast
-        // before any download, instead of dying in sherpa's lang validation.
-        for spec in ["sherpa-canary-1b-v2-int8", "sherpa-canary"] {
-            resolve_model(spec).expect_err("canary spec must reject for now");
+        // Unknown sherpa specs still fail fast before any download.
+        for spec in ["sherpa-bogus", "sherpa-canary-bogus"] {
+            resolve_model(spec).expect_err("unknown sherpa spec must reject");
         }
     }
 
