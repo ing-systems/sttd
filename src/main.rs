@@ -1,7 +1,8 @@
 //! Real-time Speech-to-Text pipeline.
 //!
 //! Data flow:
-//! `cpal` (hw rate, stereo) -> downmix mono -> per ~10 ms raw chunk
+//! `cpal` (hw rate, N channels) -> channel pick (`--channel`) or mix to mono
+//! -> per ~10 ms raw chunk
 //! (`FrameProcessor`: `ResamplerFft` behind a 10 ms framing adapter, see
 //! `FftStream`). By default (`--denoiser none`) a single `resampler`
 //! hop (-> 16 kHz) feeds both branches below, each completed frame serving
@@ -15,13 +16,16 @@
 //! frames (a single VAD false positive no longer opens one), with ~300 ms of
 //! pre-roll prepended at that point so quiet word starts aren't clipped.
 //! Once open, every frame is appended regardless of the VAD verdict (speech
-//! or not) until `SILENCE_FRAMES_THRESHOLD` closes it — but only
+//! or not) until the `--hangover-ms` silence hangover closes it — but only
 //! `MIN_SPEECH_FRAMES` worth of actual VAD-flagged speech at a `MIN_DENSITY`
 //! share of the transmitted frames (long utterances exempt), trimmed to
 //! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper,
 //! carried alongside its acoustic evidence (speech-frame count, density, RMS) as an
-//! `Utterance` -> `crossbeam-channel` queue -> isolated `whisper-rs` inference
-//! thread (GPU/CPU and model per flags): conditioning (`condition_utterance`:
+//! `Utterance` -> `crossbeam-channel` queue (raw audio bounded with counted
+//! sheds; utterances shed oldest-first past `WHISPER_SHED_KEEP`) -> isolated
+//! `whisper-rs` inference
+//! thread (GPU/CPU and model per flags, aborted promptly on shutdown):
+//! conditioning (`condition_utterance`:
 //! DC removal, 60 Hz high-pass, 5 ms fades, peak safety) -> pre-inference
 //! gain toward `--target-rms`
 //! (`apply_gain`, quiet-but-real speech only, never attenuates) -> average
@@ -29,7 +33,10 @@
 //! timestamp tokens every whisper.cpp segment carries; whisper.cpp's own
 //! `no_speech_thold` being a no-op) at a floor `confidence_floor` relaxes when
 //! the acoustic evidence already vouches for real speech ->
-//! known-hallucination-boilerplate filter (`is_hallucination`).
+//! known-hallucination-boilerplate filter (`is_hallucination`, exact plus
+//! fuzzy for long patterns) -> repetition-loop filter (`is_repetition`,
+//! unique-ratio plus bigram loops). A device disconnect rebuilds the input
+//! path instead of capturing deaf.
 //!
 //! `sttd --file <wav>` runs the same pipeline offline against a WAV file
 //! instead of the microphone, for comparing tuning changes against a fixed
@@ -58,7 +65,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, StreamTrait};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use signal_hook::consts::{SIGHUP, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::iterator::Signals;
 
@@ -221,6 +228,11 @@ fn format_available_models(selected: Option<&str>, installed: &[bool]) -> String
 // Microphone mode
 // ---------------------------------------------------------------------------
 
+/// Raw 10 ms chunks the callback may backlog: 256 ≈ 2.5 s. Past that the
+/// callback drops (counted) instead of growing memory without bound while
+/// the model loads or the GPU lags.
+pub(crate) const RAW_QUEUE_BOUND: usize = 256;
+
 fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // Cheap, fallible audio setup first (device pick, hw config) — *before*
     // the heavy model resolve/download and GPU load. Spawning the whisper
@@ -228,63 +240,38 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // this setup then failed via `?`, the process would tear down mid-init
     // and race whisper.cpp's CUDA cleanup (observed: "CUDA error: driver
     // shutting down" abort on e.g. a mistyped --device). Resolving (and
-    // downloading, ~800 MiB, minutes) before `play()` also keeps `raw_rx`
-    // from growing unbounded while the main loop hasn't started draining
+    // downloading, ~800 MiB, minutes) before `play()` also keeps the bounded
+    // `raw_rx` from shedding while the main loop hasn't started draining
     // yet. GPU load itself still happens in the background after capture
-    // starts, so audio queues only briefly in `raw_rx` while it loads.
+    // starts, so only the first ~2.5 s of audio is retained while it loads
+    // (the default `--start-paused` discards even that).
     let host = cpal::default_host();
-    let device = select_input_device(&host, cli.device.as_deref())?;
-    log::info!(
-        "input device: {}",
-        device.name().unwrap_or_else(|_| "<unknown>".into())
-    );
-
-    let supported = device
-        .default_input_config()
-        .context("failed to query default input config")?;
-    let hw_rate = supported.sample_rate().0;
-    let channels = supported.channels() as usize;
-    let sample_format = supported.sample_format();
-    let stream_config: cpal::StreamConfig = supported.into();
-    log::info!(
-        "hw config: {} Hz, {} ch, {:?}",
-        hw_rate,
-        channels,
-        sample_format
-    );
 
     // Heavy but pre-capture: resolve/download the model before the stream
     // starts so the callback can't outrun the drain loop.
     let model_path = resolve_model_input(cli)?;
     log::info!("model: {}", model_path.display());
 
+    // Raw mono captures (hw rate, f32 in [-1, 1]) from the cpal callback.
+    // Bounded + `try_send` (never blocks) keeps callback lock time minimal;
+    // overflow sheds (counted) instead of growing memory without bound.
+    let (raw_tx, raw_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(RAW_QUEUE_BOUND);
+    // Utterances queue unbounded (each is seconds of audio; MBs at most) and
+    // the whisper worker sheds oldest-first past `WHISPER_SHED_KEEP` so live
+    // speech stays fresh instead of lagging minutes behind.
+    let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
+    let telemetry = StreamTelemetry::default();
+
+    // First open fails fast (bad --device/--channel), like before; later
+    // disconnects rebuild inside the loop (see `device_gone`).
+    let (mut hw_rate, mut stream, mut fp) =
+        open_input_path(&host, cli, raw_tx.clone(), whisper_tx.clone(), &telemetry)?;
+    let mut input_frames = fp.required_input_frames();
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
-    // Raw mono captures (hw rate, f32 in [-1, 1]) from the cpal callback.
-    // Unbounded + `send` (never blocks) keeps callback lock time minimal.
-    let (raw_tx, raw_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = unbounded();
-
-    // `FrameProcessor` owns all resampling (a shared hw -> 16k hop by
-    // default, or hw -> 48k -> denoise -> 48k -> 16k for the VAD branch plus
-    // hw -> 16k for whisper with `--denoiser deepfilter`); building it is
-    // fallible setup like everything above (including DeepFilter init), so
-    // it happens here too — before capture starts.
-    let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
-    let mut fp = FrameProcessor::new(
-        hw_rate,
-        whisper_tx,
-        cli.denoiser,
-        cli.vad_threshold,
-        cli.vad_adapt,
-        gate_config(cli),
-    )?;
-    let input_frames = fp.required_input_frames();
-
-    // ---- build + start the cpal input stream (callback does NOT unwrap) ---
+    // ---- capture is running (callback does NOT unwrap) ----------------------
     let running = Arc::new(AtomicBool::new(true));
     let paused = Arc::new(AtomicBool::new(cli.start_paused));
-    let stream = build_input_stream(&device, &stream_config, channels, sample_format, raw_tx)?;
-    stream.play().context("failed to start input stream")?;
     if cli.start_paused {
         log::info!("starting paused (SIGUSR2/SIGHUP to resume)");
     } else {
@@ -314,14 +301,15 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     }
 
     // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
-    // Capture is already running above and the drain loop below keeps
-    // `raw_rx` bounded while it loads.
+    // Capture is already running above and the drain loop below sheds (counted)
+    // while it loads.
     let (whisper_handle, whisper_ready) = spawn_whisper_worker(
         whisper_rx,
         model_path,
-        whisper_options(cli),
+        whisper_options(cli, true),
         make_emitter(cli)?,
         Arc::clone(&paused),
+        Arc::clone(&running),
         cli.auto_unload,
         cli.auto_unload_after,
         cli.sound,
@@ -331,12 +319,46 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
     // ---- main processing loop (NOT the audio callback) --------------------
     let mut last_queue_warn = Instant::now();
+    let mut last_drop_report = (0usize, 0usize);
+    let mut rebuild_attempts: u32 = 0;
     let mut was_paused = paused.load(Ordering::Acquire);
     if was_paused {
         // Start-paused: drop any callback audio that raced stream start.
         fp.discard_pending();
     }
     while running.load(Ordering::Acquire) {
+        // USB mics vanish mid-session: rebuild the device + stream + resamplers
+        // instead of capturing deaf. Stale audio is discarded; the noise floor
+        // (warm) survives inside the VAD.
+        if telemetry.device_gone.load(Ordering::Acquire) {
+            rebuild_attempts += 1;
+            log::warn!("input device lost, rebuild attempt #{rebuild_attempts}...");
+            thread::sleep(Duration::from_secs(2));
+            match open_input_path(
+                &host,
+                cli,
+                raw_tx.clone(),
+                whisper_tx.clone(),
+                &telemetry,
+            ) {
+                Ok((new_rate, new_stream, new_fp)) => {
+                    hw_rate = new_rate;
+                    stream = new_stream;
+                    fp = new_fp;
+                    input_frames = fp.required_input_frames();
+                    accumulator.clear();
+                    accumulator.reserve(hw_rate as usize * 2);
+                    fp.discard_pending();
+                    telemetry.device_gone.store(false, Ordering::Release);
+                    rebuild_attempts = 0;
+                    log::info!("input stream rebuilt ({} Hz)", hw_rate);
+                }
+                Err(e) => {
+                    log::warn!("rebuild failed: {e:?}; retrying...");
+                    continue;
+                }
+            }
+        }
         // Fail fast if the whisper worker died during init instead of
         // capturing deaf: ready Err / disconnect, or early thread exit.
         match whisper_ready.try_recv() {
@@ -403,27 +425,35 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             thread::sleep(Duration::from_millis(2));
         }
 
-        // Backpressure visibility: both queues are unbounded (the cpal
-        // callback must never block, speech must not be dropped), so report
-        // instead of shedding — throttled to one line per 5 s. Signal-path
-        // pairing depths catch a resampler divergence the other two miss.
+        // Backpressure visibility: bounded queues shed under load (callback
+        // must never block, live speech must stay fresh), so report depths
+        // plus shed totals — throttled to one line per 5 s. Signal-path
+        // pairing depths catch a resampler divergence the others miss.
         if last_queue_warn.elapsed() >= Duration::from_secs(5) {
             last_queue_warn = Instant::now();
             let raw_depth = raw_rx.len();
             let whisper_depth = fp.queue_depth();
             let (signal_vad, signal_whisper) = fp.signal_pending_depths();
+            let raw_dropped = telemetry.dropped_chunks.load(Ordering::Relaxed);
+            let stream_errors = telemetry.errors.load(Ordering::Relaxed);
+            let drops = (raw_dropped, stream_errors);
+            let drops_grew = drops != last_drop_report;
+            last_drop_report = drops;
             if raw_depth > 64
                 || whisper_depth > 4
                 || signal_vad > crate::signal::SIGNAL_PENDING_WARN
                 || signal_whisper > crate::signal::SIGNAL_PENDING_WARN
+                || drops_grew
             {
                 log::warn!(
-                    "queues growing (raw_rx={raw_depth}, whisper={whisper_depth}, signal_vad={signal_vad}, signal_whisper={signal_whisper}): capture outruns resampling, branches diverged, or whisper outruns real time"
+                    "queues (raw_rx={raw_depth}, whisper={whisper_depth}, signal_vad={signal_vad}, signal_whisper={signal_whisper}, dropped_chunks={raw_dropped}, stream_errors={stream_errors}): capture outruns resampling, branches diverged, or whisper outruns real time"
                 );
             }
         }
     }
 
+    // Stop capture before the trailing flush so no new audio races teardown.
+    drop(stream);
     // Flush trailing speech, then wait for the whisper thread to actually
     // finish transcribing it (and any earlier backlog) before the process
     // exits — otherwise the last utterance can be silently dropped, and an
@@ -436,6 +466,64 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("whisper worker panicked"))?;
     log::info!("stopped");
     Ok(())
+}
+
+/// Open the input device + stream + frame processor in one go, playing the
+/// stream before returning. Used for the initial open (fails fast, so a bad
+/// `--device`/`--channel` aborts before the model loads) and for rebuilds
+/// after `DeviceNotAvailable` (see the main loop). A rebuild re-creates the
+/// resamplers for the (possibly changed) hw rate; utterance state is lost and
+/// warm VAD noise floor is kept.
+#[allow(clippy::too_many_arguments)]
+fn open_input_path(
+    host: &cpal::Host,
+    cli: &Cli,
+    raw_tx: Sender<Vec<f32>>,
+    whisper_tx: Sender<Utterance>,
+    telemetry: &StreamTelemetry,
+) -> Result<(u32, cpal::Stream, FrameProcessor)> {
+    let device = select_input_device(host, cli.device.as_deref())?;
+    log::info!(
+        "input device: {}",
+        device.name().unwrap_or_else(|_| "<unknown>".into())
+    );
+    let supported = device
+        .default_input_config()
+        .context("failed to query default input config")?;
+    let hw_rate = supported.sample_rate().0;
+    let channels = supported.channels() as usize;
+    let sample_format = supported.sample_format();
+    let stream_config: cpal::StreamConfig = supported.into();
+    log::info!(
+        "hw config: {} Hz, {} ch, {:?}, channel={}",
+        hw_rate,
+        channels,
+        sample_format,
+        cli.channel.map_or("mix".to_string(), |c| c.to_string()),
+    );
+    // `FrameProcessor` owns all resampling (a shared hw -> 16k hop by
+    // default, or hw -> 48k -> denoise -> 48k -> 16k for the VAD branch plus
+    // hw -> 16k for whisper with `--denoiser deepfilter`).
+    let fp = FrameProcessor::new(
+        hw_rate,
+        whisper_tx,
+        cli.denoiser,
+        cli.vad_threshold,
+        cli.vad_adapt,
+        gate_config(cli),
+        crate::config::hangover_frames(cli.hangover_ms),
+    )?;
+    let stream = build_input_stream(
+        &device,
+        &stream_config,
+        channels,
+        cli.channel,
+        sample_format,
+        raw_tx,
+        telemetry,
+    )?;
+    stream.play().context("failed to start input stream")?;
+    Ok((hw_rate, stream, fp))
 }
 
 /// Install the Ctrl-C handler that stops the processing loop. A failed
@@ -533,13 +621,14 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         cli.vad_threshold,
         cli.vad_adapt,
         gate_config(cli),
+        crate::config::hangover_frames(cli.hangover_ms),
     )?;
     let input_frames = fp.required_input_frames();
 
     let (whisper_handle, whisper_ready) = spawn_whisper_worker(
         whisper_rx,
         model_path,
-        whisper_options(cli),
+        whisper_options(cli, false),
         make_emitter(cli)?,
         // File mode has no pause signalling; a permanently-clear flag plus
         // disabled auto-unload can never trigger an unload mid-file. Sounds
@@ -547,6 +636,8 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         // Autopause is forced off for the same reason: file input must never
         // flip the (unread) pause flag into an unload mid-file.
         Arc::new(AtomicBool::new(false)),
+        // File input runs to completion; inference is never aborted.
+        Arc::new(AtomicBool::new(true)),
         false,
         cli.auto_unload_after,
         false,
@@ -591,7 +682,7 @@ fn resolve_model_input(cli: &Cli) -> Result<std::path::PathBuf> {
     ensure_available(&path)
 }
 
-fn whisper_options(cli: &Cli) -> WhisperOptions {
+fn whisper_options(cli: &Cli, shed_stale: bool) -> WhisperOptions {
     WhisperOptions {
         model_spec: cli.model_input(),
         prompt: cli.prompt.clone(),
@@ -603,6 +694,7 @@ fn whisper_options(cli: &Cli) -> WhisperOptions {
         beam_size: cli.beam_size,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
+        shed_stale,
     }
 }
 

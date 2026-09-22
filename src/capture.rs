@@ -1,8 +1,11 @@
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::Sender;
 
-use crate::dsp::downmix_to_mono;
+use crate::dsp::{downmix_to_mono_with_channel, resolve_channel};
 
 // ---------------------------------------------------------------------------
 // Input device: discovery, selection, capture
@@ -124,18 +127,50 @@ pub(crate) fn select_input_device(host: &cpal::Host, wanted: Option<&str>) -> Re
         .context("no default input device available")
 }
 
+/// Shared capture telemetry, written by the cpal callback / error handler and
+/// read by the main loop's throttled warn line. Atomics only — the callback
+/// must never block or allocate beyond the mono buffer.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamTelemetry {
+    /// Chunks dropped because the bounded `raw_rx` was full (capture outruns
+    /// resampling; see `RAW_QUEUE_BOUND`).
+    pub(crate) dropped_chunks: Arc<AtomicUsize>,
+    /// `err_fn` invocations (xruns, backend errors).
+    pub(crate) errors: Arc<AtomicUsize>,
+    /// Set on `DeviceNotAvailable`: the main loop rebuilds the stream.
+    pub(crate) device_gone: Arc<AtomicBool>,
+}
+
 /// Build the cpal input stream for the device's native sample format.
 ///
-/// The callback only downmixes to mono and forwards to `raw_tx`. It never
-/// calls `unwrap`/`expect`, never blocks, and does no heavy work.
+/// The callback only selects/mixes to mono and `try_send`s to `raw_tx`: it
+/// never calls `unwrap`/`expect`, never blocks, and does no heavy work. On a
+/// full queue the chunk is dropped and counted (`dropped_chunks`) instead of
+/// stalling the audio thread — the main loop reports the total.
 pub(crate) fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     channels: usize,
+    channel: Option<usize>,
     sample_format: cpal::SampleFormat,
     raw_tx: Sender<Vec<f32>>,
+    telemetry: &StreamTelemetry,
 ) -> Result<cpal::Stream> {
-    let err_fn = |err| log::error!("stream error: {err}");
+    // Fail fast on a bad `--channel` rather than capturing silence.
+    let channel = resolve_channel(channel, channels)?;
+    let dropped = Arc::clone(&telemetry.dropped_chunks);
+    let errors = Arc::clone(&telemetry.errors);
+    let device_gone = Arc::clone(&telemetry.device_gone);
+    let err_fn = move |err: cpal::StreamError| {
+        errors.fetch_add(1, Ordering::Relaxed);
+        match err {
+            cpal::StreamError::DeviceNotAvailable => {
+                device_gone.store(true, Ordering::Release);
+                log::error!("input device disconnected: {err}");
+            }
+            _ => log::error!("stream error: {err}"),
+        }
+    };
 
     match sample_format {
         cpal::SampleFormat::F32 => {
@@ -143,9 +178,13 @@ pub(crate) fn build_input_stream(
             let stream = device.build_input_stream(
                 config,
                 move |data: &[f32], _| {
-                    let mono = downmix_to_mono(data, channels);
-                    if let Err(e) = tx.send(mono) {
-                        log::warn!("raw queue closed: {e}");
+                    let mono = downmix_to_mono_with_channel(data, channels, channel);
+                    if let Err(e) = tx.try_send(mono) {
+                        if e.is_full() {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            log::warn!("raw queue closed, dropping chunk");
+                        }
                     }
                 },
                 err_fn,
@@ -162,9 +201,13 @@ pub(crate) fn build_input_stream(
                     for s in data {
                         tmp.push(*s as f32 / 32768.0);
                     }
-                    let mono = downmix_to_mono(&tmp, channels);
-                    if let Err(e) = tx.send(mono) {
-                        log::warn!("raw queue closed: {e}");
+                    let mono = downmix_to_mono_with_channel(&tmp, channels, channel);
+                    if let Err(e) = tx.try_send(mono) {
+                        if e.is_full() {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            log::warn!("raw queue closed, dropping chunk");
+                        }
                     }
                 },
                 err_fn,
@@ -181,9 +224,13 @@ pub(crate) fn build_input_stream(
                     for s in data {
                         tmp.push(*s as f32 / 65535.0 * 2.0 - 1.0);
                     }
-                    let mono = downmix_to_mono(&tmp, channels);
-                    if let Err(e) = tx.send(mono) {
-                        log::warn!("raw queue closed: {e}");
+                    let mono = downmix_to_mono_with_channel(&tmp, channels, channel);
+                    if let Err(e) = tx.try_send(mono) {
+                        if e.is_full() {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            log::warn!("raw queue closed, dropping chunk");
+                        }
                     }
                 },
                 err_fn,

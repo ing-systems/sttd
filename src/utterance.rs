@@ -60,15 +60,21 @@ pub(crate) enum FrameAction {
 /// verdict — an invariant the caller could only uphold by remembering to. Only
 /// `reset` clears it: the ring deliberately spans utterances, holding the
 /// run-up to the *next* onset.
-#[derive(Default)]
+///
+/// `hangover_frames` is config, not per-utterance state: `reset`/`discard`
+/// never touch it, and `Default` carries the compiled-in default so existing
+/// struct literals keep behaving.
 pub(crate) struct UtteranceBuffer {
     /// Rolling ~300 ms of recent whisper-branch audio (see the struct doc).
     preroll: VecDeque<f32>,
     /// Whisper-branch audio (16 kHz), from the moment the utterance opens.
     buf: Vec<f32>,
     /// Consecutive non-speech frames since the last speech frame, once the
-    /// utterance is open. Drives the close decision (`SILENCE_FRAMES_THRESHOLD`).
+    /// utterance is open. Drives the close decision (`hangover_frames`).
     silence_frames: u32,
+    /// Silence hangover before cutting an utterance, in 10 ms frames
+    /// (`--hangover-ms / 10`). Config, never reset.
+    hangover_frames: u32,
     /// Consecutive speech frames seen before the utterance has opened.
     /// Drives the open decision (`ONSET_SPEECH_FRAMES`); reset to 0 on any
     /// non-speech frame.
@@ -86,12 +92,36 @@ pub(crate) struct UtteranceBuffer {
     speech_sample_count: usize,
 }
 
+impl Default for UtteranceBuffer {
+    fn default() -> Self {
+        Self {
+            preroll: VecDeque::new(),
+            buf: Vec::new(),
+            silence_frames: 0,
+            hangover_frames: SILENCE_FRAMES_THRESHOLD,
+            onset_run: 0,
+            speech_frames: 0,
+            samples_at_last_speech: 0,
+            speech_energy_sum_sq: 0.0,
+            speech_sample_count: 0,
+        }
+    }
+}
+
 impl UtteranceBuffer {
     pub(crate) fn new() -> Self {
         Self {
             preroll: VecDeque::with_capacity(RING_FRAMES * FRAME_16K),
             ..Default::default()
         }
+    }
+
+    /// Override the silence hangover (in 10 ms frames, see
+    /// `hangover_frames`). Builder-style so `FrameProcessor::new` can apply
+    /// `--hangover-ms` once while tests keep the default.
+    pub(crate) fn with_hangover_frames(mut self, frames: u32) -> Self {
+        self.hangover_frames = frames.max(1);
+        self
     }
 
     /// Whether an utterance has opened and is still accumulating.
@@ -152,7 +182,7 @@ impl UtteranceBuffer {
             }
             self.buf.extend_from_slice(frame);
             self.silence_frames += 1;
-            if self.silence_frames > SILENCE_FRAMES_THRESHOLD {
+            if self.silence_frames > self.hangover_frames {
                 FrameAction::Flush
             } else if self.buf.len() >= EARLY_SPLIT_SAMPLES && self.silence_frames >= EARLY_SPLIT_SILENCE_FRAMES {
                 // Near whisper's 30 s cap with a real pause in progress: cut
@@ -220,7 +250,7 @@ impl UtteranceBuffer {
             return None;
         }
 
-        // Trim the tail: `SILENCE_FRAMES_THRESHOLD` decided *when* to close this
+        // Trim the tail: the hangover decided *when* to close this
         // utterance, but everything past `samples_at_last_speech +
         // TAIL_KEEP_SAMPLES` is silence hangover that doesn't need to reach
         // whisper.
@@ -305,6 +335,42 @@ mod tests {
         let frame = vec![0.0f32; FRAME_16K];
         assert_eq!(buffer.push_frame(&frame, false), FrameAction::Continue);
         assert!(buffer.buf.is_empty());
+    }
+
+    #[test]
+    fn hangover_default_matches_compiled_constant() {
+        assert_eq!(
+            UtteranceBuffer::default().hangover_frames,
+            SILENCE_FRAMES_THRESHOLD
+        );
+        assert_eq!(UtteranceBuffer::new().hangover_frames, SILENCE_FRAMES_THRESHOLD);
+    }
+
+    #[test]
+    fn custom_hangover_closes_earlier_and_later() {
+        // Open an utterance the same way twice, then count silence frames to
+        // Flush: 300 ms must close well before the 800 ms default, 1200 ms
+        // must stay open past it.
+        fn frames_to_flush(hangover_frames: u32) -> u32 {
+            let mut buffer =
+                UtteranceBuffer::new().with_hangover_frames(hangover_frames);
+            let speech = vec![0.5f32; FRAME_16K];
+            for _ in 0..ONSET_SPEECH_FRAMES {
+                buffer.push_frame(&speech, true);
+            }
+            assert!(buffer.is_open());
+            let silence = vec![0.0f32; FRAME_16K];
+            for n in 1..=200u32 {
+                if buffer.push_frame(&silence, false) == FrameAction::Flush {
+                    return n;
+                }
+            }
+            panic!("hangover {hangover_frames} never flushed");
+        }
+        // Flush fires when silence_frames *exceeds* the threshold.
+        assert_eq!(frames_to_flush(30), 31);
+        assert_eq!(frames_to_flush(SILENCE_FRAMES_THRESHOLD), 81);
+        assert_eq!(frames_to_flush(120), 121);
     }
 
     #[test]

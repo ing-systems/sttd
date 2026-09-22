@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::config::{
-    parse_beam_size, parse_bool, parse_context_chars, parse_threads, DEFAULT_AUTO_UNLOAD,
-    DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE,
-    DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC,
-    DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TARGET_RMS, DEFAULT_THREADS,
-    DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
+    parse_beam_size, parse_bool, parse_context_chars, parse_hangover_ms, parse_threads,
+    DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_BEAM_SIZE, DEFAULT_HANGOVER_MS,
+    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
+    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS,
+    DEFAULT_TARGET_RMS, DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::whisper::Language;
@@ -37,6 +37,13 @@ pub(crate) struct Cli {
     /// default, `>` = matches `--device`) and exit.
     #[arg(long, help_heading = "Input", conflicts_with_all = ["file", "list_models", "start", "stop", "status"])]
     pub(crate) list_devices: bool,
+
+    /// Input channel to transcribe: `0` = first channel, `1` = second, ...;
+    /// unset mixes all channels down to mono by averaging (previous behavior).
+    /// Useful when one channel is a noisy webcam capsule and the other a
+    /// headset mic.
+    #[arg(long, env = "STTD_CHANNEL", value_name = "N", help_heading = "Input")]
+    pub(crate) channel: Option<usize>,
 
     /// Model spec (e.g. `small`, `large-v3-turbo-q8_0`) or path to a ggml
     /// whisper model file (auto-downloaded if missing). `STTD_MODEL` wins
@@ -123,6 +130,12 @@ pub(crate) struct Cli {
     /// Min share of transmitted frames flagged as speech (long utterances exempt).
     #[arg(long, env = "STTD_MIN_DENSITY", default_value_t = DEFAULT_MIN_DENSITY, help_heading = "Acoustic gates")]
     pub(crate) min_density: f32,
+
+    /// Silence hangover before an utterance closes (ms, step 10). Lower =
+    /// faster emission, more sentence splits; the prompt context keeps split
+    /// decodes coherent.
+    #[arg(long, env = "STTD_HANGOVER_MS", default_value_t = DEFAULT_HANGOVER_MS, value_parser = parse_hangover_ms, value_name = "MS", help_heading = "Acoustic gates")]
+    pub(crate) hangover_ms: u64,
 
     /// Pre-inference gain target RMS, 0 disables.
     #[arg(long, env = "STTD_TARGET_RMS", default_value_t = DEFAULT_TARGET_RMS, help_heading = "Acoustic gates")]
@@ -384,6 +397,8 @@ mod tests {
         );
         assert_eq!(cli.prompt, DEFAULT_PROMPT);
         assert_eq!(cli.prompt_context_chars, DEFAULT_PROMPT_CONTEXT_CHARS);
+        assert_eq!(cli.hangover_ms, DEFAULT_HANGOVER_MS);
+        assert_eq!(cli.channel, None);
         assert_eq!(cli.language, crate::whisper::Language::Polish);
         assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
         assert_eq!(cli.threads, DEFAULT_THREADS);
@@ -448,6 +463,16 @@ mod tests {
         assert_eq!(cli.beam_size, 3);
         assert_eq!(cli.threads, 0);
         assert!(!cli.gpu);
+    }
+
+    #[test]
+    fn cli_channel_and_hangover_parse() {
+        let cli = Cli::try_parse_from(["sttd", "--channel", "1", "--hangover-ms", "350"])
+            .expect("channel/hangover must parse");
+        assert_eq!(cli.channel, Some(1));
+        assert_eq!(cli.hangover_ms, 350);
+        assert!(Cli::try_parse_from(["sttd", "--hangover-ms", "355"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--hangover-ms", "100"]).is_err());
     }
 
     #[test]

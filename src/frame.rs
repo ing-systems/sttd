@@ -34,6 +34,7 @@ impl FrameProcessor {
         vad_threshold: f32,
         vad_adapt: bool,
         gate: GateConfig,
+        hangover_frames: u32,
     ) -> Result<Self> {
         let hw_input_frames = hw_input_frames(hw_rate);
         let signal = SignalPath::new(hw_rate, denoiser_kind)?;
@@ -45,7 +46,7 @@ impl FrameProcessor {
             hw_input_frames,
             signal,
             vad,
-            utterance: UtteranceBuffer::new(),
+            utterance: UtteranceBuffer::new().with_hangover_frames(hangover_frames),
             gate,
             whisper_tx,
         })
@@ -85,6 +86,9 @@ impl FrameProcessor {
     /// Close the open utterance and hand it to the whisper thread if it
     /// cleared the acoustic gates. Separated from `UtteranceBuffer::close` so
     /// the accept/reject decision stays testable without a live channel.
+    /// Stale-backlog shedding lives in the whisper worker (see
+    /// `WHISPER_SHED_KEEP`), which owns the queue's receiver — this side
+    /// never blocks the processing loop.
     fn enqueue_utterance(&mut self) {
         if let Some(utterance) = self.utterance.close(&self.gate) {
             if let Err(e) = self.whisper_tx.send(utterance) {

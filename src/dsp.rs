@@ -7,6 +7,19 @@ use resampler::{ResamplerFft, SampleRate};
 
 /// Downmix an interleaved multi-channel buffer to mono by averaging.
 pub(crate) fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
+    downmix_to_mono_with_channel(data, channels, None)
+}
+
+/// Downmix with an optional channel pick: `None` averages all channels (see
+/// `downmix_to_mono`), `Some(i)` takes channel `i` verbatim. An out-of-range
+/// `i` falls back to silence (zeros) rather than panicking on the audio
+/// callback — the caller validates and fails fast at startup (see
+/// `resolve_channel`).
+pub(crate) fn downmix_to_mono_with_channel(
+    data: &[f32],
+    channels: usize,
+    channel: Option<usize>,
+) -> Vec<f32> {
     debug_assert!(channels > 0, "channels must be >= 1 (cpal guarantees this)");
     debug_assert_eq!(
         data.len() % channels.max(1),
@@ -16,9 +29,30 @@ pub(crate) fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return data.to_vec();
     }
-    data.chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
+    match channel {
+        None => data
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect(),
+        Some(i) if i < channels => data
+            .chunks_exact(channels)
+            .map(|frame| frame[i])
+            .collect(),
+        Some(_) => vec![0.0f32; data.len() / channels.max(1)],
+    }
+}
+
+/// Validate `--channel` against the device's channel count: `None` (mix)
+/// always passes, `Some(i)` needs `i < channels`.
+pub(crate) fn resolve_channel(channel: Option<usize>, channels: usize) -> anyhow::Result<Option<usize>> {
+    match channel {
+        None => Ok(None),
+        Some(i) if i < channels.max(1) => Ok(Some(i)),
+        Some(i) => anyhow::bail!(
+            "--channel/STTD_CHANNEL={i} out of range for {channels}-channel input (valid: 0..{})",
+            channels.max(1) - 1,
+        ),
+    }
 }
 
 /// Raw hw-rate samples per ~10 ms chunk: the external framing every caller
@@ -192,6 +226,38 @@ mod tests {
     fn downmix_averages_channels() {
         assert_eq!(downmix_to_mono(&[1.0, 3.0, 2.0, 4.0], 2), vec![2.0, 3.0]);
         assert_eq!(downmix_to_mono(&[1.0, 2.0, 3.0], 1), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn downmix_channel_pick_selects_verbatim() {
+        assert_eq!(
+            downmix_to_mono_with_channel(&[1.0, 3.0, 2.0, 4.0], 2, Some(0)),
+            vec![1.0, 2.0]
+        );
+        assert_eq!(
+            downmix_to_mono_with_channel(&[1.0, 3.0, 2.0, 4.0], 2, Some(1)),
+            vec![3.0, 4.0]
+        );
+        assert_eq!(
+            downmix_to_mono_with_channel(&[1.0, 3.0, 2.0, 4.0], 2, None),
+            vec![2.0, 3.0]
+        );
+        // Out-of-range never panics (callback safety); startup validation
+        // rejects it instead (see `resolve_channel`).
+        assert_eq!(
+            downmix_to_mono_with_channel(&[1.0, 3.0, 2.0, 4.0], 2, Some(7)),
+            vec![0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn resolve_channel_validates_against_device() {
+        assert_eq!(resolve_channel(None, 2).unwrap(), None);
+        assert_eq!(resolve_channel(Some(0), 2).unwrap(), Some(0));
+        assert_eq!(resolve_channel(Some(1), 2).unwrap(), Some(1));
+        assert!(resolve_channel(Some(2), 2).is_err());
+        assert_eq!(resolve_channel(Some(0), 1).unwrap(), Some(0));
+        assert!(resolve_channel(Some(1), 1).is_err());
     }
 
     #[test]

@@ -22,7 +22,18 @@ pub(crate) const RING_FRAMES: usize = 30;
 /// Silence hangover before cutting an utterance: 800 ms = 80 x 10 ms frames.
 /// This only decides *when* to close an utterance; how much of that silence
 /// actually reaches whisper is capped separately by `TAIL_KEEP_SAMPLES`.
+/// Default for `--hangover-ms` (see `DEFAULT_HANGOVER_MS`); the constant stays
+/// as the code default so `UtteranceBuffer::default()` behaves identically.
 pub(crate) const SILENCE_FRAMES_THRESHOLD: u32 = 80;
+/// Default silence hangover (ms) before an utterance closes. Lower = faster
+/// emission, more sentence splits; higher = fewer splits, slower. Short splits
+/// are cheap now that the prompt context (see `prompt_context`) keeps the
+/// next decode coherent. Override with `STTD_HANGOVER_MS` (200..=2000, step 10).
+pub(crate) const DEFAULT_HANGOVER_MS: u64 = 800;
+/// Bounds for `--hangover-ms`: below 200 ms word-final stops split
+/// utterances; above 2000 ms the pipeline feels laggy and buffers grow.
+pub(crate) const MIN_HANGOVER_MS: u64 = 200;
+pub(crate) const MAX_HANGOVER_MS: u64 = 2000;
 /// Consecutive speech frames required before an utterance is opened at all.
 /// A single VAD false positive (a click, a breath, mains hum) used to be
 /// enough to open a full utterance — padded out to ~1.2-1.9s by pre-roll and
@@ -260,6 +271,20 @@ pub(crate) const HALLUCINATION_PATTERNS: &[&str] = &[
     "zapraszam do subskrypcji kanalu",
 ];
 
+/// Fuzzy hallucination matching: normalized transcripts of at least this
+/// many chars (post-normalization) are also compared by Levenshtein distance
+/// (see `is_hallucination`). Shorter ones stay exact-only — a 1-2 edit
+/// allowance on "napisy" would eat real single words.
+pub(crate) const HALLUCINATION_FUZZ_MIN_LEN: usize = 10;
+/// Max edit distance for the fuzzy match above: covers a missed diacritic
+/// fold, a doubled letter, a dropped ending — not a different sentence (a
+/// real sentence with extra words is dozens of edits away).
+pub(crate) const HALLUCINATION_FUZZ_MAX_DIST: usize = 2;
+/// Word-bigram repetitions that mark a decode loop (see `is_repetition`):
+/// any adjacent word pair occurring this many times. Catches tight loops
+/// ("pada deszcz" x4) the unique-ratio rule can miss on short texts.
+pub(crate) const REPETITION_BIGRAM_COUNT: usize = 4;
+
 /// Parse a bool CLI/env value. Accepts `1/0`, `true/false`, `yes/no`,
 /// `on/off` (case-insensitive, surrounding whitespace ignored). Used as the
 /// clap `value_parser` for every bool flag so `--copy no`, `STTD_COPY=0`
@@ -323,6 +348,28 @@ pub(crate) fn parse_context_chars(s: &str) -> Result<usize, String> {
     }
 }
 
+/// Parse `--hangover-ms`/`STTD_HANGOVER_MS`: `MIN_HANGOVER_MS..=MAX_HANGOVER_MS`
+/// in 10 ms steps (the pipeline's frame cadence — no false precision).
+pub(crate) fn parse_hangover_ms(s: &str) -> Result<u64, String> {
+    let v: u64 = s.trim().parse().map_err(|_| {
+        format!(
+            "expected a multiple of 10 in {MIN_HANGOVER_MS}..={MAX_HANGOVER_MS} ms, got {s:?}"
+        )
+    })?;
+    if !(MIN_HANGOVER_MS..=MAX_HANGOVER_MS).contains(&v) || !v.is_multiple_of(10) {
+        return Err(format!(
+            "expected a multiple of 10 in {MIN_HANGOVER_MS}..={MAX_HANGOVER_MS} ms, got {s:?}"
+        ));
+    }
+    Ok(v)
+}
+
+/// Whole 10 ms frames in `ms` of hangover. Exact: the parser only accepts
+/// multiples of 10.
+pub(crate) fn hangover_frames(ms: u64) -> u32 {
+    (ms / 10) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +420,22 @@ mod tests {
         assert!(parse_context_chars("2001").is_err());
         assert!(parse_context_chars("-1").is_err());
         assert!(parse_context_chars("bogus").is_err());
+    }
+
+    #[test]
+    fn parse_hangover_ms_needs_step_10_in_range() {
+        assert_eq!(parse_hangover_ms("800"), Ok(800));
+        assert_eq!(parse_hangover_ms("200"), Ok(MIN_HANGOVER_MS));
+        assert_eq!(parse_hangover_ms("2000"), Ok(MAX_HANGOVER_MS));
+        assert_eq!(parse_hangover_ms("350"), Ok(350));
+        assert_eq!(DEFAULT_HANGOVER_MS, 800);
+        assert_eq!(hangover_frames(800), SILENCE_FRAMES_THRESHOLD);
+        assert_eq!(hangover_frames(350), 35);
+        assert!(parse_hangover_ms("199").is_err());
+        assert!(parse_hangover_ms("355").is_err());
+        assert!(parse_hangover_ms("100").is_err());
+        assert!(parse_hangover_ms("2100").is_err());
+        assert!(parse_hangover_ms("bogus").is_err());
     }
 
     #[test]

@@ -74,7 +74,15 @@ pub(crate) struct WhisperOptions {
     pub(crate) beam_size: i32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
+    /// Shed oldest-first past `WHISPER_SHED_KEEP` (microphone mode). File
+    /// mode sets false: offline decoding must be lossless.
+    pub(crate) shed_stale: bool,
 }
+
+/// Backlog past which the loaded loop sheds oldest-first (see
+/// `WHISPER_QUEUE` rationale in `run_microphone_mode`): live speech stays
+/// fresh instead of transcribing minutes-late audio.
+pub(crate) const WHISPER_SHED_KEEP: usize = 4;
 
 /// Query `available_parallelism` for `--threads 0` (auto). Falls back to
 /// `DEFAULT_THREADS` when the query fails.
@@ -101,6 +109,7 @@ pub(crate) fn spawn_whisper_worker(
     opts: WhisperOptions,
     emitter: impl Emitter + Send + 'static,
     paused: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
     auto_unload: bool,
     auto_unload_after_secs: u64,
     sound_enabled: bool,
@@ -126,6 +135,7 @@ pub(crate) fn spawn_whisper_worker(
                 ready_tx,
                 &mut emitter,
                 &paused,
+                &running,
                 auto_unload,
                 auto_unload_after_secs,
                 sound_enabled,
@@ -150,6 +160,7 @@ fn whisper_loop(
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &mut impl Emitter,
     paused: &Arc<AtomicBool>,
+    running: &Arc<AtomicBool>,
     auto_unload: bool,
     auto_unload_after_secs: u64,
     sound_enabled: bool,
@@ -165,6 +176,7 @@ fn whisper_loop(
         &ready,
         emitter,
         paused,
+        running,
         auto_unload,
         auto_unload_after_secs,
         sound_enabled,
@@ -209,6 +221,7 @@ fn whisper_init_and_run(
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &mut impl Emitter,
     paused: &Arc<AtomicBool>,
+    running: &Arc<AtomicBool>,
     auto_unload: bool,
     auto_unload_after_secs: u64,
     sound_enabled: bool,
@@ -220,6 +233,7 @@ fn whisper_init_and_run(
 
     let prompt = opts.prompt.clone();
     let prompt_context_chars = opts.prompt_context_chars;
+    let shed_stale = opts.shed_stale;
     let language = opts.language;
     let gate = opts.gate.clone();
     let target_rms = opts.target_rms;
@@ -326,6 +340,7 @@ fn whisper_init_and_run(
                 debug_tokens,
                 beam_size,
                 n_threads,
+                running,
                 emitter,
             );
             if should_autopause(autopause_enabled, emitted) {
@@ -354,6 +369,24 @@ fn whisper_init_and_run(
                     if utterance.pcm.is_empty() {
                         continue;
                     }
+                    // Backlogged GPU: shed oldest-first so the transcript that
+                    // follows is fresh, not minutes late. `utterance` (already
+                    // popped, the oldest) is still transcribed; the remainder
+                    // is trimmed to the newest `WHISPER_SHED_KEEP`.
+                    if shed_stale {
+                        let mut shed = 0usize;
+                        while rx.len() > WHISPER_SHED_KEEP {
+                            match rx.try_recv() {
+                                Ok(_) => shed += 1,
+                                Err(_) => break,
+                            }
+                        }
+                        if shed > 0 {
+                            log::warn!(
+                                "shed {shed} stale utterance(s): whisper outruns real time"
+                            );
+                        }
+                    }
                     utterance_no += 1;
                     let emitted = transcribe_and_emit(
                         &mut state,
@@ -369,6 +402,7 @@ fn whisper_init_and_run(
                         debug_tokens,
                         beam_size,
                         n_threads,
+                        running,
                         emitter,
                     );
                     if should_autopause(autopause_enabled, emitted) {
@@ -554,6 +588,7 @@ fn transcribe_and_emit(
     debug_tokens: bool,
     beam_size: i32,
     n_threads: i32,
+    running: &Arc<AtomicBool>,
     emitter: &mut impl Emitter,
 ) -> bool {
     let tag = format!("utt_{utterance_no:06}");
@@ -573,6 +608,7 @@ fn transcribe_and_emit(
         debug_tokens,
         beam_size,
         n_threads,
+        running,
     ) {
         Ok(t) => {
             let trimmed = t.text.trim();
@@ -601,7 +637,13 @@ fn transcribe_and_emit(
             emitted
         }
         Err(e) => {
-            log::error!("{tag}: transcription failed: {e:?}");
+            // Shutdown aborts in-flight inference via the abort callback
+            // (see `transcribe`): not a failure, just a fast exit.
+            if !running.load(Ordering::Relaxed) {
+                log::info!("{tag}: transcription aborted (shutdown)");
+            } else {
+                log::error!("{tag}: transcription failed: {e:?}");
+            }
             false
         }
     }
@@ -810,7 +852,11 @@ pub(crate) fn average_text_confidence(
 /// needed to tell text tokens from timestamp tokens when scoring confidence
 /// (see `average_text_confidence`). `debug_tokens` dumps every token's
 /// id/text/p/plog/is-timestamp to stderr, for confirming that scoring on a
-/// real utterance (`STTD_DEBUG_TOKENS=1`).
+/// real utterance (`STTD_DEBUG_TOKENS=1`). `running` aborts in-flight
+/// inference on shutdown (Ctrl-C/`--stop`): whisper.cpp polls the callback,
+/// so a long CPU decode exits promptly instead of delaying the trailing
+/// flush. The per-call closure box leaks a few dozen bytes, same class as the
+/// existing `initial_prompt` leak.
 #[allow(clippy::too_many_arguments)]
 fn transcribe(
     state: &mut whisper_rs::WhisperState,
@@ -821,6 +867,7 @@ fn transcribe(
     debug_tokens: bool,
     beam_size: i32,
     n_threads: i32,
+    running: &Arc<AtomicBool>,
 ) -> Result<Transcript> {
     // Pad sub-second utterances (e.g. 300-999 ms, which the acoustic gates are
     // happy to pass) so whisper processes them instead of warning "input is too
@@ -866,6 +913,24 @@ fn transcribe(
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    // Abort in-flight inference on shutdown. Raw C callback: the closure-box
+    // helper (`set_abort_callback_safe`) can't infer its type here, and the
+    // box would leak per utterance anyway. `abort_flag` outlives `full()`
+    // (both local to this call; whisper.cpp only polls during `full()`), so
+    // the pointer never dangles.
+    // SAFETY: `abort_cb` only reads the `Arc<AtomicBool>` behind `user_data`;
+    // no mutation, no whisper state touched.
+    unsafe extern "C" fn abort_cb(user_data: *mut std::ffi::c_void) -> bool {
+        let flag = &*(user_data as *const Arc<AtomicBool>);
+        !flag.load(Ordering::Relaxed)
+    }
+    let abort_flag = Arc::clone(running);
+    unsafe {
+        params.set_abort_callback(Some(abort_cb));
+        params.set_abort_callback_user_data(
+            &abort_flag as *const Arc<AtomicBool> as *mut std::ffi::c_void,
+        );
+    }
 
     state.full(params, pcm_16k).context("whisper full failed")?;
     let n = state.full_n_segments().context("no segments")?;
@@ -1401,6 +1466,7 @@ mod tests {
             beam_size: DEFAULT_BEAM_SIZE,
             n_threads: DEFAULT_THREADS,
             use_gpu: false,
+            shed_stale: false,
         };
         let bad = std::path::PathBuf::from("/nonexistent/ggml-bogus.bin");
         let (handle, ready) = spawn_whisper_worker(
@@ -1409,6 +1475,7 @@ mod tests {
             opts,
             crate::emit::RecordingEmitter::new(),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             false,
             0,
             false,

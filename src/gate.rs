@@ -14,7 +14,8 @@
 // data; conditioning / gain / transcription stay outside (see `whisper`).
 
 use crate::config::{
-    DENSITY_LONG_EXEMPT_SAMPLES, HALLUCINATION_PATTERNS, MIN_SPEECH_FRAMES, STRONG_RMS_FACTOR,
+    DENSITY_LONG_EXEMPT_SAMPLES, HALLUCINATION_FUZZ_MAX_DIST, HALLUCINATION_FUZZ_MIN_LEN,
+    HALLUCINATION_PATTERNS, MIN_SPEECH_FRAMES, REPETITION_BIGRAM_COUNT, STRONG_RMS_FACTOR,
     STRONG_SPEECH_FRAMES,
 };
 
@@ -263,7 +264,8 @@ pub(crate) fn normalize_transcript(text: &str) -> String {
 }
 
 /// Whether `text` is a Whisper repetition-loop decode: 6+ words with at most
-/// half unique.
+/// half unique, or any word bigram repeated `REPETITION_BIGRAM_COUNT`+ times
+/// (tight loops the ratio rule can miss on barely-6-word texts).
 pub(crate) fn is_repetition(text: &str) -> bool {
     let normalized = normalize_transcript(text);
     let words: Vec<&str> = normalized.split(' ').filter(|w| !w.is_empty()).collect();
@@ -273,17 +275,67 @@ pub(crate) fn is_repetition(text: &str) -> bool {
     let mut unique = words.to_vec();
     unique.sort_unstable();
     unique.dedup();
-    unique.len() * 2 <= words.len()
+    if unique.len() * 2 <= words.len() {
+        return true;
+    }
+    // Tight bigram loop: "pada deszcz" x4 needs only 8 words and can stay
+    // above the ratio floor when padded with filler.
+    use std::collections::HashMap;
+    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
+    for pair in words.windows(2) {
+        let entry = counts.entry((pair[0], pair[1])).or_insert(0);
+        *entry += 1;
+        if *entry >= REPETITION_BIGRAM_COUNT {
+            return true;
+        }
+    }
+    false
 }
 
-/// Whether `text` is a known Whisper hallucination on silence/noise, checked
-/// as an exact match after normalization.
+/// Edit distance over chars (plain DP; inputs are short normalized lines).
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, &ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// Whether `text` is a known Whisper hallucination on silence/noise: exact
+/// match after normalization, or (for lines of at least
+/// `HALLUCINATION_FUZZ_MIN_LEN` chars) within `HALLUCINATION_FUZZ_MAX_DIST`
+/// edits of a long pattern. The fuzzy arm catches single-letter variants the
+/// diacritic fold can't (doubled letters, dropped endings); whole-string
+/// distance keeps real sentences containing boilerplate plus more words far
+/// away from any pattern.
 pub(crate) fn is_hallucination(text: &str) -> bool {
     let normalized = normalize_transcript(text);
     if normalized.is_empty() {
         return true;
     }
-    HALLUCINATION_PATTERNS.contains(&normalized.as_str())
+    if HALLUCINATION_PATTERNS.contains(&normalized.as_str()) {
+        return true;
+    }
+    if normalized.chars().count() < HALLUCINATION_FUZZ_MIN_LEN {
+        return false;
+    }
+    HALLUCINATION_PATTERNS
+        .iter()
+        .filter(|p| p.chars().count() >= HALLUCINATION_FUZZ_MIN_LEN)
+        .any(|p| levenshtein(&normalized, p) <= HALLUCINATION_FUZZ_MAX_DIST)
 }
 
 #[cfg(test)]
@@ -415,5 +467,47 @@ mod tests {
             gate.decide_transcript(137, 0.01178, "", 0.99),
             TranscriptVerdict::DropEmpty
         );
+    }
+
+    #[test]
+    fn hallucination_fuzzy_catches_letter_variants() {
+        // Exact arm still works.
+        assert!(is_hallucination("Wszelkie prawa zastrzeżone."));
+        // One-edit variants the fold can't cover: doubled letter, dropped
+        // ending, swapped ending.
+        assert!(is_hallucination("Wszelkie prawa zastrzezonee."));
+        assert!(is_hallucination("Wszelkie prawa zastrzezon."));
+        assert!(is_hallucination("Dziekuje za uwagee."));
+        assert!(is_hallucination("Zapraszam do subskrypcji kanałuu."));
+    }
+
+    #[test]
+    fn hallucination_fuzzy_leaves_real_speech_alone() {
+        // Boilerplate plus real words is dozens of edits from any pattern.
+        assert!(!is_hallucination("Dziękuję za uwagę, do widzenia jutro."));
+        assert!(!is_hallucination(
+            "Zrób commit i wypchnij zmiany do repozytorium."
+        ));
+        // Short lines stay exact-only: "napis" is not "napisy".
+        assert!(!is_hallucination("napis"));
+        assert!(!is_hallucination("subtitles"));
+    }
+
+    #[test]
+    fn repetition_bigram_loop_caught() {
+        // Tight loop the ratio arm already sees.
+        assert!(is_repetition(
+            "pada deszcz pada deszcz pada deszcz pada deszcz"
+        ));
+        // Loop padded with distinct filler so the unique-ratio arm passes
+        // (7 unique over 13 words: 7*2 > 13) while the bigram arm fires.
+        assert!(is_repetition(
+            "pada deszcz pada deszcz pada deszcz pada deszcz rano wczoraj jutro szybko wolno"
+        ));
+        // Real speech with a repeated pair stays clean.
+        assert!(!is_repetition(
+            "Zrób commit i wypchnij zmiany do repozytorium."
+        ));
+        assert!(!is_repetition("nie nie nie"));
     }
 }
