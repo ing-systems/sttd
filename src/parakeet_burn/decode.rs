@@ -24,7 +24,7 @@ impl TdtGreedy {
         }
     }
 
-    fn argmax(v: &[f32]) -> usize {
+    pub(crate) fn argmax(v: &[f32]) -> usize {
         v.iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))

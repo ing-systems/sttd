@@ -6,22 +6,22 @@
 // This module is only built with the `parakeet-burn` Cargo feature and
 // selected at runtime via `--parakeet-engine burn`.
 //
-// Status: bring-up in progress. The mel frontend (`frontend`), the TDT
-// greedy loop (`decode`) and int8 weight containers (`quant`) are fully
-// implemented and unit-tested; the FastConformer encoder stack
-// (`encoder`) runs its Burn matmuls on the NdArray backend today and the
-// CubeCL CUDA backend with `parakeet-burn-cuda` + `--gpu`. Full 0.6B
-// weight mapping lands incrementally — `load` fails fast with the exact
-// converter command until converted weights exist, so a half-wired model
-// can never silently mistranscribe.
+// Status: end-to-end transcription runs (frontend -> `BurnEncoder` ->
+// `BurnJoint::decode` -> `BurnVocab::rebuild`), ORT-verified per module
+// in isolation (see `docs/parakeet-burn.md`). Known gap: the fp32
+// forward skips dynamic activation quantization, so chained encoder
+// states drift from the int8 graph (~40% relative at the tiny final
+// states); word-level parity against `--parakeet-engine ort` is still
+// open (step 6) and exact match waits on step 4. `parakeet-rs` (ORT)
+// stays the default engine.
 //
 // Weight layout (see `tools/convert-parakeet-int8-to-burn.py`):
 // `models/parakeet-tdt-0.6b-v3-int8/encoder-burn.safetensors` +
 // `decoder_joint-burn.safetensors` + existing `vocab.txt`.
 
-// Bring-up: submodules are unit-tested but not all wired into
-// `ParakeetBurnModel::transcribe` yet (encoder weight mapping lands next),
-// so dead-code lints stay off here until the engine decodes end to end.
+// Bring-up: all submodules are wired into `ParakeetBurnModel` now;
+// dead-code lints stay off until word-level parity against ORT (step 6)
+// decides whether the port can become anything but opt-in.
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
 mod backend;
@@ -68,14 +68,11 @@ mod model {
     use crate::config::PARAKEET_MIN_SAMPLES;
 
     /// Native Burn Parakeet model (see module docs for status).
-    /// `vocab`/`use_gpu` wire into the decoder/backend in the next
-    /// bring-up step (joint decode + device selection).
-    #[allow(dead_code)]
     pub(crate) struct ParakeetBurnModel {
         vocab: super::vocab::BurnVocab,
         frontend: super::frontend::MelFrontend,
-        // Encoder/joint stay boxed behind their modules; `None` until the
-        // converted-weight check below passes (fail-fast, never partial).
+        encoder: super::encoder::BurnEncoder,
+        joint: super::joint::BurnJoint,
         ready_line: String,
         use_gpu: bool,
     }
@@ -108,9 +105,34 @@ mod model {
             // error tells the operator exactly how to produce the files.
             super::weights::require_converted_weights(dir)?;
 
+            let (encoder, joint) = with_loading_ticker("burn parakeet weights", || {
+                let manifest_json = std::fs::read_to_string(dir.join("encoder-manifest.json"))
+                    .with_context(|| {
+                        format!(
+                            "burn parakeet: missing encoder-manifest.json in {}",
+                            dir.display()
+                        )
+                    })?;
+                let manifest = super::encoder::load_manifest(&manifest_json)?;
+                let enc_want = super::encoder::encoder_want(&manifest)?;
+                let enc_tensors = super::weights::load_selected(
+                    &dir.join(super::weights::ENCODER_BURN_FILE),
+                    &enc_want,
+                )?;
+                let encoder = super::encoder::BurnEncoder::load(&enc_tensors, &manifest)?;
+                let joint_tensors = super::weights::load_selected(
+                    &dir.join(super::weights::JOINT_BURN_FILE),
+                    &super::joint::joint_want(),
+                )?;
+                let joint = super::joint::BurnJoint::load(&joint_tensors, vocab.size())?;
+                Ok::<_, anyhow::Error>((encoder, joint))
+            })?;
+
             Ok(Self {
                 vocab,
                 frontend,
+                encoder,
+                joint,
                 ready_line: format!(
                     "burn parakeet ready (model={}, threads={}, gpu={})",
                     opts.model_spec, opts.n_threads, opts.use_gpu
@@ -137,16 +159,16 @@ mod model {
             } else {
                 pcm_16k
             };
-            // Frontend parity with parakeet-rs is implemented; encoder
-            // weights are still being mapped (see `require_converted_weights`
-            // gate in `load`). Reaching here without converted weights is a
-            // bug — `load` must have failed first.
-            let _features = self.frontend.extract(pcm)?;
-            anyhow::bail!(
-                "burn parakeet inference not wired yet (frontend ok, {} frames): \
-                 convert weights then implement encoder bring-up; using `--parakeet-engine ort` transcribes today",
-                _features.len()
-            );
+            // Full native path: mel -> encoder states -> TDT greedy
+            // decode -> text rebuild. Like the ORT engine, greedy decoding
+            // reports no per-token probability (`confidence: None`).
+            let mel = self.frontend.extract(pcm)?;
+            let enc = self.encoder.forward(&mel)?;
+            let (tokens, _frames, _durations) = self.joint.decode(&enc);
+            Ok(Transcript {
+                text: self.vocab.rebuild(&tokens),
+                confidence: None,
+            })
         }
 
         fn uses_prompt(&self) -> bool {
