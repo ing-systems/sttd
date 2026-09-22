@@ -164,7 +164,16 @@ pub(crate) struct FftStream {
     chunk_out: usize,
     frame_out: usize,
     pending_in: Vec<f32>,
+    /// Consumed prefix of `pending_in` (see `feed_into`): advancing a head
+    /// index avoids an O(n) `drain(..chunk_in)` memmove per FFT chunk on the
+    /// 100 fps hot path; the buffer is compacted only when the head grows
+    /// large.
+    in_head: usize,
     pending_out: Vec<f32>,
+    /// Consumed prefix of `pending_out` (see `drain_frames_into`): same
+    /// rationale as `in_head`, one memmove per ~50 frames instead of one per
+    /// frame.
+    out_head: usize,
     scratch_in: Vec<f32>,
     scratch_out: Vec<f32>,
 }
@@ -178,7 +187,9 @@ impl FftStream {
                 chunk_out: frame_out,
                 frame_out,
                 pending_in: Vec::new(),
+                in_head: 0,
                 pending_out: Vec::new(),
+                out_head: 0,
                 scratch_in: Vec::new(),
                 scratch_out: Vec::new(),
             });
@@ -202,7 +213,9 @@ impl FftStream {
             chunk_out,
             frame_out,
             pending_in: Vec::new(),
+            in_head: 0,
             pending_out: Vec::new(),
+            out_head: 0,
             scratch_in,
             scratch_out,
         })
@@ -218,26 +231,38 @@ impl FftStream {
     /// output frame this input completes (usually 0-2 at 10 ms input
     /// cadence, occasionally more on catch-up).
     pub(crate) fn feed(&mut self, input: &[f32]) -> Vec<Vec<f32>> {
+        let mut out = Vec::new();
+        self.feed_into(input, &mut out);
+        out
+    }
+
+    /// Same as `feed`, but appends into a caller-reused buffer so the outer
+    /// `Vec` container doesn't reallocate on every 10 ms chunk (the inner
+    /// per-frame `Vec`s are still freshly allocated — they become queue
+    /// entries downstream). `SignalPath` reuses one scratch across calls.
+    pub(crate) fn feed_into(&mut self, input: &[f32], out: &mut Vec<Vec<f32>>) {
         match self.inner.as_mut() {
             Some(inner) => {
                 self.pending_in.extend_from_slice(input);
-                while self.pending_in.len() >= self.chunk_in {
-                    self.scratch_in.copy_from_slice(&self.pending_in[..self.chunk_in]);
+                while self.pending_in.len() - self.in_head >= self.chunk_in {
+                    self.scratch_in
+                        .copy_from_slice(&self.pending_in[self.in_head..self.in_head + self.chunk_in]);
                     // Scratch buffers are exactly chunk-sized, the only error
                     // condition on mono input. Never panic on the hot path:
                     // skip the chunk and keep the pipeline running.
                     if let Err(e) = inner.resample(&self.scratch_in, &mut self.scratch_out) {
                         log::warn!("resampler error: {e:?} (skipping chunk)");
-                        self.pending_in.drain(..self.chunk_in);
+                        self.in_head += self.chunk_in;
                         continue;
                     }
                     self.pending_out.extend_from_slice(&self.scratch_out);
-                    self.pending_in.drain(..self.chunk_in);
+                    self.in_head += self.chunk_in;
                 }
+                self.maybe_compact_in();
             }
             None => self.pending_out.extend_from_slice(input),
         }
-        self.drain_frames()
+        self.drain_frames_into(out)
     }
 
     /// Zero-pad a trailing partial input chunk through one final resample so
@@ -245,12 +270,24 @@ impl FftStream {
     /// every complete output frame left buffered. A trailing partial frame
     /// (< `frame_out` samples) is still dropped, same as before.
     pub(crate) fn flush(&mut self) -> Vec<Vec<f32>> {
-        if self.inner.is_some() && !self.pending_in.is_empty() {
-            self.pending_in.resize(self.chunk_in, 0.0);
-            let chunk: Vec<f32> = self.pending_in.drain(..).collect();
-            // Same guarantee as in `feed`: exact chunk size, cannot fail.
+        let mut out = Vec::new();
+        self.flush_into(&mut out);
+        out
+    }
+
+    /// Same as `flush`, appending into a caller-reused buffer (see
+    /// `feed_into`).
+    pub(crate) fn flush_into(&mut self, out: &mut Vec<Vec<f32>>) {
+        if self.inner.is_some() && self.pending_in.len() > self.in_head {
+            let remaining = self.pending_in.len() - self.in_head;
+            debug_assert!(remaining < self.chunk_in);
+            self.scratch_in[..remaining]
+                .copy_from_slice(&self.pending_in[self.in_head..]);
+            self.scratch_in[remaining..].fill(0.0);
+            self.pending_in.clear();
+            self.in_head = 0;
+            // Same guarantee as in `feed_into`: exact chunk size, cannot fail.
             // Never panic on shutdown either; drop the tail on error.
-            self.scratch_in.copy_from_slice(&chunk);
             if let Some(inner) = self.inner.as_mut() {
                 if let Err(e) = inner.resample(&self.scratch_in, &mut self.scratch_out) {
                     log::warn!("resampler flush error: {e:?} (dropping tail)");
@@ -259,15 +296,35 @@ impl FftStream {
                 }
             }
         }
-        self.drain_frames()
+        self.drain_frames_into(out)
     }
 
-    fn drain_frames(&mut self) -> Vec<Vec<f32>> {
-        let mut frames = Vec::new();
-        while self.pending_out.len() >= self.frame_out {
-            frames.push(self.pending_out.drain(..self.frame_out).collect());
+    fn drain_frames_into(&mut self, out: &mut Vec<Vec<f32>>) {
+        while self.pending_out.len() - self.out_head >= self.frame_out {
+            out.push(
+                self.pending_out[self.out_head..self.out_head + self.frame_out].to_vec(),
+            );
+            self.out_head += self.frame_out;
         }
-        frames
+        self.maybe_compact_out();
+    }
+
+    /// Drop the consumed prefix once it grows large, so the buffers stay
+    /// bounded without a memmove per chunk/frame.
+    fn maybe_compact_in(&mut self) {
+        if self.in_head >= 8192 || (self.in_head > 0 && self.in_head * 2 >= self.pending_in.len()) {
+            self.pending_in.drain(..self.in_head);
+            self.in_head = 0;
+        }
+    }
+
+    fn maybe_compact_out(&mut self) {
+        if self.out_head >= 8192
+            || (self.out_head > 0 && self.out_head * 2 >= self.pending_out.len())
+        {
+            self.pending_out.drain(..self.out_head);
+            self.out_head = 0;
+        }
     }
 
     /// Drop buffered partial-chunk/partial-frame state for a pause
@@ -275,7 +332,9 @@ impl FftStream {
     /// pre-pause audio.
     pub(crate) fn clear(&mut self) {
         self.pending_in.clear();
+        self.in_head = 0;
         self.pending_out.clear();
+        self.out_head = 0;
     }
 }
 

@@ -392,8 +392,25 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         was_paused = now_paused;
         if now_paused {
             fp.discard_speech_keep_warm();
-            while let Ok(chunk) = raw_rx.try_recv() {
-                accumulator.extend_from_slice(&chunk);
+            // Park until the next callback chunk (wakes immediately on
+            // audio) instead of drain + `sleep(50ms)`: the noise floor still
+            // learns from every chunk, but resume (SIGUSR2/SIGHUP) is
+            // noticed within ~10 ms instead of ~50 ms.
+            match raw_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(chunk) => {
+                    accumulator.extend_from_slice(&chunk);
+                    while let Ok(chunk) = raw_rx.try_recv() {
+                        accumulator.extend_from_slice(&chunk);
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    while let Ok(chunk) = raw_rx.try_recv() {
+                        accumulator.extend_from_slice(&chunk);
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
             }
             while accumulator.len() >= input_frames {
                 fp.observe_pause(&accumulator[..input_frames]);
@@ -404,14 +421,27 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             if accumulator.len() >= input_frames {
                 accumulator.clear();
             }
-            thread::sleep(Duration::from_millis(50));
             continue;
         }
         // Drain everything the callback delivered since last iteration.
-        let mut got_audio = false;
         while let Ok(chunk) = raw_rx.try_recv() {
-            got_audio = true;
             accumulator.extend_from_slice(&chunk);
+        }
+        // A full hw frame still isn't available: park until the next chunk
+        // (wakes immediately on audio) instead of `sleep(2ms)` polling. Same
+        // ~2 ms worst-case cadence for the device/whisper checks below, but
+        // audio that arrives mid-wait is processed without the extra 0-2 ms
+        // poll jitter.
+        if accumulator.len() < input_frames {
+            match raw_rx.recv_timeout(Duration::from_millis(2)) {
+                Ok(chunk) => {
+                    accumulator.extend_from_slice(&chunk);
+                    while let Ok(chunk) = raw_rx.try_recv() {
+                        accumulator.extend_from_slice(&chunk);
+                    }
+                }
+                Err(_) => {}
+            }
         }
 
         // Raw hw-rate chunks -> FrameProcessor (denoise/VAD + whisper
@@ -419,10 +449,6 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         while accumulator.len() >= input_frames {
             fp.process_frame(&accumulator[..input_frames]);
             accumulator.drain(..input_frames);
-        }
-
-        if !got_audio && accumulator.len() < input_frames {
-            thread::sleep(Duration::from_millis(2));
         }
 
         // Backpressure visibility: bounded queues shed under load (callback

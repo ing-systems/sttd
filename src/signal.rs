@@ -21,9 +21,18 @@ use crate::config::{DENOISE_RATE, FRAME_16K, FRAME_48K, WHISPER_RATE};
 use crate::denoise::{Denoiser, DenoiserKind};
 use crate::dsp::FftStream;
 
+/// Shared 16 kHz frame: one audio allocation, cheap `Arc` clones. The
+/// default (`Direct`) path decodes one frame and hands it to both the VAD
+/// verdict and the utterance buffer — previously a `Vec::clone()` (640 B
+/// memcpy + second alloc) per 10 ms frame. `Arc::new(Vec)` moves the buffer
+/// without copying elements; clones are a single atomic increment.
+pub(crate) type SharedFrame = std::sync::Arc<Vec<f32>>;
+
 /// Paired 16 kHz frames: VAD-branch audio for the verdict + whisper-branch
-/// audio for the utterance buffer. Always 160 samples each.
-pub(crate) type PairedFrames = (Vec<f32>, Vec<f32>);
+/// audio for the utterance buffer. Always 160 samples each. In `Direct` mode
+/// both `Arc`s point at the same allocation (`Arc::ptr_eq`); in `Denoised`
+/// mode they are independent allocations from separate resamplers.
+pub(crate) type PairedFrames = (SharedFrame, SharedFrame);
 
 /// Warn threshold for unpaired frames waiting in `SignalPath` queues (see
 /// `pending_depths`). Both branches average 100 frames/s, so steady state is
@@ -35,11 +44,17 @@ pub(crate) const SIGNAL_PENDING_WARN: usize = 8;
 /// always describes the whisper audio it is attached to.
 pub(crate) struct SignalPath {
     vad_path: VadPath,
-    pending_vad: VecDeque<Vec<f32>>,
-    pending_whisper: VecDeque<Vec<f32>>,
+    pending_vad: VecDeque<SharedFrame>,
+    pending_whisper: VecDeque<SharedFrame>,
     fed_chunks: u64,
     paired_frames: u64,
     max_pending: usize,
+    /// Reused outer container for `FftStream::feed_into` / `flush_into`:
+    /// cleared (capacity kept) on every resampler call so the 100 fps hot
+    /// path doesn't reallocate the `Vec<Vec<_>>` wrapper per hw chunk. The
+    /// inner per-frame `Vec`s are moved out (`drain(..)`) into `Arc`s and
+    /// become queue entries — no element copy.
+    scratch: Vec<Vec<f32>>,
 }
 
 /// The VAD branch's signal path, chosen once at startup from `--denoiser`
@@ -110,6 +125,7 @@ impl SignalPath {
             fed_chunks: 0,
             paired_frames: 0,
             max_pending: 0,
+            scratch: Vec::new(),
         })
     }
 
@@ -134,12 +150,17 @@ impl SignalPath {
     /// running ahead waits in its queue. Both average 100 frames/s, so the
     /// queues stay bounded at a frame or two.
     pub(crate) fn feed(&mut self, frame_hw_raw: &[f32]) -> Vec<PairedFrames> {
+        use std::sync::Arc;
         self.fed_chunks += 1;
         match &mut self.vad_path {
             VadPath::Direct { resampler } => {
-                for frame16 in resampler.feed(frame_hw_raw) {
-                    self.pending_whisper.push_back(frame16.clone());
-                    self.pending_vad.push_back(frame16);
+                self.scratch.clear();
+                resampler.feed_into(frame_hw_raw, &mut self.scratch);
+                for frame in self.scratch.drain(..) {
+                    // One allocation shared by both branches: no 640 B memcpy.
+                    let shared: SharedFrame = Arc::new(frame);
+                    self.pending_whisper.push_back(Arc::clone(&shared));
+                    self.pending_vad.push_back(shared);
                 }
             }
             VadPath::Denoised {
@@ -149,12 +170,23 @@ impl SignalPath {
                 denoiser,
                 clean48_vad,
             } => {
-                for frame48 in resampler_hw48.feed(frame_hw_raw) {
+                self.scratch.clear();
+                resampler_hw48.feed_into(frame_hw_raw, &mut self.scratch);
+                for frame48 in self.scratch.drain(..) {
+                    debug_assert_eq!(frame48.len(), FRAME_48K);
                     denoiser.denoise_frame(&frame48, clean48_vad);
-                    self.pending_vad.extend(resampler_vad.feed(clean48_vad));
+                    // Opt-in path only: outer `Vec` alloc per denoised frame
+                    // is acceptable here; the default `Direct` path above is
+                    // the 100 fps hotspot and uses `feed_into` + sharing.
+                    for vad_frame in resampler_vad.feed(&clean48_vad[..]) {
+                        self.pending_vad.push_back(Arc::new(vad_frame));
+                    }
                 }
-                self.pending_whisper
-                    .extend(resampler_whisper.feed(frame_hw_raw));
+                self.scratch.clear();
+                resampler_whisper.feed_into(frame_hw_raw, &mut self.scratch);
+                for frame in self.scratch.drain(..) {
+                    self.pending_whisper.push_back(Arc::new(frame));
+                }
             }
         }
         self.note_pending();
@@ -165,11 +197,15 @@ impl SignalPath {
     /// in an incomplete FFT chunk still reaches the utterance instead of
     /// being lost at shutdown, then return every paired frame left buffered.
     pub(crate) fn flush(&mut self) -> Vec<PairedFrames> {
+        use std::sync::Arc;
         match &mut self.vad_path {
             VadPath::Direct { resampler } => {
-                for frame16 in resampler.flush() {
-                    self.pending_whisper.push_back(frame16.clone());
-                    self.pending_vad.push_back(frame16);
+                self.scratch.clear();
+                resampler.flush_into(&mut self.scratch);
+                for frame16 in self.scratch.drain(..) {
+                    let shared: SharedFrame = Arc::new(frame16);
+                    self.pending_whisper.push_back(Arc::clone(&shared));
+                    self.pending_vad.push_back(shared);
                 }
             }
             VadPath::Denoised {
@@ -179,12 +215,20 @@ impl SignalPath {
                 denoiser,
                 clean48_vad,
             } => {
-                for frame48 in resampler_hw48.flush() {
+                self.scratch.clear();
+                resampler_hw48.flush_into(&mut self.scratch);
+                for frame48 in self.scratch.drain(..) {
                     denoiser.denoise_frame(&frame48, clean48_vad);
-                    self.pending_vad.extend(resampler_vad.feed(clean48_vad));
+                    for vad_frame in resampler_vad.feed(&clean48_vad[..]) {
+                        self.pending_vad.push_back(Arc::new(vad_frame));
+                    }
                 }
-                self.pending_vad.extend(resampler_vad.flush());
-                self.pending_whisper.extend(resampler_whisper.flush());
+                for vad_frame in resampler_vad.flush() {
+                    self.pending_vad.push_back(Arc::new(vad_frame));
+                }
+                for whisper_frame in resampler_whisper.flush() {
+                    self.pending_whisper.push_back(Arc::new(whisper_frame));
+                }
             }
         }
         self.note_pending();
@@ -198,6 +242,7 @@ impl SignalPath {
     pub(crate) fn clear(&mut self) {
         self.pending_vad.clear();
         self.pending_whisper.clear();
+        self.scratch.clear();
         self.fed_chunks = 0;
         self.paired_frames = 0;
         self.max_pending = 0;
@@ -267,6 +312,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn direct_shares_one_allocation_between_branches() {
+        // Regression for the per-frame `Vec::clone()` (640 B memcpy + second
+        // alloc at 100 fps): both `Arc`s must point at the same allocation.
+        let mut signal = SignalPath::new(48_000, DenoiserKind::Bypass).unwrap();
+        let hw_chunk = hw_input_frames(48_000);
+        let input = vec![0.1f32; hw_chunk];
+        let mut saw_pair = false;
+        for _ in 0..50 {
+            for (vad, whisper) in signal.feed(&input) {
+                saw_pair = true;
+                assert!(
+                    std::sync::Arc::ptr_eq(&vad, &whisper),
+                    "direct pair must share one Arc allocation"
+                );
+            }
+        }
+        assert!(saw_pair, "expected at least one pair in 50 chunks");
     }
 
     #[test]
