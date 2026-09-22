@@ -86,6 +86,22 @@ pub(crate) const DEFAULT_MIN_CONFIDENCE: f32 = 0.6;
 /// a single scalar threshold can't separate the two cases; VAD/RMS evidence
 /// can. Override with `STTD_MIN_CONF_STRONG`.
 pub(crate) const DEFAULT_MIN_CONFIDENCE_STRONG: f32 = 0.35;
+/// Minimum share of an utterance's transmitted frames that must have been
+/// VAD-flagged as speech (speech frames / post-trim transmitted frames, see
+/// `UtteranceBuffer::close`). Catches utterances that clear
+/// `MIN_SPEECH_FRAMES` on scattered VAD flicker yet are mostly silence by the
+/// time they would reach the model — the shape a boilerplate hallucination is
+/// made of. Density is judged post-trim (what whisper would actually receive,
+/// i.e. up to `samples_at_last_speech + TAIL_KEEP_SAMPLES`), so a short real
+/// word with a full silence hangover still passes; utterances longer than
+/// `DENSITY_LONG_EXEMPT_SAMPLES` skip the gate since genuine pauses lower
+/// their density. `0` disables the gate. Override with `STTD_MIN_DENSITY`.
+pub(crate) const DEFAULT_MIN_DENSITY: f32 = 0.25;
+/// Transmitted audio longer than this skips the speech-density gate: past ~3 s real
+/// pauses and turn-taking drive density down without implying silence, and
+/// the downstream transcript gates (`confidence_floor`, `is_hallucination`,
+/// `is_repetition`) still apply.
+pub(crate) const DENSITY_LONG_EXEMPT_SAMPLES: usize = WHISPER_RATE as usize * 3;
 /// Minimum earshot score (see `vad`) for a 16 ms window to count as speech.
 /// earshot returns a score in `[0, 1]`; upstream suggests 0.5 as the general
 /// voice threshold. Override with `STTD_VAD_THRESHOLD` while tuning against

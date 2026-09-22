@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::config::{
-    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_SPEECH_RMS,
-    DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_TARGET_RMS, DEFAULT_VAD_THRESHOLD, parse_bool,
+    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
+    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_TARGET_RMS,
+    DEFAULT_VAD_THRESHOLD, parse_bool,
 };
 use crate::denoise::DenoiserKind;
 use crate::whisper::Language;
@@ -77,6 +78,10 @@ pub(crate) struct Cli {
     /// Min speech-only RMS to keep an utterance.
     #[arg(long, env = "STTD_MIN_RMS", default_value_t = DEFAULT_MIN_SPEECH_RMS)]
     pub(crate) min_rms: f32,
+
+    /// Min share of transmitted frames flagged as speech (long utterances exempt).
+    #[arg(long, env = "STTD_MIN_DENSITY", default_value_t = DEFAULT_MIN_DENSITY)]
+    pub(crate) min_density: f32,
 
     /// Min avg token confidence, weak acoustic evidence.
     #[arg(long, env = "STTD_MIN_CONF", default_value_t = DEFAULT_MIN_CONFIDENCE)]
@@ -181,6 +186,7 @@ mod tests {
         assert_eq!(cli.prompt, DEFAULT_PROMPT);
         assert_eq!(cli.language, crate::whisper::Language::Polish);
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
+        assert_eq!(cli.min_density, DEFAULT_MIN_DENSITY);
         assert_eq!(cli.min_conf, DEFAULT_MIN_CONFIDENCE);
         assert_eq!(cli.min_conf_strong, DEFAULT_MIN_CONFIDENCE_STRONG);
         assert_eq!(cli.target_rms, DEFAULT_TARGET_RMS);

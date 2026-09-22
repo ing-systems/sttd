@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::config::{
-    FRAME_16K, MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES, RING_FRAMES,
-    SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
+    DENSITY_LONG_EXEMPT_SAMPLES, FRAME_16K, MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES,
+    ONSET_SPEECH_FRAMES, RING_FRAMES, SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
 };
 
 /// What the acoustics observed about an utterance, independent of what whisper
@@ -15,9 +15,20 @@ pub(crate) struct Evidence {
     /// Total VAD-flagged speech frames over the utterance's life (see
     /// `UtteranceBuffer::speech_frames`).
     pub(crate) speech_frames: u32,
+    /// Transmitted frames whisper actually receives (post-trim, i.e.
+    /// `samples_at_last_speech + TAIL_KEEP_SAMPLES` in frames) — the
+    /// denominator for the speech-density gate.
+    pub(crate) total_frames: u32,
     /// RMS over VAD-flagged speech frames only (see
     /// `UtteranceBuffer::speech_energy_sum_sq`).
     pub(crate) rms: f32,
+}
+
+impl Evidence {
+    /// Share of transmitted frames that were VAD-flagged as speech.
+    pub(crate) fn density(&self) -> f32 {
+        self.speech_frames as f32 / self.total_frames.max(1) as f32
+    }
 }
 
 /// One utterance that cleared `UtteranceBuffer::close` and is ready for
@@ -160,20 +171,45 @@ impl UtteranceBuffer {
     /// its trailing silence and return it. Resets `self` to its (empty) default
     /// state either way, leaving the pre-roll ring intact.
     ///
-    /// Two gates, both defending against the same failure mode: a VAD false
+    /// Three gates, all defending against the same failure mode: a VAD false
     /// positive (a click, a breath, mains hum) opening an utterance that
     /// pre-roll and silence hangover then pad out to ~1-2s of near-silence —
     /// which whisper, lacking any working confidence gate of its own (see
     /// `DEFAULT_MIN_CONFIDENCE`'s doc comment), would otherwise happily
     /// hallucinate a sentence for:
     /// - `MIN_SPEECH_FRAMES`: not enough VAD-flagged speech overall.
+    /// - `min_density`: enough speech frames, but scattered across so much
+    ///   silence that the transmitted audio is mostly not-speech (long
+    ///   utterances exempt, see `DENSITY_LONG_EXEMPT_SAMPLES`).
     /// - `min_rms`: VAD-flagged frames present, but too quiet to be real speech.
-    pub(crate) fn close(&mut self, min_rms: f32) -> Option<Utterance> {
+    pub(crate) fn close(&mut self, min_rms: f32, min_density: f32) -> Option<Utterance> {
         let speech_frames = self.speech_frames;
         if speech_frames < MIN_SPEECH_FRAMES {
             eprintln!(
                 "[sttd] dropping utterance ({speech_frames} speech frames, {} samples)",
                 self.buf.len()
+            );
+            self.reset();
+            return None;
+        }
+
+        // What whisper would actually receive (see the trim below): judging
+        // density post-trim keeps a short real word with a full silence
+        // hangover above the floor, while scattered VAD flicker spread over a
+        // long span still scores low.
+        let tail_end = (self.samples_at_last_speech + TAIL_KEEP_SAMPLES).min(self.buf.len());
+        let total_frames = (tail_end / FRAME_16K) as u32;
+        let density = speech_frames as f32 / total_frames.max(1) as f32;
+        // Exemption judged on the same post-trim length as density: the raw
+        // buffer still holds the full silence hangover at this point, which
+        // would otherwise exempt utterances ~600 ms shorter than intended.
+        if tail_end <= DENSITY_LONG_EXEMPT_SAMPLES
+            && min_density > 0.0
+            && density < min_density
+        {
+            eprintln!(
+                "[sttd] dropping low-density utterance ({speech_frames} speech frames \
+                 in {total_frames} frames, density={density:.3} < {min_density:.3})"
             );
             self.reset();
             return None;
@@ -197,17 +233,21 @@ impl UtteranceBuffer {
         // utterance, but everything past `samples_at_last_speech +
         // TAIL_KEEP_SAMPLES` is silence hangover that doesn't need to reach
         // whisper.
-        let tail_end = (self.samples_at_last_speech + TAIL_KEEP_SAMPLES).min(self.buf.len());
         self.buf.truncate(tail_end);
 
         let pcm = std::mem::take(&mut self.buf);
         eprintln!(
-            "[sttd] utterance: {} samples ({speech_frames} speech frames, rms={rms:.5}) -> whisper",
+            "[sttd] utterance: {} samples ({speech_frames} speech frames, \
+             density={density:.3}, rms={rms:.5}) -> whisper",
             pcm.len()
         );
         let utterance = Utterance {
             pcm,
-            evidence: Evidence { speech_frames, rms },
+            evidence: Evidence {
+                speech_frames,
+                total_frames,
+                rms,
+            },
         };
         self.reset();
         Some(utterance)
@@ -230,8 +270,8 @@ impl UtteranceBuffer {
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_MIN_SPEECH_RMS, FRAME_16K, MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES,
-        SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
+        DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES, FRAME_16K,
+        MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES, SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
     };
 
     #[test]
@@ -344,7 +384,7 @@ mod tests {
 
         // rms gate disabled: isolate MIN_SPEECH_FRAMES
         assert!(
-            buffer.close(0.0).is_none(),
+            buffer.close(0.0, 0.0).is_none(),
             "an utterance with too little VAD-flagged speech must be dropped"
         );
     }
@@ -362,11 +402,86 @@ mod tests {
         }
 
         let utterance = buffer
-            .close(DEFAULT_MIN_SPEECH_RMS)
+            .close(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY)
             .expect("real speech must be sent to whisper");
         assert!(!utterance.pcm.is_empty());
         assert_eq!(utterance.evidence.speech_frames, 25);
+        assert!(utterance.evidence.total_frames > 0);
+        assert!(utterance.evidence.density() >= DEFAULT_MIN_DENSITY);
         assert!(utterance.evidence.rms > 0.0);
+    }
+
+    #[test]
+    fn scattered_flicker_fails_density_gate() {
+        // 25 speech frames — past MIN_SPEECH_FRAMES — but scattered across a
+        // long silence span (VAD flicker on noise, never 81 silent frames in
+        // a row so the utterance stays open). Post-trim the transmitted audio
+        // is ~200 frames with only 25 of them speech: mostly silence that
+        // whisper would hallucinate boilerplate for.
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..5 {
+            for _ in 0..5 {
+                buffer.push_frame(&speech, true);
+            }
+            for _ in 0..40 {
+                buffer.push_frame(&silence, false);
+            }
+        }
+        let mut action = FrameAction::Continue;
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            action = buffer.push_frame(&silence, false);
+            if action == FrameAction::Flush {
+                break;
+            }
+        }
+        assert_eq!(action, FrameAction::Flush);
+        // rms gate disabled: isolate the density gate.
+        assert!(
+            buffer.close(0.0, DEFAULT_MIN_DENSITY).is_none(),
+            "scattered speech across mostly silence must be dropped"
+        );
+    }
+
+    #[test]
+    fn dense_short_utterance_passes_density_gate() {
+        // Consecutive speech: post-trim density ~0.5, well clear of the floor.
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..25 {
+            buffer.push_frame(&speech, true);
+        }
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            buffer.push_frame(&silence, false);
+        }
+        let utterance = buffer
+            .close(0.0, DEFAULT_MIN_DENSITY)
+            .expect("dense speech must be sent to whisper");
+        assert!(utterance.evidence.density() >= DEFAULT_MIN_DENSITY);
+    }
+
+    #[test]
+    fn long_utterance_is_exempt_from_density_gate() {
+        // Same low density (~0.08) on both sides of the exemption boundary:
+        // the long one skips the gate even at a floor of 1.0, the short one
+        // is dropped. rms gate disabled on both (rms 0.0 == min 0.0 passes).
+        let mut long = UtteranceBuffer {
+            buf: vec![0.0f32; DENSITY_LONG_EXEMPT_SAMPLES + 2_000],
+            speech_frames: 25,
+            samples_at_last_speech: DENSITY_LONG_EXEMPT_SAMPLES + 2_000,
+            ..Default::default()
+        };
+        assert!(long.close(0.0, 1.0).is_some());
+
+        let mut short = UtteranceBuffer {
+            buf: vec![0.0f32; 20_000],
+            speech_frames: 25,
+            samples_at_last_speech: 20_000,
+            ..Default::default()
+        };
+        assert!(short.close(0.0, 1.0).is_none());
     }
 
     #[test]
@@ -382,7 +497,7 @@ mod tests {
             buffer.push_frame(&silence, false);
         }
 
-        let utterance = buffer.close(0.0).unwrap();
+        let utterance = buffer.close(0.0, 0.0).unwrap();
         assert_eq!(
             utterance.pcm.len(),
             samples_at_last_speech + TAIL_KEEP_SAMPLES
@@ -398,7 +513,7 @@ mod tests {
             speech_energy_sum_sq: 1.0, // high RMS: isolate the frame-count gate
             ..Default::default()
         };
-        assert!(short.close(0.0).is_none());
+        assert!(short.close(0.0, 0.0).is_none());
 
         let mut long = UtteranceBuffer {
             buf: vec![0.5f32; 5_000],
@@ -408,7 +523,7 @@ mod tests {
             speech_energy_sum_sq: 1.0,
             ..Default::default()
         };
-        let utterance = long.close(0.0).unwrap();
+        let utterance = long.close(0.0, 0.0).unwrap();
         assert_eq!(utterance.pcm.len(), 5_000);
     }
 }

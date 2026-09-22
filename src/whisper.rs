@@ -359,8 +359,10 @@ fn whisper_init_and_run(
                 );
                 eprintln!(
                     "[sttd] {tag}: avg_p={:.3} avg_logprob={:.3} threshold={floor:.3} \
-                     ({strength} evidence)",
-                    t.confidence.prob, t.confidence.logprob
+                     ({strength} evidence, density={:.3})",
+                    t.confidence.prob,
+                    t.confidence.logprob,
+                    utterance.evidence.density()
                 );
                 if t.confidence.prob < floor {
                     eprintln!("[sttd] {tag}: dropped low-confidence transcript: {trimmed:?}");
@@ -757,6 +759,7 @@ mod tests {
         // close to correct (one misheard word), not a hallucination.
         let evidence = Evidence {
             speech_frames: 137,
+            total_frames: 200,
             rms: 0.01178,
         };
         let (floor, strength) = confidence_floor(
@@ -782,6 +785,7 @@ mod tests {
         // case above lets through.
         let evidence = Evidence {
             speech_frames: MIN_SPEECH_FRAMES,
+            total_frames: 131,
             rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
         };
         let (floor, strength) = confidence_floor(

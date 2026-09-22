@@ -34,6 +34,8 @@ pub(crate) struct FrameProcessor {
     utterance: UtteranceBuffer,
     /// `min_speech_rms`, read once at startup and reused for every utterance.
     min_speech_rms: f32,
+    /// `min_density`, read once at startup and reused for every utterance.
+    min_density: f32,
 
     whisper_tx: Sender<Utterance>,
 }
@@ -72,6 +74,7 @@ impl FrameProcessor {
         denoiser_kind: DenoiserKind,
         vad_threshold: f32,
         min_speech_rms: f32,
+        min_density: f32,
     ) -> Result<Self> {
         let hw_input_frames = hw_input_frames(hw_rate);
         let vad_path = match denoiser_kind {
@@ -118,6 +121,7 @@ impl FrameProcessor {
             vad,
             utterance: UtteranceBuffer::new(),
             min_speech_rms,
+            min_density,
             whisper_tx,
         })
     }
@@ -198,7 +202,10 @@ impl FrameProcessor {
     /// cleared the acoustic gates. Separated from `UtteranceBuffer::close` so
     /// the accept/reject decision stays testable without a live channel.
     fn enqueue_utterance(&mut self) {
-        if let Some(utterance) = self.utterance.close(self.min_speech_rms) {
+        if let Some(utterance) = self
+            .utterance
+            .close(self.min_speech_rms, self.min_density)
+        {
             if let Err(e) = self.whisper_tx.send(utterance) {
                 eprintln!("[sttd] whisper queue closed: {e}");
             }

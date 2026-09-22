@@ -16,9 +16,10 @@
 //! pre-roll prepended at that point so quiet word starts aren't clipped.
 //! Once open, every frame is appended regardless of the VAD verdict (speech
 //! or not) until `SILENCE_FRAMES_THRESHOLD` closes it — but only
-//! `MIN_SPEECH_FRAMES` worth of actual VAD-flagged speech, trimmed to
+//! `MIN_SPEECH_FRAMES` worth of actual VAD-flagged speech at a `MIN_DENSITY`
+//! share of the transmitted frames (long utterances exempt), trimmed to
 //! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper,
-//! carried alongside its acoustic evidence (speech-frame count, RMS) as an
+//! carried alongside its acoustic evidence (speech-frame count, density, RMS) as an
 //! `Utterance` -> `crossbeam-channel` queue -> isolated `whisper-rs` inference
 //! thread (CUDA, large-v3-turbo-q8_0): pre-inference gain toward `--target-rms`
 //! (`apply_gain`, quiet-but-real speech only, never attenuates) -> average
@@ -163,6 +164,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         cli.denoiser,
         cli.vad_threshold,
         cli.min_rms,
+        cli.min_density,
     )?;
     let input_frames = fp.required_input_frames();
 
@@ -274,6 +276,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         cli.denoiser,
         cli.vad_threshold,
         cli.min_rms,
+        cli.min_density,
     )?;
     let input_frames = fp.required_input_frames();
 

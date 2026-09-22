@@ -64,6 +64,13 @@ it is strong, because one fixed value cannot separate hard-but-real speech from
 an invention over silence.
 _Avoid_: threshold, cutoff, score
 
+**Speech density**:
+The share of an utterance's transmitted frames that were VAD-flagged as
+speech. Judged post-trim, so a short real word with a full silence hangover
+still passes while scattered VAD flicker spread over a long span does not.
+Long utterances skip the gate since genuine pauses lower their density.
+_Avoid_: speech ratio, fill factor
+
 **Text token**:
 A token of the transcript itself, as opposed to a timestamp token, which marks
 when a segment started or ended and says nothing about what was said. Only text
