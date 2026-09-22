@@ -159,7 +159,7 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_HANGOVER_MS", default_value_t = DEFAULT_HANGOVER_MS, value_parser = parse_hangover_ms, value_name = "MS", help_heading = "Acoustic gates")]
     pub(crate) hangover_ms: u64,
 
-    /// Pre-inference gain target RMS, 0 disables.
+    /// Frame-level Agc target RMS (VAD-gated shared gain, speech-only), 0 disables.
     #[arg(long, env = "STTD_TARGET_RMS", default_value_t = DEFAULT_TARGET_RMS, help_heading = "Acoustic gates")]
     pub(crate) target_rms: f32,
 

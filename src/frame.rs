@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::agc::Agc;
 use crate::denoise::DenoiserKind;
 use crate::dsp::hw_input_frames;
 use crate::gate::GateConfig;
@@ -8,23 +9,30 @@ use crate::utterance::{FrameAction, Utterance, UtteranceBuffer};
 use crate::vad::SpeechDetector;
 
 // ---------------------------------------------------------------------------
-// Frame processing: VAD verdicts + utterance buffer, fed by the signal path
+// Frame processing: Hp (in SignalPath) -> Agc (shared-gain, VAD-gated) ->
+// VAD verdicts + utterance buffer, fed by the signal path
 // ---------------------------------------------------------------------------
 
 /// Owns per-frame VAD/buffering state. Fed one raw hw-rate chunk at a time
 /// (`required_input_frames()` samples) by either the microphone loop or file
 /// mode, so both share identical resampling and utterance-detection behavior.
-/// Resampling / denoising / pairing lives behind `SignalPath`; this module
-/// only turns paired frames into VAD verdicts and utterances.
+/// Resampling / denoising / Hp / pairing lives behind `SignalPath`; this module
+/// applies shared-gain Agc then turns paired frames into VAD verdicts and
+/// utterances.
 pub(crate) struct FrameProcessor {
     hw_input_frames: usize,
     signal: SignalPath,
     vad: SpeechDetector,
     utterance: UtteranceBuffer,
     gate: GateConfig,
+    agc: Agc,
+    /// Previous frame's verdict. Gates Agc (1-frame delay breaks the
+    /// VAD<->gain feedback loop): silence passes at unity, speech adapts.
+    prev_speech: bool,
 }
 
 impl FrameProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         hw_rate: u32,
         denoiser_kind: DenoiserKind,
@@ -32,6 +40,8 @@ impl FrameProcessor {
         vad_adapt: bool,
         gate: GateConfig,
         hangover_frames: u32,
+        target_rms: f32,
+        max_gain: f32,
     ) -> Result<Self> {
         let hw_input_frames = hw_input_frames(hw_rate);
         let signal = SignalPath::new(hw_rate, denoiser_kind)?;
@@ -45,6 +55,8 @@ impl FrameProcessor {
             vad,
             utterance: UtteranceBuffer::new().with_hangover_frames(hangover_frames),
             gate,
+            agc: Agc::new(target_rms, max_gain),
+            prev_speech: false,
         })
     }
 
@@ -68,8 +80,13 @@ impl FrameProcessor {
         debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);
 
         for (vad16, whisper16) in self.signal.feed(frame_hw_raw) {
-            let is_speech = self.vad.verdict(&vad16);
-            if self.utterance.push_frame(&whisper16, is_speech) == FrameAction::Flush {
+            let mut vad_frame = (*vad16).clone();
+            let mut whisper_frame = (*whisper16).clone();
+            self.agc
+                .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
+            let is_speech = self.vad.verdict(&vad_frame);
+            self.prev_speech = is_speech;
+            if self.utterance.push_frame(&whisper_frame, is_speech) == FrameAction::Flush {
                 return self.close_current();
             }
         }
@@ -87,40 +104,36 @@ impl FrameProcessor {
     }
 
 
-    /// Discard all in-flight audio for a pause transition: signal-path
-    /// queues + resampler state, VAD staging/latch, and the utterance buffer
-    /// including pre-roll. Idempotent; discarding an already-empty pipeline
-    /// is a no-op.
+    /// Discard all in-flight audio for a pause/hold transition: signal-path
+    /// queues + resampler/Hp state, Agc gain, VAD staging/latch, and the
+    /// utterance buffer including pre-roll. Idempotent; discarding an
+    /// already-empty pipeline is a no-op. Noise floor preserved.
     pub(crate) fn discard_pending(&mut self) {
         self.signal.clear();
         self.vad.reset();
         self.utterance.discard();
+        self.agc.reset();
+        self.prev_speech = false;
     }
 
-    /// Observe-only background feed for pause: resample + RMS -> noise floor,
-    /// no earshot, no utterance, no latch change. Keeps resamplers continuous
-    /// (no `clear()` here) so the floor estimate has no chunk gaps.
-    pub(crate) fn observe_pause(&mut self, frame_hw_raw: &[f32]) {
-        for (vad16, _) in self.signal.feed(frame_hw_raw) {
-            self.vad.observe_background(&vad16);
-        }
-    }
-
-    /// Drop pre-pause speech state on pause entry without touching warm
-    /// state: VAD inference reset (noise floor preserved, see `vad`) +
-    /// utterance discard (pre-roll included). Resamplers are kept continuous
-    /// for `observe_pause`. Idempotent.
-    pub(crate) fn discard_speech_keep_warm(&mut self) {
-        self.vad.reset();
-        self.utterance.discard();
+    /// Full-pipeline hold (pause): same as `discard_pending` — no background
+    /// learning, no resampling, frozen floor. The main loop parks (drains and
+    /// drops raw) after calling this once on the pause edge.
+    pub(crate) fn hold_pipeline(&mut self) {
+        self.discard_pending();
     }
 
     /// Flush any trailing speech. Call once at shutdown / end of input.
     /// Returns the trailing utterance, if any.
     pub(crate) fn flush_trailing_speech(&mut self) -> Option<Utterance> {
         for (vad16, whisper16) in self.signal.flush() {
-            let is_speech = self.vad.verdict(&vad16);
-            if self.utterance.push_frame(&whisper16, is_speech) == FrameAction::Flush {
+            let mut vad_frame = (*vad16).clone();
+            let mut whisper_frame = (*whisper16).clone();
+            self.agc
+                .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
+            let is_speech = self.vad.verdict(&vad_frame);
+            self.prev_speech = is_speech;
+            if self.utterance.push_frame(&whisper_frame, is_speech) == FrameAction::Flush {
                 return self.close_current();
             }
         }

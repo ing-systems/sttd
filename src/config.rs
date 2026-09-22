@@ -133,21 +133,20 @@ pub(crate) const RTF_WARN_RTF: f64 = 1.0;
 /// signal. ~-50 dBFS. Override with `STTD_MIN_RMS` while tuning against real
 /// mic noise.
 pub(crate) const DEFAULT_MIN_SPEECH_RMS: f32 = 0.003;
-/// Target speech-only RMS for the pre-inference gain applied to an utterance
-/// that already cleared the acoustic gates (see `apply_gain`). Only ever
-/// amplifies, never attenuates — quiet-but-real speech (e.g. the
-/// rms=0.01178 case that prompted this) gets a boost toward whisper's
-/// comfort zone. `0` disables gain entirely. Override with `STTD_TARGET_RMS`.
-pub(crate) const DEFAULT_TARGET_RMS: f32 = 0.05;
-/// Ceiling on the gain `apply_gain` will apply (8x = +18 dB), so a near-
-/// silent utterance that slipped past `STTD_MIN_RMS` doesn't get blown up
-/// into clipped noise.
+/// Target speech-only RMS for the frame-level `Agc` (see `agc`): quiet-but-real
+/// speech gets lifted toward whisper's comfort zone. Only ever amplifies,
+/// never attenuates; frozen on silence. `0` disables gain entirely. Override
+/// with `STTD_TARGET_RMS`.
+pub(crate) const DEFAULT_TARGET_RMS: f32 = 0.04;
+/// Ceiling on the gain `Agc` will apply (8x = +18 dB), so a near-silent frame
+/// that slips past the activation threshold doesn't get blown into noise.
 pub(crate) const MAX_GAIN: f32 = 8.0;
-/// Cutoff of the one-pole high-pass in `condition_utterance`: 60 Hz keeps
-/// Polish speech intact (male F0 starts ~85 Hz, nasal murmur ~250 Hz+,
-/// sibilants at 4-8 kHz) while attenuating 50 Hz mains hum, a confirmed
-/// hallucination trigger. Gentle 6 dB/oct: at 150 Hz the loss is ~0.5 dB.
-pub(crate) const CONDITION_HP_CUTOFF_HZ: f32 = 60.0;
+/// AGC attack: how fast gain falls for loud sound (anti-clip). Per-sample
+/// envelope coefficient derived from this at 16 kHz.
+pub(crate) const AGC_ATTACK_MS: f32 = 10.0;
+/// AGC release: how slowly gain rises for quiet sound (anti-pumping, ~10 dB/s
+/// compliant with ITU-T G.169).
+pub(crate) const AGC_RELEASE_MS: f32 = 200.0;
 /// Linear fade applied to each end of an utterance by `condition_utterance`:
 /// 5 ms at 16 kHz. Lands in pre-roll/tail silence, killing trim/resampler
 /// clicks that whisper can decode as a token.

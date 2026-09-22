@@ -3,8 +3,8 @@
 //! Data flow:
 //! `cpal` (hw rate, N channels) -> channel pick (`--channel`) or mix to mono
 //! -> per ~10 ms raw chunk
-//! (`FrameProcessor`: `ResamplerFft` behind a 10 ms framing adapter, see
-//! `FftStream`). By default (`--denoiser none`) a single `resampler`
+//! (`FrameProcessor`: `ResamplerFir` behind a 10 ms framing adapter, see
+//! `FirStream`). By default (`--denoiser none`) a single `resampler`
 //! hop (-> 16 kHz) feeds both branches below, each completed frame serving
 //! both roles; with `--denoiser deepfilter` (requires the `denoise` Cargo
 //! feature) the VAD branch instead takes
@@ -26,10 +26,9 @@
 //! sheds; utterances shed weakest-first past `WHISPER_SHED_KEEP`) -> isolated
 //! `whisper-rs` inference
 //! thread (GPU/CPU and model per flags, aborted promptly on shutdown):
-//! conditioning (`condition_utterance`:
-//! DC removal, 60 Hz high-pass, 5 ms fades, peak safety) -> pre-inference
-//! gain toward `--target-rms`
-//! (`apply_gain`, quiet-but-real speech only, never attenuates) -> average
+//! conditioning (`condition_utterance`: DC removal, 5 ms fades, peak safety;
+//! hum removed earlier by `Hp`, levels by VAD-gated shared-gain `Agc`)
+//! -> average
 //! *text-token* probability gate (`average_text_confidence` excludes the
 //! timestamp tokens every whisper.cpp segment carries; whisper.cpp's own
 //! `no_speech_thold` being a no-op) at a floor `confidence_floor` relaxes when
@@ -83,6 +82,8 @@ mod emit;
 use emit::SystemEmitter;
 mod frame;
 mod gate;
+mod hp;
+mod agc;
 mod noise;
 mod signal;
 mod sound;
@@ -405,38 +406,26 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
                 }
             }
         }
-        // While paused, no utterance may open, but the background keeps
-        // teaching the noise floor: drain the callback into the accumulator
-        // and observe (resample + RMS -> floor, no earshot, no buffering).
-        // Pre-pause speech state was already dropped (`discard_speech_keep_warm`,
-        // idempotent), so resume starts clean with no pre-pause pre-roll
-        // while the threshold stays adapted to the room.
+        // Full-pipeline hold while paused: no resampling, no VAD, no
+        // utterance, no floor learning, no whisper input. The raw ring is
+        // drained and dropped so resume starts fresh with no stale speech;
+        // the whisper worker idles and holds its queue (see whisper).
         let now_paused = paused.load(Ordering::Acquire);
         if now_paused && !was_paused {
-            // Pause entry edge: full clear (resamplers + detector + utterance,
-            // noise floor preserved) so pre-pause partials can't leak into the
-            // background estimate or the first post-resume utterance.
-            fp.discard_pending();
+            // Pause entry edge: full clear (resamplers + Hp + Agc + detector +
+            // utterance, noise floor preserved) so pre-pause partials can't
+            // leak into the first post-resume utterance.
+            fp.hold_pipeline();
         }
         was_paused = now_paused;
         if now_paused {
-            fp.discard_speech_keep_warm();
-            // Drain the sample ring, then park briefly when empty instead of
-            // drain + `sleep(50ms)`: the noise floor still learns from every
-            // sample, but resume (SIGUSR2/SIGHUP) is noticed within ~10 ms
-            // instead of ~50 ms.
+            // Drain-and-drop without feeding SignalPath; park briefly so resume
+            // is noticed within ~50 ms while idle CPU stays negligible.
             drain_raw_into(&mut raw_rx, &mut accumulator);
-            if accumulator.len() < input_frames && !raw_rx.is_abandoned() {
-                thread::sleep(Duration::from_millis(10));
+            accumulator.clear();
+            if !raw_rx.is_abandoned() {
+                thread::sleep(Duration::from_millis(50));
                 drain_raw_into(&mut raw_rx, &mut accumulator);
-            }
-            while accumulator.len() >= input_frames {
-                fp.observe_pause(&accumulator[..input_frames]);
-                accumulator.drain(..input_frames);
-            }
-            // Keep only a partial chunk for continuity; full chunks are always
-            // consumed above, so this just caps a callback burst.
-            if accumulator.len() >= input_frames {
                 accumulator.clear();
             }
             continue;
@@ -577,6 +566,8 @@ fn open_input_path(
         cli.vad_adapt,
         gate_config(cli),
         crate::config::hangover_frames(cli.hangover_ms),
+        cli.target_rms,
+        crate::config::MAX_GAIN,
     )?;
     let raw_cap = (hw_rate as usize).saturating_mul(RAW_RING_SECS).max(65536);
     let (raw_tx, raw_rx) = RingBuffer::<f32>::new(raw_cap);
@@ -690,6 +681,8 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         cli.vad_adapt,
         gate_config(cli),
         crate::config::hangover_frames(cli.hangover_ms),
+        cli.target_rms,
+        crate::config::MAX_GAIN,
     )?;
     let input_frames = fp.required_input_frames();
 
@@ -761,7 +754,6 @@ fn whisper_options(cli: &Cli, shed_stale: bool) -> WhisperOptions {
         prompt_context_chars: cli.prompt_context_chars,
         language: cli.language,
         gate: gate_config(cli),
-        target_rms: cli.target_rms,
         debug_tokens: cli.debug_tokens,
         beam_size: cli.beam_size,
         temperature: cli.temperature,

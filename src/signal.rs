@@ -4,14 +4,15 @@
 //
 // One concept — a paired VAD verdict describing the whisper-branch audio it
 // is attached to — used to require bouncing between `frame`, `dsp`,
-// `denoise` and `vad`. `FrameProcessor` managed three `FftStream` adapters,
+// `denoise` and `vad`. `FrameProcessor` managed three `FirStream` adapters,
 // paired queues, `Arc` sharing and `clean48` scratch, triplicating
 // Direct vs Denoised logic across feed / flush / discard.
 //
-// This module owns branch topology, resampling cadence, denoising and
-// verdict pairing internally. Callers feed hw-rate chunks and receive ready
-// `(vad16, whisper16)` pairs; they never see `FftStream`, the denoiser's
-// 48 kHz intermediate, or how pairing stays in lockstep.
+// This module owns branch topology, resampling cadence, denoising, high-pass
+// filtering and verdict pairing internally. Callers feed hw-rate chunks and
+// receive ready `(vad16, whisper16)` pairs (already 80 Hz HP'd); they never
+// see `FirStream`, the denoiser's 48 kHz intermediate, or how pairing stays
+// in lockstep.
 
 use std::collections::VecDeque;
 
@@ -23,7 +24,8 @@ use crate::config::{DENOISE_RATE, FRAME_48K};
 use crate::denoise::DenoiserKind;
 #[cfg(feature = "denoise")]
 use crate::denoise::Denoiser;
-use crate::dsp::FftStream;
+use crate::dsp::FirStream;
+use crate::hp::Hp;
 
 /// Shared 16 kHz frame: one audio allocation, cheap `Arc` clones. The
 /// default (`Direct`) path decodes one frame and hands it to both the VAD
@@ -53,7 +55,7 @@ pub(crate) struct SignalPath {
     fed_chunks: u64,
     paired_frames: u64,
     max_pending: usize,
-    /// Reused outer container for `FftStream::feed_into` / `flush_into`:
+    /// Reused outer container for `FirStream::feed_into` / `flush_into`:
     /// cleared (capacity kept) on every resampler call so the 100 fps hot
     /// path doesn't reallocate the `Vec<Vec<_>>` wrapper per hw chunk. The
     /// inner per-frame `Vec`s are moved out (`drain(..)`) into `Arc`s and
@@ -68,7 +70,7 @@ enum VadPath {
     /// verdict and the utterance buffer — no 48 kHz intermediate, no
     /// denoiser object. Each completed 16 kHz frame serves both roles, so
     /// VAD/whisper pairing is trivially 1:1.
-    Direct { resampler: FftStream },
+    Direct { resampler: FirStream, hp: Hp },
     /// Opt-in (`deepfilter`, `denoise` feature): hw_rate -> 48 kHz -> denoise
     /// -> 48 kHz -> 16 kHz for VAD, plus an independent direct hw_rate ->
     /// 16 kHz hop for the whisper branch (which stays raw — the model was
@@ -80,12 +82,14 @@ enum VadPath {
         // fixed FFT chunks complete on their own cadence, so drained
         // 480-frames are denoised one by one as they arrive rather than one
         // per input chunk.
-        resampler_hw48: FftStream,
+        resampler_hw48: FirStream,
         // 48 kHz -> 16 kHz, VAD branch only (post-denoise).
-        resampler_vad: FftStream,
-        resampler_whisper: FftStream,
+        resampler_vad: FirStream,
+        resampler_whisper: FirStream,
         denoiser: Denoiser,
         clean48_vad: Vec<f32>,
+        hp_vad: Hp,
+        hp_whisper: Hp,
     },
 }
 
@@ -93,25 +97,23 @@ impl SignalPath {
     pub(crate) fn new(hw_rate: u32, denoiser_kind: DenoiserKind) -> Result<Self> {
         let vad_path = match denoiser_kind {
             DenoiserKind::Bypass => {
-                let resampler = FftStream::new(hw_rate, WHISPER_RATE, FRAME_16K)
+                let resampler = FirStream::new(hw_rate, WHISPER_RATE, FRAME_16K)
                     .with_context(|| format!("failed to create resampler (hw -> {WHISPER_RATE})"))?;
                 log::info!("denoiser: none");
-                VadPath::Direct { resampler }
+                VadPath::Direct { resampler, hp: Hp::new() }
             }
             #[cfg(feature = "denoise")]
             DenoiserKind::DeepFilter => {
-                let resampler_hw48 = FftStream::new(hw_rate, DENOISE_RATE, FRAME_48K)
+                let resampler_hw48 = FirStream::new(hw_rate, DENOISE_RATE, FRAME_48K)
                     .with_context(|| format!("failed to create resampler (hw -> {DENOISE_RATE})"))?;
-                let (chunk_in, chunk_out) = resampler_hw48.chunk_sizes();
                 log::info!(
-                    "resampler: {hw_rate} -> {DENOISE_RATE}, \
-                     fft_chunk_in={chunk_in} fft_chunk_out={chunk_out} frame_out={FRAME_48K}"
+                    "resampler: {hw_rate} -> {DENOISE_RATE} (fir, frame_out={FRAME_48K})"
                 );
 
-                let resampler_vad = FftStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K)
+                let resampler_vad = FirStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K)
                     .context("failed to create resampler (48k -> 16k, vad branch)")?;
 
-                let resampler_whisper = FftStream::new(hw_rate, WHISPER_RATE, FRAME_16K)
+                let resampler_whisper = FirStream::new(hw_rate, WHISPER_RATE, FRAME_16K)
                     .with_context(|| format!("failed to create resampler (hw -> {WHISPER_RATE})"))?;
 
                 let denoiser = Denoiser::new(DenoiserKind::DeepFilter)?;
@@ -121,6 +123,8 @@ impl SignalPath {
                     resampler_whisper,
                     denoiser,
                     clean48_vad: vec![0.0f32; FRAME_48K],
+                    hp_vad: Hp::new(),
+                    hp_whisper: Hp::new(),
                 }
             }
         };
@@ -151,7 +155,7 @@ impl SignalPath {
     }
 
     /// Feed one raw hw-rate chunk; returns every completed `(vad16,
-    /// whisper16)` pair in order. Each branch's `FftStream` may complete
+    /// whisper16)` pair in order. Each branch's `FirStream` may complete
     /// zero, one, or (on catch-up) several 10 ms frames per call; a branch
     /// running ahead waits in its queue. Both average 100 frames/s, so the
     /// queues stay bounded at a frame or two.
@@ -159,10 +163,11 @@ impl SignalPath {
         use std::sync::Arc;
         self.fed_chunks += 1;
         match &mut self.vad_path {
-            VadPath::Direct { resampler } => {
+            VadPath::Direct { resampler, hp } => {
                 self.scratch.clear();
                 resampler.feed_into(frame_hw_raw, &mut self.scratch);
-                for frame in self.scratch.drain(..) {
+                for mut frame in self.scratch.drain(..) {
+                    hp.process(&mut frame);
                     // One allocation shared by both branches: no 640 B memcpy.
                     let shared: SharedFrame = Arc::new(frame);
                     self.pending_whisper.push_back(Arc::clone(&shared));
@@ -176,6 +181,8 @@ impl SignalPath {
                 resampler_whisper,
                 denoiser,
                 clean48_vad,
+                hp_vad,
+                hp_whisper,
             } => {
                 self.scratch.clear();
                 resampler_hw48.feed_into(frame_hw_raw, &mut self.scratch);
@@ -185,13 +192,15 @@ impl SignalPath {
                     // Opt-in path only: outer `Vec` alloc per denoised frame
                     // is acceptable here; the default `Direct` path above is
                     // the 100 fps hotspot and uses `feed_into` + sharing.
-                    for vad_frame in resampler_vad.feed(&clean48_vad[..]) {
+                    for mut vad_frame in resampler_vad.feed(&clean48_vad[..]) {
+                        hp_vad.process(&mut vad_frame);
                         self.pending_vad.push_back(Arc::new(vad_frame));
                     }
                 }
                 self.scratch.clear();
                 resampler_whisper.feed_into(frame_hw_raw, &mut self.scratch);
-                for frame in self.scratch.drain(..) {
+                for mut frame in self.scratch.drain(..) {
+                    hp_whisper.process(&mut frame);
                     self.pending_whisper.push_back(Arc::new(frame));
                 }
             }
@@ -206,10 +215,11 @@ impl SignalPath {
     pub(crate) fn flush(&mut self) -> Vec<PairedFrames> {
         use std::sync::Arc;
         match &mut self.vad_path {
-            VadPath::Direct { resampler } => {
+            VadPath::Direct { resampler, hp } => {
                 self.scratch.clear();
                 resampler.flush_into(&mut self.scratch);
-                for frame16 in self.scratch.drain(..) {
+                for mut frame16 in self.scratch.drain(..) {
+                    hp.process(&mut frame16);
                     let shared: SharedFrame = Arc::new(frame16);
                     self.pending_whisper.push_back(Arc::clone(&shared));
                     self.pending_vad.push_back(shared);
@@ -222,19 +232,24 @@ impl SignalPath {
                 resampler_whisper,
                 denoiser,
                 clean48_vad,
+                hp_vad,
+                hp_whisper,
             } => {
                 self.scratch.clear();
                 resampler_hw48.flush_into(&mut self.scratch);
                 for frame48 in self.scratch.drain(..) {
                     denoiser.denoise_frame(&frame48, clean48_vad);
-                    for vad_frame in resampler_vad.feed(&clean48_vad[..]) {
+                    for mut vad_frame in resampler_vad.feed(&clean48_vad[..]) {
+                        hp_vad.process(&mut vad_frame);
                         self.pending_vad.push_back(Arc::new(vad_frame));
                     }
                 }
-                for vad_frame in resampler_vad.flush() {
+                for mut vad_frame in resampler_vad.flush() {
+                    hp_vad.process(&mut vad_frame);
                     self.pending_vad.push_back(Arc::new(vad_frame));
                 }
-                for whisper_frame in resampler_whisper.flush() {
+                for mut whisper_frame in resampler_whisper.flush() {
+                    hp_whisper.process(&mut whisper_frame);
                     self.pending_whisper.push_back(Arc::new(whisper_frame));
                 }
             }
@@ -255,18 +270,25 @@ impl SignalPath {
         self.paired_frames = 0;
         self.max_pending = 0;
         match &mut self.vad_path {
-            VadPath::Direct { resampler } => resampler.clear(),
+            VadPath::Direct { resampler, hp } => {
+                resampler.clear();
+                hp.reset();
+            }
             #[cfg(feature = "denoise")]
             VadPath::Denoised {
                 resampler_hw48,
                 resampler_vad,
                 resampler_whisper,
                 denoiser,
+                hp_vad,
+                hp_whisper,
                 ..
             } => {
                 resampler_hw48.clear();
                 resampler_vad.clear();
                 resampler_whisper.clear();
+                hp_vad.reset();
+                hp_whisper.reset();
                 denoiser.reset();
             }
         }
@@ -351,7 +373,7 @@ mod tests {
             let mut signal = SignalPath::new(hw, DenoiserKind::Bypass).unwrap();
             let n = feed_silence(&mut signal, hw, 200);
             assert!(
-                (198..=203).contains(&n),
+                (193..=210).contains(&n),
                 "hw={hw}: expected ~200 pairs, got {n}"
             );
         }
@@ -359,18 +381,21 @@ mod tests {
 
     #[test]
     fn flush_recovers_trailing_audio() {
-        // Two 480-frame feeds at 48k->16k complete one FFT chunk; without a
-        // flush the tail would be lost at shutdown.
+        // FIR buffers delay + lookahead: fed frames plus zero-drain flush must
+        // recover the tail instead of losing it at shutdown.
         let mut signal = SignalPath::new(48_000, DenoiserKind::Bypass).unwrap();
         let hw_chunk = hw_input_frames(48_000);
         assert_eq!(hw_chunk, 480);
         let fed: usize = (0..2)
             .map(|_| signal.feed(&vec![0.1f32; hw_chunk]).len())
             .sum();
-        assert_eq!(fed, 1);
         let flushed = signal.flush();
         assert!(!flushed.is_empty(), "flush must recover the tail");
-        assert_eq!(fed + flushed.len(), 3);
+        assert!(
+            (2..=6).contains(&(fed + flushed.len())),
+            "fed={fed} flushed={} out of range",
+            flushed.len()
+        );
     }
 
     #[test]
@@ -398,10 +423,10 @@ mod tests {
             }
             let (fed, paired, max_pending) = signal.stats();
             assert_eq!(fed, 200, "hw={hw}");
-            // FFT chunking shifts the count by a frame or two, same
+            // FIR delay shifts the count by a few frames, same
             // tolerance as `branches_stay_in_lockstep`.
             assert!(
-                (198..=203).contains(&paired),
+                (193..=210).contains(&paired),
                 "hw={hw}: paired={paired} for 200 fed"
             );
             assert!(

@@ -13,6 +13,7 @@ cpal = "0.15"
 daemonize = "0.5"
 libc = "0.2"
 resampler = "0.5"
+biquad = "0.6"
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"], optional = true }
 ndarray = { version = "0.15", optional = true }
 earshot = { version = "1.2", features = ["alloc"] }

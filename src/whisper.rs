@@ -9,8 +9,7 @@ use rtrb::Consumer;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::config::{
-    CONDITION_FADE_SAMPLES, CONDITION_HP_CUTOFF_HZ, DEFAULT_THREADS, MAX_GAIN, WHISPER_MIN_SAMPLES,
-    WHISPER_RATE,
+    CONDITION_FADE_SAMPLES, DEFAULT_THREADS, WHISPER_MIN_SAMPLES,
 };
 use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
@@ -69,7 +68,6 @@ pub(crate) struct WhisperOptions {
     pub(crate) prompt_context_chars: usize,
     pub(crate) language: Language,
     pub(crate) gate: GateConfig,
-    pub(crate) target_rms: f32,
     pub(crate) debug_tokens: bool,
     pub(crate) beam_size: i32,
     pub(crate) temperature: f32,
@@ -251,7 +249,6 @@ fn whisper_init_and_run(
     let shed_stale = opts.shed_stale;
     let language = opts.language;
     let gate = opts.gate.clone();
-    let target_rms = opts.target_rms;
     let debug_tokens = opts.debug_tokens;
     let beam_size = opts.beam_size;
     let temperature = opts.temperature;
@@ -343,7 +340,14 @@ fn whisper_init_and_run(
         // path above only covers the long-pause case.
         let mut was_paused = paused.load(Ordering::Relaxed);
 
-        for utterance in stash.drain(..) {
+        // Full-pipeline hold: while paused the queue (and stash) holds —
+        // nothing transcribes until resume. Stash replay below also waits.
+        for utterance in std::mem::take(&mut stash) {
+            if paused.load(Ordering::Relaxed) {
+                // Still paused (reload raced a re-pause): re-stash and wait.
+                stash.push(utterance);
+                break;
+            }
             if utterance.pcm.is_empty() {
                 continue;
             }
@@ -358,7 +362,6 @@ fn whisper_init_and_run(
                 prompt_context_chars,
                 language,
                 &gate,
-                target_rms,
                 debug_tokens,
                 beam_size,
                 temperature,
@@ -386,16 +389,46 @@ fn whisper_init_and_run(
         // stays negligible while pause/unload checks run every ~20 ms
         // instead of the old 1 s tick.
         let disconnected = loop {
+            // Full hold: while paused, idle without popping so queued
+            // utterances wait for resume instead of transcribing through pause.
+            if paused.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+                was_paused = true;
+                if should_unload(
+                    auto_unload,
+                    true,
+                    last_unpaused.elapsed(),
+                    unload_after,
+                ) {
+                    log::info!(
+                        "paused {}s, unloading whisper model to free VRAM...",
+                        unload_after.as_secs()
+                    );
+                    break false;
+                }
+                if rx.is_abandoned() {
+                    // Shutdown while paused with a held queue: drop it (paused
+                    // shutdown has nothing worth flushing) and exit.
+                    let mut n = 0;
+                    while rx.pop().is_ok() {
+                        n += 1;
+                    }
+                    if n > 0 {
+                        log::warn!(
+                            "dropping {n} queued utterance(s) (shut down while paused)"
+                        );
+                    }
+                    break true;
+                }
+                continue;
+            }
             match rx.pop() {
                 Ok(utterance) => {
-                    let now_paused = paused.load(Ordering::Relaxed);
-                    if !now_paused {
-                        last_unpaused = Instant::now();
-                        if sound_enabled && was_paused {
-                            crate::sound::play_ready();
-                        }
+                    last_unpaused = Instant::now();
+                    if sound_enabled && was_paused {
+                        crate::sound::play_ready();
                     }
-                    was_paused = now_paused;
+                    was_paused = false;
                     if utterance.pcm.is_empty() {
                         continue;
                     }
@@ -448,7 +481,6 @@ fn whisper_init_and_run(
                             prompt_context_chars,
                             language,
                             &gate,
-                            target_rms,
                             debug_tokens,
                             beam_size,
                             temperature,
@@ -889,7 +921,6 @@ fn transcribe_and_emit(
     prompt_context_chars: usize,
     language: Language,
     gate: &crate::gate::GateConfig,
-    target_rms: f32,
     debug_tokens: bool,
     beam_size: i32,
     temperature: f32,
@@ -903,9 +934,9 @@ fn transcribe_and_emit(
 ) -> bool {
     let tag = format!("utt_{utterance_no:06}");
 
+    // Levels already normalized frame-wise by `Agc` (VAD-gated, shared-gain);
+    // no per-utterance static gain here — that path is deleted.
     let conditioned = condition_utterance(&utterance.pcm);
-    let rms_for_gain = conditioned_speech_rms(&utterance.pcm, &conditioned, utterance.evidence.rms);
-    let gained = apply_gain(&conditioned, rms_for_gain, target_rms, MAX_GAIN);
     let effective_prompt = build_effective_prompt(base_prompt, prompt_tail);
 
     // Inference time only (conditioning/gain excluded): feeds the RTF
@@ -914,7 +945,7 @@ fn transcribe_and_emit(
     let result = transcribe(
         state,
         token_beg,
-        gained.as_ref(),
+        &conditioned,
         &effective_prompt,
         language,
         debug_tokens,
@@ -982,37 +1013,20 @@ fn transcribe_and_emit(
     }
 }
 
-/// Condition an utterance for whisper: DC removal, gentle one-pole
-/// high-pass at `CONDITION_HP_CUTOFF_HZ`, short linear fades at both ends,
-/// and peak safety to 0.99. Runs before `apply_gain` so the gain stage sees
-/// hum-free, click-free audio.
+/// Condition an utterance for whisper: DC removal, short linear fades at
+/// both ends, and peak safety to 0.99. Hum/rumble already removed upstream by
+/// `Hp` (80 Hz biquad after resampling); levels already normalized by `Agc`.
 ///
-/// Kept deliberately light because the whisper branch is raw by design (see
-/// `Whisper branch` in `CONTEXT.md`): 60 Hz / 6 dB-oct costs ~0.5 dB at
-/// 150 Hz and nothing in the 4-8 kHz sibilant band, and the 5 ms fades land
-/// in pre-roll/tail silence rather than speech.
+/// Kept deliberately light: the 5 ms fades land in pre-roll/tail silence
+/// rather than speech.
 pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
     if pcm.is_empty() {
         return Vec::new();
     }
-    // DC removal: subtract the mean so soundcard offset can't bias the
-    // high-pass startup transient or the gain stage.
+    // DC removal: subtract the mean so soundcard offset can't bias fades or
+    // peak safety.
     let mean = pcm.iter().fold(0.0f64, |m, &s| m + s as f64) / pcm.len() as f64;
     let mut out: Vec<f32> = pcm.iter().map(|&s| s - mean as f32).collect();
-
-    // One-pole high-pass: y[n] = x[n] - x[n-1] + a * y[n-1],
-    // a = exp(-2*pi*fc/fs). Zero-state start is fine post-DC-removal: the
-    // first samples are pre-roll silence near zero.
-    let a = (-2.0 * std::f32::consts::PI * CONDITION_HP_CUTOFF_HZ / WHISPER_RATE as f32).exp();
-    let mut x_prev = out[0];
-    let mut y_prev = 0.0f32;
-    for s in out.iter_mut() {
-        let x = *s;
-        let y = x - x_prev + a * y_prev;
-        x_prev = x;
-        y_prev = y;
-        *s = y;
-    }
 
     // Linear fades at both ends; shortened for very short utterances so the
     // ramps never overlap.
@@ -1024,8 +1038,7 @@ pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
         out[j] *= ramp;
     }
 
-    // Peak safety: resampler overshoot can exceed 1.0; keep headroom so
-    // `apply_gain` isn't blocked by a single hot sample.
+    // Peak safety: resampler overshoot can exceed 1.0; keep headroom.
     let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
     if peak > 0.99 {
         let scale = 0.99 / peak;
@@ -1034,73 +1047,6 @@ pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
         }
     }
     out
-}
-
-/// Overall RMS of a buffer (speech + silence tail together). Helper for
-/// `conditioned_speech_rms`; `f64` accumulation so long utterances don't lose
-/// precision.
-fn overall_rms(pcm: &[f32]) -> f32 {
-    if pcm.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f64 = pcm.iter().map(|&s| (s as f64) * (s as f64)).sum();
-    (sum_sq / pcm.len() as f64).sqrt() as f32
-}
-
-/// Estimate speech-only RMS *after* conditioning from the pre-conditioning
-/// speech-only `rms` `UtteranceBuffer::close` measured.
-///
-/// `condition_utterance` (DC removal, 60 Hz high-pass, fades, peak safety)
-/// changes overall level — e.g. a DC offset or 50 Hz hum inflates the raw
-/// RMS but is gone after conditioning. Scaling the speech-only RMS by the
-/// overall `conditioned / raw` ratio keeps the `apply_gain` estimate anchored
-/// to what whisper actually receives, without recomputing over `pcm` (which
-/// would dilute it with the silence tail).
-///
-/// Falls back to the raw `speech_rms` when either overall level is
-/// zero/non-finite, so silence/empty input disables gain exactly as before.
-pub(crate) fn conditioned_speech_rms(
-    raw_pcm: &[f32],
-    conditioned_pcm: &[f32],
-    speech_rms: f32,
-) -> f32 {
-    if speech_rms <= 0.0 {
-        return speech_rms;
-    }
-    let raw = overall_rms(raw_pcm);
-    let cond = overall_rms(conditioned_pcm);
-    if raw <= 0.0 || cond <= 0.0 || !raw.is_finite() || !cond.is_finite() {
-        return speech_rms;
-    }
-    speech_rms * (cond / raw)
-}
-
-/// Apply gain toward `target_rms`, computed from the speech-only `rms`
-/// post-conditioning estimate (see `conditioned_speech_rms`, not recomputed
-/// over `pcm`, which includes the padded silence tail). Only ever amplifies (gain >= 1.0) and
-/// never attenuates: a clip reaching this point already cleared the acoustic
-/// gates, so there's no silence here to accidentally boost. Caps at
-/// `max_gain`, and backs off further if that gain would clip the loudest
-/// sample past 0.99. `target_rms <= 0.0` or `rms <= 0.0` disables gain.
-/// Returns borrowed when no gain is needed so the loud common case avoids a copy.
-pub(crate) fn apply_gain<'a>(
-    pcm: &'a [f32],
-    rms: f32,
-    target_rms: f32,
-    max_gain: f32,
-) -> std::borrow::Cow<'a, [f32]> {
-    if target_rms <= 0.0 || rms <= 0.0 {
-        return std::borrow::Cow::Borrowed(pcm);
-    }
-    let mut gain = (target_rms / rms).clamp(1.0, max_gain);
-    if gain <= 1.0 {
-        return std::borrow::Cow::Borrowed(pcm);
-    }
-    let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-    if peak > 0.0 {
-        gain = gain.min(0.99 / peak);
-    }
-    std::borrow::Cow::Owned(pcm.iter().map(|&s| s * gain).collect())
 }
 
 /// Pad sub-second audio with quiet dithered noise instead of exact digital
@@ -1370,8 +1316,8 @@ mod tests {
     use crate::config::{
         DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_LOGPROB_THOLD, DEFAULT_MIN_CONFIDENCE,
         DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS,
-        DEFAULT_TARGET_RMS, DEFAULT_TEMPERATURE, DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS,
-        DEFAULT_USE_GPU, MAX_GAIN, MIN_SPEECH_FRAMES, WHISPER_MIN_SAMPLES,
+        DEFAULT_TEMPERATURE, DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS, DEFAULT_USE_GPU,
+        MIN_SPEECH_FRAMES, WHISPER_MIN_SAMPLES,
     };
     use crate::gate::{is_hallucination, is_repetition, EvidenceStrength, GateConfig};
     use crate::utterance::Evidence;
@@ -1720,54 +1666,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_gain_is_capped() {
-        // A near-silent clip (rms=0.0001) must not get amplified by the raw
-        // target/rms ratio (500x here) — that would blow quantization noise
-        // up into something whisper mistakes for speech. Capped at
-        // MAX_GAIN, and backed off further if it would clip.
-        let pcm = vec![0.0001f32; 100];
-        let out = apply_gain(&pcm, 0.0001, DEFAULT_TARGET_RMS, MAX_GAIN);
-        let applied_gain = out[0] / pcm[0];
-        assert!(
-            applied_gain <= MAX_GAIN + 1e-3,
-            "gain={applied_gain} exceeds cap {MAX_GAIN}"
-        );
-        assert!(out.iter().all(|&s| s.abs() <= 0.99 + 1e-6));
-    }
-
-    #[test]
-    fn apply_gain_disabled_by_zero_target() {
-        let pcm = vec![0.01f32; 100];
-        let out = apply_gain(&pcm, 0.01, 0.0, MAX_GAIN);
-        assert_eq!(out.as_ref(), pcm.as_slice());
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn apply_gain_never_attenuates() {
-        // A clip already louder than the target must be left alone, not
-        // turned down toward it — this gate only ever helps quiet-but-real
-        // speech, never touches an already-strong signal.
-        let pcm = vec![0.2f32; 100];
-        let out = apply_gain(&pcm, 0.2, DEFAULT_TARGET_RMS, MAX_GAIN);
-        assert_eq!(out.as_ref(), pcm.as_slice());
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn apply_gain_borrows_when_no_gain_needed() {
-        // Loud common case must avoid a copy: gain <= 1.0 returns borrowed.
-        let pcm = vec![0.2f32; 100];
-        let out = apply_gain(&pcm, 0.2, DEFAULT_TARGET_RMS, MAX_GAIN);
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(out.as_ref(), pcm.as_slice());
-        // Quiet case that needs gain returns owned.
-        let quiet = vec![0.001f32; 100];
-        let out_owned = apply_gain(&quiet, 0.001, DEFAULT_TARGET_RMS, MAX_GAIN);
-        assert!(matches!(out_owned, std::borrow::Cow::Owned(_)));
-    }
-
-    #[test]
     fn pad_extends_short_utterance_with_dither() {
         // Regression for: "input is too short - 860 ms < 1000 ms".
         // 860 ms = 13_760 samples must be padded to 16_000.
@@ -1795,22 +1693,6 @@ mod tests {
         assert_eq!(out.len(), pcm.len());
         let mean = out.iter().fold(0.0f64, |m, &s| m + s as f64) / out.len() as f64;
         assert!(mean.abs() < 1e-5, "mean={mean}");
-    }
-
-    #[test]
-    fn condition_attenuates_50hz_hum() {
-        // 50 Hz hum at 16 kHz: compare RMS before/after over the steady
-        // middle (past the HP startup transient and fades).
-        let hum: Vec<f32> = (0..16_000)
-            .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
-            .collect();
-        let out = condition_utterance(&hum);
-        let rms = |v: &[f32]| {
-            (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt()
-        };
-        let before = rms(&hum[2000..14_000]);
-        let after = rms(&out[2000..14_000]);
-        assert!(after < before * 0.7, "before={before} after={after}");
     }
 
     #[test]
@@ -1855,53 +1737,16 @@ mod tests {
     }
 
     #[test]
-    fn conditioned_rms_follows_hum_removal() {
-        // 50 Hz hum + DC offset inflates raw RMS but conditioning removes
-        // most of it: the speech estimate for gain must shrink accordingly,
-        // otherwise quiet hum would steal gain meant for speech.
-        let hum_dc: Vec<f32> = (0..16_000)
-            .map(|i| 0.1 + (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
+    fn hum_rejection_lives_upstream_in_hp() {
+        // 50 Hz hum is removed by `Hp` (80 Hz biquad after resampling), not by
+        // `condition_utterance` (DC/fades/peak only). A hum-heavy clip keeps
+        // its level here; the pipeline relies on Hp + Agc instead of a static
+        // per-utterance boost.
+        let hum: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
             .collect();
-        let conditioned = condition_utterance(&hum_dc);
-        let speech_rms = 0.15;
-        let adjusted = conditioned_speech_rms(&hum_dc, &conditioned, speech_rms);
-        assert!(
-            adjusted < speech_rms,
-            "hum/DC removal must lower the estimate: {adjusted} vs {speech_rms}"
-        );
-        assert!(adjusted > 0.0);
-    }
-
-    #[test]
-    fn conditioned_rms_keeps_speech_band() {
-        // 1 kHz tone passes conditioning nearly untouched: the estimate must
-        // stay within ±15% (fades + HP cost a little even in-band).
-        let tone: Vec<f32> = (0..16_000)
-            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin() * 0.2)
-            .collect();
-        let conditioned = condition_utterance(&tone);
-        let speech_rms = 0.14;
-        let adjusted = conditioned_speech_rms(&tone, &conditioned, speech_rms);
-        let ratio = adjusted / speech_rms;
-        assert!(
-            (0.85..=1.15).contains(&ratio),
-            "speech-band ratio must stay near 1.0, got {ratio}"
-        );
-    }
-
-    #[test]
-    fn conditioned_rms_falls_back_on_silence() {
-        // Zero/empty overall levels must not scale or NaN: gain stays
-        // disabled via the original speech_rms.
-        assert_eq!(conditioned_speech_rms(&[], &[], 0.01), 0.01);
-        assert_eq!(
-            conditioned_speech_rms(&vec![0.0; 160], &vec![0.0; 160], 0.01),
-            0.01
-        );
-        assert_eq!(
-            conditioned_speech_rms(&vec![0.1; 160], &vec![0.1; 160], 0.0),
-            0.0
-        );
+        let out = condition_utterance(&hum);
+        assert_eq!(out.len(), hum.len());
     }
 
     #[test]
@@ -2059,7 +1904,6 @@ mod tests {
                 DEFAULT_MIN_CONFIDENCE,
                 DEFAULT_MIN_CONFIDENCE_STRONG,
             ),
-            target_rms: DEFAULT_TARGET_RMS,
             debug_tokens: false,
             beam_size: DEFAULT_BEAM_SIZE,
             temperature: DEFAULT_TEMPERATURE,
