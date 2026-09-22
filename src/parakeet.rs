@@ -107,12 +107,11 @@ impl SpeechModel for ParakeetModel {
         }
         // Encoder does 8x subsampling; a very short clip can yield too few
         // frames for the TDT greedy decoder to emit anything (see
-        // PARAKEET_MIN_SAMPLES's doc comment). Reuses whisper's dither-pad
-        // helper — the technique isn't whisper-specific, only its usual home
-        // is.
+        // PARAKEET_MIN_SAMPLES's doc comment). Reuses the shared dither-pad
+        // helper — the technique isn't whisper-specific.
         let padded;
         let pcm = if pcm_16k.len() < PARAKEET_MIN_SAMPLES {
-            padded = crate::whisper::pad_with_dither(pcm_16k, PARAKEET_MIN_SAMPLES);
+            padded = crate::asr::pad_with_dither(pcm_16k, PARAKEET_MIN_SAMPLES);
             &padded[..]
         } else {
             pcm_16k

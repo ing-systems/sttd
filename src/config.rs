@@ -96,6 +96,8 @@ pub(crate) const MIC_CLIP_RATIO: f32 = 0.005;
 /// `WHISPER_RATE` (16_000) samples yields only 990 ms this way and still
 /// gets rejected — confirmed via `sttd --file` on a sub-second clip. The
 /// true minimum is 16_040; padded well past it for margin.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const WHISPER_MIN_SAMPLES: usize = 16_400;
 /// Parakeet's encoder does 8x subsampling; a very short clip can yield too
 /// few encoder frames for the TDT greedy decoder to emit anything. Padded to
@@ -236,30 +238,36 @@ pub(crate) const DEFAULT_AUTO_UNLOAD_AFTER_SECS: u64 = 180;
 /// `SamplingStrategy::BeamSearch`). `1` is greedy (fastest,
 /// repetition-prone); larger explores more hypotheses (slower, diminishing
 /// returns). Default 5 (whisper.cpp default). Override with
-/// `STTD_BEAM_SIZE`.
+/// `STTD_BEAM_SIZE`. Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_BEAM_SIZE: i32 = 5;
 /// Initial decoding temperature (`set_temperature`). `0.0` is greedy
 /// (deterministic, fastest); higher samples more diversely. Default 0.0
 /// (whisper.cpp default). Override with `STTD_TEMPERATURE`.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_TEMPERATURE: f32 = 0.0;
 /// Temperature increment for whisper.cpp's fallback ladder
 /// (`set_temperature_inc`): on `entropy/logprob` fallback the decoder
 /// re-tries at `temperature + temperature_inc`, `+ 2*inc`, ... up to 1.0.
 /// `0.0` disables the ladder (single-temp decode). Default 0.2, i.e. the
 /// historical `[0.0, 0.2, .., 1.0]` ladder. Override with
-/// `STTD_TEMPERATURE_INC`.
+/// `STTD_TEMPERATURE_INC`. Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_TEMPERATURE_INC: f32 = 0.2;
 /// Entropy threshold for the fallback ladder (`set_entropy_thold`,
 /// whisper.cpp default 2.4): a decode with entropy above this re-tries at
 /// the next ladder temperature. Higher = fewer re-tries (faster, stickier);
 /// lower = more re-tries (slower, rescues repetition loops). Override with
-/// `STTD_ENTROPY_THOLD`.
+/// `STTD_ENTROPY_THOLD`. Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_ENTROPY_THOLD: f32 = 2.4;
 /// Log-probability threshold for the fallback ladder (`set_logprob_thold`,
 /// whisper.cpp default -1.0): a decode with average logprob below this
 /// re-tries at the next ladder temperature. Less negative (e.g. -0.5) =
 /// more re-tries; `-10.0` effectively disables the logprob arm. Override
-/// with `STTD_LOGPROB_THOLD`.
+/// with `STTD_LOGPROB_THOLD`. Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_LOGPROB_THOLD: f32 = -1.0;
 /// Decoder thread count (`set_n_threads`). Default 8 (historical value);
 /// `0` means auto = `available_parallelism` at startup. Override with
@@ -270,21 +278,31 @@ pub(crate) const DEFAULT_THREADS: i32 = 8;
 pub(crate) const DEFAULT_USE_GPU: bool = true;
 /// Whether whisper translates non-English speech to English (`set_translate`)
 /// instead of transcribing it. Default false. Override with
-/// `STTD_TRANSLATE=1` / `--translate`.
+/// `STTD_TRANSLATE=1` / `--translate`. Whisper-only (see the `whisper`
+/// Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_TRANSLATE: bool = false;
 
 /// Whisper model auto-download. The URL is derived from the filename (see
 /// `ensure_available`), so `--model` as an explicit path can point at any
 /// ggml model published in this repo, not just the compiled-in default.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg(feature = "whisper")]
+pub(crate) const MODEL_BASE_URL: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
+#[cfg(not(feature = "whisper"))]
+#[allow(dead_code)]
 pub(crate) const MODEL_BASE_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 pub(crate) const DEFAULT_MODELS_DIR: &str = "models";
-pub(crate) const DEFAULT_MODEL_SPEC: &str = "large-v3-turbo-q8_0";
+pub(crate) const DEFAULT_MODEL_SPEC: &str = "parakeet";
 
 /// All `--model` symbolic specs (Polish-relevant, no `.en` variants),
 /// with their `ggml-*.bin` filename and upstream download size.
 /// `large-v1` has no quantized build upstream; `tiny`/`base`/`small` use
 /// `q5_1` while `medium`/`large-v2`/`large-v3`/`large-v3-turbo` use `q5_0`.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg(feature = "whisper")]
 pub(crate) const MODEL_CATALOG: &[(&str, &str, &str)] = &[
     ("tiny", "ggml-tiny.bin", "75 MiB"),
     ("tiny-q5_1", "ggml-tiny-q5_1.bin", "31 MiB"),
@@ -319,6 +337,8 @@ pub(crate) const MODEL_CATALOG: &[(&str, &str, &str)] = &[
 
 /// Filename for a catalog `spec` (e.g. `base-q5_1` ->
 /// `ggml-base-q5_1.bin`), or `None` when the spec is unknown.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg(feature = "whisper")]
 pub(crate) fn model_file_for_spec(spec: &str) -> Option<&'static str> {
     MODEL_CATALOG
         .iter()
@@ -327,14 +347,28 @@ pub(crate) fn model_file_for_spec(spec: &str) -> Option<&'static str> {
 }
 
 /// Comma-separated valid specs for `--model` error messages (whisper
-/// catalog plus Parakeet catalog).
+/// catalog plus Parakeet catalog when the `whisper` feature is enabled,
+/// Parakeet catalog alone otherwise).
 pub(crate) fn valid_model_specs() -> String {
-    MODEL_CATALOG
-        .iter()
-        .map(|(s, _, _)| *s)
-        .chain(PARAKEET_CATALOG.iter().map(|(s, ..)| *s))
-        .collect::<Vec<_>>()
-        .join(", ")
+    #[cfg(feature = "whisper")]
+    {
+        MODEL_CATALOG
+            .iter()
+            .map(|(s, _, _)| *s)
+            .chain(PARAKEET_CATALOG.iter().map(|(s, ..)| *s))
+            .chain(std::iter::once("parakeet"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    #[cfg(not(feature = "whisper"))]
+    {
+        PARAKEET_CATALOG
+            .iter()
+            .map(|(s, ..)| *s)
+            .chain(std::iter::once("parakeet"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Parakeet-TDT-0.6B-v3 weights, published as loose ONNX files (no archive)
@@ -398,6 +432,8 @@ pub(crate) fn parakeet_entry_for_spec(
 /// audio the model falls back on that prior instead of the (absent) acoustic
 /// evidence — i.e. it would recite from the prompt itself. Override with
 /// `STTD_PROMPT` to opt back into a domain vocabulary at the cost of that risk.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_PROMPT: &str =
     "Technical conversation in Polish and English. Rozmowa techniczna po polsku i angielsku.";
 
@@ -407,16 +443,22 @@ pub(crate) const DEFAULT_PROMPT: &str =
 /// a Polish prior drags translate-mode output back to Polish (or makes the
 /// model recite the prompt instead of translating). This exact string gave
 /// the best translation in local `--file` tests.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_TRANSLATE_PROMPT: &str = "Technical conversation in English.";
 
 /// How many trailing chars of accepted transcripts are appended to the
 /// whisper `initial_prompt` as conversational context (see `prompt_context`
 /// in `whisper`). `0` disables the carryover. Override with
-/// `STTD_PROMPT_CONTEXT_CHARS`.
+/// `STTD_PROMPT_CONTEXT_CHARS`. Whisper-only (see the `whisper` Cargo
+/// feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_PROMPT_CONTEXT_CHARS: usize = 150;
 /// Hard cap for `--prompt-context-chars`: whisper.cpp's `initial_prompt`
 /// is prior context, not storage — past a few hundred chars it starts
 /// reciting the prompt on low-signal audio (see `DEFAULT_PROMPT`).
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const MAX_PROMPT_CONTEXT_CHARS: usize = 2000;
 
 /// Transcripts that are near-exact matches for common Whisper hallucinations
@@ -467,6 +509,8 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
 }
 
 /// Parse `--beam-size`/`STTD_BEAM_SIZE`: must be >= 1.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) fn parse_beam_size(s: &str) -> Result<i32, String> {
     let v: i32 = s
         .trim()
@@ -480,6 +524,8 @@ pub(crate) fn parse_beam_size(s: &str) -> Result<i32, String> {
 }
 
 /// Parse `--temperature`/`STTD_TEMPERATURE`: 0.0..=2.0 (`0.0` = greedy).
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) fn parse_temperature(s: &str) -> Result<f32, String> {
     let v: f32 = s
         .trim()
@@ -494,6 +540,8 @@ pub(crate) fn parse_temperature(s: &str) -> Result<f32, String> {
 
 /// Parse `--temperature-inc`/`STTD_TEMPERATURE_INC`: 0.0..=1.0
 /// (`0.0` = single-temp decode, no fallback ladder).
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) fn parse_temperature_inc(s: &str) -> Result<f32, String> {
     let v: f32 = s
         .trim()
@@ -507,6 +555,8 @@ pub(crate) fn parse_temperature_inc(s: &str) -> Result<f32, String> {
 }
 
 /// Parse `--entropy-thold`/`STTD_ENTROPY_THOLD`: 0.0..=10.0.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) fn parse_entropy_thold(s: &str) -> Result<f32, String> {
     let v: f32 = s
         .trim()
@@ -520,6 +570,8 @@ pub(crate) fn parse_entropy_thold(s: &str) -> Result<f32, String> {
 }
 
 /// Parse `--logprob-thold`/`STTD_LOGPROB_THOLD`: -10.0..=0.0.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) fn parse_logprob_thold(s: &str) -> Result<f32, String> {
     let v: f32 = s
         .trim()
@@ -547,7 +599,9 @@ pub(crate) fn parse_threads(s: &str) -> Result<i32, String> {
 }
 
 /// Parse `--prompt-context-chars`/`STTD_PROMPT_CONTEXT_CHARS`: 0 disables,
-/// max `MAX_PROMPT_CONTEXT_CHARS`.
+/// max `MAX_PROMPT_CONTEXT_CHARS`. Whisper-only (see the `whisper` Cargo
+/// feature).
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) fn parse_context_chars(s: &str) -> Result<usize, String> {
     let v: usize = s.trim().parse().map_err(|_| {
         format!(
@@ -757,6 +811,7 @@ mod tests {
         assert_eq!(RTF_WARN_RTF, 1.0);
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn whisper_min_clears_whisper_cpp_mel_length_check() {
         // Regression: exactly WHISPER_RATE (16_000) samples passes our own
@@ -770,9 +825,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn model_catalog_has_default_and_no_english_variants() {
-        assert_eq!(DEFAULT_MODEL_SPEC, "large-v3-turbo-q8_0");
         assert_eq!(DEFAULT_MODELS_DIR, "models");
         assert_eq!(MODEL_CATALOG.len(), 21);
         for (spec, file, _) in MODEL_CATALOG {
@@ -784,12 +839,20 @@ mod tests {
             assert_eq!(model_file_for_spec(spec), Some(*file));
         }
         assert_eq!(
-            model_file_for_spec(DEFAULT_MODEL_SPEC),
+            model_file_for_spec("large-v3-turbo-q8_0"),
             Some("ggml-large-v3-turbo-q8_0.bin")
         );
         assert!(model_file_for_spec("tiny-q5_0").is_none());
         assert!(model_file_for_spec("medium-q5_1").is_none());
         assert!(model_file_for_spec("bogus").is_none());
+    }
+
+    #[test]
+    fn default_model_spec_is_parakeet() {
+        assert_eq!(DEFAULT_MODEL_SPEC, "parakeet");
+        assert_eq!(DEFAULT_MODELS_DIR, "models");
+        // The `parakeet` alias must resolve via the Parakeet catalog.
+        assert!(parakeet_entry_for_spec(DEFAULT_MODEL_SPEC).is_some());
     }
 
     #[test]
@@ -825,5 +888,10 @@ mod tests {
         let specs = valid_model_specs();
         assert!(specs.contains(DEFAULT_MODEL_SPEC));
         assert!(specs.contains(PARAKEET_DEFAULT_SPEC));
+        assert!(specs.contains("parakeet"));
+        #[cfg(feature = "whisper")]
+        assert!(specs.contains("large-v3-turbo-q8_0"));
+        #[cfg(not(feature = "whisper"))]
+        assert!(!specs.contains("large-v3-turbo-q8_0"));
     }
 }

@@ -2,7 +2,7 @@
 name = "sttd"
 version = "0.1.0"
 edition = "2021"
-description = "Real-time Speech-to-Text pipeline: cpal + resampler + deep_filter + earshot + whisper-rs"
+description = "Real-time Speech-to-Text pipeline: cpal + resampler + deep_filter + earshot + parakeet (+ whisper-rs with the `whisper` feature)"
 license = "MIT"
 
 [dependencies]
@@ -17,7 +17,7 @@ biquad = "0.6"
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"], optional = true }
 ndarray = { version = "0.15", optional = true }
 earshot = { version = "1.2", features = ["alloc"] }
-whisper-rs = { version = "0.13", features = ["cuda", "whisper-cpp-log"] }
+whisper-rs = { version = "0.13", features = ["cuda", "whisper-cpp-log"], optional = true }
 # Second ASR engine (see src/parakeet.rs). Default features (cpu +
 # ort-defaults + api-28) pull in `ort`'s `download-binaries`, so the ONNX
 # Runtime native library is fetched by the build script the same way
@@ -36,6 +36,11 @@ signal-hook = { version = "0.3", features = ["iterator"] }
 [features]
 default = []
 denoise = ["dep:deep_filter", "dep:ndarray"]
+# Whisper engine (see src/whisper.rs). Off by default: the default model is
+# Parakeet, and enabling this pulls in the whisper.cpp build (cmake + CUDA
+# knobs in .cargo/config.toml). When disabled, whisper specs/paths are
+# rejected and whisper-only CLI flags disappear from `--help`.
+whisper = ["dep:whisper-rs"]
 # CUDA execution for Parakeet (see src/parakeet.rs). Off by default: the
 # prebuilt ORT CUDA EP targets older CUDA/cuDNN than the CUDA 13.4/sm_120
 # toolchain whisper.cpp is built against here, so it may not load; CPU

@@ -3,17 +3,22 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::config::{
-    parse_beam_size, parse_bool, parse_context_chars, parse_entropy_thold, parse_fraction,
-    parse_hangover_ms, parse_linear_rms, parse_logprob_thold, parse_temperature,
-    parse_temperature_inc, parse_threads, DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS,
-    DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_HANGOVER_MS, DEFAULT_LOGPROB_THOLD,
+    parse_bool, parse_fraction, parse_hangover_ms, parse_linear_rms, parse_threads,
+    DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_HANGOVER_MS,
     DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS,
-    DEFAULT_TARGET_RMS, DEFAULT_TEMPERATURE, DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS,
-    DEFAULT_TRANSLATE, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
+    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS, DEFAULT_THREADS,
+    DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
+};
+#[cfg(feature = "whisper")]
+use crate::config::{
+    parse_beam_size, parse_context_chars, parse_entropy_thold, parse_logprob_thold,
+    parse_temperature, parse_temperature_inc, DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD,
+    DEFAULT_LOGPROB_THOLD, DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TEMPERATURE,
+    DEFAULT_TEMPERATURE_INC, DEFAULT_TRANSLATE,
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
+#[cfg(feature = "whisper")]
 use crate::whisper::Language;
 
 /// Real-time Polish-English speech-to-text.
@@ -50,8 +55,10 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_CHANNEL", value_name = "MIX|AUTO|N", default_value = "mix", value_parser = parse_channel_sel, help_heading = "Input")]
     pub(crate) channel: ChannelSel,
 
-    /// Model spec (e.g. `small`, `large-v3-turbo-q8_0`) or path to a ggml
-    /// whisper model file (auto-downloaded if missing). `STTD_MODEL` wins
+    /// Model spec (e.g. `parakeet`, `parakeet-tdt-0.6b-v3-int8`, or with the
+    /// `whisper` Cargo feature also `small`, `large-v3-turbo-q8_0`) or path
+    /// to model weights (a Parakeet model directory, or with `whisper` a
+    /// ggml `.bin` file; auto-downloaded if missing). `STTD_MODEL` wins
     /// over the legacy `WHISPER_MODEL_PATH` fallback; CLI wins over both.
     #[arg(
         short,
@@ -62,12 +69,14 @@ pub(crate) struct Cli {
     )]
     pub(crate) model: Option<String>,
 
-    /// List known whisper models (with installed/default markers) and exit.
+    /// List known models (with installed/default markers) and exit.
     #[arg(long, help_heading = "Model", conflicts_with_all = ["file", "list_devices", "start", "stop", "status"])]
     pub(crate) list_models: bool,
 
     /// Whisper decoding language: `pl` forces Polish, `en` forces English,
-    /// `auto` detects per utterance.
+    /// `auto` detects per utterance. Whisper-only (requires the `whisper`
+    /// Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(
         short,
         long,
@@ -82,6 +91,8 @@ pub(crate) struct Cli {
     /// Translate non-English speech to English instead of transcribing it
     /// (`set_translate(true)`). `--language` still selects the source
     /// language (`pl` forces Polish, `auto` detects per utterance).
+    /// Whisper-only (requires the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(
         long,
         env = "STTD_TRANSLATE",
@@ -93,12 +104,16 @@ pub(crate) struct Cli {
     )]
     pub(crate) translate: bool,
 
-    /// Override the whisper initial prompt.
+    /// Override the whisper initial prompt. Whisper-only (requires the
+    /// `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(short, long, env = "STTD_PROMPT", default_value = DEFAULT_PROMPT, help_heading = "Model")]
     pub(crate) prompt: String,
 
     /// Trailing chars of accepted transcripts appended to the initial prompt
     /// (`0` = off). Only emitted transcripts feed it — drops never do.
+    /// Whisper-only (requires the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(long, env = "STTD_PROMPT_CONTEXT_CHARS", default_value_t = DEFAULT_PROMPT_CONTEXT_CHARS, value_parser = parse_context_chars, value_name = "N", help_heading = "Model")]
     pub(crate) prompt_context_chars: usize,
 
@@ -114,23 +129,33 @@ pub(crate) struct Cli {
     pub(crate) denoiser: DenoiserKind,
 
     /// Beam width of whisper's beam-search decoder (`1` = greedy).
+    /// Whisper-only (requires the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(long, env = "STTD_BEAM_SIZE", default_value_t = DEFAULT_BEAM_SIZE, value_parser = parse_beam_size, value_name = "N", help_heading = "Model")]
     pub(crate) beam_size: i32,
 
     /// Initial decoding temperature (`0.0` = greedy, deterministic).
+    /// Whisper-only (requires the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(long, env = "STTD_TEMPERATURE", default_value_t = DEFAULT_TEMPERATURE, value_parser = parse_temperature, value_name = "T", help_heading = "Model")]
     pub(crate) temperature: f32,
 
     /// Temperature increment for the fallback ladder (`0.0` = single-temp,
     /// no re-tries; `0.2` = the historical `[temp, .., 1.0]` ladder).
+    /// Whisper-only (requires the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(long, env = "STTD_TEMPERATURE_INC", default_value_t = DEFAULT_TEMPERATURE_INC, value_parser = parse_temperature_inc, value_name = "DT", help_heading = "Model")]
     pub(crate) temperature_inc: f32,
 
     /// Entropy threshold for the fallback ladder (higher = fewer re-tries).
+    /// Whisper-only (requires the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(long, env = "STTD_ENTROPY_THOLD", default_value_t = DEFAULT_ENTROPY_THOLD, value_parser = parse_entropy_thold, value_name = "E", help_heading = "Model")]
     pub(crate) entropy_thold: f32,
 
     /// Logprob threshold for the fallback ladder (more negative = fewer re-tries).
+    /// Whisper-only (requires the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(long, env = "STTD_LOGPROB_THOLD", default_value_t = DEFAULT_LOGPROB_THOLD, value_parser = parse_logprob_thold, value_name = "LP", help_heading = "Model", allow_negative_numbers = true)]
     pub(crate) logprob_thold: f32,
 
@@ -238,7 +263,7 @@ pub(crate) struct Cli {
     #[arg(short = 'o', long, env = "STTD_DUMP_DIR", help_heading = "Emission")]
     pub(crate) dump_dir: Option<PathBuf>,
 
-    /// Start microphone mode paused (no audio reaches whisper until
+    /// Start microphone mode paused (no audio is transcribed until
     /// SIGUSR2/SIGHUP). File mode ignores this.
     #[arg(
         long,
@@ -267,6 +292,8 @@ pub(crate) struct Cli {
     pub(crate) autopause: bool,
 
     /// Dump per-token id/text/p/plog/is_timestamp to stderr.
+    /// Whisper-only (requires the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     #[arg(
         long,
         env = "STTD_DEBUG_TOKENS",
@@ -345,7 +372,7 @@ pub(crate) struct Cli {
     )]
     pub(crate) status: bool,
 
-    /// Unload the whisper model while paused to free VRAM; reloaded eagerly
+    /// Unload the model while paused to free VRAM; reloaded eagerly
     /// on resume. Disabled by default.
     #[arg(
         long,
@@ -358,7 +385,7 @@ pub(crate) struct Cli {
     )]
     pub(crate) auto_unload: bool,
 
-    /// While paused longer than this (seconds), unload the whisper model
+    /// While paused longer than this (seconds), unload the model
     /// to free VRAM; reloaded eagerly on resume. Only takes effect if
     /// `--auto-unload` is enabled. `0` unloads immediately on pause.
     #[arg(
@@ -437,25 +464,41 @@ mod tests {
             effective_model_input(cli.model.as_deref(), None),
             DEFAULT_MODEL_SPEC
         );
-        // Default spec resolves to the historical default path.
+        // Default spec resolves to the Parakeet model directory.
         let resolved = crate::weights::resolve_model(DEFAULT_MODEL_SPEC)
             .expect("default spec must resolve");
         assert_eq!(
             resolved,
-            crate::weights::ModelRef::Whisper(PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin"))
+            crate::weights::ModelRef::Parakeet {
+                dir: PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"),
+                assets: &[
+                    "encoder-model.int8.onnx",
+                    "decoder_joint-model.int8.onnx",
+                    "vocab.txt",
+                ],
+            }
         );
-        assert_eq!(cli.prompt, DEFAULT_PROMPT);
-        assert_eq!(cli.prompt_context_chars, DEFAULT_PROMPT_CONTEXT_CHARS);
+        #[cfg(feature = "whisper")]
+        {
+            use crate::config::{
+                DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_LOGPROB_THOLD,
+                DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TEMPERATURE,
+                DEFAULT_TEMPERATURE_INC, DEFAULT_TRANSLATE,
+            };
+            assert_eq!(cli.prompt, DEFAULT_PROMPT);
+            assert_eq!(cli.prompt_context_chars, DEFAULT_PROMPT_CONTEXT_CHARS);
+            assert_eq!(cli.language, crate::whisper::Language::Polish);
+            assert_eq!(cli.translate, DEFAULT_TRANSLATE);
+            assert!(!cli.translate);
+            assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
+            assert_eq!(cli.temperature, DEFAULT_TEMPERATURE);
+            assert_eq!(cli.temperature_inc, DEFAULT_TEMPERATURE_INC);
+            assert_eq!(cli.entropy_thold, DEFAULT_ENTROPY_THOLD);
+            assert_eq!(cli.logprob_thold, DEFAULT_LOGPROB_THOLD);
+            assert!(!cli.debug_tokens);
+        }
         assert_eq!(cli.hangover_ms, DEFAULT_HANGOVER_MS);
         assert_eq!(cli.channel, ChannelSel::Mix);
-        assert_eq!(cli.language, crate::whisper::Language::Polish);
-        assert_eq!(cli.translate, DEFAULT_TRANSLATE);
-        assert!(!cli.translate);
-        assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
-        assert_eq!(cli.temperature, DEFAULT_TEMPERATURE);
-        assert_eq!(cli.temperature_inc, DEFAULT_TEMPERATURE_INC);
-        assert_eq!(cli.entropy_thold, DEFAULT_ENTROPY_THOLD);
-        assert_eq!(cli.logprob_thold, DEFAULT_LOGPROB_THOLD);
         assert_eq!(cli.threads, DEFAULT_THREADS);
         assert_eq!(cli.gpu, DEFAULT_USE_GPU);
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
@@ -468,7 +511,6 @@ mod tests {
         assert!(cli.copy);
         assert!(cli.paste);
         assert!(!cli.stdout);
-        assert!(!cli.debug_tokens);
         assert!(cli.start_paused);
         assert!(!cli.autopause);
         assert!(cli.sound);
@@ -484,6 +526,7 @@ mod tests {
         assert_eq!(cli.auto_unload_after, DEFAULT_AUTO_UNLOAD_AFTER_SECS);
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn cli_flags_override_defaults() {
         #[cfg(feature = "denoise")]
@@ -549,6 +592,63 @@ mod tests {
         assert!(!cli.gpu);
     }
 
+    #[cfg(not(feature = "whisper"))]
+    #[test]
+    fn cli_flags_override_defaults() {
+        #[cfg(feature = "denoise")]
+        let cli = Cli::try_parse_from([
+            "sttd",
+            "--denoiser",
+            "deepfilter",
+            "--min-rms",
+            "0.01",
+            "--copy",
+            "off",
+            "--stdout",
+            "--start-paused",
+            "off",
+            "--autopause",
+            "on",
+            "--threads",
+            "0",
+            "--gpu",
+            "off",
+        ])
+        .expect("flags must parse");
+        #[cfg(not(feature = "denoise"))]
+        let cli = Cli::try_parse_from([
+            "sttd",
+            "--denoiser",
+            "none",
+            "--min-rms",
+            "0.01",
+            "--copy",
+            "off",
+            "--stdout",
+            "--start-paused",
+            "off",
+            "--autopause",
+            "on",
+            "--threads",
+            "0",
+            "--gpu",
+            "off",
+        ])
+        .expect("flags must parse");
+        #[cfg(feature = "denoise")]
+        assert_eq!(cli.denoiser, DenoiserKind::DeepFilter);
+        #[cfg(not(feature = "denoise"))]
+        assert_eq!(cli.denoiser, DenoiserKind::Bypass);
+        assert!((cli.min_rms - 0.01).abs() < 1e-6);
+        assert!(!cli.copy);
+        assert!(cli.stdout);
+        assert!(!cli.start_paused);
+        assert!(cli.autopause);
+        assert_eq!(cli.threads, 0);
+        assert!(!cli.gpu);
+    }
+
+    #[cfg(feature = "whisper")]
     #[test]
     fn cli_decoder_tunables_override_and_reject() {
         let cli = Cli::try_parse_from([
@@ -659,6 +759,7 @@ mod tests {
         assert!(!cli.vad_adapt);
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn cli_language_accepts_pl_en_auto() {
         use crate::whisper::Language;
@@ -671,6 +772,7 @@ mod tests {
         assert!(Cli::try_parse_from(["sttd", "--language", "de"]).is_err());
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn cli_translate_toggles() {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
@@ -682,10 +784,34 @@ mod tests {
         assert!(!cli.translate);
     }
 
+    #[cfg(not(feature = "whisper"))]
+    #[test]
+    fn cli_whisper_flags_are_unknown_without_feature() {
+        // Whisper-only flags disappear from `--help` when the feature is off:
+        // clap must reject them as unknown arguments.
+        for args in [
+            vec!["sttd", "--language", "en"],
+            vec!["sttd", "--translate"],
+            vec!["sttd", "--prompt", "hi"],
+            vec!["sttd", "--prompt-context-chars", "10"],
+            vec!["sttd", "--beam-size", "3"],
+            vec!["sttd", "--temperature", "0.2"],
+            vec!["sttd", "--temperature-inc", "0.0"],
+            vec!["sttd", "--entropy-thold", "3.0"],
+            vec!["sttd", "--logprob-thold", "-0.5"],
+            vec!["sttd", "--debug-tokens"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "args={args:?}");
+        }
+    }
+
     #[test]
     fn cli_inference_tunables_reject_out_of_range() {
-        assert!(Cli::try_parse_from(["sttd", "--beam-size", "0"]).is_err());
-        assert!(Cli::try_parse_from(["sttd", "--beam-size", "-1"]).is_err());
+        #[cfg(feature = "whisper")]
+        {
+            assert!(Cli::try_parse_from(["sttd", "--beam-size", "0"]).is_err());
+            assert!(Cli::try_parse_from(["sttd", "--beam-size", "-1"]).is_err());
+        }
         assert!(Cli::try_parse_from(["sttd", "--threads", "-1"]).is_err());
         let cli = Cli::try_parse_from(["sttd", "--threads", "0"]).expect("0 = auto");
         assert_eq!(cli.threads, 0);

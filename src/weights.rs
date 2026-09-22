@@ -3,18 +3,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::{
-    parakeet_entry_for_spec, DEFAULT_MODELS_DIR, MODEL_BASE_URL, PARAKEET_BASE_URL,
-    model_file_for_spec, valid_model_specs,
+    parakeet_entry_for_spec, valid_model_specs, DEFAULT_MODELS_DIR, PARAKEET_BASE_URL,
 };
+#[cfg(feature = "whisper")]
+use crate::config::{MODEL_BASE_URL, model_file_for_spec};
 
 /// Which ASR engine a resolved `--model` value maps to, and where its
-/// weights live on disk. Whisper's engine takes a single `ggml-*.bin` file;
-/// Parakeet's takes a directory (encoder + decoder_joint + `vocab.txt`) —
+/// weights live on disk. Whisper's engine takes a single `ggml-*.bin` file
+/// (only with the `whisper` Cargo feature); Parakeet's takes a directory
+/// (encoder + decoder_joint + `vocab.txt`) —
 /// `parakeet-rs::ParakeetTDT::from_pretrained` only accepts a directory, so
 /// there is no single-file equivalent to fall back to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModelRef {
-    /// `ggml-*.bin` for whisper.cpp.
+    /// `ggml-*.bin` for whisper.cpp (only with the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     Whisper(PathBuf),
     /// Model directory for Parakeet. `assets` lists the files
     /// `ensure_available` must fetch if missing; empty for a directory the
@@ -31,6 +34,7 @@ impl std::fmt::Display for ModelRef {
     /// line: a `.bin` path for whisper, the model directory for Parakeet.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "whisper")]
             Self::Whisper(path) => write!(f, "{}", path.display()),
             Self::Parakeet { dir, .. } => write!(f, "{}", dir.display()),
         }
@@ -40,16 +44,27 @@ impl std::fmt::Display for ModelRef {
 /// Resolve a `--model` value to an engine + location: an explicit `.bin`
 /// path or directory path (contains a path separator) passes through
 /// untouched, otherwise the value must be a catalog spec — whisper's
-/// (`ggml-<spec>.bin`) or Parakeet's (a model directory under
-/// `models/`, see `PARAKEET_CATALOG`) — or the `parakeet` alias.
+/// (`ggml-<spec>.bin`, only with the `whisper` Cargo feature) or Parakeet's
+/// (a model directory under `models/`, see `PARAKEET_CATALOG`) — or the
+/// `parakeet` alias.
 pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         anyhow::bail!("empty --model value; expected one of: {}", valid_model_specs());
     }
+    #[cfg(feature = "whisper")]
     if trimmed.ends_with(".bin") {
         return Ok(ModelRef::Whisper(PathBuf::from(trimmed)));
     }
+    #[cfg(not(feature = "whisper"))]
+    if trimmed.ends_with(".bin") {
+        anyhow::bail!(
+            "whisper model {trimmed:?} needs the `whisper` Cargo feature \
+             (rebuild with `--features whisper`); available: {}",
+            valid_model_specs()
+        );
+    }
+    #[cfg(feature = "whisper")]
     if let Some(file) = model_file_for_spec(trimmed) {
         return Ok(ModelRef::Whisper(PathBuf::from(format!(
             "{DEFAULT_MODELS_DIR}/{file}"
@@ -63,17 +78,25 @@ pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
     }
     if trimmed.contains('/') || trimmed.contains('\\') {
         // A manually-prepared model: a directory is Parakeet (nothing to
-        // download, just validated at load time), anything else is treated
-        // as a whisper `.bin` path even without the extension.
+        // download, just validated at load time), anything else used to be
+        // treated as a whisper `.bin` path even without the extension.
         let path = PathBuf::from(trimmed);
         if path.is_dir() {
             return Ok(ModelRef::Parakeet { dir: path, assets: &[] });
         }
+        #[cfg(feature = "whisper")]
         return Ok(ModelRef::Whisper(path));
+        #[cfg(not(feature = "whisper"))]
+        anyhow::bail!(
+            "model path {trimmed:?} is not an existing Parakeet directory, and \
+             whisper support is not compiled in (rebuild with `--features \
+             whisper`); expected one of: {}",
+            valid_model_specs()
+        );
     }
     anyhow::bail!(
-        "unknown model {trimmed:?}; expected a path (*.bin or a Parakeet model \
-         directory) or one of: {}",
+        "unknown model {trimmed:?}; expected a path (*.bin with the `whisper` \
+         feature, or a Parakeet model directory) or one of: {}",
         valid_model_specs()
     );
 }
@@ -82,12 +105,15 @@ pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
 /// into place first.
 pub(crate) fn ensure_available(model: &ModelRef) -> Result<()> {
     match model {
+        #[cfg(feature = "whisper")]
         ModelRef::Whisper(path) => ensure_whisper_available(path),
         ModelRef::Parakeet { dir, assets } => ensure_parakeet_available(dir, assets),
     }
 }
 
 /// Whisper: downloads the model into place if it isn't already there.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg(feature = "whisper")]
 fn ensure_whisper_available(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -158,7 +184,9 @@ fn ensure_parakeet_available(dir: &Path, assets: &'static [&'static str]) -> Res
 
 /// Download URL for a `ggml-*.bin` model filename (full or quantized,
 /// e.g. `ggml-large-v3-turbo-q8_0.bin`), or `None` when the filename
-/// doesn't look like a whisper.cpp model.
+/// doesn't look like a whisper.cpp model. Whisper-only (see the `whisper`
+/// Cargo feature).
+#[cfg(feature = "whisper")]
 pub(crate) fn download_url(file_name: &str) -> Option<String> {
     if !file_name.starts_with("ggml-") || !file_name.ends_with(".bin") {
         return None;
@@ -272,24 +300,22 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MODEL_BASE_URL, PARAKEET_BASE_URL, PARAKEET_DEFAULT_SPEC};
+    use crate::config::{PARAKEET_BASE_URL, PARAKEET_DEFAULT_SPEC};
+    #[cfg(feature = "whisper")]
+    use crate::config::MODEL_BASE_URL;
 
     #[test]
-    fn default_model_is_quantized_q8() {
+    fn default_model_is_parakeet() {
         let resolved =
             resolve_model(crate::config::DEFAULT_MODEL_SPEC).expect("default spec must resolve");
-        let ModelRef::Whisper(path) = resolved else {
-            panic!("default spec must resolve to a whisper model");
+        let ModelRef::Parakeet { dir, assets } = resolved else {
+            panic!("default spec must resolve to a Parakeet model");
         };
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("default model path has a filename");
-        assert_eq!(file_name, "ggml-large-v3-turbo-q8_0.bin");
-        let url = download_url(file_name).expect("default model must have a download URL");
-        assert_eq!(url, format!("{MODEL_BASE_URL}{file_name}"));
+        assert_eq!(dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"));
+        assert!(assets.contains(&"vocab.txt"));
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn quantized_filenames_resolve_to_hf_urls() {
         for file_name in [
@@ -302,6 +328,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn non_ggml_filenames_are_rejected() {
         for file_name in [
@@ -314,6 +341,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn specs_resolve_into_models_dir() {
         for (spec, file) in [
@@ -330,10 +358,27 @@ mod tests {
                 "spec={spec}"
             );
         }
-        assert_eq!(
-            resolve_model(crate::config::DEFAULT_MODEL_SPEC).expect("default spec must resolve"),
-            ModelRef::Whisper(PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin"))
-        );
+    }
+
+    #[cfg(not(feature = "whisper"))]
+    #[test]
+    fn whisper_specs_are_rejected_without_feature() {
+        for spec in ["tiny", "small", "large-v3-turbo-q8_0"] {
+            let err = resolve_model(spec).expect_err("whisper spec must reject");
+            assert!(
+                err.to_string().contains("whisper") || err.to_string().contains("unknown model"),
+                "msg={}",
+                err
+            );
+        }
+        for path in ["models/custom.bin", "models/ggml-small.bin"] {
+            let err = resolve_model(path).expect_err("whisper path must reject");
+            assert!(
+                err.to_string().contains("whisper"),
+                "msg={}",
+                err
+            );
+        }
     }
 
     #[test]
@@ -374,6 +419,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn paths_pass_through_untouched() {
         for path in ["models/custom.bin", "models/ggml-large-v3-turbo-q8_0.bin", "/abs/models/ggml-base.bin", "custom/ggml-tiny.bin"] {
@@ -385,6 +431,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn nonexistent_directory_path_is_treated_as_whisper() {
         // A path with a separator that isn't an existing directory falls
@@ -394,6 +441,13 @@ mod tests {
             resolve_model("models/does-not-exist-dir/model").expect("path must resolve"),
             ModelRef::Whisper(PathBuf::from("models/does-not-exist-dir/model"))
         );
+    }
+
+    #[cfg(not(feature = "whisper"))]
+    #[test]
+    fn nonexistent_directory_path_is_rejected_without_whisper() {
+        let err = resolve_model("models/does-not-exist-dir/model").expect_err("must reject");
+        assert!(err.to_string().contains("whisper"), "msg={err}");
     }
 
     #[test]
@@ -423,7 +477,12 @@ mod tests {
         for bad in ["", "   ", "tiny-q5_0", "medium-q5_1", "large-v1-q8_0", "huge", "tiny.en"] {
             let err = resolve_model(bad).expect_err("must reject");
             let msg = err.to_string();
-            assert!(msg.contains("large-v3-turbo-q8_0"), "msg={msg}");
+            assert!(msg.contains("parakeet"), "msg={msg}");
+        }
+        #[cfg(feature = "whisper")]
+        for bad in ["tiny-q5_0", "medium-q5_1"] {
+            let err = resolve_model(bad).expect_err("must reject");
+            assert!(err.to_string().contains("large-v3-turbo-q8_0"), "msg={err}");
         }
     }
 

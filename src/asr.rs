@@ -32,7 +32,26 @@ use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
 use crate::utterance::Utterance;
 use crate::weights::ModelRef;
-use crate::whisper::{Language, TokenConfidence};
+#[cfg(feature = "whisper")]
+use crate::whisper::Language;
+
+/// Confidence of one inference, averaged over *text* tokens only (see
+/// `whisper::average_text_confidence` when the `whisper` feature is enabled).
+/// Engine-agnostic: lives here so `Transcript` needs no `whisper` import;
+/// `None` for engines with no per-token probability (Parakeet).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TokenConfidence {
+    /// `sttd`'s stand-in for whisper.cpp's `no_speech_thold`, which is
+    /// declared in `whisper_full_params` but never actually read by the
+    /// decoder (see `DEFAULT_MIN_CONFIDENCE`'s doc comment) — so whisper.cpp
+    /// itself never rejects a low-confidence segment, and the caller must
+    /// do it based on this value.
+    pub(crate) prob: f32,
+    /// Same average, in log space — the statistic whisper.cpp's own
+    /// fallback ladder uses internally (`whisper.cpp`: `avg_logprobs`),
+    /// logged alongside `prob` for comparable-scale tuning.
+    pub(crate) logprob: f32,
+}
 
 /// Result of one inference: the joined text plus its confidence, when the
 /// engine reports one. `None` for engines with no per-token probability
@@ -88,6 +107,7 @@ pub(crate) trait SpeechModel {
 /// Called once per load/reload cycle by `asr_init_and_run`.
 pub(crate) fn load_model(model: &ModelRef, opts: &AsrOptions) -> Result<Box<dyn SpeechModel>> {
     match model {
+        #[cfg(feature = "whisper")]
         ModelRef::Whisper(path) => Ok(Box::new(crate::whisper::WhisperModel::load(path, opts)?)),
         ModelRef::Parakeet { dir, .. } => {
             Ok(Box::new(crate::parakeet::ParakeetModel::load(dir, opts)?))
@@ -130,27 +150,37 @@ pub(crate) fn with_loading_ticker<T>(label: &str, f: impl FnOnce() -> Result<T>)
 }
 
 /// Tunables the ASR worker needs, resolved once from `Cli`. Carries every
-/// engine's decode parameters (whisper's beam/temperature/etc. included)
-/// even though a given run only loads one engine — `load_model` picks out
-/// what its engine needs and ignores the rest (see
-/// `main::unsupported_parakeet_flags` for the corresponding warning when a
-/// whisper-only flag is set alongside a Parakeet model). Emission policy
-/// (`dump_dir`, clipboard, paste) lives with the `Emitter`, not here.
+/// engine's decode parameters (whisper's beam/temperature/etc. included when
+/// the `whisper` feature is enabled) even though a given run only loads one
+/// engine — `load_model` picks out what its engine needs and ignores the rest
+/// (see `main::unsupported_parakeet_flags` for the corresponding warning when
+/// a whisper-only flag is set alongside a Parakeet model, whisper builds
+/// only). Emission policy (`dump_dir`, clipboard, paste) lives with the
+/// `Emitter`, not here.
 #[derive(Debug, Clone)]
 pub(crate) struct AsrOptions {
     pub(crate) model_spec: String,
     pub(crate) prompt: String,
     pub(crate) prompt_context_chars: usize,
+    #[cfg(feature = "whisper")]
     pub(crate) language: Language,
     /// Translate non-English speech to English (`FullParams::set_translate`,
     /// whisper only). `--language` selects the source language when enabled.
+    /// Whisper-only (see the `whisper` Cargo feature).
+    #[cfg(feature = "whisper")]
     pub(crate) translate: bool,
     pub(crate) gate: GateConfig,
+    #[cfg(feature = "whisper")]
     pub(crate) debug_tokens: bool,
+    #[cfg(feature = "whisper")]
     pub(crate) beam_size: i32,
+    #[cfg(feature = "whisper")]
     pub(crate) temperature: f32,
+    #[cfg(feature = "whisper")]
     pub(crate) temperature_inc: f32,
+    #[cfg(feature = "whisper")]
     pub(crate) entropy_thold: f32,
+    #[cfg(feature = "whisper")]
     pub(crate) logprob_thold: f32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
@@ -1567,6 +1597,7 @@ mod tests {
         assert!(auto_threads() >= 1);
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn asr_worker_signals_init_failure() {
         // Bad model path must propagate via the ready channel instead of

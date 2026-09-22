@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
+use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, TokenConfidence, Transcript};
 use crate::config::WHISPER_MIN_SAMPLES;
 
 /// Whisper decoding language, chosen once at startup via `STTD_LANGUAGE`
@@ -227,26 +227,12 @@ pub(crate) fn decoded_sample_count(conditioned_len: usize) -> usize {
     conditioned_len.max(WHISPER_MIN_SAMPLES)
 }
 
-/// Confidence of one inference, averaged over *text* tokens only (see
-/// `average_text_confidence`).
-pub(crate) struct TokenConfidence {
-    /// `sttd`'s stand-in for whisper.cpp's `no_speech_thold`, which is
-    /// declared in `whisper_full_params` but never actually read by the
-    /// decoder (see `DEFAULT_MIN_CONFIDENCE`'s doc comment) — so whisper.cpp
-    /// itself never rejects a low-confidence segment, and the caller must
-    /// do it based on this value.
-    pub(crate) prob: f32,
-    /// Same average, in log space — the statistic whisper.cpp's own
-    /// fallback ladder uses internally (`whisper.cpp`: `avg_logprobs`),
-    /// logged alongside `prob` for comparable-scale tuning.
-    pub(crate) logprob: f32,
-}
-
 /// Result of one whisper inference: the joined segment text plus its
-/// `TokenConfidence`. Distinct from `asr::Transcript` (whose `confidence` is
-/// `Option<TokenConfidence>`, `None` for engines without per-token
-/// probabilities) — this one always has a confidence, so `WhisperModel::
-/// transcribe` wraps it in `Some` at the trait boundary.
+/// `TokenConfidence` (see `asr::TokenConfidence`). Distinct from
+/// `asr::Transcript` (whose `confidence` is `Option<TokenConfidence>`,
+/// `None` for engines without per-token probabilities) — this one always
+/// has a confidence, so `WhisperModel::transcribe` wraps it in `Some` at
+/// the trait boundary.
 struct WhisperTranscript {
     text: String,
     confidence: TokenConfidence,

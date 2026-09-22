@@ -72,10 +72,9 @@ use signal_hook::iterator::Signals;
 mod cli;
 use cli::Cli;
 mod config;
-use config::{
-    model_file_for_spec, parakeet_entry_for_spec, DEFAULT_MODELS_DIR, DEFAULT_PROMPT,
-    DEFAULT_TRANSLATE_PROMPT, MODEL_CATALOG, PARAKEET_CATALOG,
-};
+use config::{parakeet_entry_for_spec, DEFAULT_MODELS_DIR, PARAKEET_CATALOG};
+#[cfg(feature = "whisper")]
+use config::{model_file_for_spec, DEFAULT_PROMPT, DEFAULT_TRANSLATE_PROMPT, MODEL_CATALOG};
 mod capture;
 use capture::*;
 mod daemon;
@@ -100,6 +99,7 @@ mod weights;
 use weights::*;
 mod asr;
 use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
+#[cfg(feature = "whisper")]
 mod whisper;
 mod parakeet;
 
@@ -135,29 +135,37 @@ fn main() -> Result<()> {
 }
 
 /// Initialize `env_logger` with timestamps, defaulting to `info` when
-/// `RUST_LOG` is unset. Must run before any `log::*` call. Also routes
-/// whisper.cpp/ggml output through the `log` crate instead of raw stderr.
+/// `RUST_LOG` is unset. Must run before any `log::*` call. With the
+/// `whisper` feature, also routes whisper.cpp/ggml output through the `log`
+/// crate instead of raw stderr.
 fn init_logging() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
+    #[cfg(feature = "whisper")]
     whisper_rs::install_whisper_log_trampoline();
 }
 
-/// Print known models — whisper's `MODEL_CATALOG` and Parakeet's
-/// `PARAKEET_CATALOG` — as two aligned tables with a two-character leading
-/// marker: `*` = currently selected (effective `--model` after CLI >
-/// `STTD_MODEL` > legacy `WHISPER_MODEL_PATH` > compiled-in default), `I` =
-/// installed (weights present on disk). A row can carry both (`*I`).
+/// Print known models — whisper's `MODEL_CATALOG` (only with the `whisper`
+/// Cargo feature) and Parakeet's `PARAKEET_CATALOG` — as aligned tables with
+/// a two-character leading marker: `*` = currently selected (effective
+/// `--model` after CLI > `STTD_MODEL` > legacy `WHISPER_MODEL_PATH` >
+/// compiled-in default), `I` = installed (weights present on disk). A row
+/// can carry both (`*I`).
 fn print_available_models(cli: &Cli) {
     let input = cli.model_input();
-    let selected = selected_spec_for_input(&input);
-    let installed: Vec<bool> = MODEL_CATALOG
-        .iter()
-        .map(|(_, file, _)| Path::new(DEFAULT_MODELS_DIR).join(file).exists())
-        .collect();
-    println!("whisper models:");
-    print!("{}", format_available_models(selected, &installed));
+    #[cfg(feature = "whisper")]
+    let whisper_selected = selected_spec_for_input(&input);
+    #[cfg(feature = "whisper")]
+    {
+        let installed: Vec<bool> = MODEL_CATALOG
+            .iter()
+            .map(|(_, file, _)| Path::new(DEFAULT_MODELS_DIR).join(file).exists())
+            .collect();
+        println!("whisper models:");
+        print!("{}", format_available_models(whisper_selected, &installed));
+        println!();
+    }
 
     let parakeet_selected = selected_parakeet_spec_for_input(&input);
     let parakeet_installed: Vec<bool> = PARAKEET_CATALOG
@@ -167,11 +175,14 @@ fn print_available_models(cli: &Cli) {
             files.iter().all(|f| base.join(f).exists())
         })
         .collect();
-    println!();
     println!("parakeet models:");
     print!("{}", format_parakeet_models(parakeet_selected, &parakeet_installed));
 
-    if selected.is_none() && parakeet_selected.is_none() {
+    #[cfg(feature = "whisper")]
+    let any_selected = whisper_selected.is_some() || parakeet_selected.is_some();
+    #[cfg(not(feature = "whisper"))]
+    let any_selected = parakeet_selected.is_some();
+    if !any_selected {
         let trimmed = input.trim();
         if !trimmed.is_empty() {
             println!("selected: {trimmed} (not in catalog)");
@@ -241,7 +252,9 @@ fn format_parakeet_models(selected: Option<&str>, installed: &[bool]) -> String 
 /// the catalog spec it selects, if any. Exact spec matches win; otherwise
 /// the path's basename is compared against catalog filenames
 /// (`models/custom.bin` matching `ggml-*.bin` selects that row, a truly
-/// custom file selects nothing).
+/// custom file selects nothing). Whisper-only (see the `whisper` Cargo
+/// feature).
+#[cfg(feature = "whisper")]
 fn selected_spec_for_input(input: &str) -> Option<&'static str> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -262,6 +275,8 @@ fn selected_spec_for_input(input: &str) -> Option<&'static str> {
 
 /// Render the `--list-models` table: header plus one row per catalog entry,
 /// `SPEC`/`FILE` left-aligned, `SIZE` right-aligned, leading `*`/`I` marker.
+/// Whisper-only (see the `whisper` Cargo feature).
+#[cfg(feature = "whisper")]
 fn format_available_models(selected: Option<&str>, installed: &[bool]) -> String {
     let spec_w = MODEL_CATALOG
         .iter()
@@ -868,34 +883,41 @@ fn resolve_model_input(cli: &Cli) -> Result<ModelRef> {
 /// compiled defaults ("explicitly set" would need clap's `ArgMatches`,
 /// which the derive API doesn't expose — a flag set to its own default is
 /// indistinguishable from not setting it, and that's fine: it changes
-/// nothing either way). Returns the flag names to warn about.
+/// nothing either way). Returns the flag names to warn about. With the
+/// `whisper` feature off, only the shared flags that Parakeet still ignores
+/// (`--min-conf*`, `--gpu` without `parakeet-cuda`) are reported; whisper
+/// decoder flags don't exist to set.
 fn unsupported_parakeet_flags(cli: &Cli) -> Vec<&'static str> {
-    use crate::config::{
-        DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_LOGPROB_THOLD, DEFAULT_MIN_CONFIDENCE,
-        DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TEMPERATURE,
-        DEFAULT_TEMPERATURE_INC,
-    };
+    use crate::config::{DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG};
     let mut flags = Vec::new();
-    if cli.prompt != DEFAULT_PROMPT {
-        flags.push("--prompt");
-    }
-    if cli.prompt_context_chars != DEFAULT_PROMPT_CONTEXT_CHARS {
-        flags.push("--prompt-context-chars");
-    }
-    if cli.beam_size != DEFAULT_BEAM_SIZE {
-        flags.push("--beam-size");
-    }
-    if (cli.temperature - DEFAULT_TEMPERATURE).abs() > f32::EPSILON {
-        flags.push("--temperature");
-    }
-    if (cli.temperature_inc - DEFAULT_TEMPERATURE_INC).abs() > f32::EPSILON {
-        flags.push("--temperature-inc");
-    }
-    if (cli.entropy_thold - DEFAULT_ENTROPY_THOLD).abs() > f32::EPSILON {
-        flags.push("--entropy-thold");
-    }
-    if (cli.logprob_thold - DEFAULT_LOGPROB_THOLD).abs() > f32::EPSILON {
-        flags.push("--logprob-thold");
+    #[cfg(feature = "whisper")]
+    {
+        use crate::config::{
+            DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_LOGPROB_THOLD,
+            DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TEMPERATURE,
+            DEFAULT_TEMPERATURE_INC,
+        };
+        if cli.prompt != DEFAULT_PROMPT {
+            flags.push("--prompt");
+        }
+        if cli.prompt_context_chars != DEFAULT_PROMPT_CONTEXT_CHARS {
+            flags.push("--prompt-context-chars");
+        }
+        if cli.beam_size != DEFAULT_BEAM_SIZE {
+            flags.push("--beam-size");
+        }
+        if (cli.temperature - DEFAULT_TEMPERATURE).abs() > f32::EPSILON {
+            flags.push("--temperature");
+        }
+        if (cli.temperature_inc - DEFAULT_TEMPERATURE_INC).abs() > f32::EPSILON {
+            flags.push("--temperature-inc");
+        }
+        if (cli.entropy_thold - DEFAULT_ENTROPY_THOLD).abs() > f32::EPSILON {
+            flags.push("--entropy-thold");
+        }
+        if (cli.logprob_thold - DEFAULT_LOGPROB_THOLD).abs() > f32::EPSILON {
+            flags.push("--logprob-thold");
+        }
     }
     if (cli.min_conf - DEFAULT_MIN_CONFIDENCE).abs() > f32::EPSILON {
         flags.push("--min-conf");
@@ -909,15 +931,18 @@ fn unsupported_parakeet_flags(cli: &Cli) -> Vec<&'static str> {
     flags
 }
 
-/// When `model` is a Parakeet model: rejects `--translate` (it would
-/// silently produce Polish text where English was requested, since
-/// Parakeet has no translate mode) and warns about every other
+/// When `model` is a Parakeet model: rejects `--translate` (whisper builds
+/// only — it would silently produce Polish text where English was requested,
+/// since Parakeet has no translate mode) and warns about every other
 /// whisper-only flag `unsupported_parakeet_flags` finds set. A no-op for a
-/// whisper model.
+/// whisper model. Without the `whisper` feature `--translate`/`--language`
+/// don't exist, so only the shared-flag warnings and the auto-detect note
+/// remain.
 fn validate_parakeet_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
     if !matches!(model, ModelRef::Parakeet { .. }) {
         return Ok(());
     }
+    #[cfg(feature = "whisper")]
     if cli.translate {
         anyhow::bail!(
             "--translate/STTD_TRANSLATE is not supported with a Parakeet model: it decodes \
@@ -933,10 +958,13 @@ fn validate_parakeet_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
             unsupported.join(", ")
         );
     }
+    #[cfg(feature = "whisper")]
     log::info!(
         "Parakeet auto-detects the spoken language per utterance; \
          --language/STTD_LANGUAGE is not honored"
     );
+    #[cfg(not(feature = "whisper"))]
+    log::info!("Parakeet auto-detects the spoken language per utterance");
     Ok(())
 }
 
@@ -947,7 +975,8 @@ fn validate_parakeet_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
 /// translate-mode output back to Polish (or makes the model recite the
 /// prompt instead of translating). An explicit `--prompt`/`STTD_PROMPT`
 /// always wins — detected by differing from `DEFAULT_PROMPT`. Pure over its
-/// inputs for tests.
+/// inputs for tests. Whisper-only (see the `whisper` Cargo feature).
+#[cfg(feature = "whisper")]
 pub(crate) fn resolve_prompt(translate: bool, prompt: &str) -> String {
     if translate && prompt == DEFAULT_PROMPT {
         DEFAULT_TRANSLATE_PROMPT.to_string()
@@ -959,16 +988,30 @@ pub(crate) fn resolve_prompt(translate: bool, prompt: &str) -> String {
 fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
     AsrOptions {
         model_spec: cli.model_input(),
+        #[cfg(feature = "whisper")]
         prompt: resolve_prompt(cli.translate, &cli.prompt),
+        #[cfg(not(feature = "whisper"))]
+        prompt: String::new(),
+        #[cfg(feature = "whisper")]
         prompt_context_chars: cli.prompt_context_chars,
+        #[cfg(not(feature = "whisper"))]
+        prompt_context_chars: 0,
+        #[cfg(feature = "whisper")]
         language: cli.language,
+        #[cfg(feature = "whisper")]
         translate: cli.translate,
         gate: gate_config(cli),
+        #[cfg(feature = "whisper")]
         debug_tokens: cli.debug_tokens,
+        #[cfg(feature = "whisper")]
         beam_size: cli.beam_size,
+        #[cfg(feature = "whisper")]
         temperature: cli.temperature,
+        #[cfg(feature = "whisper")]
         temperature_inc: cli.temperature_inc,
+        #[cfg(feature = "whisper")]
         entropy_thold: cli.entropy_thold,
+        #[cfg(feature = "whisper")]
         logprob_thold: cli.logprob_thold,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
@@ -1000,6 +1043,7 @@ fn gate_config(cli: &Cli) -> gate::GateConfig {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn resolve_prompt_swaps_english_base_for_default_prompt_under_translate() {
         use crate::config::{DEFAULT_PROMPT, DEFAULT_TRANSLATE_PROMPT};
@@ -1013,6 +1057,7 @@ mod tests {
         assert_eq!(resolve_prompt(true, ""), "");
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn selected_spec_matches_spec_exactly() {
         assert_eq!(selected_spec_for_input("small"), Some("small"));
@@ -1023,6 +1068,7 @@ mod tests {
         assert_eq!(selected_spec_for_input("  small  "), Some("small"));
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn selected_spec_matches_path_basename() {
         assert_eq!(
@@ -1040,6 +1086,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn selected_spec_rejects_custom_and_empty() {
         assert_eq!(selected_spec_for_input("models/custom.bin"), None);
@@ -1048,6 +1095,7 @@ mod tests {
         assert_eq!(selected_spec_for_input("   "), None);
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn models_table_marks_selected_and_installed() {
         let installed = vec![false; MODEL_CATALOG.len()];
@@ -1068,6 +1116,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn models_table_combines_selected_and_installed() {
         let mut installed = vec![false; MODEL_CATALOG.len()];
@@ -1094,6 +1143,7 @@ mod tests {
         assert!(tiny_row.starts_with("  "), "row={tiny_row:?}");
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn models_table_aligns_columns() {
         let installed = vec![false; MODEL_CATALOG.len()];
@@ -1161,6 +1211,7 @@ mod tests {
         assert_eq!(unsupported_parakeet_flags(&cli), vec!["--gpu"]);
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn unsupported_parakeet_flags_lists_whisper_only_tunables() {
         let cli = Cli::try_parse_from([
@@ -1179,6 +1230,17 @@ mod tests {
         assert_eq!(flags.len(), 2, "flags={flags:?}");
     }
 
+    #[cfg(not(feature = "whisper"))]
+    #[test]
+    fn unsupported_parakeet_flags_lists_shared_tunables_without_whisper() {
+        let cli = Cli::try_parse_from(["sttd", "--min-conf", "0.4", "--gpu", "off"])
+            .expect("flags must parse");
+        let flags = unsupported_parakeet_flags(&cli);
+        assert!(flags.contains(&"--min-conf"), "flags={flags:?}");
+        assert_eq!(flags.len(), 1, "flags={flags:?}");
+    }
+
+    #[cfg(feature = "whisper")]
     #[test]
     fn validate_parakeet_flags_rejects_translate() {
         let cli = Cli::try_parse_from(["sttd", "--translate"]).expect("flags must parse");
@@ -1190,6 +1252,7 @@ mod tests {
         assert!(err.to_string().contains("--translate"), "err={err}");
     }
 
+    #[cfg(feature = "whisper")]
     #[test]
     fn validate_parakeet_flags_is_a_noop_for_whisper() {
         // A whisper model must never be affected by the Parakeet-only
