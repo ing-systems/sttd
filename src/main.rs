@@ -461,6 +461,13 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // above used to.
     fp.flush_trailing_speech();
     drop(fp);
+    // Disconnect the utterance queue so the whisper worker sees
+    // `Disconnected` and exits; without this the root sender kept alive here
+    // (cloned into `FrameProcessor` on open/rebuild) holds the channel open
+    // and `join` below hangs forever on Ctrl-C / SIGTERM.
+    drop(whisper_tx);
+    drop(raw_tx);
+    drop(raw_rx);
     whisper_handle
         .join()
         .map_err(|_| anyhow::anyhow!("whisper worker panicked"))?;
