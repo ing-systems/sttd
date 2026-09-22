@@ -99,21 +99,46 @@ fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
     }
 }
 
-/// Copy `text` to the Wayland clipboard via `wl-copy` (from wl-clipboard).
-/// Pipes the trimmed transcript over `wl-copy`'s stdin with no trailing
-/// newline, so the user can paste it immediately. Returns the `io::Error`
-/// unwrapped (not `anyhow`) so the caller can match `NotFound` and disable
-/// itself with a single warning on machines without wl-clipboard.
-pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+/// Whether the current session is Wayland, where `ydotool` typing is
+/// supported. Pure over its inputs so tests don't touch the process
+/// environment (see `is_wayland_session_env` for the env-reading wrapper).
+/// `WAYLAND_DISPLAY` set wins over `DISPLAY` (XWayland sets both), so an
+/// X.org session is `XDG_SESSION_TYPE=x11` with `WAYLAND_DISPLAY` empty.
+pub(crate) fn is_wayland_session(
+    xdg_session_type: Option<&str>,
+    wayland_display: Option<&str>,
+) -> bool {
+    if wayland_display.is_some_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    xdg_session_type.is_some_and(|v| v.trim().eq_ignore_ascii_case("wayland"))
+}
+
+/// Env-reading wrapper around [`is_wayland_session`].
+pub(crate) fn is_wayland_session_env() -> bool {
+    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+    is_wayland_session(session_type.as_deref(), wayland_display.as_deref())
+}
+
+/// Type `text` at the current cursor position via `ydotool` (requires the
+/// `ydotoold` daemon). Pipes the trimmed transcript over stdin with
+/// `ydotool type --file -` so it is typed literally: file/stdin input
+/// disables `ydotool`'s argv escape processing and avoids argv quoting and
+/// length issues. Returns the `io::Error` unwrapped (not `anyhow`) so the
+/// caller can match `NotFound` and disable itself with a single warning on
+/// machines without `ydotool`.
+pub(crate) fn type_via_ydotool(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("wl-copy")
+    let mut child = Command::new("ydotool")
+        .args(["type", "--file", "-"])
         .stdin(Stdio::piped())
         .spawn()?;
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| std::io::Error::other("wl-copy stdin unavailable"))?;
+        .ok_or_else(|| std::io::Error::other("ydotool stdin unavailable"))?;
     stdin.write_all(text.as_bytes())?;
     drop(stdin);
     let status = child.wait()?;
@@ -121,27 +146,7 @@ pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::other(format!(
-            "wl-copy exited with {status}"
-        )))
-    }
-}
-
-/// Paste the clipboard at the current cursor position via `wtype`
-/// (fixed `Ctrl+V`). Wayland has no universal "paste here" request, so the
-/// transcript is first copied with `wl-copy` and then the paste keystroke is
-/// synthesized through the virtual-keyboard protocol. Returns `io::Error`
-/// unwrapped so the caller can match `NotFound` and disable itself with a
-/// single warning on machines without `wtype`.
-pub(crate) fn paste_at_cursor() -> std::io::Result<()> {
-    use std::process::Command;
-    let status = Command::new("wtype")
-        .args(["-M", "ctrl", "-k", "v", "-m", "ctrl"])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "wtype exited with {status}"
+            "ydotool exited with {status}"
         )))
     }
 }
@@ -207,20 +212,29 @@ fn whisper_init_and_run(
     // thread knows captures aren't going into a dead queue.
     let _ = ready.send(Ok(()));
     let copy_enabled = opts.copy_enabled;
-    // Becomes `false` permanently after the first "binary not found" so a
-    // machine without wl-clipboard installed logs one warning instead of
-    // one per utterance.
-    let mut clipboard_available = copy_enabled;
-    if !copy_enabled {
-        eprintln!("[sttd] clipboard copy disabled (--copy=false)");
-    }
     let paste_enabled = opts.paste_enabled;
-    // Same one-warning latch as above, for machines without `wtype`.
-    let mut paste_available = paste_enabled;
+    // `ydotool` typing replaces the old `wl-copy` + `wtype` pair with a
+    // single action, but both flags still gate it (AND semantics preserve
+    // the old behavior where `--copy=false` disabled everything and
+    // `--paste=false` disabled insertion). Becomes `false` permanently
+    // after "binary not found" so a machine without `ydotool` logs one
+    // warning instead of one per utterance; daemon-down failures keep
+    // retrying since `ydotoold` may start later.
+    let mut type_available = copy_enabled && paste_enabled;
+    if !copy_enabled {
+        eprintln!("[sttd] auto-type disabled (--copy=false)");
+    }
     if !paste_enabled {
-        eprintln!("[sttd] auto-paste disabled (--paste=false)");
-    } else if !copy_enabled {
-        eprintln!("[sttd] warning: --paste is enabled but --copy=false, paste will be skipped (nothing fresh to paste)");
+        eprintln!("[sttd] auto-type disabled (--paste=false)");
+    }
+    // `ydotool` only works on Wayland; on X.org (or headless/`--file`
+    // without a Wayland socket) disable typing once with a warning rather
+    // than failing every utterance.
+    if type_available && !is_wayland_session_env() {
+        eprintln!(
+            "[sttd] warning: auto-type is enabled but this is not a Wayland session (no WAYLAND_DISPLAY, XDG_SESSION_TYPE!=wayland); disabling ydotool typing"
+        );
+        type_available = false;
     }
 
     let mut utterance_no: u64 = 0;
@@ -285,33 +299,16 @@ fn whisper_init_and_run(
                     continue;
                 }
                 println!("{trimmed}");
-                // Track whether this utterance actually refreshed the
-                // clipboard: paste synthesizes Ctrl+V, so it must only run
-                // on fresh content, never on stale clipboard or a failed
-                // copy.
-                let mut copied = false;
-                if clipboard_available {
-                    match copy_to_clipboard(trimmed) {
-                        Ok(()) => copied = true,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            eprintln!(
-                                "[sttd] warning: --copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
-                            );
-                            clipboard_available = false;
-                        }
-                        Err(e) => eprintln!("[sttd] {tag}: clipboard copy failed: {e:?}"),
-                    }
-                }
-                if paste_available && copied {
-                    match paste_at_cursor() {
+                if type_available {
+                    match type_via_ydotool(trimmed) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             eprintln!(
-                                "[sttd] warning: --paste is enabled but `wtype` was not found on PATH; disabling auto-paste"
+                                "[sttd] warning: auto-type is enabled but `ydotool` was not found on PATH; disabling ydotool typing"
                             );
-                            paste_available = false;
+                            type_available = false;
                         }
-                        Err(e) => eprintln!("[sttd] {tag}: auto-paste failed: {e:?}"),
+                        Err(e) => eprintln!("[sttd] {tag}: ydotool typing failed (is ydotoold running?): {e:?}"),
                     }
                 }
                 if let Some(dir) = &dump_dir {
@@ -743,6 +740,20 @@ mod tests {
         assert!(!is_hallucination(
             "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
         ));
+    }
+
+    #[test]
+    fn wayland_session_detection_prefers_wayland_display() {
+        // Plain Wayland, X11-only, XWayland (both DISPLAY and
+        // WAYLAND_DISPLAY set counts as Wayland), and headless.
+        assert!(is_wayland_session(Some("wayland"), Some("wayland-0")));
+        assert!(is_wayland_session(Some("wayland"), None));
+        assert!(is_wayland_session(None, Some("wayland-0")));
+        assert!(is_wayland_session(Some("WAYLAND"), None));
+        assert!(!is_wayland_session(Some("x11"), None));
+        assert!(!is_wayland_session(Some("x11"), Some("")));
+        assert!(!is_wayland_session(None, None));
+        assert!(!is_wayland_session(Some(""), Some("  ")));
     }
 
     #[test]

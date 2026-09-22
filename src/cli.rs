@@ -82,7 +82,9 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_VAD_THRESHOLD", default_value_t = DEFAULT_VAD_THRESHOLD)]
     pub(crate) vad_threshold: f32,
 
-    /// Copy each accepted transcript to the Wayland clipboard via `wl-copy`.
+    /// Type each accepted transcript at the cursor via `ydotool type`
+    /// (Wayland only, requires `ydotoold` running). Flag name kept for
+    /// compat; gates auto-typing together with `--paste` (both must be true).
     #[arg(
         long,
         env = "STTD_COPY",
@@ -93,8 +95,8 @@ pub(crate) struct Cli {
     )]
     pub(crate) copy: bool,
 
-    /// Paste the clipboard at the cursor via `wtype -M ctrl -k v -m ctrl`.
-    /// Skipped when the copy above did not run.
+    /// Type the transcript at the cursor via `ydotool type` (Wayland only).
+    /// Gates the same auto-typing action as `--copy`; both must be true.
     #[arg(
         long,
         env = "STTD_PASTE",
