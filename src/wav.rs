@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -10,30 +10,34 @@ use crate::dsp::downmix_to_mono;
 // ---------------------------------------------------------------------------
 
 pub(crate) fn write_wav_mono16(path: &Path, pcm_f32: &[f32], sample_rate: u32) -> Result<()> {
-    let mut file =
-        std::fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    // Buffer header + samples: one allocation-free batch instead of a
+    // syscall per sample (up to 480k `write_all`s for a 30s utterance).
+    let mut out = BufWriter::with_capacity((pcm_f32.len() * 2 + 44).max(8192), file);
 
     let num_samples = pcm_f32.len() as u32;
     let byte_rate = sample_rate * 2; // mono, 16-bit
     let data_bytes = num_samples * 2;
 
-    file.write_all(b"RIFF")?;
-    file.write_all(&(36 + data_bytes).to_le_bytes())?;
-    file.write_all(b"WAVE")?;
-    file.write_all(b"fmt ")?;
-    file.write_all(&16u32.to_le_bytes())?; // fmt chunk size
-    file.write_all(&1u16.to_le_bytes())?; // PCM
-    file.write_all(&1u16.to_le_bytes())?; // mono
-    file.write_all(&sample_rate.to_le_bytes())?;
-    file.write_all(&byte_rate.to_le_bytes())?;
-    file.write_all(&2u16.to_le_bytes())?; // block align
-    file.write_all(&16u16.to_le_bytes())?; // bits per sample
-    file.write_all(b"data")?;
-    file.write_all(&data_bytes.to_le_bytes())?;
+    out.write_all(b"RIFF")?;
+    out.write_all(&(36 + data_bytes).to_le_bytes())?;
+    out.write_all(b"WAVE")?;
+    out.write_all(b"fmt ")?;
+    out.write_all(&16u32.to_le_bytes())?; // fmt chunk size
+    out.write_all(&1u16.to_le_bytes())?; // PCM
+    out.write_all(&1u16.to_le_bytes())?; // mono
+    out.write_all(&sample_rate.to_le_bytes())?;
+    out.write_all(&byte_rate.to_le_bytes())?;
+    out.write_all(&2u16.to_le_bytes())?; // block align
+    out.write_all(&16u16.to_le_bytes())?; // bits per sample
+    out.write_all(b"data")?;
+    out.write_all(&data_bytes.to_le_bytes())?;
     for &s in pcm_f32 {
         let clamped = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        file.write_all(&clamped.to_le_bytes())?;
+        out.write_all(&clamped.to_le_bytes())?;
     }
+    out.flush()?;
     Ok(())
 }
 

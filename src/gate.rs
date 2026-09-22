@@ -302,14 +302,16 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     if b.is_empty() {
         return a.len();
     }
+    // Reuse two rows instead of allocating one per `a` char.
     let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
     for (i, &ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1; b.len() + 1];
+        cur[0] = i + 1;
         for (j, &cb) in b.iter().enumerate() {
             let cost = usize::from(ca != cb);
             cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
         }
-        prev = cur;
+        std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
 }
@@ -329,12 +331,19 @@ pub(crate) fn is_hallucination(text: &str) -> bool {
     if HALLUCINATION_PATTERNS.contains(&normalized.as_str()) {
         return true;
     }
-    if normalized.chars().count() < HALLUCINATION_FUZZ_MIN_LEN {
+    let norm_len = normalized.chars().count();
+    if norm_len < HALLUCINATION_FUZZ_MIN_LEN {
         return false;
     }
     HALLUCINATION_PATTERNS
         .iter()
         .filter(|p| p.chars().count() >= HALLUCINATION_FUZZ_MIN_LEN)
+        .filter(|p| {
+            // Length pre-check: distance can't be smaller than the length
+            // gap, so skip the DP entirely for real sentences vs. short
+            // boilerplate.
+            norm_len.abs_diff(p.chars().count()) <= HALLUCINATION_FUZZ_MAX_DIST
+        })
         .any(|p| levenshtein(&normalized, p) <= HALLUCINATION_FUZZ_MAX_DIST)
 }
 

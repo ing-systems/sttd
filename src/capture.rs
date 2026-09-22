@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::Sender;
 
-use crate::dsp::{downmix_to_mono_with_channel, resolve_channel};
+use crate::dsp::{
+    downmix_i16_to_mono_with_channel, downmix_to_mono_with_channel,
+    downmix_u16_to_mono_with_channel, resolve_channel,
+};
 
 // ---------------------------------------------------------------------------
 // Input device: discovery, selection, capture
@@ -180,11 +183,10 @@ pub(crate) fn build_input_stream(
                 move |data: &[f32], _| {
                     let mono = downmix_to_mono_with_channel(data, channels, channel);
                     if let Err(e) = tx.try_send(mono) {
-                        if e.is_full() {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            log::warn!("raw queue closed, dropping chunk");
-                        }
+                        // RT thread: count only, never log/allocate. The main
+                        // loop reports `dropped_chunks`.
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        let _ = e;
                     }
                 },
                 err_fn,
@@ -197,17 +199,11 @@ pub(crate) fn build_input_stream(
             let stream = device.build_input_stream(
                 config,
                 move |data: &[i16], _| {
-                    let mut tmp = Vec::with_capacity(data.len());
-                    for s in data {
-                        tmp.push(*s as f32 / 32768.0);
-                    }
-                    let mono = downmix_to_mono_with_channel(&tmp, channels, channel);
+                    // Single alloc: convert + downmix in one pass.
+                    let mono = downmix_i16_to_mono_with_channel(data, channels, channel);
                     if let Err(e) = tx.try_send(mono) {
-                        if e.is_full() {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            log::warn!("raw queue closed, dropping chunk");
-                        }
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        let _ = e;
                     }
                 },
                 err_fn,
@@ -220,17 +216,11 @@ pub(crate) fn build_input_stream(
             let stream = device.build_input_stream(
                 config,
                 move |data: &[u16], _| {
-                    let mut tmp = Vec::with_capacity(data.len());
-                    for s in data {
-                        tmp.push(*s as f32 / 65535.0 * 2.0 - 1.0);
-                    }
-                    let mono = downmix_to_mono_with_channel(&tmp, channels, channel);
+                    // Single alloc: convert + downmix in one pass.
+                    let mono = downmix_u16_to_mono_with_channel(data, channels, channel);
                     if let Err(e) = tx.try_send(mono) {
-                        if e.is_full() {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            log::warn!("raw queue closed, dropping chunk");
-                        }
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        let _ = e;
                     }
                 },
                 err_fn,

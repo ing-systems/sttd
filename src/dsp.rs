@@ -42,6 +42,81 @@ pub(crate) fn downmix_to_mono_with_channel(
     }
 }
 
+/// Single-pass I16 -> mono f32 with channel select/mix. Avoids the
+/// intermediate f32 buffer the callback used to build before downmixing,
+/// halving per-callback allocs on I16 devices. Same scale as before:
+/// `s / 32768.0`. Same out-of-range rule as the f32 variant: silence.
+pub(crate) fn downmix_i16_to_mono_with_channel(
+    data: &[i16],
+    channels: usize,
+    channel: Option<usize>,
+) -> Vec<f32> {
+    let frames = data.len() / channels.max(1);
+    if channels <= 1 {
+        return data.iter().map(|&s| s as f32 / 32768.0).collect();
+    }
+    match channel {
+        None => {
+            let inv = 1.0 / channels as f32;
+            let mut out = Vec::with_capacity(frames);
+            for frame in data.chunks_exact(channels) {
+                let mut sum = 0.0f32;
+                for &s in frame {
+                    sum += s as f32 / 32768.0;
+                }
+                out.push(sum * inv);
+            }
+            out
+        }
+        Some(i) if i < channels => {
+            let mut out = Vec::with_capacity(frames);
+            for frame in data.chunks_exact(channels) {
+                out.push(frame[i] as f32 / 32768.0);
+            }
+            out
+        }
+        Some(_) => vec![0.0f32; frames],
+    }
+}
+
+/// Single-pass U16 -> mono f32 with channel select/mix. Same scale as
+/// before: `s / 65535.0 * 2.0 - 1.0`. Same out-of-range rule: silence.
+pub(crate) fn downmix_u16_to_mono_with_channel(
+    data: &[u16],
+    channels: usize,
+    channel: Option<usize>,
+) -> Vec<f32> {
+    let frames = data.len() / channels.max(1);
+    if channels <= 1 {
+        return data
+            .iter()
+            .map(|&s| s as f32 / 65535.0 * 2.0 - 1.0)
+            .collect();
+    }
+    match channel {
+        None => {
+            let inv = 1.0 / channels as f32;
+            let mut out = Vec::with_capacity(frames);
+            for frame in data.chunks_exact(channels) {
+                let mut sum = 0.0f32;
+                for &s in frame {
+                    sum += s as f32 / 65535.0 * 2.0 - 1.0;
+                }
+                out.push(sum * inv);
+            }
+            out
+        }
+        Some(i) if i < channels => {
+            let mut out = Vec::with_capacity(frames);
+            for frame in data.chunks_exact(channels) {
+                out.push(frame[i] as f32 / 65535.0 * 2.0 - 1.0);
+            }
+            out
+        }
+        Some(_) => vec![0.0f32; frames],
+    }
+}
+
 /// Validate `--channel` against the device's channel count: `None` (mix)
 /// always passes, `Some(i)` needs `i < channels`.
 pub(crate) fn resolve_channel(channel: Option<usize>, channels: usize) -> anyhow::Result<Option<usize>> {
@@ -246,6 +321,46 @@ mod tests {
         // rejects it instead (see `resolve_channel`).
         assert_eq!(
             downmix_to_mono_with_channel(&[1.0, 3.0, 2.0, 4.0], 2, Some(7)),
+            vec![0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn downmix_i16_matches_f32_path() {
+        // 0.5 in f32 == 16384 in i16; check mix, pick, mono, OOR.
+        let stereo_i16 = [16384i16, -16384, 8192, 8192];
+        let mixed = downmix_i16_to_mono_with_channel(&stereo_i16, 2, None);
+        assert_eq!(mixed.len(), 2);
+        assert!((mixed[0] - 0.0).abs() < 1e-6);
+        assert!((mixed[1] - 0.25).abs() < 1e-6);
+        assert_eq!(
+            downmix_i16_to_mono_with_channel(&stereo_i16, 2, Some(0)),
+            vec![0.5, 0.25]
+        );
+        assert_eq!(
+            downmix_i16_to_mono_with_channel(&stereo_i16, 2, Some(7)),
+            vec![0.0, 0.0]
+        );
+        assert_eq!(
+            downmix_i16_to_mono_with_channel(&[16384i16, -16384], 1, None),
+            vec![0.5, -0.5]
+        );
+    }
+
+    #[test]
+    fn downmix_u16_matches_f32_path() {
+        // 0 -> -1.0, 65535 -> 1.0, midscale ~0.
+        let mono = downmix_u16_to_mono_with_channel(&[0u16, 65535, 32768], 1, None);
+        assert!((mono[0] + 1.0).abs() < 1e-6);
+        assert!((mono[1] - 1.0).abs() < 1e-6);
+        assert!(mono[2].abs() < 1e-3);
+        let stereo = [0u16, 65535, 65535, 0];
+        let mixed = downmix_u16_to_mono_with_channel(&stereo, 2, None);
+        assert_eq!(mixed.len(), 2);
+        assert!(mixed[0].abs() < 1e-6);
+        assert!(mixed[1].abs() < 1e-6);
+        assert_eq!(
+            downmix_u16_to_mono_with_channel(&stereo, 2, Some(7)),
             vec![0.0, 0.0]
         );
     }
