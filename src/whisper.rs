@@ -99,8 +99,8 @@ fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
     }
 }
 
-/// Whether the current session is Wayland, where `ydotool` typing is
-/// supported. Pure over its inputs so tests don't touch the process
+/// Whether the current session is Wayland, where clipboard (`wl-copy`) + paste
+/// (`ydotool key` Ctrl+V) is supported. Pure over its inputs so tests don't touch the process
 /// environment (see `is_wayland_session_env` for the env-reading wrapper).
 /// `WAYLAND_DISPLAY` set wins over `DISPLAY` (XWayland sets both), so an
 /// X.org session is `XDG_SESSION_TYPE=x11` with `WAYLAND_DISPLAY` empty.
@@ -121,27 +121,46 @@ pub(crate) fn is_wayland_session_env() -> bool {
     is_wayland_session(session_type.as_deref(), wayland_display.as_deref())
 }
 
-/// Type `text` at the current cursor position via `ydotool` (requires the
-/// `ydotoold` daemon). Pipes the trimmed transcript over stdin with
-/// `ydotool type --file -` so it is typed literally: file/stdin input
-/// disables `ydotool`'s argv escape processing and avoids argv quoting and
-/// length issues. Returns the `io::Error` unwrapped (not `anyhow`) so the
-/// caller can match `NotFound` and disable itself with a single warning on
-/// machines without `ydotool`.
-pub(crate) fn type_via_ydotool(text: &str) -> std::io::Result<()> {
+/// Copy `text` to the Wayland clipboard via `wl-copy` (from wl-clipboard).
+/// Pipes the trimmed transcript over `wl-copy`'s stdin with no trailing
+/// newline, so it is pasted verbatim (UTF-8, including Polish diacritics) by
+/// the subsequent paste step. Returns the `io::Error` unwrapped (not `anyhow`)
+/// so the caller can match `NotFound` and disable itself with a single warning
+/// on machines without wl-clipboard.
+pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("ydotool")
-        .args(["type", "--file", "-"])
+    let mut child = Command::new("wl-copy")
         .stdin(Stdio::piped())
         .spawn()?;
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| std::io::Error::other("ydotool stdin unavailable"))?;
+        .ok_or_else(|| std::io::Error::other("wl-copy stdin unavailable"))?;
     stdin.write_all(text.as_bytes())?;
     drop(stdin);
     let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "wl-copy exited with {status}"
+        )))
+    }
+}
+
+/// Paste the clipboard at the current cursor position via `ydotool`
+/// (requires the `ydotoold` daemon). Synthesizes a single Ctrl+V
+/// (`29:1 47:1 47:0 29:0`, i.e. LEFTCTRL down, V down/up, LEFTCTRL up) instead
+/// of typing the transcript key-by-key: a fixed 4-event sequence, so it is
+/// fast and preserves non-ASCII text already on the clipboard. Returns
+/// `io::Error` unwrapped so the caller can match `NotFound` and disable
+/// itself with a single warning on machines without `ydotool`.
+pub(crate) fn paste_via_ydotool() -> std::io::Result<()> {
+    use std::process::Command;
+    let status = Command::new("ydotool")
+        .args(["key", "29:1", "47:1", "47:0", "29:0"])
+        .status()?;
     if status.success() {
         Ok(())
     } else {
@@ -213,28 +232,35 @@ fn whisper_init_and_run(
     let _ = ready.send(Ok(()));
     let copy_enabled = opts.copy_enabled;
     let paste_enabled = opts.paste_enabled;
-    // `ydotool` typing replaces the old `wl-copy` + `wtype` pair with a
-    // single action, but both flags still gate it (AND semantics preserve
-    // the old behavior where `--copy=false` disabled everything and
-    // `--paste=false` disabled insertion). Becomes `false` permanently
-    // after "binary not found" so a machine without `ydotool` logs one
-    // warning instead of one per utterance; daemon-down failures keep
-    // retrying since `ydotoold` may start later.
-    let mut type_available = copy_enabled && paste_enabled;
+    // Clipboard (`wl-copy`) carries the transcript verbatim (UTF-8, so Polish
+    // diacritics survive), then a single Ctrl+V via `ydotool key` pastes it.
+    // Both flags still gate the action (AND semantics preserve the old
+    // behavior where `--copy=false` disabled everything and `--paste=false`
+    // disabled insertion). Each becomes `false` permanently after "binary not
+    // found" so a machine without the binary logs one warning instead of one
+    // per utterance; daemon-down failures keep retrying since `ydotoold` may
+    // start later.
+    let mut clipboard_available = copy_enabled;
+    let mut paste_available = paste_enabled;
     if !copy_enabled {
-        eprintln!("[sttd] auto-type disabled (--copy=false)");
+        eprintln!("[sttd] clipboard copy disabled (--copy=false)");
     }
     if !paste_enabled {
-        eprintln!("[sttd] auto-type disabled (--paste=false)");
-    }
-    // `ydotool` only works on Wayland; on X.org (or headless/`--file`
-    // without a Wayland socket) disable typing once with a warning rather
-    // than failing every utterance.
-    if type_available && !is_wayland_session_env() {
+        eprintln!("[sttd] auto-paste disabled (--paste=false)");
+    } else if !copy_enabled {
         eprintln!(
-            "[sttd] warning: auto-type is enabled but this is not a Wayland session (no WAYLAND_DISPLAY, XDG_SESSION_TYPE!=wayland); disabling ydotool typing"
+            "[sttd] warning: --paste is enabled but --copy=false, paste will be skipped (nothing fresh to paste)"
         );
-        type_available = false;
+    }
+    // Both `wl-copy` and the paste target only make sense on Wayland; on X.org
+    // (or headless/`--file` without a Wayland socket) disable once with a
+    // warning rather than failing every utterance.
+    if (clipboard_available || paste_available) && !is_wayland_session_env() {
+        eprintln!(
+            "[sttd] warning: auto-paste is enabled but this is not a Wayland session (no WAYLAND_DISPLAY, XDG_SESSION_TYPE!=wayland); disabling clipboard + ydotool paste"
+        );
+        clipboard_available = false;
+        paste_available = false;
     }
 
     let mut utterance_no: u64 = 0;
@@ -298,17 +324,43 @@ fn whisper_init_and_run(
                     );
                     continue;
                 }
+                if is_repetition(trimmed) {
+                    eprintln!("[sttd] {tag}: dropped repetition-loop decode: {trimmed:?}");
+                    dump_drop_reason(
+                        &dump_dir,
+                        &tag,
+                        &format!("DROPPED(repetition): {trimmed}"),
+                    );
+                    continue;
+                }
                 println!("{trimmed}");
-                if type_available {
-                    match type_via_ydotool(trimmed) {
+                // Track whether this utterance actually refreshed the
+                // clipboard: paste synthesizes Ctrl+V, so it must only run
+                // on fresh content, never on stale clipboard or a failed
+                // copy.
+                let mut copied = false;
+                if clipboard_available {
+                    match copy_to_clipboard(trimmed) {
+                        Ok(()) => copied = true,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            eprintln!(
+                                "[sttd] warning: --copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
+                            );
+                            clipboard_available = false;
+                        }
+                        Err(e) => eprintln!("[sttd] {tag}: clipboard copy failed: {e:?}"),
+                    }
+                }
+                if paste_available && copied {
+                    match paste_via_ydotool() {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             eprintln!(
-                                "[sttd] warning: auto-type is enabled but `ydotool` was not found on PATH; disabling ydotool typing"
+                                "[sttd] warning: --paste is enabled but `ydotool` was not found on PATH; disabling auto-paste"
                             );
-                            type_available = false;
+                            paste_available = false;
                         }
-                        Err(e) => eprintln!("[sttd] {tag}: ydotool typing failed (is ydotoold running?): {e:?}"),
+                        Err(e) => eprintln!("[sttd] {tag}: auto-paste failed (is ydotoold running?): {e:?}"),
                     }
                 }
                 if let Some(dir) = &dump_dir {
@@ -548,10 +600,10 @@ pub(crate) fn fold_polish_diacritic(c: char) -> char {
     }
 }
 
-/// Whether `text` (a full transcript) is a known Whisper hallucination on
-/// silence/noise, checked as an exact match after normalization so genuine
-/// sentences that merely contain e.g. "dziękuję" are never caught.
-pub(crate) fn is_hallucination(text: &str) -> bool {
+/// Lowercase, fold Polish diacritics, turn punctuation into spaces and
+/// collapse whitespace. Shared by [`is_hallucination`] and
+/// [`is_repetition`] so both gates judge the same spelling.
+pub(crate) fn normalize_transcript(text: &str) -> String {
     // Punctuation becomes a space (not dropped): "Amara.org" must normalize
     // to "amara org" to match the pattern list, not "amaraorg". Diacritics
     // are folded (see `fold_polish_diacritic`) before the alphanumeric check,
@@ -563,7 +615,33 @@ pub(crate) fn is_hallucination(text: &str) -> bool {
         .map(fold_polish_diacritic)
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
-    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `text` (a full transcript) is a Whisper repetition-loop decode:
+/// the same 1-2 words on repeat (e.g. the observed
+/// "Współpraca w Współpraca w ..." emitted for a 300 ms noise burst with
+/// `avg_p=0.741`, well clear of either confidence floor). Judged on
+/// [`normalize_transcript`] words: 6+ words with at most half of them
+/// unique. Short emphases ("nie nie nie", 3 words) stay exempt; genuine
+/// 6-word sentences never approach a 0.5 uniqueness ratio.
+pub(crate) fn is_repetition(text: &str) -> bool {
+    let normalized = normalize_transcript(text);
+    let words: Vec<&str> = normalized.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.len() < 6 {
+        return false;
+    }
+    let mut unique = words.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    unique.len() * 2 <= words.len()
+}
+
+/// Whether `text` (a full transcript) is a known Whisper hallucination on
+/// silence/noise, checked as an exact match after normalization so genuine
+/// sentences that merely contain e.g. "dziękuję" are never caught.
+pub(crate) fn is_hallucination(text: &str) -> bool {
+    let normalized = normalize_transcript(text);
     if normalized.is_empty() {
         return true; // pure punctuation, e.g. "..."
     }
@@ -723,6 +801,11 @@ mod tests {
         assert!(is_hallucination("  napisy  "));
         assert!(is_hallucination("..."));
         assert!(is_hallucination(""));
+        // Observed forced-input decodes: white noise (rms=0.008) at
+        // avg_p=0.890 and 50 Hz hum at avg_p=0.993 — both clear either
+        // confidence floor, so the pattern list is the only gate.
+        assert!(is_hallucination("Wszelkie prawa."));
+        assert!(is_hallucination("Wszelkie prawa zastrzeżone."));
     }
 
     #[test]
@@ -732,6 +815,28 @@ mod tests {
         // folding this exact-match filter let it straight through.
         assert!(is_hallucination("Dziękuje za uwagę."));
         assert!(is_hallucination("dziekuje za uwage"));
+    }
+
+    #[test]
+    fn repetition_filter_catches_decode_loops() {
+        // Observed production-shape leak: 300 ms noise burst -> 26 speech
+        // frames -> "Współpraca w ..." at avg_p=0.741, clear of the 0.6
+        // weak floor and absent from the boilerplate list.
+        assert!(is_repetition(
+            "Współpraca w Współpraca w Współpraca w Współpraca w Współpraca."
+        ));
+        assert!(is_repetition("tak tak tak tak tak tak"));
+    }
+
+    #[test]
+    fn repetition_filter_leaves_real_speech_alone() {
+        assert!(!is_repetition("Zrób commit i wypchnij zmiany do repozytorium."));
+        assert!(!is_repetition(
+            "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
+        ));
+        // Short emphasis is exempt (< 6 words).
+        assert!(!is_repetition("nie nie nie"));
+        assert!(!is_repetition("tak"));
     }
 
     #[test]

@@ -173,6 +173,8 @@ pub(crate) const HALLUCINATION_PATTERNS: &[&str] = &[
     "subtitles by",
     "dziekuje za obejrzenie",
     "dziekuje za uwage",
+    "wszelkie prawa",
+    "wszelkie prawa zastrzezone",
     "zapraszam do subskrypcji",
     "zapraszam do subskrypcji kanalu",
 ];
