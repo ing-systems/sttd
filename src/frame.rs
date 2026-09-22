@@ -73,7 +73,7 @@ impl FrameProcessor {
     fn enqueue_utterance(&mut self) {
         if let Some(utterance) = self.utterance.close(&self.gate) {
             if let Err(e) = self.whisper_tx.send(utterance) {
-                eprintln!("[sttd] whisper queue closed: {e}");
+                log::warn!("whisper queue closed: {e}");
             }
         }
     }

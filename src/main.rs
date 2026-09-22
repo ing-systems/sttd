@@ -87,6 +87,7 @@ use whisper::*;
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    init_logging();
     let cli = Cli::parse();
 
     if cli.stop {
@@ -110,6 +111,14 @@ fn main() -> Result<()> {
     }
 
     run_microphone_mode(&cli)
+}
+
+/// Initialize `env_logger` with timestamps, defaulting to `info` when
+/// `RUST_LOG` is unset. Must run before any `log::*` call.
+fn init_logging() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .init();
 }
 
 /// Print known whisper models (`MODEL_CATALOG`) as an aligned table with a
@@ -216,8 +225,8 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // starts, so audio queues only briefly in `raw_rx` while it loads.
     let host = cpal::default_host();
     let device = select_input_device(&host, cli.device.as_deref())?;
-    eprintln!(
-        "[sttd] input device: {}",
+    log::info!(
+        "input device: {}",
         device.name().unwrap_or_else(|_| "<unknown>".into())
     );
 
@@ -228,15 +237,15 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let channels = supported.channels() as usize;
     let sample_format = supported.sample_format();
     let stream_config: cpal::StreamConfig = supported.into();
-    eprintln!(
-        "[sttd] hw config: {} Hz, {} ch, {:?}",
+    log::info!(
+        "hw config: {} Hz, {} ch, {:?}",
         hw_rate, channels, sample_format
     );
 
     // Heavy but pre-capture: resolve/download the model before the stream
     // starts so the callback can't outrun the drain loop.
     let model_path = resolve_model_input(cli)?;
-    eprintln!("[sttd] model: {}", model_path.display());
+    log::info!("model: {}", model_path.display());
 
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
@@ -265,17 +274,17 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let stream = build_input_stream(&device, &stream_config, channels, sample_format, raw_tx)?;
     stream.play().context("failed to start input stream")?;
     if cli.start_paused {
-        eprintln!("[sttd] starting paused (SIGUSR2/SIGHUP to resume)");
+        log::info!("starting paused (SIGUSR2/SIGHUP to resume)");
     } else {
-        eprintln!("[sttd] listening... Ctrl-C to stop");
+        log::info!("listening... Ctrl-C to stop");
     }
-    eprintln!("[sttd] pause: SIGUSR1, resume: SIGUSR2, toggle: SIGHUP");
+    log::info!("pause: SIGUSR1, resume: SIGUSR2, toggle: SIGHUP");
 
     // Ctrl-C sets the flag; the loop below flushes trailing speech first.
     {
         let running = Arc::clone(&running);
         if let Err(e) = install_ctrlc_handler(move || running.store(false, Ordering::Release)) {
-            eprintln!("[sttd] warning: {e:?} (Ctrl-C will terminate immediately)");
+            log::warn!("{e:?} (Ctrl-C will terminate immediately)");
         }
     }
 
@@ -287,7 +296,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         let paused = Arc::clone(&paused);
         let running = Arc::clone(&running);
         if let Err(e) = install_pause_handlers(paused, running) {
-            eprintln!("[sttd] warning: {e:?} (signal pause/resume unavailable)");
+            log::warn!("{e:?} (signal pause/resume unavailable)");
         }
     }
 
@@ -363,7 +372,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     whisper_handle
         .join()
         .map_err(|_| anyhow::anyhow!("whisper worker panicked"))?;
-    eprintln!("[sttd] stopped");
+    log::info!("stopped");
     Ok(())
 }
 
@@ -389,22 +398,22 @@ fn install_pause_handlers(paused: Arc<AtomicBool>, running: Arc<AtomicBool>) -> 
             match sig {
                 SIGUSR1 => {
                     paused.store(true, Ordering::Release);
-                    eprintln!("[sttd] paused (SIGUSR1)");
+                    log::info!("paused (SIGUSR1)");
                 }
                 SIGUSR2 => {
                     paused.store(false, Ordering::Release);
-                    eprintln!("[sttd] resumed (SIGUSR2)");
+                    log::info!("resumed (SIGUSR2)");
                 }
                 SIGHUP => {
                     let was_paused = paused.fetch_xor(true, Ordering::AcqRel);
                     if was_paused {
-                        eprintln!("[sttd] resumed (SIGHUP toggle)");
+                        log::info!("resumed (SIGHUP toggle)");
                     } else {
-                        eprintln!("[sttd] paused (SIGHUP toggle)");
+                        log::info!("paused (SIGHUP toggle)");
                     }
                 }
                 SIGTERM => {
-                    eprintln!("[sttd] shutting down (SIGTERM)");
+                    log::info!("shutting down (SIGTERM)");
                     running.store(false, Ordering::Release);
                 }
                 _ => {}
@@ -424,8 +433,8 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     // heavy work (denoiser init, GPU load), so a bad file/spec fails fast
     // instead of racing whisper.cpp's CUDA teardown.
     let wav = read_wav_mono_f32(path)?;
-    eprintln!(
-        "[sttd] file: {} ({} Hz, {} samples, {:.1}s)",
+    log::info!(
+        "file: {} ({} Hz, {} samples, {:.1}s)",
         path.display(),
         wav.sample_rate,
         wav.samples.len(),
@@ -433,7 +442,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     );
 
     let model_path = resolve_model_input(cli)?;
-    eprintln!("[sttd] model: {}", model_path.display());
+    log::info!("model: {}", model_path.display());
 
     let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
     let mut fp = FrameProcessor::new(

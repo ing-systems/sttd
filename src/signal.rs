@@ -67,15 +67,15 @@ impl SignalPath {
             DenoiserKind::Bypass => {
                 let resampler = FftStream::new(hw_rate, WHISPER_RATE, FRAME_16K)
                     .with_context(|| format!("failed to create resampler (hw -> {WHISPER_RATE})"))?;
-                eprintln!("[sttd] denoiser: none");
+                log::info!("denoiser: none");
                 VadPath::Direct { resampler }
             }
             DenoiserKind::DeepFilter => {
                 let resampler_hw48 = FftStream::new(hw_rate, DENOISE_RATE, FRAME_48K)
                     .with_context(|| format!("failed to create resampler (hw -> {DENOISE_RATE})"))?;
                 let (chunk_in, chunk_out) = resampler_hw48.chunk_sizes();
-                eprintln!(
-                    "[sttd] resampler: {hw_rate} -> {DENOISE_RATE}, \
+                log::info!(
+                    "resampler: {hw_rate} -> {DENOISE_RATE}, \
                      fft_chunk_in={chunk_in} fft_chunk_out={chunk_out} frame_out={FRAME_48K}"
                 );
 

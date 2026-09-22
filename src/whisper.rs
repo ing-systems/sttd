@@ -95,7 +95,7 @@ pub(crate) fn spawn_whisper_worker(
                 &paused,
                 paused_unload_after_secs,
             ) {
-                eprintln!("[sttd] whisper worker failed: {e:?}");
+                log::error!("whisper worker failed: {e:?}");
             }
         })
         .expect("failed to spawn whisper thread");
@@ -189,7 +189,7 @@ fn whisper_init_and_run(
                     let _ = ready.send(Err(format!("{e:#}")));
                     return Err(e);
                 }
-                eprintln!("[sttd] model reload failed: {e:?}; retrying in 5s");
+                log::warn!("model reload failed: {e:?}; retrying in 5s");
                 std::thread::sleep(Duration::from_secs(5));
                 continue;
             }
@@ -204,7 +204,7 @@ fn whisper_init_and_run(
                     let _ = ready.send(Err(format!("{e:#}")));
                     return Err(e);
                 }
-                eprintln!("[sttd] model reload failed: {e:?}; retrying in 5s");
+                log::warn!("model reload failed: {e:?}; retrying in 5s");
                 std::thread::sleep(Duration::from_secs(5));
                 continue;
             }
@@ -215,8 +215,8 @@ fn whisper_init_and_run(
             .model_type_readable()
             .unwrap_or_else(|_| "unknown".to_string());
         if first_load {
-            eprintln!(
-                "[sttd] whisper ready (model={model_name}, lang={}, beam=5, threads=8, gpu=true)",
+            log::info!(
+                "whisper ready (model={model_name}, lang={}, beam=5, threads=8, gpu=true)",
                 language.as_str()
             );
             // Init succeeded (model + state): signal ready so the main
@@ -226,7 +226,7 @@ fn whisper_init_and_run(
             let _ = ready.send(Ok(()));
             first_load = false;
         } else {
-            eprintln!("[sttd] whisper ready (model={model_name}, reloaded after pause)");
+            log::info!("whisper ready (model={model_name}, reloaded after pause)");
         }
         // A pause that raced the (tens of seconds) load gets a full fresh
         // timeout rather than an instant unload.
@@ -285,8 +285,8 @@ fn whisper_init_and_run(
                         last_unpaused.elapsed(),
                         unload_after,
                     ) {
-                        eprintln!(
-                            "[sttd] paused {}s, unloading whisper model to free VRAM...",
+                        log::info!(
+                            "paused {}s, unloading whisper model to free VRAM...",
                             unload_after.as_secs()
                         );
                         break false;
@@ -301,7 +301,7 @@ fn whisper_init_and_run(
         // Scope exit frees VRAM: state (borrows ctx) first, then ctx.
         drop(state);
         drop(ctx);
-        eprintln!("[sttd] whisper model unloaded (paused, VRAM freed)");
+        log::info!("whisper model unloaded (paused, VRAM freed)");
 
         // Unloaded wait: never transcribe here, just stash late arrivals and
         // reload eagerly the moment resume is seen — before the next
@@ -315,8 +315,8 @@ fn whisper_init_and_run(
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     if !stash.is_empty() {
-                        eprintln!(
-                            "[sttd] dropping {} queued utterance(s) (shut down while model unloaded)",
+                        log::warn!(
+                            "dropping {} queued utterance(s) (shut down while model unloaded)",
                             stash.len()
                         );
                     }
@@ -324,7 +324,7 @@ fn whisper_init_and_run(
                 }
             }
             if !paused.load(Ordering::Relaxed) {
-                eprintln!("[sttd] resumed, reloading whisper model...");
+                log::info!("resumed, reloading whisper model...");
                 break;
             }
         }
@@ -338,11 +338,11 @@ fn load_whisper_context(path_str: &str, model_path: &Path) -> Result<WhisperCont
     let mut ctx_params = WhisperContextParameters::default();
     ctx_params.use_gpu = true;
     match std::fs::metadata(model_path) {
-        Ok(meta) => eprintln!(
-            "[sttd] loading whisper context ({:.1} MiB, gpu requested)...",
+        Ok(meta) => log::info!(
+            "loading whisper context ({:.1} MiB, gpu requested)...",
             meta.len() as f64 / 1_048_576.0
         ),
-        Err(_) => eprintln!("[sttd] loading whisper context (gpu requested)..."),
+        Err(_) => log::info!("loading whisper context (gpu requested)..."),
     }
     // `new_with_params` blocks for tens of seconds on a large model with no
     // callback; tick elapsed time so the wait doesn't look hung.
@@ -362,7 +362,7 @@ fn load_whisper_context(path_str: &str, model_path: &Path) -> Result<WhisperCont
                 let elapsed = start.elapsed().as_secs();
                 if elapsed > last_printed {
                     last_printed = elapsed;
-                    eprintln!("[sttd] loading whisper context... {elapsed}s");
+                    log::info!("loading whisper context... {elapsed}s");
                 }
             }
         })
@@ -420,7 +420,7 @@ fn transcribe_and_emit(
                 evidence: &utterance.evidence,
             });
         }
-        Err(e) => eprintln!("[sttd] {tag}: transcription failed: {e:?}"),
+        Err(e) => log::error!("{tag}: transcription failed: {e:?}"),
     }
 }
 
@@ -657,7 +657,7 @@ fn transcribe(
                     out.push_str(t);
                 }
             }
-            Err(e) => eprintln!("[sttd] segment {i} read failed: {e:?}"),
+            Err(e) => log::warn!("segment {i} read failed: {e:?}"),
         }
         let n_tokens = state.full_n_tokens(i).unwrap_or(0);
         for t in 0..n_tokens {
@@ -666,8 +666,8 @@ fn transcribe(
                     let text = state
                         .full_get_token_text_lossy(i, t)
                         .unwrap_or_else(|_| "?".to_string());
-                    eprintln!(
-                        "[sttd]   token seg={i} idx={t} id={} p={:.3} plog={:.3} \
+                    log::debug!(
+                        "  token seg={i} idx={t} id={} p={:.3} plog={:.3} \
                          timestamp={} {text:?}",
                         data.id,
                         data.p,

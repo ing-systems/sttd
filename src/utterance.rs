@@ -209,7 +209,7 @@ impl UtteranceBuffer {
             total_frames,
             self.buf.len(),
         ) {
-            eprintln!("{}", drop.message());
+            log::info!("{}", drop.message());
             self.reset();
             return None;
         }
@@ -221,8 +221,8 @@ impl UtteranceBuffer {
         self.buf.truncate(tail_end);
 
         let pcm = std::mem::take(&mut self.buf);
-        eprintln!(
-            "[sttd] utterance: {} samples ({speech_frames} speech frames, \
+        log::info!(
+            "utterance: {} samples ({speech_frames} speech frames, \
              density={density:.3}, rms={rms:.5}) -> whisper",
             pcm.len()
         );

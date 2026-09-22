@@ -64,8 +64,8 @@ impl Denoiser {
                 Denoiser::DeepFilter(Box::new(tract))
             }
         };
-        eprintln!(
-            "[sttd] denoiser: {} (init {:.1}ms)",
+        log::info!(
+            "denoiser: {} (init {:.1}ms)",
             denoiser.name(),
             t0.elapsed().as_secs_f64() * 1000.0
         );
@@ -86,7 +86,7 @@ impl Denoiser {
         debug_assert_eq!(noisy.len(), FRAME_48K);
         debug_assert_eq!(clean.len(), FRAME_48K);
         if noisy.len() != FRAME_48K || clean.len() != FRAME_48K {
-            eprintln!("[sttd] deepfilter frame length mismatch (passing through)");
+            log::warn!("deepfilter frame length mismatch (passing through)");
             let n = noisy.len().min(clean.len());
             clean[..n].copy_from_slice(&noisy[..n]);
             return;
@@ -94,18 +94,18 @@ impl Denoiser {
         match self {
             Denoiser::DeepFilter(tract) => {
                 let Ok(noisy_view) = ArrayView2::from_shape((1, FRAME_48K), noisy) else {
-                    eprintln!("[sttd] deepfilter noisy view failed (passing through)");
+                    log::warn!("deepfilter noisy view failed (passing through)");
                     clean.copy_from_slice(noisy);
                     return;
                 };
                 let Ok(mut enh_view) = ArrayViewMut2::from_shape((1, FRAME_48K), clean) else {
-                    eprintln!("[sttd] deepfilter clean view failed (passing through)");
+                    log::warn!("deepfilter clean view failed (passing through)");
                     return;
                 };
                 if let Err(e) = tract.process(noisy_view, enh_view.view_mut()) {
                     // Hand the VAD branch the raw frame rather than lose
                     // frame-count sync with the rest of the pipeline.
-                    eprintln!("[sttd] deepfilter process error: {e}; passing frame through");
+                    log::warn!("deepfilter process error: {e}; passing frame through");
                     clean.copy_from_slice(noisy);
                 }
             }

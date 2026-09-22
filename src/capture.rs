@@ -59,7 +59,7 @@ pub(crate) fn build_input_stream(
     sample_format: cpal::SampleFormat,
     raw_tx: Sender<Vec<f32>>,
 ) -> Result<cpal::Stream> {
-    let err_fn = |err| eprintln!("[sttd] stream error: {err}");
+    let err_fn = |err| log::error!("stream error: {err}");
 
     match sample_format {
         cpal::SampleFormat::F32 => {
@@ -69,7 +69,7 @@ pub(crate) fn build_input_stream(
                 move |data: &[f32], _| {
                     let mono = downmix_to_mono(data, channels);
                     if let Err(e) = tx.send(mono) {
-                        eprintln!("[sttd] raw queue closed: {e}");
+                        log::warn!("raw queue closed: {e}");
                     }
                 },
                 err_fn,
@@ -88,7 +88,7 @@ pub(crate) fn build_input_stream(
                     }
                     let mono = downmix_to_mono(&tmp, channels);
                     if let Err(e) = tx.send(mono) {
-                        eprintln!("[sttd] raw queue closed: {e}");
+                        log::warn!("raw queue closed: {e}");
                     }
                 },
                 err_fn,
@@ -107,7 +107,7 @@ pub(crate) fn build_input_stream(
                     }
                     let mono = downmix_to_mono(&tmp, channels);
                     if let Err(e) = tx.send(mono) {
-                        eprintln!("[sttd] raw queue closed: {e}");
+                        log::warn!("raw queue closed: {e}");
                     }
                 },
                 err_fn,

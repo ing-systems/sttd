@@ -118,7 +118,7 @@ impl FftStream {
                     // condition on mono input. Never panic on the hot path:
                     // skip the chunk and keep the pipeline running.
                     if let Err(e) = inner.resample(&self.scratch_in, &mut self.scratch_out) {
-                        eprintln!("[sttd] resampler error: {e:?} (skipping chunk)");
+                        log::warn!("resampler error: {e:?} (skipping chunk)");
                         self.pending_in.drain(..self.chunk_in);
                         continue;
                     }
@@ -144,7 +144,7 @@ impl FftStream {
             self.scratch_in.copy_from_slice(&chunk);
             if let Some(inner) = self.inner.as_mut() {
                 if let Err(e) = inner.resample(&self.scratch_in, &mut self.scratch_out) {
-                    eprintln!("[sttd] resampler flush error: {e:?} (dropping tail)");
+                    log::warn!("resampler flush error: {e:?} (dropping tail)");
                 } else {
                     self.pending_out.extend_from_slice(&self.scratch_out);
                 }

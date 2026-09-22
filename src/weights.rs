@@ -55,8 +55,8 @@ pub(crate) fn ensure_available(model: &Path) -> Result<PathBuf> {
             path.display()
         );
     };
-    eprintln!(
-        "[sttd] model not found at {}, downloading {url}...",
+    log::info!(
+        "model not found at {}, downloading {url}...",
         path.display()
     );
     download(&url, path)?;
@@ -114,18 +114,16 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 
     let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
     if let Some(n) = total {
-        eprintln!("[sttd] downloading {:.1} MiB...", n as f64 / 1_048_576.0);
+        log::info!("downloading {:.1} MiB...", n as f64 / 1_048_576.0);
     } else {
-        eprintln!("[sttd] downloading (size unknown)...");
+        log::info!("downloading (size unknown)...");
     }
 
     let mut reader = resp.into_reader();
     let mut out = std::fs::File::create(&tmp)
         .with_context(|| format!("failed to create {}", tmp.display()))?;
     // Chunked copy (instead of `std::io::copy`) so a large model download
-    // reports progress. On a tty the bar rewrites one line via `\r`; when
-    // stderr isn't a tty (piped logs) `\r` would smear, so log whole lines
-    // every 64 MiB instead.
+    // reports progress via the logger (timestamps replace the old `\r` bar).
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
     let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -134,8 +132,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     let mut last_render = Instant::now() - Duration::from_secs(3600);
     let mut next_log_at: u64 = 64 * 1_048_576;
     // Initial 0% so even a fast download shows the bar shape.
-    eprint!("\r[sttd] {}", format_download_progress(0, total));
-    std::io::stderr().flush().ok();
+    log::debug!("{}", format_download_progress(0, total));
     loop {
         let n = reader.read(&mut buf).context("download I/O failed")?;
         if n == 0 {
@@ -145,25 +142,23 @@ fn download(url: &str, dest: &Path) -> Result<()> {
         downloaded += n as u64;
         if tty {
             if last_render.elapsed() >= Duration::from_millis(200) {
-                eprint!("\r[sttd] {}", format_download_progress(downloaded, total));
-                std::io::stderr().flush().ok();
+                log::debug!("{}", format_download_progress(downloaded, total));
                 last_render = Instant::now();
             }
         } else if downloaded >= next_log_at {
-            eprintln!("[sttd] {}", format_download_progress(downloaded, total));
+            log::info!("{}", format_download_progress(downloaded, total));
             next_log_at += 64 * 1_048_576;
         }
     }
     if tty {
-        eprint!("\r[sttd] {}", format_download_progress(downloaded, total));
-        eprintln!();
+        log::debug!("{}", format_download_progress(downloaded, total));
     }
     out.flush().ok();
     drop(out);
     std::fs::rename(&tmp, dest)
         .with_context(|| format!("failed to move {} -> {}", tmp.display(), dest.display()))?;
-    eprintln!(
-        "[sttd] downloaded {} ({:.1} MiB)",
+    log::info!(
+        "downloaded {} ({:.1} MiB)",
         dest.display(),
         downloaded as f64 / 1_048_576.0
     );

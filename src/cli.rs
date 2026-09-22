@@ -181,7 +181,7 @@ pub(crate) struct Cli {
     pub(crate) pid_file: Option<PathBuf>,
 
     /// Combined stdout+stderr log (append) for `--start`. Transcripts
-    /// (`println!`) and diagnostics (`eprintln!`) both land here.
+    /// (`println!`) and diagnostics (`log`) both land here.
     /// Defaults to `<tmp>/sttd.log`.
     #[arg(long, env = "STTD_LOG_FILE", value_name = "PATH", help_heading = "Runtime")]
     pub(crate) log_file: Option<PathBuf>,

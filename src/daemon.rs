@@ -159,7 +159,7 @@ pub(crate) fn run_stop(pid_file: &Path) -> Result<()> {
         }
         return Ok(());
     }
-    eprintln!("[sttd] SIGTERM timed out, sending SIGKILL (pid {pid})...");
+    log::warn!("SIGTERM timed out, sending SIGKILL (pid {pid})...");
     send_signal(pid, libc::SIGKILL, "SIGKILL")?;
     if wait_for_exit(pid, std::time::Duration::from_secs(2)) {
         println!("[sttd] killed (pid {pid})");

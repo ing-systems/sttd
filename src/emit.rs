@@ -4,7 +4,7 @@
 //
 // One step — handing a decided transcript to the user — used to live inside
 // `whisper_init_and_run` alongside inference, conditioning and the gate call:
-// `println!`, metrics `eprintln!`, clipboard copy, auto-paste and WAV/TXT
+// `println!`, metrics `log::info!`, clipboard copy, auto-paste and WAV/TXT
 // dumps shared one loop with the decoder. To answer "was this emitted, and
 // where did it go" you had to run the model.
 //
@@ -66,7 +66,7 @@ impl SystemEmitter {
         if let Some(dir) = &dump_dir {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
-            eprintln!("[sttd] dumping utterances to {}", dir.display());
+            log::info!("dumping utterances to {}", dir.display());
         }
         let mut emitter = Self {
             dump_dir,
@@ -74,21 +74,21 @@ impl SystemEmitter {
             paste_available: paste_enabled,
         };
         if !copy_enabled {
-            eprintln!("[sttd] clipboard copy disabled (--copy=false)");
+            log::info!("clipboard copy disabled (--copy=false)");
         }
         if !paste_enabled {
-            eprintln!("[sttd] auto-paste disabled (--paste=false)");
+            log::info!("auto-paste disabled (--paste=false)");
         } else if !copy_enabled {
-            eprintln!(
-                "[sttd] warning: --paste is enabled but --copy=false, paste will be skipped (nothing fresh to paste)"
+            log::warn!(
+                "--paste is enabled but --copy=false, paste will be skipped (nothing fresh to paste)"
             );
         }
         // Both `wl-copy` and the paste target only make sense on Wayland; on
         // X.org (or headless/`--file` without a Wayland socket) disable once
         // with a warning rather than failing every utterance.
         if (emitter.clipboard_available || emitter.paste_available) && !is_wayland_session_env() {
-            eprintln!(
-                "[sttd] warning: auto-paste is enabled but this is not a Wayland session (no WAYLAND_DISPLAY, XDG_SESSION_TYPE!=wayland); disabling clipboard + ydotool paste"
+            log::warn!(
+                "auto-paste is enabled but this is not a Wayland session (no WAYLAND_DISPLAY, XDG_SESSION_TYPE!=wayland); disabling clipboard + ydotool paste"
             );
             emitter.clipboard_available = false;
             emitter.paste_available = false;
@@ -112,7 +112,7 @@ impl Emitter for SystemEmitter {
         if let Some(dir) = &self.dump_dir {
             let wav_path = dir.join(format!("{tag}.wav"));
             if let Err(e) = write_wav_mono16(&wav_path, pcm, WHISPER_RATE) {
-                eprintln!("[sttd] failed to dump {}: {e:?}", wav_path.display());
+                log::warn!("failed to dump {}: {e:?}", wav_path.display());
             }
         }
         match verdict {
@@ -121,8 +121,8 @@ impl Emitter for SystemEmitter {
                 return;
             }
             TranscriptVerdict::Emit { floor, strength } => {
-                eprintln!(
-                    "[sttd] {tag}: avg_p={prob:.3} avg_logprob={logprob:.3} threshold={floor:.3} \
+                log::info!(
+                    "{tag}: avg_p={prob:.3} avg_logprob={logprob:.3} threshold={floor:.3} \
                      ({strength} evidence, density={:.3})",
                     evidence.density()
                 );
@@ -133,20 +133,20 @@ impl Emitter for SystemEmitter {
                 floor,
                 strength,
             } => {
-                eprintln!(
-                    "[sttd] {tag}: avg_p={prob:.3} avg_logprob={logprob:.3} threshold={floor:.3} \
+                log::info!(
+                    "{tag}: avg_p={prob:.3} avg_logprob={logprob:.3} threshold={floor:.3} \
                      ({strength} evidence, density={:.3})",
                     evidence.density()
                 );
                 match kind {
                     TranscriptDropKind::LowConfidence => {
-                        eprintln!("[sttd] {tag}: dropped low-confidence transcript: {text:?}");
+                        log::info!("{tag}: dropped low-confidence transcript: {text:?}");
                     }
                     TranscriptDropKind::Hallucination => {
-                        eprintln!("[sttd] {tag}: dropped likely hallucination: {text:?}");
+                        log::info!("{tag}: dropped likely hallucination: {text:?}");
                     }
                     TranscriptDropKind::Repetition => {
-                        eprintln!("[sttd] {tag}: dropped repetition-loop decode: {text:?}");
+                        log::info!("{tag}: dropped repetition-loop decode: {text:?}");
                     }
                 }
                 // All fields are `Copy`, so the verdict can be re-spoken for
@@ -170,30 +170,30 @@ impl Emitter for SystemEmitter {
             match copy_to_clipboard(text) {
                 Ok(()) => copied = true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!(
-                        "[sttd] warning: --copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
+                    log::warn!(
+                        "--copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
                     );
                     self.clipboard_available = false;
                 }
-                Err(e) => eprintln!("[sttd] {tag}: clipboard copy failed: {e:?}"),
+                Err(e) => log::warn!("{tag}: clipboard copy failed: {e:?}"),
             }
         }
         if self.paste_available && copied {
             match paste_via_ydotool() {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!(
-                        "[sttd] warning: --paste is enabled but `ydotool` was not found on PATH; disabling auto-paste"
+                    log::warn!(
+                        "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste"
                     );
                     self.paste_available = false;
                 }
-                Err(e) => eprintln!("[sttd] {tag}: auto-paste failed (is ydotoold running?): {e:?}"),
+                Err(e) => log::warn!("{tag}: auto-paste failed (is ydotoold running?): {e:?}"),
             }
         }
         if let Some(dir) = &self.dump_dir {
             let txt_path = dir.join(format!("{tag}.txt"));
             if let Err(e) = std::fs::write(&txt_path, text) {
-                eprintln!("[sttd] failed to write {}: {e:?}", txt_path.display());
+                log::warn!("failed to write {}: {e:?}", txt_path.display());
             }
         }
     }
@@ -207,7 +207,7 @@ fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
     if let Some(dir) = dump_dir {
         let txt_path = dir.join(format!("{tag}.txt"));
         if let Err(e) = std::fs::write(&txt_path, reason) {
-            eprintln!("[sttd] failed to write {}: {e:?}", txt_path.display());
+            log::warn!("failed to write {}: {e:?}", txt_path.display());
         }
     }
 }
