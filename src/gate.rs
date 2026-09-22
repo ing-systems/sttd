@@ -405,6 +405,15 @@ mod tests {
     }
 
     #[test]
+    fn short_word_with_strong_rms_earns_strong_evidence() {
+        let gate = default_gate();
+        // 25 speech frames (e.g. "Ale" ~250 ms) with high RMS (0.05) earns strong evidence.
+        let (floor, strength) = gate.floor_for(25, 0.05);
+        assert_eq!(strength, EvidenceStrength::Strong);
+        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE_STRONG);
+    }
+
+    #[test]
     fn weak_evidence_keeps_strict_floor() {
         let gate = default_gate();
         let (floor, strength) = gate.floor_for(MIN_SPEECH_FRAMES, DEFAULT_MIN_SPEECH_RMS + 0.0005);

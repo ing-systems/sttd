@@ -195,8 +195,9 @@ pub(crate) const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
 /// the pause-state reset fix.
 pub(crate) const DEFAULT_VAD_ADAPT: bool = true;
 /// `speech_frames` (see `Evidence`) required to count as "strong" acoustic
-/// evidence: 500 ms of VAD-flagged speech, well past `MIN_SPEECH_FRAMES`.
-pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
+/// evidence when paired with `STRONG_RMS_FACTOR` energy: 200 ms (20 frames,
+/// matching `MIN_SPEECH_FRAMES`) so energetic short words can earn strong evidence too.
+pub(crate) const STRONG_SPEECH_FRAMES: u32 = 20;
 /// Multiple of `min_speech_rms` required to count as "strong" acoustic
 /// evidence.
 pub(crate) const STRONG_RMS_FACTOR: f32 = 3.0;

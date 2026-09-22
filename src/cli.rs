@@ -74,7 +74,7 @@ pub(crate) struct Cli {
         env = "STTD_LANGUAGE",
         value_enum,
         ignore_case = true,
-        default_value_t = Language::Auto,
+        default_value_t = Language::Polish,
         help_heading = "Model"
     )]
     pub(crate) language: Language,
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(cli.prompt_context_chars, DEFAULT_PROMPT_CONTEXT_CHARS);
         assert_eq!(cli.hangover_ms, DEFAULT_HANGOVER_MS);
         assert_eq!(cli.channel, ChannelSel::Mix);
-        assert_eq!(cli.language, crate::whisper::Language::Auto);
+        assert_eq!(cli.language, crate::whisper::Language::Polish);
         assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
         assert_eq!(cli.temperature, DEFAULT_TEMPERATURE);
         assert_eq!(cli.temperature_inc, DEFAULT_TEMPERATURE_INC);

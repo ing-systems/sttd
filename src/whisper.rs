@@ -1143,8 +1143,21 @@ struct Transcript {
     confidence: TokenConfidence,
 }
 
+/// One token decoded by whisper, scored for confidence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScoredToken {
+    pub(crate) id: whisper_rs::WhisperToken,
+    pub(crate) p: f32,
+    pub(crate) plog: f32,
+    /// Whether this token contains alphanumeric characters (spoken text).
+    /// Pure punctuation tokens (e.g. trailing '.', ',', '?') are emitted by
+    /// whisper's LM and carry low LM probabilities on isolated words, dragging
+    /// short-utterance confidence down; excluding them scores the spoken words themselves.
+    pub(crate) is_lexical: bool,
+}
+
 /// Average token probability/log-probability over *text* tokens only, given
-/// each token's `(id, p, plog)`. Timestamp tokens (`id >= token_beg`) sit in
+/// each token's `ScoredToken`. Timestamp tokens (`id >= token_beg`) sit in
 /// every whisper.cpp segment — a leading `<|0.00|>` and a closing `<|t|>`
 /// (confirmed in the vendored whisper.cpp 1.7.1 source,
 /// `whisper.cpp:6191-6193`: `result_all.back().tokens` is filled from
@@ -1153,21 +1166,41 @@ struct Transcript {
 /// their probability says nothing about transcript quality. Averaging them
 /// in dilutes the score, worst on short utterances, which is exactly where
 /// keeping the gate accurate matters most.
+///
+/// Furthermore, pure punctuation tokens (like trailing periods on 1-word
+/// utterances) are excluded when lexical tokens are present: whisper's LM
+/// attaches low probability to sentence terminators on headless single words,
+/// which would otherwise cut confidence of genuine speech below the gate.
 pub(crate) fn average_text_confidence(
-    tokens: &[(whisper_rs::WhisperToken, f32, f32)],
+    tokens: &[ScoredToken],
     token_beg: whisper_rs::WhisperToken,
 ) -> TokenConfidence {
     let mut prob_sum = 0f64;
     let mut logprob_sum = 0f64;
     let mut count = 0usize;
-    for &(id, p, plog) in tokens {
-        if id >= token_beg {
+
+    // First pass: average over lexical text tokens (words/syllables).
+    for token in tokens {
+        if token.id >= token_beg || !token.is_lexical {
             continue;
         }
-        prob_sum += p as f64;
-        logprob_sum += plog as f64;
+        prob_sum += token.p as f64;
+        logprob_sum += token.plog as f64;
         count += 1;
     }
+
+    // Fallback: if no tokens were lexical (e.g. all punctuation), average all text tokens.
+    if count == 0 {
+        for token in tokens {
+            if token.id >= token_beg {
+                continue;
+            }
+            prob_sum += token.p as f64;
+            logprob_sum += token.plog as f64;
+            count += 1;
+        }
+    }
+
     if count == 0 {
         TokenConfidence {
             prob: 0.0,
@@ -1280,7 +1313,7 @@ fn transcribe(
     state.full(params, pcm_16k).context("whisper full failed")?;
     let n = state.full_n_segments().context("no segments")?;
     let mut out = String::new();
-    let mut tokens: Vec<(whisper_rs::WhisperToken, f32, f32)> = Vec::new();
+    let mut tokens: Vec<ScoredToken> = Vec::new();
     for i in 0..n {
         match state.full_get_segment_text_lossy(i) {
             Ok(s) => {
@@ -1297,10 +1330,10 @@ fn transcribe(
         let n_tokens = state.full_n_tokens(i).unwrap_or(0);
         for t in 0..n_tokens {
             if let Ok(data) = state.full_get_token_data(i, t) {
+                let text = state
+                    .full_get_token_text_lossy(i, t)
+                    .unwrap_or_else(|_| "?".to_string());
                 if debug_tokens {
-                    let text = state
-                        .full_get_token_text_lossy(i, t)
-                        .unwrap_or_else(|_| "?".to_string());
                     log::debug!(
                         "  token seg={i} idx={t} id={} p={:.3} plog={:.3} \
                          timestamp={} {text:?}",
@@ -1310,7 +1343,13 @@ fn transcribe(
                         data.id >= token_beg
                     );
                 }
-                tokens.push((data.id, data.p, data.plog));
+                let is_lexical = text.chars().any(|c| c.is_alphanumeric());
+                tokens.push(ScoredToken {
+                    id: data.id,
+                    p: data.p,
+                    plog: data.plog,
+                    is_lexical,
+                });
             }
         }
     }
@@ -1358,15 +1397,77 @@ mod tests {
         // 3-token average, so including the two 0.99 tokens would miss them.
         let token_beg: whisper_rs::WhisperToken = 50364; // whisper.cpp's typical <|0.00|> id
         let tokens = vec![
-            (token_beg, 0.99, -0.01),      // leading timestamp: must be excluded
-            (100, 0.9, -0.1),              // text
-            (101, 0.5, -0.7),              // text
-            (102, 0.4, -0.9),              // text
-            (token_beg + 50, 0.99, -0.01), // closing timestamp: must be excluded
+            ScoredToken {
+                id: token_beg,
+                p: 0.99,
+                plog: -0.01,
+                is_lexical: false,
+            },
+            ScoredToken {
+                id: 100,
+                p: 0.9,
+                plog: -0.1,
+                is_lexical: true,
+            },
+            ScoredToken {
+                id: 101,
+                p: 0.5,
+                plog: -0.7,
+                is_lexical: true,
+            },
+            ScoredToken {
+                id: 102,
+                p: 0.4,
+                plog: -0.9,
+                is_lexical: true,
+            },
+            ScoredToken {
+                id: token_beg + 50,
+                p: 0.99,
+                plog: -0.01,
+                is_lexical: false,
+            },
         ];
         let confidence = average_text_confidence(&tokens, token_beg);
         assert!((confidence.prob - (0.9 + 0.5 + 0.4) / 3.0).abs() < 1e-6);
         assert!((confidence.logprob - (-0.1 - 0.7 - 0.9) / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn confidence_ignores_trailing_punctuation() {
+        // Regression: trailing period/punctuation on single-word utterances
+        // carries low LM probability (e.g. 0.272), dragging down average
+        // confidence of genuine speech. Lexical tokens only must be scored.
+        let token_beg: whisper_rs::WhisperToken = 50364;
+        let tokens = vec![
+            ScoredToken {
+                id: token_beg,
+                p: 0.88,
+                plog: -0.12,
+                is_lexical: false,
+            },
+            ScoredToken {
+                id: 9366,
+                p: 0.71,
+                plog: -0.34,
+                is_lexical: true,
+            }, // " Ale"
+            ScoredToken {
+                id: 13,
+                p: 0.27,
+                plog: -1.30,
+                is_lexical: false,
+            }, // "."
+            ScoredToken {
+                id: token_beg + 10,
+                p: 0.23,
+                plog: -1.46,
+                is_lexical: false,
+            },
+        ];
+        let confidence = average_text_confidence(&tokens, token_beg);
+        assert!((confidence.prob - 0.71).abs() < 1e-6);
+        assert!((confidence.logprob - (-0.34)).abs() < 1e-6);
     }
 
     #[test]
@@ -1530,7 +1631,7 @@ mod tests {
 
     #[test]
     fn metrics_row_escapes_text_for_json() {
-        use crate::gate::{EvidenceStrength, TranscriptVerdict};
+        use crate::gate::TranscriptVerdict;
         let evidence = Evidence {
             speech_frames: 20,
             total_frames: 100,

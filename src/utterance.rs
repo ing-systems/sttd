@@ -221,6 +221,10 @@ impl UtteranceBuffer {
         } else {
             self.onset_run = 0;
             if self.buf.is_empty() {
+                self.speech_frames = 0;
+                self.speech_energy_sum_sq = 0.0;
+                self.speech_sample_count = 0;
+                self.speech_frame_rms.clear();
                 return FrameAction::Continue;
             }
             self.buf.extend_from_slice(frame);
@@ -355,12 +359,21 @@ impl UtteranceBuffer {
         } else {
             0.0
         };
+        // When raw frame density is clearly concentrated (short dense words where
+        // pre-roll and tail silence dominate total_frames), use density so quiet-but-dense
+        // speech isn't starved by the weighted-density denominator.
+        let effective_density = if density >= 0.35 {
+            density.max(weighted)
+        } else {
+            weighted
+        };
+
         // Exemption judged on the same post-trim length as density: the raw
         // buffer still holds the full silence hangover at this point, which
         // would otherwise exempt utterances ~600 ms shorter than intended.
         if let Err(drop) = gate.check_acoustic(
             speech_frames,
-            weighted,
+            effective_density,
             rms,
             tail_end,
             total_frames,
