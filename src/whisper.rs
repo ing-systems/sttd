@@ -124,13 +124,16 @@ pub(crate) fn is_wayland_session_env() -> bool {
 /// Copy `text` to the Wayland clipboard via `wl-copy` (from wl-clipboard).
 /// Pipes the trimmed transcript over `wl-copy`'s stdin with no trailing
 /// newline, so it is pasted verbatim (UTF-8, including Polish diacritics) by
-/// the subsequent paste step. Returns the `io::Error` unwrapped (not `anyhow`)
+/// the subsequent paste step. Passes `--sensitive` (`x-kde-passwordManagerHint=secret`)
+/// so Klipper skips clipboard history while paste still works.
+/// Returns the `io::Error` unwrapped (not `anyhow`)
 /// so the caller can match `NotFound` and disable itself with a single warning
 /// on machines without wl-clipboard.
 pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new("wl-copy")
+        .arg("--sensitive")
         .stdin(Stdio::piped())
         .spawn()?;
     let mut stdin = child
