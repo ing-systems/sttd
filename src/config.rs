@@ -247,6 +247,10 @@ pub(crate) const DEFAULT_THREADS: i32 = 8;
 /// Whether to load the model onto the GPU (`use_gpu`). Default true.
 /// Override with `STTD_GPU=0` / `--gpu off` for CPU-only machines.
 pub(crate) const DEFAULT_USE_GPU: bool = true;
+/// Whether whisper translates non-English speech to English (`set_translate`)
+/// instead of transcribing it. Default false. Override with
+/// `STTD_TRANSLATE=1` / `--translate`.
+pub(crate) const DEFAULT_TRANSLATE: bool = false;
 
 /// Whisper model auto-download. The URL is derived from the filename (see
 /// `ensure_available`), so `--model` as an explicit path can point at any

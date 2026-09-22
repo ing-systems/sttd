@@ -753,6 +753,7 @@ fn whisper_options(cli: &Cli, shed_stale: bool) -> WhisperOptions {
         prompt: cli.prompt.clone(),
         prompt_context_chars: cli.prompt_context_chars,
         language: cli.language,
+        translate: cli.translate,
         gate: gate_config(cli),
         debug_tokens: cli.debug_tokens,
         beam_size: cli.beam_size,

@@ -67,6 +67,9 @@ pub(crate) struct WhisperOptions {
     pub(crate) prompt: String,
     pub(crate) prompt_context_chars: usize,
     pub(crate) language: Language,
+    /// Translate non-English speech to English (`FullParams::set_translate`).
+    /// `--language` selects the source language when enabled.
+    pub(crate) translate: bool,
     pub(crate) gate: GateConfig,
     pub(crate) debug_tokens: bool,
     pub(crate) beam_size: i32,
@@ -248,6 +251,7 @@ fn whisper_init_and_run(
     let prompt_context_chars = opts.prompt_context_chars;
     let shed_stale = opts.shed_stale;
     let language = opts.language;
+    let translate = opts.translate;
     let gate = opts.gate.clone();
     let debug_tokens = opts.debug_tokens;
     let beam_size = opts.beam_size;
@@ -313,7 +317,7 @@ fn whisper_init_and_run(
 
         if first_load {
             log::info!(
-                "whisper ready (model={model_spec}, lang={}, beam={beam_size}, temp={temperature}/{temperature_inc}, entropy_thold={entropy_thold}, logprob_thold={logprob_thold}, threads={n_threads}, gpu={use_gpu})",
+                "whisper ready (model={model_spec}, lang={}, translate={translate}, beam={beam_size}, temp={temperature}/{temperature_inc}, entropy_thold={entropy_thold}, logprob_thold={logprob_thold}, threads={n_threads}, gpu={use_gpu})",
                 language.as_str()
             );
             // Init succeeded (model + state): signal ready so the main
@@ -361,6 +365,7 @@ fn whisper_init_and_run(
                 &mut prompt_tail,
                 prompt_context_chars,
                 language,
+                translate,
                 &gate,
                 debug_tokens,
                 beam_size,
@@ -480,6 +485,7 @@ fn whisper_init_and_run(
                             &mut prompt_tail,
                             prompt_context_chars,
                             language,
+                            translate,
                             &gate,
                             debug_tokens,
                             beam_size,
@@ -920,6 +926,7 @@ fn transcribe_and_emit(
     prompt_tail: &mut String,
     prompt_context_chars: usize,
     language: Language,
+    translate: bool,
     gate: &crate::gate::GateConfig,
     debug_tokens: bool,
     beam_size: i32,
@@ -948,6 +955,7 @@ fn transcribe_and_emit(
         &conditioned,
         &effective_prompt,
         language,
+        translate,
         debug_tokens,
         beam_size,
         temperature,
@@ -1176,6 +1184,7 @@ fn transcribe(
     pcm_16k: &[f32],
     prompt: &str,
     language: Language,
+    translate: bool,
     debug_tokens: bool,
     beam_size: i32,
     temperature: f32,
@@ -1202,7 +1211,7 @@ fn transcribe(
     });
     params.set_n_threads(n_threads);
     params.set_language(language.as_whisper_code());
-    params.set_translate(false);
+    params.set_translate(translate);
     // Leaked per call: whisper.cpp reads a fresh initial_prompt C-string on
     // every whisper_full and whisper-rs's FullParams has no Drop to free it
     // (crate-level quirk). A few hundred bytes per utterance; not worth
@@ -1898,6 +1907,7 @@ mod tests {
             prompt: String::new(),
             prompt_context_chars: crate::config::DEFAULT_PROMPT_CONTEXT_CHARS,
             language: Language::Polish,
+            translate: false,
             gate: GateConfig::new(
                 DEFAULT_MIN_SPEECH_RMS,
                 DEFAULT_MIN_DENSITY,

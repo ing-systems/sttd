@@ -9,7 +9,7 @@ use crate::config::{
     DEFAULT_HANGOVER_MS, DEFAULT_LOGPROB_THOLD, DEFAULT_MIN_CONFIDENCE,
     DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC,
     DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TARGET_RMS, DEFAULT_TEMPERATURE,
-    DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT,
+    DEFAULT_TEMPERATURE_INC, DEFAULT_THREADS, DEFAULT_TRANSLATE, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT,
     DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
@@ -78,6 +78,20 @@ pub(crate) struct Cli {
         help_heading = "Model"
     )]
     pub(crate) language: Language,
+
+    /// Translate non-English speech to English instead of transcribing it
+    /// (`set_translate(true)`). `--language` still selects the source
+    /// language (`pl` forces Polish, `auto` detects per utterance).
+    #[arg(
+        long,
+        env = "STTD_TRANSLATE",
+        default_value_t = DEFAULT_TRANSLATE,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Model"
+    )]
+    pub(crate) translate: bool,
 
     /// Override the whisper initial prompt.
     #[arg(short, long, env = "STTD_PROMPT", default_value = DEFAULT_PROMPT, help_heading = "Model")]
@@ -434,6 +448,8 @@ mod tests {
         assert_eq!(cli.hangover_ms, DEFAULT_HANGOVER_MS);
         assert_eq!(cli.channel, ChannelSel::Mix);
         assert_eq!(cli.language, crate::whisper::Language::Polish);
+        assert_eq!(cli.translate, DEFAULT_TRANSLATE);
+        assert!(!cli.translate);
         assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
         assert_eq!(cli.temperature, DEFAULT_TEMPERATURE);
         assert_eq!(cli.temperature_inc, DEFAULT_TEMPERATURE_INC);
@@ -652,6 +668,17 @@ mod tests {
         let cli = Cli::try_parse_from(["sttd", "--language", "PL"]).expect("case-insensitive");
         assert_eq!(cli.language, Language::Polish);
         assert!(Cli::try_parse_from(["sttd", "--language", "de"]).is_err());
+    }
+
+    #[test]
+    fn cli_translate_toggles() {
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert!(!cli.translate);
+        let cli = Cli::try_parse_from(["sttd", "--translate"]).expect("bare flag must parse");
+        assert!(cli.translate);
+        let cli =
+            Cli::try_parse_from(["sttd", "--translate", "off"]).expect("off must parse");
+        assert!(!cli.translate);
     }
 
     #[test]
