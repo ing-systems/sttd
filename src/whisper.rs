@@ -6,8 +6,8 @@ use crossbeam_channel::Receiver;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::config::{
-    HALLUCINATION_PATTERNS, MAX_GAIN, STRONG_RMS_FACTOR, STRONG_SPEECH_FRAMES,
-    WHISPER_MIN_SAMPLES, WHISPER_RATE,
+    CONDITION_FADE_SAMPLES, CONDITION_HP_CUTOFF_HZ, HALLUCINATION_PATTERNS, MAX_GAIN,
+    STRONG_RMS_FACTOR, STRONG_SPEECH_FRAMES, WHISPER_MIN_SAMPLES, WHISPER_RATE,
 };
 use crate::utterance::{Evidence, Utterance};
 use crate::wav::write_wav_mono16;
@@ -330,12 +330,8 @@ fn whisper_init_and_run(
             }
         }
 
-        let gained = apply_gain(
-            &utterance.pcm,
-            utterance.evidence.rms,
-            target_rms,
-            MAX_GAIN,
-        );
+        let conditioned = condition_utterance(&utterance.pcm);
+        let gained = apply_gain(&conditioned, utterance.evidence.rms, target_rms, MAX_GAIN);
 
         match transcribe(
             &mut state,
@@ -435,6 +431,60 @@ fn whisper_init_and_run(
         }
     }
     Ok(())
+}
+
+/// Condition an utterance for whisper: DC removal, gentle one-pole
+/// high-pass at `CONDITION_HP_CUTOFF_HZ`, short linear fades at both ends,
+/// and peak safety to 0.99. Runs before `apply_gain` so the gain stage sees
+/// hum-free, click-free audio.
+///
+/// Kept deliberately light because the whisper branch is raw by design (see
+/// `Whisper branch` in `CONTEXT.md`): 60 Hz / 6 dB-oct costs ~0.5 dB at
+/// 150 Hz and nothing in the 4-8 kHz sibilant band, and the 5 ms fades land
+/// in pre-roll/tail silence rather than speech.
+pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
+    if pcm.is_empty() {
+        return Vec::new();
+    }
+    // DC removal: subtract the mean so soundcard offset can't bias the
+    // high-pass startup transient or the gain stage.
+    let mean = pcm.iter().fold(0.0f64, |m, &s| m + s as f64) / pcm.len() as f64;
+    let mut out: Vec<f32> = pcm.iter().map(|&s| s - mean as f32).collect();
+
+    // One-pole high-pass: y[n] = x[n] - x[n-1] + a * y[n-1],
+    // a = exp(-2*pi*fc/fs). Zero-state start is fine post-DC-removal: the
+    // first samples are pre-roll silence near zero.
+    let a = (-2.0 * std::f32::consts::PI * CONDITION_HP_CUTOFF_HZ / WHISPER_RATE as f32).exp();
+    let mut x_prev = out[0];
+    let mut y_prev = 0.0f32;
+    for s in out.iter_mut() {
+        let x = *s;
+        let y = x - x_prev + a * y_prev;
+        x_prev = x;
+        y_prev = y;
+        *s = y;
+    }
+
+    // Linear fades at both ends; shortened for very short utterances so the
+    // ramps never overlap.
+    let fade = CONDITION_FADE_SAMPLES.min(out.len() / 2);
+    for i in 0..fade {
+        let ramp = (i + 1) as f32 / (fade + 1) as f32;
+        out[i] *= ramp;
+        let j = out.len() - 1 - i;
+        out[j] *= ramp;
+    }
+
+    // Peak safety: resampler overshoot can exceed 1.0; keep headroom so
+    // `apply_gain` isn't blocked by a single hot sample.
+    let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak > 0.99 {
+        let scale = 0.99 / peak;
+        for s in out.iter_mut() {
+            *s *= scale;
+        }
+    }
+    out
 }
 
 /// Apply gain toward `target_rms`, computed from the speech-only `rms`
@@ -867,6 +917,66 @@ mod tests {
         let padded = pad_with_dither(&long, WHISPER_MIN_SAMPLES);
         assert_eq!(padded.len(), long.len());
         assert_eq!(padded, long);
+    }
+
+    #[test]
+    fn condition_removes_dc_offset() {
+        // Soundcard offset must not reach whisper: a constant 0.1 offset
+        // carries no speech and would bias gain.
+        let pcm = vec![0.1f32; 1600];
+        let out = condition_utterance(&pcm);
+        assert_eq!(out.len(), pcm.len());
+        let mean = out.iter().fold(0.0f64, |m, &s| m + s as f64) / out.len() as f64;
+        assert!(mean.abs() < 1e-5, "mean={mean}");
+    }
+
+    #[test]
+    fn condition_attenuates_50hz_hum() {
+        // 50 Hz hum at 16 kHz: compare RMS before/after over the steady
+        // middle (past the HP startup transient and fades).
+        let hum: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
+            .collect();
+        let out = condition_utterance(&hum);
+        let rms = |v: &[f32]| (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt();
+        let before = rms(&hum[2000..14_000]);
+        let after = rms(&out[2000..14_000]);
+        assert!(after < before * 0.7, "before={before} after={after}");
+    }
+
+    #[test]
+    fn condition_keeps_speech_band_intact() {
+        // 1 kHz tone (speech band) must pass nearly untouched in the middle.
+        let tone: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin() * 0.2)
+            .collect();
+        let out = condition_utterance(&tone);
+        let rms = |v: &[f32]| (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt();
+        let before = rms(&tone[2000..14_000]);
+        let after = rms(&out[2000..14_000]);
+        let ratio = after / before;
+        assert!((0.9..=1.1).contains(&ratio), "ratio={ratio}");
+    }
+
+    #[test]
+    fn condition_fades_edges_and_caps_peak() {
+        // Flat loud input: fades pull both ends to near zero, peak safety
+        // caps the middle at 0.99.
+        let pcm = vec![2.0f32; 1600];
+        let out = condition_utterance(&pcm);
+        assert_eq!(out.len(), pcm.len());
+        assert!(out[0].abs() < 0.05, "first={}", out[0]);
+        assert!(out[out.len() - 1].abs() < 0.05, "last={}", out[out.len() - 1]);
+        assert!(out.iter().all(|&s| s.abs() <= 0.99 + 1e-6));
+        // Short input: fades shorten instead of overlapping.
+        let short = vec![0.5f32; 10];
+        let out_short = condition_utterance(&short);
+        assert_eq!(out_short.len(), short.len());
+    }
+
+    #[test]
+    fn condition_empty_stays_empty() {
+        assert!(condition_utterance(&[]).is_empty());
     }
 
     #[test]

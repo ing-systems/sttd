@@ -70,6 +70,15 @@ pub(crate) const DEFAULT_TARGET_RMS: f32 = 0.05;
 /// silent utterance that slipped past `STTD_MIN_RMS` doesn't get blown up
 /// into clipped noise.
 pub(crate) const MAX_GAIN: f32 = 8.0;
+/// Cutoff of the one-pole high-pass in `condition_utterance`: 60 Hz keeps
+/// Polish speech intact (male F0 starts ~85 Hz, nasal murmur ~250 Hz+,
+/// sibilants at 4-8 kHz) while attenuating 50 Hz mains hum, a confirmed
+/// hallucination trigger. Gentle 6 dB/oct: at 150 Hz the loss is ~0.5 dB.
+pub(crate) const CONDITION_HP_CUTOFF_HZ: f32 = 60.0;
+/// Linear fade applied to each end of an utterance by `condition_utterance`:
+/// 5 ms at 16 kHz. Lands in pre-roll/tail silence, killing trim/resampler
+/// clicks that whisper can decode as a token.
+pub(crate) const CONDITION_FADE_SAMPLES: usize = 80;
 /// Minimum average whisper token probability for a transcript to be kept,
 /// used when the utterance's *acoustic* evidence (see `Evidence`) is weak.
 /// whisper.cpp declares `no_speech_thold` but never reads it (`whisper.h`:
