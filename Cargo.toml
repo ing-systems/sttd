@@ -41,3 +41,7 @@ denoise = ["dep:deep_filter", "dep:ndarray"]
 # toolchain whisper.cpp is built against here, so it may not load; CPU
 # stays the safe default and the loader falls back to it if CUDA fails.
 parakeet-cuda = ["parakeet-rs/cuda"]
+
+[profile.release]
+strip = true
+lto = true
