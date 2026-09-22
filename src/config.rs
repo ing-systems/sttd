@@ -123,10 +123,15 @@ pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
 /// evidence.
 pub(crate) const STRONG_RMS_FACTOR: f32 = 3.0;
 
+/// Whether the whisper worker unloads the model while paused (see `whisper`).
+/// Default false (no unloading). Override with `STTD_AUTO_UNLOAD`.
+pub(crate) const DEFAULT_AUTO_UNLOAD: bool = false;
+
 /// While paused longer than this (seconds), the whisper worker unloads the
-/// model to free VRAM and reloads it on resume (see `whisper`). Default
-/// 180 s. Override with `STTD_PAUSED_UNLOAD_AFTER`; `0` disables unloading.
-pub(crate) const DEFAULT_PAUSED_UNLOAD_AFTER_SECS: u64 = 180;
+/// model to free VRAM and reloads it on resume (see `whisper`). Only takes
+/// effect if auto-unload is enabled. Default 180 s. Override with
+/// `STTD_AUTO_UNLOAD_AFTER`; `0` unloads immediately on pause.
+pub(crate) const DEFAULT_AUTO_UNLOAD_AFTER_SECS: u64 = 180;
 
 /// Beam width of whisper's beam-search decoder (`beam_size` in
 /// `SamplingStrategy::BeamSearch`). `1` is greedy (fastest,

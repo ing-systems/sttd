@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::config::{
-    parse_beam_size, parse_bool, parse_threads, DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE,
-    DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC,
-    DEFAULT_PAUSED_UNLOAD_AFTER_SECS, DEFAULT_PROMPT, DEFAULT_TARGET_RMS, DEFAULT_THREADS,
-    DEFAULT_USE_GPU, DEFAULT_VAD_THRESHOLD,
+    parse_beam_size, parse_bool, parse_threads, DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS,
+    DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
+    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_TARGET_RMS,
+    DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::whisper::Language;
@@ -176,6 +176,21 @@ pub(crate) struct Cli {
     )]
     pub(crate) start_paused: bool,
 
+    /// After each emitted transcript, pause again automatically
+    /// (single-shot resume: every `SIGUSR2`/`SIGHUP` arms one sentence).
+    /// Drops (low-confidence, hallucination, repetition, acoustic) never
+    /// trigger it, so noise can't steal the shot. File mode ignores this.
+    #[arg(
+        long,
+        env = "STTD_AUTOPAUSE",
+        default_value_t = false,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Runtime"
+    )]
+    pub(crate) autopause: bool,
+
     /// Dump per-token id/text/p/plog/is_timestamp to stderr.
     #[arg(
         long,
@@ -242,16 +257,44 @@ pub(crate) struct Cli {
     )]
     pub(crate) status: bool,
 
-    /// While paused longer than this (seconds), unload the whisper model
-    /// to free VRAM; reloaded eagerly on resume. `0` disables unloading.
+    /// Unload the whisper model while paused to free VRAM; reloaded eagerly
+    /// on resume. Disabled by default.
     #[arg(
         long,
-        env = "STTD_PAUSED_UNLOAD_AFTER",
-        default_value_t = DEFAULT_PAUSED_UNLOAD_AFTER_SECS,
+        env = "STTD_AUTO_UNLOAD",
+        default_value_t = DEFAULT_AUTO_UNLOAD,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Runtime"
+    )]
+    pub(crate) auto_unload: bool,
+
+    /// While paused longer than this (seconds), unload the whisper model
+    /// to free VRAM; reloaded eagerly on resume. Only takes effect if
+    /// `--auto-unload` is enabled. `0` unloads immediately on pause.
+    #[arg(
+        long,
+        env = "STTD_AUTO_UNLOAD_AFTER",
+        default_value_t = DEFAULT_AUTO_UNLOAD_AFTER_SECS,
         value_name = "SECS",
         help_heading = "Runtime"
     )]
-    pub(crate) paused_unload_after: u64,
+    pub(crate) auto_unload_after: u64,
+
+    /// Play audible cues on pause (low beep), resume (mid blip) and when
+    /// transcription is actually ready (rising two-tone) via the default
+    /// output device. Best-effort: missing/busy audio only logs.
+    #[arg(
+        long,
+        env = "STTD_SOUND",
+        default_value_t = true,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Runtime"
+    )]
+    pub(crate) sound: bool,
 }
 
 impl Cli {
@@ -328,13 +371,17 @@ mod tests {
         assert!(cli.paste);
         assert!(!cli.debug_tokens);
         assert!(cli.start_paused);
+        assert!(!cli.autopause);
+        assert!(cli.sound);
         assert_eq!(cli.denoiser, DenoiserKind::Bypass);
         assert!(!cli.start);
         assert!(!cli.stop);
         assert!(!cli.status);
         assert_eq!(cli.pid_file, None);
         assert_eq!(cli.log_file, None);
-        assert_eq!(cli.paused_unload_after, DEFAULT_PAUSED_UNLOAD_AFTER_SECS);
+        assert!(!cli.auto_unload);
+        assert_eq!(cli.auto_unload, DEFAULT_AUTO_UNLOAD);
+        assert_eq!(cli.auto_unload_after, DEFAULT_AUTO_UNLOAD_AFTER_SECS);
     }
 
     #[test]
@@ -351,6 +398,8 @@ mod tests {
             "1",
             "--start-paused",
             "off",
+            "--autopause",
+            "on",
             "--beam-size",
             "3",
             "--threads",
@@ -364,6 +413,7 @@ mod tests {
         assert!(!cli.copy);
         assert!(cli.debug_tokens);
         assert!(!cli.start_paused);
+        assert!(cli.autopause);
         assert_eq!(cli.beam_size, 3);
         assert_eq!(cli.threads, 0);
         assert!(!cli.gpu);
@@ -401,7 +451,8 @@ mod tests {
             "/tmp/custom.pid",
             "--log-file",
             "/tmp/custom.log",
-            "--paused-unload-after",
+            "--auto-unload",
+            "--auto-unload-after",
             "0",
         ])
         .expect("daemon paths must parse");
@@ -413,7 +464,8 @@ mod tests {
             cli.log_file.as_deref(),
             Some(std::path::Path::new("/tmp/custom.log"))
         );
-        assert_eq!(cli.paused_unload_after, 0);
+        assert_eq!(cli.auto_unload_after, 0);
+        assert!(cli.auto_unload);
         // Defaults resolve into tmp when unset.
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert!(cli.pid_file_path().ends_with("sttd.pid"));

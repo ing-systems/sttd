@@ -40,8 +40,11 @@
 //! with a leading marker (`*` = currently selected via `--model`/`STTD_MODEL`,
 //! `I` = installed on disk). `sttd --start` forks microphone mode into the
 //! (pid file, combined log); `--stop`/`--status` manage it via the pid
-//! file. While paused longer than `--paused-unload-after` the whisper
-//! model is unloaded to free VRAM and reloaded eagerly on resume.
+//! file. With `--auto-unload`, while paused longer than
+//! `--auto-unload-after` the whisper model is unloaded to free VRAM and
+//! reloaded eagerly on resume.
+//! `--autopause` re-pauses after each emitted transcript (single-shot
+//! resume: every `SIGUSR2`/`SIGHUP` arms one sentence).
 //! Every tunable is a CLI flag with `STTD_*` env
 //! fallback (see `--help`); CLI wins over env. `--model` additionally honors
 //! the legacy `WHISPER_MODEL_PATH` when `STTD_MODEL` is unset.
@@ -73,6 +76,7 @@ use emit::SystemEmitter;
 mod frame;
 mod gate;
 mod signal;
+mod sound;
 use frame::*;
 mod utterance;
 use utterance::*;
@@ -301,7 +305,8 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     {
         let paused = Arc::clone(&paused);
         let running = Arc::clone(&running);
-        if let Err(e) = install_pause_handlers(paused, running) {
+        let sound_enabled = cli.sound;
+        if let Err(e) = install_pause_handlers(paused, running, sound_enabled) {
             log::warn!("{e:?} (signal pause/resume unavailable)");
         }
     }
@@ -315,7 +320,10 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         whisper_options(cli),
         make_emitter(cli)?,
         Arc::clone(&paused),
-        cli.paused_unload_after,
+        cli.auto_unload,
+        cli.auto_unload_after,
+        cli.sound,
+        cli.autopause,
     );
     let mut whisper_ready_ok = false;
 
@@ -395,8 +403,15 @@ fn install_ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
 /// trailing speech instead of dying mid-CUDA-op). The handler thread only
 /// flips shared flags; the main loop does the actual discarding, so the
 /// transition is idempotent (pause-while-paused / resume-while-running are
-/// no-ops, double TERM is one shutdown).
-fn install_pause_handlers(paused: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
+/// no-ops, double TERM is one shutdown). Audible ack (`sound` module) fires
+/// alongside the flag flip so a daemon user hears the transition; `ready`
+/// itself is signaled separately by the whisper thread once transcription
+/// can actually resume.
+fn install_pause_handlers(
+    paused: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    sound_enabled: bool,
+) -> Result<()> {
     let mut signals = Signals::new([SIGUSR1, SIGUSR2, SIGHUP, SIGTERM])
         .context("failed to register pause/resume signals")?;
     thread::spawn(move || {
@@ -405,17 +420,29 @@ fn install_pause_handlers(paused: Arc<AtomicBool>, running: Arc<AtomicBool>) -> 
                 SIGUSR1 => {
                     paused.store(true, Ordering::Release);
                     log::info!("paused (SIGUSR1)");
+                    if sound_enabled {
+                        crate::sound::play_paused();
+                    }
                 }
                 SIGUSR2 => {
                     paused.store(false, Ordering::Release);
                     log::info!("resumed (SIGUSR2)");
+                    if sound_enabled {
+                        crate::sound::play_resumed();
+                    }
                 }
                 SIGHUP => {
                     let was_paused = paused.fetch_xor(true, Ordering::AcqRel);
                     if was_paused {
                         log::info!("resumed (SIGHUP toggle)");
+                        if sound_enabled {
+                            crate::sound::play_resumed();
+                        }
                     } else {
                         log::info!("paused (SIGHUP toggle)");
+                        if sound_enabled {
+                            crate::sound::play_paused();
+                        }
                     }
                 }
                 SIGTERM => {
@@ -466,9 +493,15 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         whisper_options(cli),
         make_emitter(cli)?,
         // File mode has no pause signalling; a permanently-clear flag plus
-        // the real timeout can never trigger an unload mid-file.
+        // disabled auto-unload can never trigger an unload mid-file. Sounds
+        // stay off offline: no pause/resume transitions exist to cue.
+        // Autopause is forced off for the same reason: file input must never
+        // flip the (unread) pause flag into an unload mid-file.
         Arc::new(AtomicBool::new(false)),
-        cli.paused_unload_after,
+        false,
+        cli.auto_unload_after,
+        false,
+        false,
     );
     // Fail fast on model-load/dump-dir errors before processing the file:
     // no realtime capture to keep bounded here, so blocking wait is fine.

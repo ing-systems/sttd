@@ -93,13 +93,17 @@ pub(crate) fn resolve_n_threads(requested: i32, auto: i32) -> i32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_whisper_worker(
     rx: Receiver<Utterance>,
     model_path: PathBuf,
     opts: WhisperOptions,
     emitter: impl Emitter + Send + 'static,
     paused: Arc<AtomicBool>,
-    paused_unload_after_secs: u64,
+    auto_unload: bool,
+    auto_unload_after_secs: u64,
+    sound_enabled: bool,
+    autopause_enabled: bool,
 ) -> (
     JoinHandle<()>,
     std::sync::mpsc::Receiver<Result<(), String>>,
@@ -121,7 +125,10 @@ pub(crate) fn spawn_whisper_worker(
                 ready_tx,
                 &mut emitter,
                 &paused,
-                paused_unload_after_secs,
+                auto_unload,
+                auto_unload_after_secs,
+                sound_enabled,
+                autopause_enabled,
             ) {
                 log::error!("whisper worker failed: {e:?}");
             }
@@ -134,6 +141,7 @@ pub(crate) fn spawn_whisper_worker(
 /// dropped rather than printed, so `STTD_DUMP_DIR` output stays correlatable
 /// with the stderr log: previously a dropped utterance left only a WAV with
 /// no indication of what became of it or why.
+#[allow(clippy::too_many_arguments)]
 fn whisper_loop(
     rx: &Receiver<Utterance>,
     model_path: &Path,
@@ -141,7 +149,10 @@ fn whisper_loop(
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &mut impl Emitter,
     paused: &Arc<AtomicBool>,
-    paused_unload_after_secs: u64,
+    auto_unload: bool,
+    auto_unload_after_secs: u64,
+    sound_enabled: bool,
+    autopause_enabled: bool,
 ) -> Result<()> {
     // `whisper_init_and_run` signals the *first* load outcome via `ready`
     // itself (later reloads only log); an `Err` return here therefore always
@@ -153,7 +164,10 @@ fn whisper_loop(
         &ready,
         emitter,
         paused,
-        paused_unload_after_secs,
+        auto_unload,
+        auto_unload_after_secs,
+        sound_enabled,
+        autopause_enabled,
     ) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -163,16 +177,30 @@ fn whisper_loop(
     }
 }
 
-/// Whether the model should be unloaded right now: paused continuously for
-/// at least `unload_after`, which must be non-zero (`0` disables unloading).
-/// Pure over its inputs so tests don't need a GPU or threads.
-pub(crate) fn should_unload(paused: bool, paused_for: Duration, unload_after: Duration) -> bool {
-    if !paused || unload_after.is_zero() {
+/// Whether the model should be unloaded right now: auto-unload enabled and
+/// paused continuously for at least `unload_after` (`0` unloads immediately
+/// on pause). Pure over its inputs so tests don't need a GPU or threads.
+pub(crate) fn should_unload(
+    enabled: bool,
+    paused: bool,
+    paused_for: Duration,
+    unload_after: Duration,
+) -> bool {
+    if !enabled || !paused {
         return false;
     }
     paused_for >= unload_after
 }
 
+/// Whether a just-finished utterance should re-pause the pipeline:
+/// single-shot resume fires only on an actually emitted transcript, never
+/// on a drop or a failed inference, so noise can't steal the shot.
+/// Pure over its inputs for tests.
+pub(crate) fn should_autopause(autopause_enabled: bool, emitted: bool) -> bool {
+    autopause_enabled && emitted
+}
+
+#[allow(clippy::too_many_arguments)]
 fn whisper_init_and_run(
     rx: &Receiver<Utterance>,
     model_path: &Path,
@@ -180,7 +208,10 @@ fn whisper_init_and_run(
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &mut impl Emitter,
     paused: &Arc<AtomicBool>,
-    paused_unload_after_secs: u64,
+    auto_unload: bool,
+    auto_unload_after_secs: u64,
+    sound_enabled: bool,
+    autopause_enabled: bool,
 ) -> Result<()> {
     let path_str = model_path
         .to_str()
@@ -195,7 +226,7 @@ fn whisper_init_and_run(
     let n_threads = opts.n_threads;
     let use_gpu = opts.use_gpu;
     let model_spec = opts.model_spec.clone();
-    let unload_after = Duration::from_secs(paused_unload_after_secs);
+    let unload_after = Duration::from_secs(auto_unload_after_secs);
 
     let mut first_load = true;
     let mut utterance_no: u64 = 0;
@@ -254,16 +285,26 @@ fn whisper_init_and_run(
         } else {
             log::info!("whisper ready (model={model_spec}, reloaded after pause)");
         }
+        // Ready jingle ("speak now") only when actually unpaused: a first
+        // load that finishes while `--start-paused` (or a reload that races
+        // a re-pause) stays silent, and the resume edge below cues later.
+        if sound_enabled && !paused.load(Ordering::Relaxed) {
+            crate::sound::play_ready();
+        }
         // A pause that raced the (tens of seconds) load gets a full fresh
         // timeout rather than an instant unload.
         let mut last_unpaused = Instant::now();
+        // Tracks the pause flag across 1 s ticks so a short-pause resume
+        // (model never unloaded) still gets its ready jingle: the reload
+        // path above only covers the long-pause case.
+        let mut was_paused = paused.load(Ordering::Relaxed);
 
         for utterance in stash.drain(..) {
             if utterance.pcm.is_empty() {
                 continue;
             }
             utterance_no += 1;
-            transcribe_and_emit(
+            let emitted = transcribe_and_emit(
                 &mut state,
                 token_beg,
                 &utterance,
@@ -277,6 +318,14 @@ fn whisper_init_and_run(
                 n_threads,
                 emitter,
             );
+            if should_autopause(autopause_enabled, emitted) {
+                paused.store(true, Ordering::Release);
+                was_paused = true;
+                log::info!("autopaused after utt_{utterance_no:06} (--autopause, single-shot)");
+                if sound_enabled {
+                    crate::sound::play_paused();
+                }
+            }
         }
 
         // Loaded loop: transcribe until the pause-idle timeout asks for an
@@ -284,14 +333,19 @@ fn whisper_init_and_run(
         let disconnected = loop {
             match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(utterance) => {
-                    if !paused.load(Ordering::Relaxed) {
+                    let now_paused = paused.load(Ordering::Relaxed);
+                    if !now_paused {
                         last_unpaused = Instant::now();
+                        if sound_enabled && was_paused {
+                            crate::sound::play_ready();
+                        }
                     }
+                    was_paused = now_paused;
                     if utterance.pcm.is_empty() {
                         continue;
                     }
                     utterance_no += 1;
-                    transcribe_and_emit(
+                    let emitted = transcribe_and_emit(
                         &mut state,
                         token_beg,
                         &utterance,
@@ -305,13 +359,29 @@ fn whisper_init_and_run(
                         n_threads,
                         emitter,
                     );
+                    if should_autopause(autopause_enabled, emitted) {
+                        paused.store(true, Ordering::Release);
+                        was_paused = true;
+                        log::info!(
+                            "autopaused after utt_{utterance_no:06} (--autopause, single-shot)"
+                        );
+                        if sound_enabled {
+                            crate::sound::play_paused();
+                        }
+                    }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    if !paused.load(Ordering::Relaxed) {
+                    let now_paused = paused.load(Ordering::Relaxed);
+                    if !now_paused {
                         last_unpaused = Instant::now();
+                        if sound_enabled && was_paused {
+                            crate::sound::play_ready();
+                        }
                     }
+                    was_paused = now_paused;
                     if should_unload(
-                        paused.load(Ordering::Relaxed),
+                        auto_unload,
+                        now_paused,
                         last_unpaused.elapsed(),
                         unload_after,
                     ) {
@@ -411,6 +481,8 @@ fn load_whisper_context(
 
 /// One utterance through conditioning, gain, inference, gate and emission.
 /// Tag numbering is owned by the caller so it stays monotonic across reloads.
+/// Returns whether the transcript was actually emitted (vs dropped or failed),
+/// so the caller can drive single-shot `--autopause` without seeing the gate.
 #[allow(clippy::too_many_arguments)]
 fn transcribe_and_emit(
     state: &mut whisper_rs::WhisperState,
@@ -425,7 +497,7 @@ fn transcribe_and_emit(
     beam_size: i32,
     n_threads: i32,
     emitter: &mut impl Emitter,
-) {
+) -> bool {
     let tag = format!("utt_{utterance_no:06}");
 
     let conditioned = condition_utterance(&utterance.pcm);
@@ -449,6 +521,10 @@ fn transcribe_and_emit(
                 trimmed,
                 t.confidence.prob,
             );
+            let emitted = matches!(
+                verdict,
+                crate::gate::TranscriptVerdict::Emit { .. }
+            );
             emitter.emit(Emission {
                 tag: &tag,
                 pcm: &utterance.pcm,
@@ -458,8 +534,12 @@ fn transcribe_and_emit(
                 logprob: t.confidence.logprob,
                 evidence: &utterance.evidence,
             });
+            emitted
         }
-        Err(e) => log::error!("{tag}: transcription failed: {e:?}"),
+        Err(e) => {
+            log::error!("{tag}: transcription failed: {e:?}");
+            false
+        }
     }
 }
 
@@ -1023,16 +1103,24 @@ mod tests {
     }
 
     #[test]
-    fn unload_predicate_requires_pause_and_timeout() {
+    fn unload_predicate_requires_enabled_pause_and_timeout() {
         use std::time::Duration;
-        // Disabled.
+        // Auto-unload disabled never unloads, even when paused past timeout.
         assert!(!should_unload(
+            false,
+            true,
+            Duration::from_secs(3600),
+            Duration::from_secs(180)
+        ));
+        assert!(!should_unload(
+            false,
             true,
             Duration::from_secs(3600),
             Duration::ZERO
         ));
         // Unpaused silence never unloads.
         assert!(!should_unload(
+            true,
             false,
             Duration::from_secs(3600),
             Duration::from_secs(180)
@@ -1040,20 +1128,47 @@ mod tests {
         // Paused but under the timeout.
         assert!(!should_unload(
             true,
+            true,
             Duration::from_secs(179),
             Duration::from_secs(180)
         ));
         // Boundary unloads.
         assert!(should_unload(
             true,
+            true,
             Duration::from_secs(180),
             Duration::from_secs(180)
         ));
         assert!(should_unload(
             true,
+            true,
             Duration::from_secs(3600),
             Duration::from_secs(180)
         ));
+        // Zero timeout with auto-unload enabled unloads immediately on pause.
+        assert!(should_unload(
+            true,
+            true,
+            Duration::ZERO,
+            Duration::ZERO
+        ));
+        assert!(!should_unload(
+            true,
+            false,
+            Duration::ZERO,
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn autopause_fires_only_on_emit_when_enabled() {
+        // Disabled never fires, even on emit.
+        assert!(!should_autopause(false, true));
+        assert!(!should_autopause(false, false));
+        // Enabled fires only when the transcript was actually emitted;
+        // drops and failed inferences (false) must not steal the shot.
+        assert!(!should_autopause(true, false));
+        assert!(should_autopause(true, true));
     }
 
     #[test]
@@ -1102,7 +1217,10 @@ mod tests {
             opts,
             crate::emit::RecordingEmitter::new(),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
             0,
+            false,
+            false,
         );
         match ready.recv_timeout(std::time::Duration::from_secs(120)) {
             Ok(Ok(())) => panic!("bad model path must not signal ready"),
