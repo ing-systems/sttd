@@ -14,15 +14,16 @@ cpal (hw rate, N ch) -> channel pick/mix -> raw rtrb<f32> ring
   -> SpeechDetector (earshot VAD verdict per 10 ms, no internal HP)
   -> UtteranceBuffer (open / append / split / close + acoustic gates)
   -> Utterance{pcm, evidence} -> rtrb<Utterance> queue (cap 16, weakest-first shed to 4)
-  -> whisper worker thread (condition -> gain -> inference -> transcript gates)
+  -> ASR worker thread (condition -> inference -> transcript gates; engine is
+     whisper.cpp or Parakeet, picked once at startup by --model)
   -> Emitter (async queue cap 512 -> WAV/TXT dump, stdout, wl-copy, ydotool paste)
 ```
 
 Mic and file modes share `FrameProcessor`; only the source differs.
 
-Source files: `src/main.rs:1`, `src/capture.rs:1`, `src/signal.rs:1`, `src/dsp.rs:1`, `src/denoise.rs:1`, `src/vad.rs:1`, `src/noise.rs:1`, `src/utterance.rs:1`, `src/gate.rs:1`, `src/whisper.rs:1`, `src/emit.rs:1`, `src/config.rs:1`, `src/cli.rs:1`, `src/wav.rs:1`, `src/weights.rs:1`, `src/sound.rs:1`, `src/daemon.rs:1`.
+Source files: `src/main.rs:1`, `src/capture.rs:1`, `src/signal.rs:1`, `src/dsp.rs:1`, `src/denoise.rs:1`, `src/vad.rs:1`, `src/noise.rs:1`, `src/utterance.rs:1`, `src/gate.rs:1`, `src/asr.rs:1`, `src/whisper.rs:1`, `src/parakeet.rs:1`, `src/emit.rs:1`, `src/config.rs:1`, `src/cli.rs:1`, `src/wav.rs:1`, `src/weights.rs:1`, `src/sound.rs:1`, `src/daemon.rs:1`.
 
-Terminology (`CONTEXT.md`): utterance, utterance buffer, pre-roll, acoustic evidence, evidence strength, VAD verdict, gate, confidence floor, speech density, text token, hallucination, emission, VAD branch, whisper branch, denoiser, direct hop.
+Terminology (`CONTEXT.md`): utterance, utterance buffer, pre-roll, acoustic evidence, evidence strength, VAD verdict, gate, confidence floor, speech density, text token, hallucination, emission, VAD branch, model branch, denoiser, direct hop.
 
 ---
 
@@ -68,23 +69,85 @@ Owner: `src/signal.rs:46` `SignalPath`. Callers feed hw chunks, get `Vec<PairedF
 
 ## 5. Queue / backpressure
 
-* `WHISPER_QUEUE_CAP:99`=16 (`src/whisper.rs:99`). `push_utterance:251` never blocks; full = warn + drop newest. Dead worker = warn.
-* Worker-side shed (`shed_stale=true` mic, false file): if `rx.slots()>WHISPER_SHED_KEEP=4`, drain all, `shed_survivors:787` keeps top-4 by `(density,rms)`, newer wins ties, transcribes chronologically so prompt context stays ordered.
+* `ASR_QUEUE_CAP:175`=16 (`src/asr.rs:175`). `push_utterance:...` (`src/main.rs`) never blocks; full = warn + drop newest. Dead worker = warn.
+* Worker-side shed (`shed_stale=true` mic, false file): if `rx.slots()>ASR_SHED_KEEP=4` (`src/asr.rs:169`), drain all, `shed_survivors` keeps top-4 by `(density,rms)`, newer wins ties, transcribes chronologically so prompt context stays ordered.
 
-## 6. Whisper worker
+## 6. ASR worker + speech model engines
 
-* `spawn_whisper_worker:120` -> `whisper_loop:171` -> `whisper_init_and_run:232` on thread `whisper`. `ready` channel fail-fast on first load; later reloads log + retry 5 s. `load_whisper_context:544` with per-second tick; `use_gpu`, `n_threads` (`resolve_n_threads:111`, `0`=auto via `auto_threads:103`).
-* Outer load/unload loop: one `ctx+state` per iteration; scope exit frees VRAM. Loaded loop polls `rx` 20 ms, transcribes, checks `should_unload:211` (enabled + paused >= `auto_unload_after`, default 180 s, `0`=immediate). Unloaded wait stashes arrivals, reloads eagerly on resume. `stash` replayed after load. Shutdown when `is_abandoned` (mic) / end (file).
-* Per utterance `transcribe_and_emit:882` (`utt_NNNNNN` monotonic across reloads):
-  * `condition_utterance:994`: DC subtract, 1-pole HP 60 Hz (`CONDITION_HP_CUTOFF_HZ=60`), 5 ms fades (`CONDITION_FADE_SAMPLES=80`), peak safety 0.99.
-  * `conditioned_speech_rms:1062`: scale speech RMS by `conditioned/raw` overall ratio so hum/DC removal lowers gain estimate; fallback raw on zero/non-finite.
-  * `apply_gain:1086` toward `--target-rms` 0.05 (`0` disables), only amplify (`>=1.0`), cap `MAX_GAIN=8.0`, clip-backoff to 0.99. Borrowed when no gain (loud common case no copy).
-  * `pad_with_dither:1109` to `WHISPER_MIN_SAMPLES=16400` (mel `1+(n+200-400)/160 >=100`; 16000 alone = 990 ms rejected). Deterministic xorshift ±1e-4.
-  * `transcribe:1227`: `BeamSearch{beam_size 5, patience -1}`, `n_threads`, lang (`pl/en/auto` -> `set_language`) + `translate` (`--translate` -> `set_translate`, non-English to English), `initial_prompt=build_effective_prompt(base,tail)`, `suppress_blank/non_speech`, `temperature 0.0 / inc 0.2 / entropy 2.4 / logprob -1.0` ladder (re-try only, final temp always accepted), abort callback on `running==false`. Joins segment texts, collects `ScoredToken{id,p,plog,is_lexical}` (`is_lexical=text has alphanumeric`).
-  * `average_text_confidence:1174`: average lexical text tokens (`id<token_beg`); fallback all text tokens if none lexical; 0/0 if none. Excludes timestamp tokens + trailing punct on words (low LM prob on isolated words).
-  * `gate.decide_transcript:123`: empty -> `DropEmpty`; `floor_for:111` (strong if `frames>=STRONG_SPEECH_FRAMES=20 && rms>=min_rms*STRONG_RMS_FACTOR=3` -> `min_conf_strong` 0.35 else `min_conf` 0.6) -> `LowConfidence`; `is_hallucination:329` (normalize lowercase+fold PL diacritics+punct->space; exact vs `HALLUCINATION_PATTERNS`, fuzzy Levenshtein<=2 if len>=10 vs long patterns) -> `Hallucination`; `is_repetition:272` (6+ words, unique<=50% or bigram x4 `REPETITION_BIGRAM_COUNT=4`) -> `Repetition`; else `Emit`. Emit pushes to `prompt_tail` via `push_prompt_context:613` (last N chars, default 150, max 2000, snap forward to sentence `.!?…` else word, `0`=clear/disable). Drops never feed context.
-  * Metrics: `infer_rtf:773`, `format_metrics_row:807`, `write_metrics_row:843` JSONL (`tag,samples,audio_sec,infer_ms,rtf,speech_frames,total_frames,density,rms,prob,logprob,verdict,text`), flush per row; RTF>1.0 warns. `should_autopause:227` re-pauses only on emit when enabled.
-* Model: `src/weights.rs:11` `resolve_model_path` (spec -> `models/ggml-<spec>.bin`, else path passthrough), `ensure_available:30` downloads `ggml-*.bin` from `MODEL_BASE_URL` (HF whisper.cpp). Default `large-v3-turbo-q8_0` (21-spec catalog `src/config.rs:264`).
+Two engines exist, picked once at startup by `--model`/`STTD_MODEL` and fixed
+for the process's lifetime: whisper.cpp (`src/whisper.rs`, default) and
+NVIDIA Parakeet-TDT-0.6B-v3 (`src/parakeet.rs`, `--model parakeet*`). Both
+implement `asr::SpeechModel` (`src/asr.rs:48`); everything engine-agnostic —
+the worker loop, gates, metrics, prompt-context tail, audio conditioning —
+lives in `src/asr.rs` and never branches on which engine is loaded.
+
+* `spawn_asr_worker:196` -> `asr_loop:238` -> `asr_init_and_run:314` on
+  thread `asr`. `ready` channel fail-fast on first load; later reloads log +
+  retry 5 s. `asr::load_model` dispatches on `weights::ModelRef` to
+  `WhisperModel::load` (`src/whisper.rs:96`) or `ParakeetModel::load`
+  (`src/parakeet.rs:39`), each wrapped in `asr::with_loading_ticker` for a
+  per-second "loading... Ns" log on models that take tens of seconds.
+* Outer load/unload loop: one `Box<dyn SpeechModel>` per iteration; scope
+  exit (`drop(model)`) frees VRAM/ORT sessions. Loaded loop polls `rx` 20 ms,
+  transcribes, checks `should_unload:278` (enabled + paused >=
+  `auto_unload_after`, default 180 s, `0`=immediate). Unloaded wait stashes
+  arrivals, reloads eagerly on resume. `stash` replayed after load. Shutdown
+  when `is_abandoned` (mic) / end (file).
+* Per utterance `transcribe_and_emit:934` (`utt_NNNNNN` monotonic across
+  reloads):
+  * `condition_utterance:1032` (`src/asr.rs`, shared by both engines): DC
+    subtract, 5 ms fades (`CONDITION_FADE_SAMPLES`), peak safety 0.99. No
+    per-utterance gain here — levels are already normalized frame-wise,
+    upstream, by the VAD-gated shared-gain `Agc`.
+  * `model.transcribe(conditioned, effective_prompt, running)`: the only
+    engine-specific step. Whisper (`src/whisper.rs`): pads to
+    `WHISPER_MIN_SAMPLES=16400` (mel `1+(n+200-400)/160 >=100`; 16000 alone =
+    990 ms rejected), then `BeamSearch{beam_size 5, patience -1}`,
+    `n_threads`, lang (`pl/en/auto` -> `set_language`) + `translate`
+    (`--translate` -> `set_translate`), `initial_prompt`,
+    `suppress_blank/non_speech`, `temperature 0.0 / inc 0.2 / entropy 2.4 /
+    logprob -1.0` ladder (re-try only, final temp always accepted), abort
+    callback on `running==false`; scores confidence via
+    `average_text_confidence` (average lexical text tokens, `id<token_beg`,
+    excluding timestamp tokens and trailing punctuation on isolated words).
+    Parakeet (`src/parakeet.rs`): pads to `PARAKEET_MIN_SAMPLES` (0.5 s,
+    encoder does 8x subsampling), decodes greedily via `parakeet-rs`
+    (auto-detects language per utterance, `--language` not honored), and
+    reports **no per-token probability** — `Transcript.confidence` is
+    `None`.
+  * `SpeechModel::uses_prompt()` gates the conversational tail: `false` for
+    Parakeet (no prompt support) and for whisper under `--translate` (a
+    prior would bias the next translation, or drag output back to the
+    source language). When `true`, an emitted transcript feeds
+    `push_prompt_context` (last N chars, default 150, max 2000, snap
+    forward to sentence `.!?…` else word, `0`=clear/disable); drops never
+    feed it.
+  * `gate.decide_transcript` (`src/gate.rs:123`): empty -> `DropEmpty`;
+    `floor_for` (strong if `frames>=STRONG_SPEECH_FRAMES=20 &&
+    rms>=min_rms*STRONG_RMS_FACTOR=3` -> `min_conf_strong` 0.35 else
+    `min_conf` 0.6) -> `LowConfidence`, but only when the engine reported a
+    `prob` at all — Parakeet's `None` skips this arm entirely and falls
+    straight to the patterns below; `is_hallucination` (normalize
+    lowercase+fold PL diacritics+punct->space; exact vs
+    `HALLUCINATION_PATTERNS`, fuzzy Levenshtein<=2 if len>=10 vs long
+    patterns) -> `Hallucination`; `is_repetition` (6+ words, unique<=50% or
+    bigram x4 `REPETITION_BIGRAM_COUNT=4`) -> `Repetition`; else `Emit`.
+  * Metrics: `infer_rtf`, `format_metrics_row`, `write_metrics_row`
+    (`src/asr.rs`) JSONL (`tag,samples,audio_sec,infer_ms,rtf,speech_frames,
+    total_frames,density,rms,prob,logprob,verdict,text`; `prob`/`logprob`
+    are JSON `null` when the engine reports none), flush per row; RTF>1.0
+    warns. `should_autopause:...` re-pauses only on emit when enabled.
+* Model resolution: `src/weights.rs` `resolve_model` maps a `--model` value
+  to `weights::ModelRef::Whisper(path)` (spec -> `models/ggml-<spec>.bin`,
+  else path passthrough) or `ModelRef::Parakeet{dir, assets}` (spec/alias ->
+  `models/<dir>`, or an existing directory passed directly).
+  `ensure_available` then downloads whatever's missing: `ggml-*.bin` from
+  `MODEL_BASE_URL` (HF whisper.cpp repo) for whisper, or the encoder/
+  decoder_joint/`vocab.txt` files from `PARAKEET_BASE_URL` (HF
+  `istupakov/parakeet-tdt-0.6b-v3-onnx`) for Parakeet. Default is whisper's
+  `large-v3-turbo-q8_0` (21-spec catalog, `MODEL_CATALOG` in
+  `src/config.rs:288`); Parakeet's own 2-spec catalog (`int8` default,
+  `fp32`) is `PARAKEET_CATALOG`, alongside it.
 
 ## 7. Emission
 
@@ -92,7 +155,7 @@ Seam: `src/emit.rs:73` `Emitter::emit(Emission{tag,pcm,text,verdict,prob,logprob
 
 * `SystemEmitter:88` async: `emit:191` clones to `OwnedEmission` + bounded `rtrb:512` push (full/worker-gone = warn, never blocks inference). Worker thread `EmitterWorker:102` FIFO handles side effects; `Drop:176` closes + joins so shutdown flushes.
 * `handle:208`: WAV dump first for every utterance (`write_wav_mono16` via `hound`, `WHISPER_RATE`); `DropEmpty` -> `DROPPED(empty)` TXT; `Drop{kind}` -> log + `dump_reason` TXT (`DROPPED(low-conf/hallucination/repetition)`); `Emit` -> log `avg_p/logprob/threshold/strength/density`, opt-in stdout (`--stdout`, default off), `wl-copy --sensitive` if `--copy` (default on), `ydotool key 29:1 47:1 47:0 29:0` Ctrl+V only if copied and `--paste` (default on), TXT dump if `--dump-dir`. Missing `wl-copy`/`ydotool` disables once. Non-Wayland (`WAYLAND_DISPLAY`/`XDG_SESSION_TYPE`) disables copy+paste once. `RecordingEmitter:403` in-memory for tests.
-* Prompt default `src/config.rs:321` short PL/EN (long keyword lists removed: `initial_prompt` as prior leaks into low-signal decodes).
+* Prompt default `src/config.rs:401` short PL/EN (long keyword lists removed: `initial_prompt` as prior leaks into low-signal decodes; whisper-only — Parakeet ignores it, see §6).
 
 ## 8. Runtime extras
 
@@ -109,6 +172,7 @@ Seam: `src/emit.rs:73` `Emitter::emit(Emission{tag,pcm,text,verdict,prob,logprob
 ## 10. Change entry points
 
 * Faster/slower splits: `--hangover-ms`, `INTERIM_*`, `EARLY_*`, `MAX_*` in `src/config.rs:42`, logic `src/utterance.rs:170`.
-* Fewer hallucinations: `GateConfig` thresholds `src/config.rs:130`, patterns `HALLUCINATION_PATTERNS:340`, `is_hallucination/is_repetition` `src/gate.rs:272`, confidence `average_text_confidence` `src/whisper.rs:1174`.
+* Fewer hallucinations: `GateConfig` thresholds `src/config.rs:130`, patterns `HALLUCINATION_PATTERNS:340`, `is_hallucination/is_repetition` `src/gate.rs:272`, whisper confidence scoring `average_text_confidence` `src/whisper.rs` (n/a for Parakeet, which reports no per-token probability).
 * VAD sensitivity: `--vad-threshold/adapt`, `NoiseTracker` gains `src/noise.rs:14`, median `MEDIAN_WINDOWS` `src/vad.rs:30`, `ONSET/MIN_SPEECH_FRAMES` `src/config.rs:57`.
-* Quality vs speed: `--model`, `--beam-size`, `--temperature*`, `--threads`, `--gpu`, `--target-rms`, `--prompt/context`.
+* Quality vs speed: `--model` (whisper spec/path, or `parakeet`/`parakeet-tdt-0.6b-v3-{int8,fp32}`), `--beam-size`, `--temperature*` (whisper only — ignored with a warning under Parakeet, see §6), `--threads`, `--gpu`, `--target-rms`, `--prompt/context` (whisper only).
+* Switching/adding an ASR engine: `weights::ModelRef`/`resolve_model`/`ensure_available` (`src/weights.rs`) for model resolution + download, `asr::SpeechModel` (`src/asr.rs:48`) for the trait a new engine implements, `main::unsupported_parakeet_flags`/`validate_parakeet_model_flags` (`src/main.rs`) for the pattern that warns/rejects flags an engine doesn't honor.

@@ -61,7 +61,10 @@ _Avoid_: filter (for the decision), validation
 The minimum average text-token probability a transcript must reach to be
 emitted. The floor is strict when evidence strength is weak and relaxed when
 it is strong, because one fixed value cannot separate hard-but-real speech from
-an invention over silence.
+an invention over silence. Only checked for a speech model that reports a
+per-token probability; a model that decodes greedily with none (Parakeet)
+skips straight to the patterns below, since there is nothing to check the
+floor against.
 _Avoid_: threshold, cutoff, score
 
 **Speech density**:
@@ -82,15 +85,35 @@ A fluent transcript produced for audio that contains no such speech — most
 often a line of subtitle boilerplate recalled from training data once there is
 nothing to transcribe. Recognised by exact match against known boilerplate,
 after folding Polish diacritics so a single mis-accented letter can't slip one
-through.
+through. The boilerplate list and the behavior it describes are whisper's; the
+gate itself still runs unconditionally for every speech model, since a
+transcript decided from noise is a risk regardless of which model produced it.
 _Avoid_: false positive, noise, garbage
 
 **Emission**:
 What happens after the transcript gate emits: opt-in stdout print
 (`--stdout`), clipboard copy, auto-paste, and WAV/TXT dump. Owned by the emitter module behind a
-seam; the whisper loop hands it one emission per utterance — tag, raw audio,
+seam; the ASR worker hands it one emission per utterance — tag, raw audio,
 trimmed text, verdict, confidence, acoustic evidence — and gets back nothing.
 _Avoid_: output, sink, side effects (as a name)
+
+### Speech models
+
+**Speech model**:
+The loaded, ready-to-run engine an utterance is handed to for transcription —
+whisper.cpp or Parakeet, chosen once at startup by the model spec and fixed
+for the process's lifetime. Both sit behind one seam so the worker loop,
+gates, metrics and prompt-context tail never branch on which is loaded; only
+their own load and inference are engine-specific.
+_Avoid_: model (bare, when the engine — as opposed to the weights — is meant), backend
+
+**Model spec**:
+A `--model` value that names a catalog entry rather than a filesystem path —
+`large-v3-turbo-q8_0` for a whisper weight, `parakeet` or
+`parakeet-tdt-0.6b-v3-int8` for a Parakeet one. Resolved to a location and,
+for a catalog spec, downloaded if missing; a bare path (`.bin` file or an
+existing directory) passes through untouched instead.
+_Avoid_: model name, model id
 
 ### Signal paths
 
@@ -104,16 +127,17 @@ _Avoid_: detection path, analysis branch
 The model that cleans the VAD branch's 48 kHz frame before it's resampled
 down and handed to `earshot`. Opt-in via `STTD_DENOISER=deepfilter`
 (default `none`: no denoising, no 48 kHz intermediate — see `direct hop`);
-only ever runs on the VAD branch, never on the whisper branch. DeepFilterNet3
+only ever runs on the VAD branch, never on the model branch. DeepFilterNet3
 adds a 20 ms lookahead ahead of its own output, absorbed by pre-roll
 (300 ms) and silence hangover (800 ms) the same way `earshot`'s own 16 ms
 prediction window is.
 _Avoid_: noise suppression (generic), the denoiser (as if only one exists)
 
-**Whisper branch**:
+**Model branch**:
 The signal path that gets transcribed, kept raw and undenoised, because the
-model was trained on raw audio. Its samples are what an utterance is made of.
-_Avoid_: audio branch, main path
+speech model (whichever one is loaded) was trained on raw audio. Its samples
+are what an utterance is made of.
+_Avoid_: audio branch, main path, whisper branch (not every speech model is whisper)
 
 **Direct hop**:
 The default path to the judged/transcribed rate: hw rate straight to 16 kHz

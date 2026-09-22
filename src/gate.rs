@@ -107,7 +107,9 @@ impl GateConfig {
 
     /// Confidence floor for a transcript, paired with the `EvidenceStrength`
     /// that selected it. Same rule as before: strong acoustic evidence relaxes
-    /// the floor; weak keeps it strict.
+    /// the floor; weak keeps it strict. Computed from acoustics alone, so it
+    /// is still meaningful (and logged) for models that never check it
+    /// against a `prob` — see `decide_transcript`.
     pub(crate) fn floor_for(&self, speech_frames: u32, rms: f32) -> (f32, EvidenceStrength) {
         if speech_frames >= STRONG_SPEECH_FRAMES && rms >= self.min_speech_rms * STRONG_RMS_FACTOR
         {
@@ -119,19 +121,25 @@ impl GateConfig {
 
     /// Transcript gate: owns the order empty -> confidence floor ->
     /// hallucination -> repetition. Callers pass the already-trimmed text and
-    /// its text-token average probability.
+    /// its text-token average probability, when the model reports one:
+    /// `prob: None` (Parakeet, which decodes greedily with no per-token
+    /// probability) skips the confidence-floor arm entirely and falls
+    /// straight through to hallucination/repetition — there is no signal to
+    /// check a floor against. `floor`/`strength` are still computed from
+    /// acoustics and carried in the verdict either way, so logs and
+    /// `--metrics` stay comparable across engines.
     pub(crate) fn decide_transcript(
         &self,
         speech_frames: u32,
         rms: f32,
         trimmed: &str,
-        prob: f32,
+        prob: Option<f32>,
     ) -> TranscriptVerdict {
         if trimmed.trim().is_empty() {
             return TranscriptVerdict::DropEmpty;
         }
         let (floor, strength) = self.floor_for(speech_frames, rms);
-        if prob < floor {
+        if prob.is_some_and(|p| p < floor) {
             return TranscriptVerdict::Drop {
                 kind: TranscriptDropKind::LowConfidence,
                 floor,
@@ -223,13 +231,16 @@ pub(crate) enum TranscriptDropKind {
 
 impl TranscriptVerdict {
     /// `<dump_dir>/<tag>.txt` body, matching historical `DROPPED(...)` strings.
-    pub(crate) fn dump_reason(&self, trimmed: &str, prob: f32) -> String {
+    /// `LowConfidence` is unreachable when `prob` is `None` (see
+    /// `decide_transcript`), so that arm can always format a real value.
+    pub(crate) fn dump_reason(&self, trimmed: &str, prob: Option<f32>) -> String {
         match self {
             Self::DropEmpty => "DROPPED(empty)".to_string(),
             Self::Drop { kind, floor, strength } => match kind {
-                TranscriptDropKind::LowConfidence => format!(
-                    "DROPPED(low-conf avg_p={prob:.3} < {floor:.3}, {strength}): {trimmed}"
-                ),
+                TranscriptDropKind::LowConfidence => {
+                    let prob = prob.expect("LowConfidence verdict implies a probability");
+                    format!("DROPPED(low-conf avg_p={prob:.3} < {floor:.3}, {strength}): {trimmed}")
+                }
                 TranscriptDropKind::Hallucination => format!("DROPPED(hallucination): {trimmed}"),
                 TranscriptDropKind::Repetition => format!("DROPPED(repetition): {trimmed}"),
             },
@@ -430,7 +441,7 @@ mod tests {
             MIN_SPEECH_FRAMES,
             DEFAULT_MIN_SPEECH_RMS + 0.0005,
             "Zrób commit i wypchnij zmiany do repozytorium.",
-            0.478,
+            Some(0.478),
         );
         assert!(matches!(
             v,
@@ -445,7 +456,7 @@ mod tests {
             137,
             0.01178,
             "Zrób commit i wypchnij zmiany do repozytorium.",
-            0.478,
+            Some(0.478),
         );
         assert!(matches!(v, TranscriptVerdict::Emit { .. }));
     }
@@ -455,7 +466,7 @@ mod tests {
         // White-noise decode at avg_p 0.89 clears either floor; pattern list
         // is the only gate. Must not be reported as low-conf.
         let gate = default_gate();
-        let v = gate.decide_transcript(137, 0.01178, "Wszelkie prawa zastrzeżone.", 0.89);
+        let v = gate.decide_transcript(137, 0.01178, "Wszelkie prawa zastrzeżone.", Some(0.89));
         assert!(matches!(
             v,
             TranscriptVerdict::Drop { kind: TranscriptDropKind::Hallucination, .. }
@@ -469,7 +480,7 @@ mod tests {
             137,
             0.01178,
             "Współpraca w Współpraca w Współpraca w Współpraca w Współpraca.",
-            0.741,
+            Some(0.741),
         );
         assert!(matches!(
             v,
@@ -481,11 +492,37 @@ mod tests {
     fn transcript_empty_drops_without_floor() {
         let gate = default_gate();
         assert_eq!(
-            gate.decide_transcript(137, 0.01178, "   ", 0.99),
+            gate.decide_transcript(137, 0.01178, "   ", Some(0.99)),
             TranscriptVerdict::DropEmpty
         );
         assert_eq!(
-            gate.decide_transcript(137, 0.01178, "", 0.99),
+            gate.decide_transcript(137, 0.01178, "", Some(0.99)),
+            TranscriptVerdict::DropEmpty
+        );
+    }
+
+    #[test]
+    fn transcript_composition_no_confidence_signal_skips_low_confidence_arm() {
+        // Parakeet reports no per-token probability: `prob: None` must never
+        // produce a LowConfidence verdict, even for text that would fail the
+        // strict floor if scored. Hallucination/repetition still apply.
+        let gate = default_gate();
+        let v = gate.decide_transcript(
+            MIN_SPEECH_FRAMES,
+            DEFAULT_MIN_SPEECH_RMS + 0.0005,
+            "Zrób commit i wypchnij zmiany do repozytorium.",
+            None,
+        );
+        assert!(matches!(v, TranscriptVerdict::Emit { .. }));
+
+        let v = gate.decide_transcript(137, 0.01178, "Wszelkie prawa zastrzeżone.", None);
+        assert!(matches!(
+            v,
+            TranscriptVerdict::Drop { kind: TranscriptDropKind::Hallucination, .. }
+        ));
+
+        assert_eq!(
+            gate.decide_transcript(137, 0.01178, "   ", None),
             TranscriptVerdict::DropEmpty
         );
     }

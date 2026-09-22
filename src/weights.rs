@@ -2,35 +2,95 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config::{DEFAULT_MODELS_DIR, MODEL_BASE_URL, model_file_for_spec, valid_model_specs};
+use crate::config::{
+    parakeet_entry_for_spec, DEFAULT_MODELS_DIR, MODEL_BASE_URL, PARAKEET_BASE_URL,
+    model_file_for_spec, valid_model_specs,
+};
 
-/// Resolve a `--model` value to a filesystem path: an explicit path
-/// (contains a path separator or ends in `.bin`) passes through untouched,
-/// otherwise the value must be a catalog spec (see `MODEL_CATALOG`) and maps
-/// to `models/ggml-<spec>.bin`.
-pub(crate) fn resolve_model_path(input: &str) -> Result<PathBuf> {
+/// Which ASR engine a resolved `--model` value maps to, and where its
+/// weights live on disk. Whisper's engine takes a single `ggml-*.bin` file;
+/// Parakeet's takes a directory (encoder + decoder_joint + `vocab.txt`) —
+/// `parakeet-rs::ParakeetTDT::from_pretrained` only accepts a directory, so
+/// there is no single-file equivalent to fall back to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelRef {
+    /// `ggml-*.bin` for whisper.cpp.
+    Whisper(PathBuf),
+    /// Model directory for Parakeet. `assets` lists the files
+    /// `ensure_available` must fetch if missing; empty for a directory the
+    /// user pointed `--model` at directly (nothing is downloaded, only
+    /// validated).
+    Parakeet {
+        dir: PathBuf,
+        assets: &'static [&'static str],
+    },
+}
+
+impl std::fmt::Display for ModelRef {
+    /// The underlying filesystem location, for the `"model: {model}"` log
+    /// line: a `.bin` path for whisper, the model directory for Parakeet.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Whisper(path) => write!(f, "{}", path.display()),
+            Self::Parakeet { dir, .. } => write!(f, "{}", dir.display()),
+        }
+    }
+}
+
+/// Resolve a `--model` value to an engine + location: an explicit `.bin`
+/// path or directory path (contains a path separator) passes through
+/// untouched, otherwise the value must be a catalog spec — whisper's
+/// (`ggml-<spec>.bin`) or Parakeet's (a model directory under
+/// `models/`, see `PARAKEET_CATALOG`) — or the `parakeet` alias.
+pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         anyhow::bail!("empty --model value; expected one of: {}", valid_model_specs());
     }
-    if trimmed.ends_with(".bin") || trimmed.contains('/') || trimmed.contains('\\') {
-        return Ok(PathBuf::from(trimmed));
+    if trimmed.ends_with(".bin") {
+        return Ok(ModelRef::Whisper(PathBuf::from(trimmed)));
     }
     if let Some(file) = model_file_for_spec(trimmed) {
-        return Ok(PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{file}")));
+        return Ok(ModelRef::Whisper(PathBuf::from(format!(
+            "{DEFAULT_MODELS_DIR}/{file}"
+        ))));
+    }
+    if let Some((_, dir, assets, _)) = parakeet_entry_for_spec(trimmed) {
+        return Ok(ModelRef::Parakeet {
+            dir: PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{dir}")),
+            assets,
+        });
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        // A manually-prepared model: a directory is Parakeet (nothing to
+        // download, just validated at load time), anything else is treated
+        // as a whisper `.bin` path even without the extension.
+        let path = PathBuf::from(trimmed);
+        if path.is_dir() {
+            return Ok(ModelRef::Parakeet { dir: path, assets: &[] });
+        }
+        return Ok(ModelRef::Whisper(path));
     }
     anyhow::bail!(
-        "unknown model {trimmed:?}; expected a path (*.bin) or one of: {}",
+        "unknown model {trimmed:?}; expected a path (*.bin or a Parakeet model \
+         directory) or one of: {}",
         valid_model_specs()
     );
 }
 
-/// `model`, guaranteed to exist on return: downloads the model into
-/// place if it isn't already there.
-pub(crate) fn ensure_available(model: &Path) -> Result<PathBuf> {
-    let path = model;
+/// `model`, guaranteed to exist on return: downloads any missing weights
+/// into place first.
+pub(crate) fn ensure_available(model: &ModelRef) -> Result<()> {
+    match model {
+        ModelRef::Whisper(path) => ensure_whisper_available(path),
+        ModelRef::Parakeet { dir, assets } => ensure_parakeet_available(dir, assets),
+    }
+}
+
+/// Whisper: downloads the model into place if it isn't already there.
+fn ensure_whisper_available(path: &Path) -> Result<()> {
     if path.exists() {
-        return Ok(path.to_path_buf());
+        return Ok(());
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -60,7 +120,40 @@ pub(crate) fn ensure_available(model: &Path) -> Result<PathBuf> {
         path.display()
     );
     download(&url, path)?;
-    Ok(path.to_path_buf())
+    Ok(())
+}
+
+/// Parakeet: downloads any of `assets` missing from `dir`. An empty
+/// `assets` (user-supplied directory) is only validated, never fetched —
+/// see `resolve_model`.
+fn ensure_parakeet_available(dir: &Path, assets: &'static [&'static str]) -> Result<()> {
+    if assets.is_empty() {
+        if !dir.is_dir() {
+            anyhow::bail!(
+                "Parakeet model directory not found: {} (expected an encoder, a \
+                 decoder_joint and vocab.txt)",
+                dir.display()
+            );
+        }
+        if !dir.join("vocab.txt").exists() {
+            anyhow::bail!(
+                "{} is missing vocab.txt; not a valid Parakeet model directory",
+                dir.display()
+            );
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    for file in assets {
+        let dest = dir.join(file);
+        if dest.exists() {
+            continue;
+        }
+        let url = parakeet_asset_url(file);
+        log::info!("model not found at {}, downloading {url}...", dest.display());
+        download(&url, &dest)?;
+    }
+    Ok(())
 }
 
 /// Download URL for a `ggml-*.bin` model filename (full or quantized,
@@ -71,6 +164,12 @@ pub(crate) fn download_url(file_name: &str) -> Option<String> {
         return None;
     }
     Some(format!("{MODEL_BASE_URL}{file_name}"))
+}
+
+/// Download URL for one Parakeet asset filename (e.g.
+/// `encoder-model.int8.onnx`).
+pub(crate) fn parakeet_asset_url(file_name: &str) -> String {
+    format!("{PARAKEET_BASE_URL}{file_name}")
 }
 
 /// One-line download progress for stderr, e.g.
@@ -106,6 +205,11 @@ pub(crate) fn format_download_progress(downloaded: u64, total: Option<u64>) -> S
     }
 }
 
+/// Note: no resume support — an interrupted download restarts from zero on
+/// the next `ensure_available` call (`.part` is recreated with
+/// `File::create` every attempt). Same gap for whisper's 1.5 GiB
+/// `ggml-large-v3-turbo.bin` and Parakeet's 2.4 GiB
+/// `encoder-model.onnx.data`; not fixed here.
 fn download(url: &str, dest: &Path) -> Result<()> {
     let tmp = dest.with_extension("part");
     let resp = ureq::get(url)
@@ -168,13 +272,16 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MODEL_BASE_URL;
+    use crate::config::{MODEL_BASE_URL, PARAKEET_BASE_URL, PARAKEET_DEFAULT_SPEC};
 
     #[test]
     fn default_model_is_quantized_q8() {
-        let resolved = resolve_model_path(crate::config::DEFAULT_MODEL_SPEC)
-            .expect("default spec must resolve");
-        let file_name = resolved
+        let resolved =
+            resolve_model(crate::config::DEFAULT_MODEL_SPEC).expect("default spec must resolve");
+        let ModelRef::Whisper(path) = resolved else {
+            panic!("default spec must resolve to a whisper model");
+        };
+        let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .expect("default model path has a filename");
@@ -218,38 +325,103 @@ mod tests {
             ("large-v3-turbo", "models/ggml-large-v3-turbo.bin"),
         ] {
             assert_eq!(
-                resolve_model_path(spec).expect("known spec must resolve"),
-                PathBuf::from(file),
+                resolve_model(spec).expect("known spec must resolve"),
+                ModelRef::Whisper(PathBuf::from(file)),
                 "spec={spec}"
             );
         }
         assert_eq!(
-            resolve_model_path(crate::config::DEFAULT_MODEL_SPEC)
-                .expect("default spec must resolve"),
-            PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin")
+            resolve_model(crate::config::DEFAULT_MODEL_SPEC).expect("default spec must resolve"),
+            ModelRef::Whisper(PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin"))
         );
     }
 
     #[test]
+    fn parakeet_specs_and_alias_resolve_to_model_dir() {
+        for spec in ["parakeet-tdt-0.6b-v3-int8", "parakeet"] {
+            let resolved = resolve_model(spec).expect("parakeet spec must resolve");
+            let ModelRef::Parakeet { dir, assets } = resolved else {
+                panic!("spec={spec} must resolve to Parakeet");
+            };
+            assert_eq!(dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"));
+            assert!(assets.contains(&"vocab.txt"));
+            assert!(assets.iter().any(|f| f.contains("int8")));
+        }
+        let ModelRef::Parakeet { dir, assets } =
+            resolve_model(PARAKEET_DEFAULT_SPEC).expect("default parakeet spec must resolve")
+        else {
+            panic!("must resolve to Parakeet");
+        };
+        assert_eq!(dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"));
+        assert_eq!(assets.len(), 3);
+    }
+
+    #[test]
+    fn parakeet_fp32_spec_resolves_with_external_data_file() {
+        let ModelRef::Parakeet { dir, assets } =
+            resolve_model("parakeet-tdt-0.6b-v3-fp32").expect("fp32 spec must resolve")
+        else {
+            panic!("must resolve to Parakeet");
+        };
+        assert_eq!(dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-fp32"));
+        assert!(assets.contains(&"encoder-model.onnx.data"));
+    }
+
+    #[test]
+    fn parakeet_asset_urls_derive_from_base_url() {
+        for file in ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "vocab.txt"] {
+            assert_eq!(parakeet_asset_url(file), format!("{PARAKEET_BASE_URL}{file}"));
+        }
+    }
+
+    #[test]
     fn paths_pass_through_untouched() {
-        for path in [
-            "models/custom.bin",
-            "models/ggml-large-v3-turbo-q8_0.bin",
-            "/abs/models/ggml-base.bin",
-            "custom/ggml-tiny.bin",
-        ] {
+        for path in ["models/custom.bin", "models/ggml-large-v3-turbo-q8_0.bin", "/abs/models/ggml-base.bin", "custom/ggml-tiny.bin"] {
             assert_eq!(
-                resolve_model_path(path).expect("path must pass through"),
-                PathBuf::from(path),
+                resolve_model(path).expect("path must pass through"),
+                ModelRef::Whisper(PathBuf::from(path)),
                 "path={path}"
             );
         }
     }
 
     #[test]
+    fn nonexistent_directory_path_is_treated_as_whisper() {
+        // A path with a separator that isn't an existing directory falls
+        // back to whisper (matches the pre-Parakeet behavior for any
+        // path-like --model value, including ones without .bin).
+        assert_eq!(
+            resolve_model("models/does-not-exist-dir/model").expect("path must resolve"),
+            ModelRef::Whisper(PathBuf::from("models/does-not-exist-dir/model"))
+        );
+    }
+
+    #[test]
+    fn existing_directory_path_resolves_to_parakeet_with_no_assets() {
+        let tmp = std::env::temp_dir().join(format!(
+            "sttd-weights-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let resolved = resolve_model(tmp.to_str().unwrap()).expect("dir path must resolve");
+        assert_eq!(
+            resolved,
+            ModelRef::Parakeet {
+                dir: tmp.clone(),
+                assets: &[],
+            }
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
     fn unknown_specs_are_rejected_with_valid_list() {
         for bad in ["", "   ", "tiny-q5_0", "medium-q5_1", "large-v1-q8_0", "huge", "tiny.en"] {
-            let err = resolve_model_path(bad).expect_err("must reject");
+            let err = resolve_model(bad).expect_err("must reject");
             let msg = err.to_string();
             assert!(msg.contains("large-v3-turbo-q8_0"), "msg={msg}");
         }

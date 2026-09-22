@@ -438,11 +438,11 @@ mod tests {
             DEFAULT_MODEL_SPEC
         );
         // Default spec resolves to the historical default path.
-        let resolved = crate::weights::resolve_model_path(DEFAULT_MODEL_SPEC)
+        let resolved = crate::weights::resolve_model(DEFAULT_MODEL_SPEC)
             .expect("default spec must resolve");
         assert_eq!(
             resolved,
-            PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin")
+            crate::weights::ModelRef::Whisper(PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin"))
         );
         assert_eq!(cli.prompt, DEFAULT_PROMPT);
         assert_eq!(cli.prompt_context_chars, DEFAULT_PROMPT_CONTEXT_CHARS);

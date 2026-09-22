@@ -36,9 +36,11 @@ pub(crate) struct Emission<'a> {
     pub(crate) text: &'a str,
     /// Transcript gate disposition, decided by the caller.
     pub(crate) verdict: TranscriptVerdict,
-    /// Text-token average probability and log-probability, for metrics lines.
-    pub(crate) prob: f32,
-    pub(crate) logprob: f32,
+    /// Text-token average probability and log-probability, for metrics
+    /// lines. `None` for models that don't report per-token probabilities
+    /// (Parakeet) — see `GateConfig::decide_transcript`.
+    pub(crate) prob: Option<f32>,
+    pub(crate) logprob: Option<f32>,
     /// Acoustic evidence, for the metrics line's density.
     pub(crate) evidence: &'a Evidence,
 }
@@ -51,8 +53,8 @@ pub(crate) struct OwnedEmission {
     pub(crate) pcm: Vec<f32>,
     pub(crate) text: String,
     pub(crate) verdict: TranscriptVerdict,
-    pub(crate) prob: f32,
-    pub(crate) logprob: f32,
+    pub(crate) prob: Option<f32>,
+    pub(crate) logprob: Option<f32>,
     pub(crate) evidence: Evidence,
 }
 
@@ -232,8 +234,10 @@ impl EmitterWorker {
             }
             TranscriptVerdict::Emit { floor, strength } => {
                 log::info!(
-                    "{tag}: avg_p={prob:.3} avg_logprob={logprob:.3} threshold={floor:.3} \
+                    "{tag}: avg_p={} avg_logprob={} threshold={floor:.3} \
                      ({strength} evidence, density={:.3})",
+                    fmt_prob(*prob),
+                    fmt_prob(*logprob),
                     evidence.density()
                 );
                 if self.stdout_enabled {
@@ -246,8 +250,10 @@ impl EmitterWorker {
                 strength,
             } => {
                 log::info!(
-                    "{tag}: avg_p={prob:.3} avg_logprob={logprob:.3} threshold={floor:.3} \
+                    "{tag}: avg_p={} avg_logprob={} threshold={floor:.3} \
                      ({strength} evidence, density={:.3})",
+                    fmt_prob(*prob),
+                    fmt_prob(*logprob),
                     evidence.density()
                 );
                 match kind {
@@ -306,6 +312,15 @@ impl EmitterWorker {
                 log::warn!("failed to write {}: {e:?}", txt_path.display());
             }
         }
+    }
+}
+
+/// Render an optional probability/log-probability for a log line: `n/a` when
+/// the model reports none (Parakeet), 3 decimals otherwise.
+fn fmt_prob(p: Option<f32>) -> String {
+    match p {
+        Some(p) => format!("{p:.3}"),
+        None => "n/a".to_string(),
     }
 }
 
@@ -509,8 +524,8 @@ mod tests {
             pcm,
             text,
             verdict,
-            prob: 0.9,
-            logprob: -0.1,
+            prob: Some(0.9),
+            logprob: Some(-0.1),
             evidence,
         });
     }
@@ -519,7 +534,7 @@ mod tests {
     fn confident_transcript_is_emitted_with_copy_and_paste() {
         let evidence = strong_evidence();
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.9);
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
         emit(
@@ -545,7 +560,7 @@ mod tests {
     fn stdout_print_is_opt_in() {
         let evidence = strong_evidence();
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.9);
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
         let pcm = vec![0.01f32; 1600];
         let mut emitter = RecordingEmitter::new();
         emit(
@@ -560,7 +575,7 @@ mod tests {
         assert!(!emitter.records[0].printed);
 
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.9);
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
         let mut emitter = RecordingEmitter::new();
         emitter.stdout_enabled = true;
         emit(
@@ -579,7 +594,7 @@ mod tests {
             evidence.speech_frames,
             evidence.rms,
             "tak tak tak tak tak tak",
-            0.9,
+            Some(0.9),
         );
         emit(
             &mut emitter,
@@ -598,7 +613,7 @@ mod tests {
     fn paste_only_runs_on_fresh_copy() {
         let evidence = strong_evidence();
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.9);
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
         let mut emitter = RecordingEmitter::new();
         emitter.fail_copy = true;
         let pcm = vec![0.01f32; 1600];
@@ -624,7 +639,7 @@ mod tests {
             evidence.speech_frames,
             evidence.rms,
             "To jest prawdziwe zdanie testowe",
-            0.1,
+            Some(0.1),
         );
         assert!(matches!(
             verdict,
@@ -662,7 +677,7 @@ mod tests {
             ),
             ("tak tak tak tak tak tak", TranscriptDropKind::Repetition),
         ] {
-            let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, text, 0.9);
+            let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, text, Some(0.9));
             assert!(matches!(verdict, TranscriptVerdict::Drop { kind: k, .. } if k == kind));
             let mut emitter = RecordingEmitter::new();
             let pcm = vec![0.01f32; 1600];
@@ -677,7 +692,7 @@ mod tests {
     #[test]
     fn empty_transcript_drops_but_wav_still_recorded() {
         let evidence = weak_evidence();
-        let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, "   ", 0.0);
+        let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, "   ", Some(0.0));
         assert_eq!(verdict, TranscriptVerdict::DropEmpty);
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
@@ -695,7 +710,7 @@ mod tests {
         // evidence must emit (and copy), not drop.
         let evidence = strong_evidence();
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.478);
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.478));
         assert!(matches!(verdict, TranscriptVerdict::Emit { .. }));
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
@@ -731,10 +746,10 @@ mod tests {
                     evidence.speech_frames,
                     evidence.rms,
                     "Dzień dobry",
-                    0.9,
+                    Some(0.9),
                 ),
-                prob: 0.9,
-                logprob: -0.1,
+                prob: Some(0.9),
+                logprob: Some(-0.1),
                 evidence: &evidence,
             });
             emitter.emit(Emission {
@@ -742,8 +757,8 @@ mod tests {
                 pcm: &pcm,
                 text: "   ",
                 verdict: TranscriptVerdict::DropEmpty,
-                prob: 0.0,
-                logprob: 0.0,
+                prob: None,
+                logprob: None,
                 evidence: &evidence,
             });
             // No join yet: Drop at scope end must flush.
@@ -757,6 +772,36 @@ mod tests {
         assert!(dir.join("utt_000002.wav").exists());
         assert!(dir.join("utt_000002.txt").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_confidence_signal_still_emits_and_copies() {
+        // Parakeet-shaped emission: `prob`/`logprob` are `None`, the gate
+        // never scored a confidence floor (see gate.rs), yet the emission
+        // path must treat this exactly like any other Emit verdict.
+        let evidence = strong_evidence();
+        let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", None);
+        assert!(matches!(verdict, TranscriptVerdict::Emit { .. }));
+        let mut emitter = RecordingEmitter::new();
+        let pcm = vec![0.01f32; 1600];
+        emitter.emit(Emission {
+            tag: "utt_000001",
+            pcm: &pcm,
+            text: "Dzień dobry",
+            verdict,
+            prob: None,
+            logprob: None,
+            evidence: &evidence,
+        });
+        let r = &emitter.records[0];
+        assert!(r.emitted);
+        assert!(r.copied);
+    }
+
+    #[test]
+    fn fmt_prob_renders_none_as_na() {
+        assert_eq!(fmt_prob(Some(0.9)), "0.900");
+        assert_eq!(fmt_prob(None), "n/a");
     }
 
     #[test]
@@ -781,10 +826,10 @@ mod tests {
                     evidence.speech_frames,
                     evidence.rms,
                     "Dzień dobry",
-                    0.9,
+                    Some(0.9),
                 ),
-                prob: 0.9,
-                logprob: -0.1,
+                prob: Some(0.9),
+                logprob: Some(-0.1),
                 evidence: &evidence,
             });
         }

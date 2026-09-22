@@ -97,6 +97,12 @@ pub(crate) const MIC_CLIP_RATIO: f32 = 0.005;
 /// gets rejected — confirmed via `sttd --file` on a sub-second clip. The
 /// true minimum is 16_040; padded well past it for margin.
 pub(crate) const WHISPER_MIN_SAMPLES: usize = 16_400;
+/// Parakeet's encoder does 8x subsampling; a very short clip can yield too
+/// few encoder frames for the TDT greedy decoder to emit anything. Padded to
+/// 0.5 s for margin (Parakeet has no documented hard minimum like whisper's
+/// mel-length check, so this is a conservative floor rather than a measured
+/// one).
+pub(crate) const PARAKEET_MIN_SAMPLES: usize = WHISPER_RATE as usize / 2;
 /// Force-flush long speech even without silence (whisper is ~30 s max).
 pub(crate) const MAX_UTTERANCE_SAMPLES: usize = WHISPER_RATE as usize * 30;
 /// Soft-split window: past 28 s, a 100 ms+ pause already closes the utterance
@@ -320,13 +326,69 @@ pub(crate) fn model_file_for_spec(spec: &str) -> Option<&'static str> {
         .map(|(_, f, _)| *f)
 }
 
-/// Comma-separated valid specs for `--model` error messages.
+/// Comma-separated valid specs for `--model` error messages (whisper
+/// catalog plus Parakeet catalog).
 pub(crate) fn valid_model_specs() -> String {
     MODEL_CATALOG
         .iter()
         .map(|(s, _, _)| *s)
+        .chain(PARAKEET_CATALOG.iter().map(|(s, ..)| *s))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Parakeet-TDT-0.6B-v3 weights, published as loose ONNX files (no archive)
+/// rather than a single `.bin`: `parakeet-rs::ParakeetTDT::from_pretrained`
+/// loads from a directory containing an encoder, a decoder_joint and
+/// `vocab.txt`. Preprocessor config is compiled into `parakeet-rs` for this
+/// model, so `config.json`/`preprocessor_config.json` are not needed.
+pub(crate) const PARAKEET_BASE_URL: &str =
+    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/";
+
+/// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
+/// int8 is the default variant (`PARAKEET_DEFAULT_SPEC`); fp32 is offered
+/// for accuracy-sensitive use. Filenames match what
+/// `parakeet_rs::model_tdt::ParakeetTDTModel::find_encoder`/
+/// `find_decoder_joint` look for, so no renaming after download.
+pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "parakeet-tdt-0.6b-v3-int8",
+        "parakeet-tdt-0.6b-v3-int8",
+        &[
+            "encoder-model.int8.onnx",
+            "decoder_joint-model.int8.onnx",
+            "vocab.txt",
+        ],
+        "640 MiB",
+    ),
+    (
+        "parakeet-tdt-0.6b-v3-fp32",
+        "parakeet-tdt-0.6b-v3-fp32",
+        &[
+            "encoder-model.onnx",
+            "encoder-model.onnx.data",
+            "decoder_joint-model.onnx",
+            "vocab.txt",
+        ],
+        "2.4 GiB",
+    ),
+];
+
+/// Short alias for `--model parakeet`, resolving to the int8 variant (see
+/// `PARAKEET_CATALOG`).
+pub(crate) const PARAKEET_DEFAULT_SPEC: &str = "parakeet-tdt-0.6b-v3-int8";
+
+/// Look up a `PARAKEET_CATALOG` entry by spec, accepting the `parakeet`
+/// alias for the default (int8) variant.
+pub(crate) fn parakeet_entry_for_spec(
+    spec: &str,
+) -> Option<&'static (&'static str, &'static str, &'static [&'static str], &'static str)> {
+    let spec = if spec == "parakeet" {
+        PARAKEET_DEFAULT_SPEC
+    } else {
+        spec
+    };
+    PARAKEET_CATALOG.iter().find(|(s, ..)| *s == spec)
 }
 
 /// Default `initial_prompt`: primes Polish orthography/diacritics and English
@@ -728,5 +790,40 @@ mod tests {
         assert!(model_file_for_spec("tiny-q5_0").is_none());
         assert!(model_file_for_spec("medium-q5_1").is_none());
         assert!(model_file_for_spec("bogus").is_none());
+    }
+
+    #[test]
+    fn parakeet_catalog_entries_are_self_consistent() {
+        assert_eq!(PARAKEET_CATALOG.len(), 2);
+        for (spec, dir, files, _size) in PARAKEET_CATALOG {
+            assert_eq!(*dir, *spec, "dir must equal spec for {spec}");
+            assert!(!files.is_empty(), "{spec} must list at least one file");
+            assert!(
+                files.contains(&"vocab.txt"),
+                "{spec} must download vocab.txt"
+            );
+            assert_eq!(parakeet_entry_for_spec(spec).map(|e| e.0), Some(*spec));
+        }
+    }
+
+    #[test]
+    fn parakeet_alias_resolves_to_int8_default() {
+        assert_eq!(PARAKEET_DEFAULT_SPEC, "parakeet-tdt-0.6b-v3-int8");
+        let default_entry =
+            parakeet_entry_for_spec(PARAKEET_DEFAULT_SPEC).expect("default spec must resolve");
+        let alias_entry = parakeet_entry_for_spec("parakeet").expect("alias must resolve");
+        assert_eq!(default_entry.0, alias_entry.0);
+        assert!(default_entry
+            .2
+            .iter()
+            .any(|f| f.contains("int8")), "default variant must be int8");
+        assert!(parakeet_entry_for_spec("parakeet-bogus").is_none());
+    }
+
+    #[test]
+    fn valid_model_specs_lists_both_catalogs() {
+        let specs = valid_model_specs();
+        assert!(specs.contains(DEFAULT_MODEL_SPEC));
+        assert!(specs.contains(PARAKEET_DEFAULT_SPEC));
     }
 }

@@ -72,7 +72,10 @@ use signal_hook::iterator::Signals;
 mod cli;
 use cli::Cli;
 mod config;
-use config::{model_file_for_spec, DEFAULT_MODELS_DIR, DEFAULT_PROMPT, DEFAULT_TRANSLATE_PROMPT, MODEL_CATALOG};
+use config::{
+    model_file_for_spec, parakeet_entry_for_spec, DEFAULT_MODELS_DIR, DEFAULT_PROMPT,
+    DEFAULT_TRANSLATE_PROMPT, MODEL_CATALOG, PARAKEET_CATALOG,
+};
 mod capture;
 use capture::*;
 mod daemon;
@@ -95,8 +98,10 @@ mod wav;
 use wav::*;
 mod weights;
 use weights::*;
+mod asr;
+use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
 mod whisper;
-use whisper::*;
+mod parakeet;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -139,11 +144,11 @@ fn init_logging() {
     whisper_rs::install_whisper_log_trampoline();
 }
 
-/// Print known whisper models (`MODEL_CATALOG`) as an aligned table with a
-/// two-character leading marker: `*` = currently selected (effective
-/// `--model` after CLI > `STTD_MODEL` > legacy `WHISPER_MODEL_PATH` >
-/// compiled-in default), `I` = installed (`models/<filename>` exists on
-/// disk). A row can carry both (`*I`).
+/// Print known models — whisper's `MODEL_CATALOG` and Parakeet's
+/// `PARAKEET_CATALOG` — as two aligned tables with a two-character leading
+/// marker: `*` = currently selected (effective `--model` after CLI >
+/// `STTD_MODEL` > legacy `WHISPER_MODEL_PATH` > compiled-in default), `I` =
+/// installed (weights present on disk). A row can carry both (`*I`).
 fn print_available_models(cli: &Cli) {
     let input = cli.model_input();
     let selected = selected_spec_for_input(&input);
@@ -151,13 +156,85 @@ fn print_available_models(cli: &Cli) {
         .iter()
         .map(|(_, file, _)| Path::new(DEFAULT_MODELS_DIR).join(file).exists())
         .collect();
+    println!("whisper models:");
     print!("{}", format_available_models(selected, &installed));
-    if selected.is_none() {
+
+    let parakeet_selected = selected_parakeet_spec_for_input(&input);
+    let parakeet_installed: Vec<bool> = PARAKEET_CATALOG
+        .iter()
+        .map(|(_, dir, files, _)| {
+            let base = Path::new(DEFAULT_MODELS_DIR).join(dir);
+            files.iter().all(|f| base.join(f).exists())
+        })
+        .collect();
+    println!();
+    println!("parakeet models:");
+    print!("{}", format_parakeet_models(parakeet_selected, &parakeet_installed));
+
+    if selected.is_none() && parakeet_selected.is_none() {
         let trimmed = input.trim();
         if !trimmed.is_empty() {
             println!("selected: {trimmed} (not in catalog)");
         }
     }
+}
+
+/// Map a `--model` input value to the Parakeet catalog spec it selects, if
+/// any (exact spec match, including the `parakeet` alias — see
+/// `parakeet_entry_for_spec`). Unlike whisper's `selected_spec_for_input`,
+/// there's no path-basename fallback: Parakeet models are directories, and a
+/// bare basename comparison would be meaningless.
+fn selected_parakeet_spec_for_input(input: &str) -> Option<&'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    parakeet_entry_for_spec(trimmed).map(|(spec, ..)| *spec)
+}
+
+/// Render the Parakeet section of `--list-models`: same `*`/`I` marker
+/// scheme as `format_available_models`, over `PARAKEET_CATALOG` (columns
+/// SPEC/DIR/SIZE instead of SPEC/FILE/SIZE, since Parakeet ships as a
+/// directory of files rather than one).
+fn format_parakeet_models(selected: Option<&str>, installed: &[bool]) -> String {
+    let spec_w = PARAKEET_CATALOG
+        .iter()
+        .map(|(s, ..)| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("SPEC".len());
+    let dir_w = PARAKEET_CATALOG
+        .iter()
+        .map(|(_, d, ..)| d.len())
+        .max()
+        .unwrap_or(0)
+        .max("DIR".len());
+    let size_w = PARAKEET_CATALOG
+        .iter()
+        .map(|(_, _, _, s)| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("SIZE".len());
+    let mut out = String::new();
+    out.push_str(&format!(
+        "   {0:<1$}  {2:<3$}  {4:>5$}\n",
+        "SPEC", spec_w, "DIR", dir_w, "SIZE", size_w
+    ));
+    for (i, (spec, dir, _files, size)) in PARAKEET_CATALOG.iter().enumerate() {
+        let is_selected = selected == Some(*spec);
+        let is_installed = installed.get(i).copied().unwrap_or(false);
+        let marker = match (is_selected, is_installed) {
+            (true, true) => "*I",
+            (true, false) => "* ",
+            (false, true) => "I ",
+            (false, false) => "  ",
+        };
+        out.push_str(&format!(
+            "{marker} {0:<1$}  {2:<3$}  {4:>5$}\n",
+            spec, spec_w, dir, dir_w, size, size_w
+        ));
+    }
+    out
 }
 
 /// Map a `--model` input value (spec or path, see `resolve_model_path`) to
@@ -313,19 +390,19 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
     // Heavy but pre-capture: resolve/download the model before the stream
     // starts so the callback can't outrun the drain loop.
-    let model_path = resolve_model_input(cli)?;
-    log::info!("model: {}", model_path.display());
+    let model = resolve_model_input(cli)?;
+    log::info!("model: {model}");
+    validate_parakeet_model_flags(cli, &model)?;
 
     // Raw mono samples (hw rate, f32 in [-1, 1]) from the cpal callback via a
     // realtime-safe `rtrb` sample ring (no allocation in the callback;
     // overflow sheds counted samples instead of growing memory without
     // bound). Created inside `open_input_path` once the hw rate is known.
-    // Utterance queue is bounded (`WHISPER_QUEUE_CAP`, each utterance seconds
-    // of audio) and the whisper worker sheds weakest-first past
-    // `WHISPER_SHED_KEEP` so live speech stays fresh instead of lagging
+    // Utterance queue is bounded (`ASR_QUEUE_CAP`, each utterance seconds
+    // of audio) and the ASR worker sheds weakest-first past
+    // `ASR_SHED_KEEP` so live speech stays fresh instead of lagging
     // minutes behind.
-    let (mut whisper_tx, whisper_rx) =
-        RingBuffer::<Utterance>::new(crate::whisper::WHISPER_QUEUE_CAP);
+    let (mut whisper_tx, whisper_rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
     let telemetry = StreamTelemetry::default();
 
     // First open fails fast (bad --device/--channel), like before; later
@@ -371,10 +448,10 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
     // Capture is already running above and the drain loop below sheds (counted)
     // while it loads.
-    let (whisper_handle, whisper_ready) = spawn_whisper_worker(
+    let (whisper_handle, whisper_ready) = spawn_asr_worker(
         whisper_rx,
-        model_path,
-        whisper_options(cli, true),
+        model,
+        asr_options(cli, true),
         make_emitter(cli)?,
         Arc::clone(&paused),
         Arc::clone(&running),
@@ -493,7 +570,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         if last_queue_warn.elapsed() >= Duration::from_secs(5) {
             last_queue_warn = Instant::now();
             let raw_depth = raw_rx.slots();
-            let whisper_depth = producer_occupied(&whisper_tx, crate::whisper::WHISPER_QUEUE_CAP);
+            let whisper_depth = producer_occupied(&whisper_tx, crate::asr::ASR_QUEUE_CAP);
             let (signal_vad, signal_whisper) = fp.signal_pending_depths();
             let raw_dropped = telemetry.dropped_chunks.load(Ordering::Relaxed);
             let stream_errors = telemetry.errors.load(Ordering::Relaxed);
@@ -708,11 +785,11 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         cli.channel,
     );
 
-    let model_path = resolve_model_input(cli)?;
-    log::info!("model: {}", model_path.display());
+    let model = resolve_model_input(cli)?;
+    log::info!("model: {model}");
+    validate_parakeet_model_flags(cli, &model)?;
 
-    let (mut whisper_tx, whisper_rx) =
-        RingBuffer::<Utterance>::new(crate::whisper::WHISPER_QUEUE_CAP);
+    let (mut whisper_tx, whisper_rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
     let mut fp = FrameProcessor::new(
         wav.sample_rate,
         cli.denoiser,
@@ -725,10 +802,10 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     )?;
     let input_frames = fp.required_input_frames();
 
-    let (whisper_handle, whisper_ready) = spawn_whisper_worker(
+    let (whisper_handle, whisper_ready) = spawn_asr_worker(
         whisper_rx,
-        model_path,
-        whisper_options(cli, false),
+        model,
+        asr_options(cli, false),
         make_emitter(cli)?,
         // File mode has no pause signalling; a permanently-clear flag plus
         // disabled auto-unload can never trigger an unload mid-file. Sounds
@@ -777,13 +854,90 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `--model` (spec or path) to a guaranteed-present file path:
-/// spec mapping first (`resolve_model_path`), then download-if-missing
-/// (`ensure_available`).
-fn resolve_model_input(cli: &Cli) -> Result<std::path::PathBuf> {
+/// Resolve `--model` (spec or path, either engine) to a guaranteed-present
+/// `ModelRef`: engine dispatch first (`resolve_model`), then
+/// download-if-missing (`ensure_available`).
+fn resolve_model_input(cli: &Cli) -> Result<ModelRef> {
     let input = cli.model_input();
-    let path = resolve_model_path(&input)?;
-    ensure_available(&path)
+    let model = resolve_model(&input)?;
+    ensure_available(&model)?;
+    Ok(model)
+}
+
+/// Whisper-only flags Parakeet doesn't honor, checked against their
+/// compiled defaults ("explicitly set" would need clap's `ArgMatches`,
+/// which the derive API doesn't expose — a flag set to its own default is
+/// indistinguishable from not setting it, and that's fine: it changes
+/// nothing either way). Returns the flag names to warn about.
+fn unsupported_parakeet_flags(cli: &Cli) -> Vec<&'static str> {
+    use crate::config::{
+        DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_LOGPROB_THOLD, DEFAULT_MIN_CONFIDENCE,
+        DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TEMPERATURE,
+        DEFAULT_TEMPERATURE_INC,
+    };
+    let mut flags = Vec::new();
+    if cli.prompt != DEFAULT_PROMPT {
+        flags.push("--prompt");
+    }
+    if cli.prompt_context_chars != DEFAULT_PROMPT_CONTEXT_CHARS {
+        flags.push("--prompt-context-chars");
+    }
+    if cli.beam_size != DEFAULT_BEAM_SIZE {
+        flags.push("--beam-size");
+    }
+    if (cli.temperature - DEFAULT_TEMPERATURE).abs() > f32::EPSILON {
+        flags.push("--temperature");
+    }
+    if (cli.temperature_inc - DEFAULT_TEMPERATURE_INC).abs() > f32::EPSILON {
+        flags.push("--temperature-inc");
+    }
+    if (cli.entropy_thold - DEFAULT_ENTROPY_THOLD).abs() > f32::EPSILON {
+        flags.push("--entropy-thold");
+    }
+    if (cli.logprob_thold - DEFAULT_LOGPROB_THOLD).abs() > f32::EPSILON {
+        flags.push("--logprob-thold");
+    }
+    if (cli.min_conf - DEFAULT_MIN_CONFIDENCE).abs() > f32::EPSILON {
+        flags.push("--min-conf");
+    }
+    if (cli.min_conf_strong - DEFAULT_MIN_CONFIDENCE_STRONG).abs() > f32::EPSILON {
+        flags.push("--min-conf-strong");
+    }
+    if cli.gpu && !cfg!(feature = "parakeet-cuda") {
+        flags.push("--gpu");
+    }
+    flags
+}
+
+/// When `model` is a Parakeet model: rejects `--translate` (it would
+/// silently produce Polish text where English was requested, since
+/// Parakeet has no translate mode) and warns about every other
+/// whisper-only flag `unsupported_parakeet_flags` finds set. A no-op for a
+/// whisper model.
+fn validate_parakeet_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
+    if !matches!(model, ModelRef::Parakeet { .. }) {
+        return Ok(());
+    }
+    if cli.translate {
+        anyhow::bail!(
+            "--translate/STTD_TRANSLATE is not supported with a Parakeet model: it decodes \
+             greedily with no translate mode, so silently ignoring the flag would produce \
+             the source-language text instead of the requested English. Use a whisper \
+             --model, or drop --translate."
+        );
+    }
+    let unsupported = unsupported_parakeet_flags(cli);
+    if !unsupported.is_empty() {
+        log::warn!(
+            "Parakeet ignores whisper-only flag(s): {} (no effect with this --model)",
+            unsupported.join(", ")
+        );
+    }
+    log::info!(
+        "Parakeet auto-detects the spoken language per utterance; \
+         --language/STTD_LANGUAGE is not honored"
+    );
+    Ok(())
 }
 
 /// Effective whisper `initial_prompt`. With `--translate` and an uncustomized
@@ -802,8 +956,8 @@ pub(crate) fn resolve_prompt(translate: bool, prompt: &str) -> String {
     }
 }
 
-fn whisper_options(cli: &Cli, shed_stale: bool) -> WhisperOptions {
-    WhisperOptions {
+fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
+    AsrOptions {
         model_spec: cli.model_input(),
         prompt: resolve_prompt(cli.translate, &cli.prompt),
         prompt_context_chars: cli.prompt_context_chars,
@@ -958,5 +1112,101 @@ mod tests {
             assert_eq!(line.len(), size_end);
             assert_eq!(line[..2].chars().count(), 2);
         }
+    }
+
+    #[test]
+    fn parakeet_selection_matches_spec_and_alias() {
+        assert_eq!(
+            selected_parakeet_spec_for_input("parakeet-tdt-0.6b-v3-int8"),
+            Some("parakeet-tdt-0.6b-v3-int8")
+        );
+        assert_eq!(
+            selected_parakeet_spec_for_input("parakeet"),
+            Some("parakeet-tdt-0.6b-v3-int8")
+        );
+        assert_eq!(selected_parakeet_spec_for_input("small"), None);
+        assert_eq!(selected_parakeet_spec_for_input(""), None);
+    }
+
+    #[test]
+    fn parakeet_models_table_aligns_columns_and_marks_rows() {
+        let installed = vec![false; PARAKEET_CATALOG.len()];
+        let table = format_parakeet_models(Some("parakeet-tdt-0.6b-v3-int8"), &installed);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), PARAKEET_CATALOG.len() + 1);
+        assert!(lines[0].contains("SPEC"));
+        assert!(lines[0].contains("DIR"));
+        assert!(lines[0].contains("SIZE"));
+        let int8_row = lines
+            .iter()
+            .find(|l| l.contains("parakeet-tdt-0.6b-v3-int8"))
+            .expect("int8 row must exist");
+        assert!(int8_row.starts_with("* "), "row={int8_row:?}");
+    }
+
+    #[test]
+    fn unsupported_parakeet_flags_are_empty_for_plain_cli_without_gpu() {
+        // `--gpu` defaults to true (DEFAULT_USE_GPU), and without the
+        // `parakeet-cuda` feature that's *always* unsupported regardless of
+        // whether the user typed the flag — see the next test. Isolate that
+        // from the "did the user set a tunable" checks with `--gpu off`.
+        let cli = Cli::try_parse_from(["sttd", "--gpu", "off"]).expect("defaults must parse");
+        assert!(unsupported_parakeet_flags(&cli).is_empty());
+    }
+
+    #[cfg(not(feature = "parakeet-cuda"))]
+    #[test]
+    fn unsupported_parakeet_flags_flags_default_gpu_without_cuda_feature() {
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert_eq!(unsupported_parakeet_flags(&cli), vec!["--gpu"]);
+    }
+
+    #[test]
+    fn unsupported_parakeet_flags_lists_whisper_only_tunables() {
+        let cli = Cli::try_parse_from([
+            "sttd",
+            "--beam-size",
+            "8",
+            "--min-conf",
+            "0.4",
+            "--gpu",
+            "off",
+        ])
+        .expect("flags must parse");
+        let flags = unsupported_parakeet_flags(&cli);
+        assert!(flags.contains(&"--beam-size"), "flags={flags:?}");
+        assert!(flags.contains(&"--min-conf"), "flags={flags:?}");
+        assert_eq!(flags.len(), 2, "flags={flags:?}");
+    }
+
+    #[test]
+    fn validate_parakeet_flags_rejects_translate() {
+        let cli = Cli::try_parse_from(["sttd", "--translate"]).expect("flags must parse");
+        let model = ModelRef::Parakeet {
+            dir: std::path::PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"),
+            assets: &[],
+        };
+        let err = validate_parakeet_model_flags(&cli, &model).expect_err("must reject translate");
+        assert!(err.to_string().contains("--translate"), "err={err}");
+    }
+
+    #[test]
+    fn validate_parakeet_flags_is_a_noop_for_whisper() {
+        // A whisper model must never be affected by the Parakeet-only
+        // validation, even with --translate set.
+        let cli = Cli::try_parse_from(["sttd", "--translate", "--beam-size", "8"])
+            .expect("flags must parse");
+        let model = ModelRef::Whisper(std::path::PathBuf::from("models/ggml-base.bin"));
+        assert!(validate_parakeet_model_flags(&cli, &model).is_ok());
+    }
+
+    #[test]
+    fn validate_parakeet_flags_accepts_plain_cli() {
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        let model = ModelRef::Parakeet {
+            dir: std::path::PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"),
+            assets: &[],
+        };
+        assert!(validate_parakeet_model_flags(&cli, &model).is_ok());
     }
 }
