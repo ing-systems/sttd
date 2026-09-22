@@ -3,11 +3,14 @@
 // ---------------------------------------------------------------------------
 
 /// Sample rate required by the VAD branch's denoiser (DeepFilterNet3,
-/// opt-in via `STTD_DENOISER=deepfilter`; see `denoise`). Only the denoised
-/// VAD path uses this rate — the default bypass path resamples straight
-/// from the hw rate to 16 kHz with no 48 kHz intermediate.
+/// opt-in via `STTD_DENOISER=deepfilter` with the `denoise` Cargo feature;
+/// see `denoise`). Only the denoised VAD path uses this rate — the default
+/// bypass path resamples straight from the hw rate to 16 kHz with no 48 kHz
+/// intermediate.
+#[cfg_attr(not(feature = "denoise"), allow(dead_code))]
 pub(crate) const DENOISE_RATE: u32 = 48_000;
 /// Samples per 10 ms frame at 48 kHz (DeepFilterNet3's `hop_size`).
+#[cfg_attr(not(feature = "denoise"), allow(dead_code))]
 pub(crate) const FRAME_48K: usize = 480;
 /// Sample rate required by whisper + VAD.
 pub(crate) const WHISPER_RATE: u32 = 16_000;

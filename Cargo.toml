@@ -13,8 +13,8 @@ cpal = "0.15"
 daemonize = "0.5"
 libc = "0.2"
 resampler = "0.5"
-deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"] }
-ndarray = "0.15"
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"], optional = true }
+ndarray = { version = "0.15", optional = true }
 earshot = { version = "1.2", features = ["alloc"] }
 whisper-rs = { version = "0.13", features = ["cuda", "whisper-cpp-log"] }
 rtrb = "0.4"
@@ -23,3 +23,7 @@ anyhow = "1"
 ctrlc = "3"
 hound = "3.5"
 signal-hook = { version = "0.3", features = ["iterator"] }
+
+[features]
+default = []
+denoise = ["dep:deep_filter", "dep:ndarray"]

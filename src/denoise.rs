@@ -1,7 +1,11 @@
+#[cfg(feature = "denoise")]
 use anyhow::{Context, Result};
+#[cfg(feature = "denoise")]
 use df::tract::{DfParams, DfTract, RuntimeParams};
+#[cfg(feature = "denoise")]
 use ndarray::{ArrayView2, ArrayViewMut2};
 
+#[cfg(feature = "denoise")]
 use crate::config::{DENOISE_RATE, FRAME_48K};
 
 // ---------------------------------------------------------------------------
@@ -16,11 +20,13 @@ use crate::config::{DENOISE_RATE, FRAME_48K};
 /// `STTD_DENOISER` and fixed for the process's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum DenoiserKind {
-    /// DeepFilterNet3 (tract/onnx). Opt-in via `STTD_DENOISER=deepfilter`:
+    /// DeepFilterNet3 (tract/onnx). Opt-in via `STTD_DENOISER=deepfilter`
+    /// (requires the `denoise` Cargo feature):
     /// markedly better than raw audio on non-stationary noise, at the cost
     /// of a 20 ms lookahead and a heavier per-frame model pass. Runs at
     /// exactly `DENOISE_RATE`/`FRAME_48K`, so it drops into the pipeline's
     /// 48 kHz VAD-branch frame with no resampling changes.
+    #[cfg(feature = "denoise")]
     #[value(name = "deepfilter")]
     DeepFilter,
     /// No denoising (default): the VAD branch resamples straight from the
@@ -34,10 +40,13 @@ pub(crate) enum DenoiserKind {
 /// The active denoiser, built once by `FrameProcessor::new` when the
 /// `DenoiserKind` chosen at startup is `DeepFilter`. There is no bypass
 /// variant: `Bypass` means no denoiser object and no 48 kHz path at all.
+/// Only available with the `denoise` Cargo feature.
+#[cfg(feature = "denoise")]
 pub(crate) enum Denoiser {
     DeepFilter(Box<DfTract>),
 }
 
+#[cfg(feature = "denoise")]
 impl Denoiser {
     pub(crate) fn new(kind: DenoiserKind) -> Result<Self> {
         let t0 = std::time::Instant::now();
@@ -134,14 +143,18 @@ mod tests {
     #[test]
     fn denoiser_kind_parses_known_values() {
         use clap::ValueEnum;
+        #[cfg(feature = "denoise")]
         assert_eq!(
             DenoiserKind::from_str("deepfilter", true).ok(),
             Some(DenoiserKind::DeepFilter)
         );
+        #[cfg(feature = "denoise")]
         assert_eq!(
             DenoiserKind::from_str("DeepFilter", true).ok(),
             Some(DenoiserKind::DeepFilter)
         );
+        #[cfg(not(feature = "denoise"))]
+        assert!(DenoiserKind::from_str("deepfilter", true).is_err());
         assert_eq!(
             DenoiserKind::from_str("none", true).ok(),
             Some(DenoiserKind::Bypass)
@@ -151,6 +164,7 @@ mod tests {
         assert!(DenoiserKind::from_str("", true).is_err());
     }
 
+    #[cfg(feature = "denoise")]
     #[test]
     fn deepfilter_frame_matches_pipeline_frame() {
         // Confirms the bundled DFN3 model's sr/hop_size line up with the
@@ -163,6 +177,7 @@ mod tests {
         assert_eq!(tract.hop_size, FRAME_48K);
     }
 
+    #[cfg(feature = "denoise")]
     #[test]
     fn deepfilter_preserves_frame_length_on_silence() {
         let mut denoiser = Denoiser::new(DenoiserKind::DeepFilter).unwrap();

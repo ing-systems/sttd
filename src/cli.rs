@@ -83,7 +83,7 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_PROMPT_CONTEXT_CHARS", default_value_t = DEFAULT_PROMPT_CONTEXT_CHARS, value_parser = parse_context_chars, value_name = "N", help_heading = "Model")]
     pub(crate) prompt_context_chars: usize,
 
-    /// VAD-branch denoiser.
+    /// VAD-branch denoiser (`deepfilter` requires the `denoise` Cargo feature).
     #[arg(
         long,
         env = "STTD_DENOISER",
@@ -430,6 +430,7 @@ mod tests {
 
     #[test]
     fn cli_flags_override_defaults() {
+        #[cfg(feature = "denoise")]
         let cli = Cli::try_parse_from([
             "sttd",
             "--denoiser",
@@ -453,7 +454,34 @@ mod tests {
             "off",
         ])
         .expect("flags must parse");
+        #[cfg(not(feature = "denoise"))]
+        let cli = Cli::try_parse_from([
+            "sttd",
+            "--denoiser",
+            "none",
+            "--min-rms",
+            "0.01",
+            "--copy",
+            "off",
+            "--stdout",
+            "--debug-tokens",
+            "1",
+            "--start-paused",
+            "off",
+            "--autopause",
+            "on",
+            "--beam-size",
+            "3",
+            "--threads",
+            "0",
+            "--gpu",
+            "off",
+        ])
+        .expect("flags must parse");
+        #[cfg(feature = "denoise")]
         assert_eq!(cli.denoiser, DenoiserKind::DeepFilter);
+        #[cfg(not(feature = "denoise"))]
+        assert_eq!(cli.denoiser, DenoiserKind::Bypass);
         assert!((cli.min_rms - 0.01).abs() < 1e-6);
         assert!(!cli.copy);
         assert!(cli.stdout);
@@ -463,6 +491,15 @@ mod tests {
         assert_eq!(cli.beam_size, 3);
         assert_eq!(cli.threads, 0);
         assert!(!cli.gpu);
+    }
+
+    #[cfg(not(feature = "denoise"))]
+    #[test]
+    fn cli_deepfilter_rejected_without_denoise_feature() {
+        assert!(Cli::try_parse_from(["sttd", "--denoiser", "deepfilter"]).is_err());
+        let cli =
+            Cli::try_parse_from(["sttd", "--denoiser", "none"]).expect("none must parse");
+        assert_eq!(cli.denoiser, DenoiserKind::Bypass);
     }
 
     #[test]

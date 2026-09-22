@@ -17,8 +17,12 @@ use std::collections::VecDeque;
 
 use anyhow::{Context, Result};
 
-use crate::config::{DENOISE_RATE, FRAME_16K, FRAME_48K, WHISPER_RATE};
-use crate::denoise::{Denoiser, DenoiserKind};
+use crate::config::{FRAME_16K, WHISPER_RATE};
+#[cfg(feature = "denoise")]
+use crate::config::{DENOISE_RATE, FRAME_48K};
+use crate::denoise::DenoiserKind;
+#[cfg(feature = "denoise")]
+use crate::denoise::Denoiser;
 use crate::dsp::FftStream;
 
 /// Shared 16 kHz frame: one audio allocation, cheap `Arc` clones. The
@@ -65,11 +69,12 @@ enum VadPath {
     /// denoiser object. Each completed 16 kHz frame serves both roles, so
     /// VAD/whisper pairing is trivially 1:1.
     Direct { resampler: FftStream },
-    /// Opt-in (`deepfilter`): hw_rate -> 48 kHz -> denoise -> 48 kHz ->
-    /// 16 kHz for VAD, plus an independent direct hw_rate -> 16 kHz hop for
-    /// the whisper branch (which stays raw — the model was trained on raw
-    /// audio, and the 48 kHz intermediate exists only so the denoiser, which
-    /// is fixed at 48 kHz, can run for the VAD branch).
+    /// Opt-in (`deepfilter`, `denoise` feature): hw_rate -> 48 kHz -> denoise
+    /// -> 48 kHz -> 16 kHz for VAD, plus an independent direct hw_rate ->
+    /// 16 kHz hop for the whisper branch (which stays raw — the model was
+    /// trained on raw audio, and the 48 kHz intermediate exists only so the
+    /// denoiser, which is fixed at 48 kHz, can run for the VAD branch).
+    #[cfg(feature = "denoise")]
     Denoised {
         // hw_rate -> 48 kHz (the denoiser's required rate). Its resampler's
         // fixed FFT chunks complete on their own cadence, so drained
@@ -93,6 +98,7 @@ impl SignalPath {
                 log::info!("denoiser: none");
                 VadPath::Direct { resampler }
             }
+            #[cfg(feature = "denoise")]
             DenoiserKind::DeepFilter => {
                 let resampler_hw48 = FftStream::new(hw_rate, DENOISE_RATE, FRAME_48K)
                     .with_context(|| format!("failed to create resampler (hw -> {DENOISE_RATE})"))?;
@@ -163,6 +169,7 @@ impl SignalPath {
                     self.pending_vad.push_back(shared);
                 }
             }
+            #[cfg(feature = "denoise")]
             VadPath::Denoised {
                 resampler_hw48,
                 resampler_vad,
@@ -208,6 +215,7 @@ impl SignalPath {
                     self.pending_vad.push_back(shared);
                 }
             }
+            #[cfg(feature = "denoise")]
             VadPath::Denoised {
                 resampler_hw48,
                 resampler_vad,
@@ -248,6 +256,7 @@ impl SignalPath {
         self.max_pending = 0;
         match &mut self.vad_path {
             VadPath::Direct { resampler } => resampler.clear(),
+            #[cfg(feature = "denoise")]
             VadPath::Denoised {
                 resampler_hw48,
                 resampler_vad,

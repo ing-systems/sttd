@@ -6,7 +6,8 @@
 //! (`FrameProcessor`: `ResamplerFft` behind a 10 ms framing adapter, see
 //! `FftStream`). By default (`--denoiser none`) a single `resampler`
 //! hop (-> 16 kHz) feeds both branches below, each completed frame serving
-//! both roles; with `--denoiser deepfilter` the VAD branch instead takes
+//! both roles; with `--denoiser deepfilter` (requires the `denoise` Cargo
+//! feature) the VAD branch instead takes
 //! a 48 kHz detour:
 //!   - VAD branch:     `resampler` (-> 16 kHz, shared hop) -> `earshot`,
 //!       or `resampler` (-> 48 kHz) -> denoise (`deepfilter`, see `denoise`)

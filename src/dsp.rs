@@ -165,6 +165,7 @@ pub(crate) fn hw_input_frames(hw_rate: u32) -> usize {
 pub(crate) struct FftStream {
     inner: Option<ResamplerFft>,
     chunk_in: usize,
+    #[cfg_attr(not(feature = "denoise"), allow(dead_code))]
     chunk_out: usize,
     frame_out: usize,
     pending_in: Vec<f32>,
@@ -227,6 +228,7 @@ impl FftStream {
 
     /// Fixed FFT chunk sizes `(in, out)`; `(frame_out, frame_out)` when
     /// passing through. For startup logging only.
+    #[cfg_attr(not(feature = "denoise"), allow(dead_code))]
     pub(crate) fn chunk_sizes(&self) -> (usize, usize) {
         (self.chunk_in, self.chunk_out)
     }
@@ -234,6 +236,7 @@ impl FftStream {
     /// Feed arbitrary input samples; returns every complete `frame_out`-sized
     /// output frame this input completes (usually 0-2 at 10 ms input
     /// cadence, occasionally more on catch-up).
+    #[cfg_attr(not(feature = "denoise"), allow(dead_code))]
     pub(crate) fn feed(&mut self, input: &[f32]) -> Vec<Vec<f32>> {
         let mut out = Vec::new();
         self.feed_into(input, &mut out);
@@ -273,6 +276,7 @@ impl FftStream {
     /// tail audio (up to one FFT chunk) isn't lost at shutdown, then return
     /// every complete output frame left buffered. A trailing partial frame
     /// (< `frame_out` samples) is still dropped, same as before.
+    #[cfg_attr(not(feature = "denoise"), allow(dead_code))]
     pub(crate) fn flush(&mut self) -> Vec<Vec<f32>> {
         let mut out = Vec::new();
         self.flush_into(&mut out);
