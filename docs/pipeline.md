@@ -21,7 +21,7 @@ cpal (hw rate, N ch) -> channel pick/mix -> raw rtrb<f32> ring
 
 Mic and file modes share `FrameProcessor`; only the source differs.
 
-Source files: `src/main.rs:1`, `src/capture.rs:1`, `src/signal.rs:1`, `src/dsp.rs:1`, `src/denoise.rs:1`, `src/vad.rs:1`, `src/noise.rs:1`, `src/utterance.rs:1`, `src/gate.rs:1`, `src/asr.rs:1`, `src/whisper.rs:1`, `src/parakeet.rs:1`, `src/emit.rs:1`, `src/config.rs:1`, `src/cli.rs:1`, `src/wav.rs:1`, `src/weights.rs:1`, `src/sound.rs:1`, `src/daemon.rs:1`.
+Source files: `src/main.rs:1`, `src/capture.rs:1`, `src/signal.rs:1`, `src/dsp.rs:1`, `src/denoise.rs:1`, `src/vad.rs:1`, `src/noise.rs:1`, `src/utterance.rs:1`, `src/gate.rs:1`, `src/asr.rs:1`, `src/whisper.rs:1`, `src/parakeet.rs:1`, `src/sherpa.rs:1`, `src/emit.rs:1`, `src/config.rs:1`, `src/cli.rs:1`, `src/wav.rs:1`, `src/weights.rs:1`, `src/sound.rs:1`, `src/daemon.rs:1`.
 
 Terminology (`CONTEXT.md`): utterance, utterance buffer, pre-roll, acoustic evidence, evidence strength, VAD verdict, gate, confidence floor, speech density, text token, hallucination, emission, VAD branch, model branch, denoiser, direct hop.
 
@@ -74,12 +74,16 @@ Owner: `src/signal.rs:46` `SignalPath`. Callers feed hw chunks, get `Vec<PairedF
 
 ## 6. ASR worker + speech model engines
 
-Two engines exist, picked once at startup by `--model`/`STTD_MODEL` and fixed
-for the process's lifetime: whisper.cpp (`src/whisper.rs`, default) and
-NVIDIA Parakeet-TDT-0.6B-v3 (`src/parakeet.rs`, `--model parakeet*`). Both
-implement `asr::SpeechModel` (`src/asr.rs:48`); everything engine-agnostic —
-the worker loop, gates, metrics, prompt-context tail, audio conditioning —
-lives in `src/asr.rs` and never branches on which engine is loaded.
+Three engine families exist, picked once at startup by `--model`/`STTD_MODEL` and fixed
+for the process's lifetime: whisper.cpp (`src/whisper.rs`, optional), NVIDIA
+Parakeet-TDT-0.6B-v3 via `parakeet-rs` (`src/parakeet.rs`, default), and sherpa-onnx
+(`src/sherpa.rs`, only with the `sherpa` Cargo feature: offline Nemo-transducer
+`sherpa-parakeet-tdt-0.6b-v3-int8`; Canary wiring exists but ships no catalog
+model — sherpa-onnx 1.13.8 hardcodes Canary langs to en/de/es/fr, see `SherpaKind`).
+The first two plus sherpa-offline implement `asr::SpeechModel` (`src/asr.rs:48`);
+everything engine-agnostic — the worker loop, gates, metrics, prompt-context
+tail, audio conditioning — lives in `src/asr.rs` and never branches on which
+engine is loaded.
 
 * `spawn_asr_worker:196` -> `asr_loop:238` -> `asr_init_and_run:314` on
   thread `asr`. `ready` channel fail-fast on first load; later reloads log +
@@ -137,17 +141,38 @@ lives in `src/asr.rs` and never branches on which engine is loaded.
     total_frames,density,rms,prob,logprob,verdict,text`; `prob`/`logprob`
     are JSON `null` when the engine reports none), flush per row; RTF>1.0
     warns. `should_autopause:...` re-pauses only on emit when enabled.
+* Sherpa streaming (`--sherpa-mode streaming`, `src/sherpa.rs`
+  `spawn_sherpa_streaming_worker`): bypasses `FrameProcessor`'s utterance
+  buffer — 16 kHz samples (same resample/Hp/AGC path via
+  `process_frame_samples`) queue into a 30 s sample ring; sherpa's Silero VAD
+  owns the cuts (`--sherpa-vad-threshold`, `--sherpa-min-silence`,
+  `--sherpa-min-speech`). Each VAD segment decodes through the same
+  `OfflineRecognizer` (sherpa's endorsed streaming path for NeMo models —
+  they ship no true online encoder), then the shared transcript gates +
+  emitter + `--metrics` JSONL (evidence synthesized at density 1.0, `prob`
+  null like Parakeet). Interim partials (`--sherpa-partials`, 1 s cadence,
+  20 s cap) only `log::info`, never clipboard/paste. Pause/unload/reload and
+  `--autopause` mirror the utterance worker; sub-`min_speech_duration`
+  blips at file end are skipped, same call as the `MIN_SPEECH_FRAMES`
+  acoustic gate.
+
 * Model resolution: `src/weights.rs` `resolve_model` maps a `--model` value
   to `weights::ModelRef::Whisper(path)` (spec -> `models/ggml-<spec>.bin`,
   else path passthrough) or `ModelRef::Parakeet{dir, assets}` (spec/alias ->
-  `models/<dir>`, or an existing directory passed directly).
+  `models/<dir>`, or an existing directory passed directly), or
+  `ModelRef::Sherpa{dir, assets, kind}` (spec/alias -> `models/sherpa-<dir>`,
+  or an existing directory containing `tokens.txt`).
   `ensure_available` then downloads whatever's missing: `ggml-*.bin` from
-  `MODEL_BASE_URL` (HF whisper.cpp repo) for whisper, or the encoder/
-  decoder_joint/`vocab.txt` files from `PARAKEET_BASE_URL` (HF
-  `istupakov/parakeet-tdt-0.6b-v3-onnx`) for Parakeet. Default is whisper's
-  `large-v3-turbo-q8_0` (21-spec catalog, `MODEL_CATALOG` in
-  `src/config.rs:288`); Parakeet's own 2-spec catalog (`int8` default,
-  `fp32`) is `PARAKEET_CATALOG`, alongside it.
+  `MODEL_BASE_URL` (HF whisper.cpp repo) for whisper, loose ONNX files from
+  `PARAKEET_BASE_URL` (HF `istupakov/parakeet-tdt-0.6b-v3-onnx`) for Parakeet,
+  or sherpa-layout ONNX + `tokens.txt` from `SHERPA_PARAKEET_BASE_URL` /
+  `SHERPA_CANARY_BASE_URL` for sherpa (plus `silero_vad.onnx` from
+  `SHERPA_VAD_URL` when `--sherpa-mode streaming`). Default is `parakeet`
+  (int8 Parakeet-TDT-v3 via parakeet-rs, 2-spec `PARAKEET_CATALOG` with an
+  `fp32` sibling); whisper's 21-spec catalog is `MODEL_CATALOG` in
+  `src/config.rs:288` (only with the `whisper` Cargo feature); sherpa's
+  catalog (`sherpa-parakeet-tdt-0.6b-v3-int8`, plus the `sherpa-parakeet`
+  alias) is `SHERPA_CATALOG` (only with the `sherpa` Cargo feature).
 
 ## 7. Emission
 
@@ -174,5 +199,5 @@ Seam: `src/emit.rs:73` `Emitter::emit(Emission{tag,pcm,text,verdict,prob,logprob
 * Faster/slower splits: `--hangover-ms`, `INTERIM_*`, `EARLY_*`, `MAX_*` in `src/config.rs:42`, logic `src/utterance.rs:170`.
 * Fewer hallucinations: `GateConfig` thresholds `src/config.rs:130`, patterns `HALLUCINATION_PATTERNS:340`, `is_hallucination/is_repetition` `src/gate.rs:272`, whisper confidence scoring `average_text_confidence` `src/whisper.rs` (n/a for Parakeet, which reports no per-token probability).
 * VAD sensitivity: `--vad-threshold/adapt`, `NoiseTracker` gains `src/noise.rs:14`, median `MEDIAN_WINDOWS` `src/vad.rs:30`, `ONSET/MIN_SPEECH_FRAMES` `src/config.rs:57`.
-* Quality vs speed: `--model` (whisper spec/path, or `parakeet`/`parakeet-tdt-0.6b-v3-{int8,fp32}`), `--beam-size`, `--temperature*` (whisper only — ignored with a warning under Parakeet, see §6), `--threads`, `--gpu`, `--target-rms`, `--prompt/context` (whisper only).
+* Quality vs speed: `--model` (whisper spec/path, or `parakeet`/`parakeet-tdt-0.6b-v3-{int8,fp32}`, or sherpa `sherpa-parakeet-tdt-0.6b-v3-int8`), `--beam-size`, `--temperature*` (whisper only — ignored with a warning under Parakeet, see §6), `--threads`, `--gpu`, `--target-rms`, `--prompt/context` (whisper only).
 * Switching/adding an ASR engine: `weights::ModelRef`/`resolve_model`/`ensure_available` (`src/weights.rs`) for model resolution + download, `asr::SpeechModel` (`src/asr.rs:48`) for the trait a new engine implements, `main::unsupported_parakeet_flags`/`validate_parakeet_model_flags` (`src/main.rs`) for the pattern that warns/rejects flags an engine doesn't honor.

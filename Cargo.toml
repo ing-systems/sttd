@@ -2,7 +2,7 @@
 name = "sttd"
 version = "0.1.0"
 edition = "2021"
-description = "Real-time Speech-to-Text pipeline: cpal + resampler + deep_filter + earshot + parakeet (+ whisper-rs with the `whisper` feature)"
+description = "Real-time Speech-to-Text pipeline: cpal + resampler + deep_filter + earshot + parakeet (+ whisper-rs with the `whisper` feature, + sherpa-onnx with the `sherpa` feature)"
 license = "MIT"
 
 [dependencies]
@@ -26,6 +26,15 @@ whisper-rs = { version = "0.13", features = ["cuda", "whisper-cpp-log"], optiona
 # through `tracing`, not `log`; without a tracing subscriber installed
 # those messages are simply dropped, which is fine here.
 parakeet-rs = "0.3"
+# Third ASR engine family (see src/sherpa.rs). Shared-link mode: the build
+# script downloads a matching prebuilt sherpa-onnx archive from GitHub
+# releases and wires rpath automatically. Shared (not static) is required:
+# `ort` (via parakeet-rs) already statically links its own onnxruntime
+# core, and two static onnxruntime cores in one binary fail the link as
+# soon as the `whisper` feature's objects join (duplicate protobuf/onnx
+# symbols) — the shared lib keeps sherpa's copy out of the static link.
+# Only built with the `sherpa` feature so the default build stays lean.
+sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"], optional = true }
 rtrb = "0.4"
 num_cpus = "1.17"
 ureq = "2"
@@ -47,6 +56,14 @@ whisper = ["dep:whisper-rs"]
 # toolchain whisper.cpp is built against here, so it may not load; CPU
 # stays the safe default and the loader falls back to it if CUDA fails.
 parakeet-cuda = ["parakeet-rs/cuda"]
+# Sherpa-onnx engine family (see src/sherpa.rs): offline Nemo-transducer
+# (Parakeet-TDT-v3) plus VAD-driven simulated streaming where sherpa's
+# Silero VAD owns the cuts. Off by default: pulls the prebuilt sherpa-onnx
+# native lib at compile time and ~640 MiB of weights at first run. Coexists
+# with `parakeet-rs` (untouched default). (Canary wiring exists in code but
+# ships no catalog model — sherpa-onnx 1.13.8 hardcodes Canary langs to
+# en/de/es/fr; see `SherpaKind`.)
+sherpa = ["dep:sherpa-onnx"]
 
 [profile.release]
 strip = true

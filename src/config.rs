@@ -348,7 +348,9 @@ pub(crate) fn model_file_for_spec(spec: &str) -> Option<&'static str> {
 
 /// Comma-separated valid specs for `--model` error messages (whisper
 /// catalog plus Parakeet catalog when the `whisper` feature is enabled,
-/// Parakeet catalog alone otherwise).
+/// Parakeet catalog alone otherwise; sherpa specs always listed — without
+/// the `sherpa` Cargo feature they resolve to a rebuild hint, same as
+/// whisper specs without `whisper`).
 pub(crate) fn valid_model_specs() -> String {
     #[cfg(feature = "whisper")]
     {
@@ -357,6 +359,8 @@ pub(crate) fn valid_model_specs() -> String {
             .map(|(s, _, _)| *s)
             .chain(PARAKEET_CATALOG.iter().map(|(s, ..)| *s))
             .chain(std::iter::once("parakeet"))
+            .chain(SHERPA_CATALOG.iter().map(|(s, ..)| *s))
+            .chain([SHERPA_PARAKEET_ALIAS])
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -366,6 +370,8 @@ pub(crate) fn valid_model_specs() -> String {
             .iter()
             .map(|(s, ..)| *s)
             .chain(std::iter::once("parakeet"))
+            .chain(SHERPA_CATALOG.iter().map(|(s, ..)| *s))
+            .chain([SHERPA_PARAKEET_ALIAS])
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -424,6 +430,123 @@ pub(crate) fn parakeet_entry_for_spec(
     };
     PARAKEET_CATALOG.iter().find(|(s, ..)| *s == spec)
 }
+
+/// Which sherpa-onnx model family a `SHERPA_CATALOG` entry holds. Both run
+/// through `sherpa_onnx::OfflineRecognizer`; only the sub-config differs —
+/// transducer (encoder/decoder/joiner, `model_type = "nemo_transducer"`) vs
+/// Canary (encoder/decoder + src/tgt lang, `model_type` left empty, see
+/// `sherpa::build_offline_recognizer`). Canary has no catalog entry yet:
+/// sherpa-onnx 1.13.8 hardcodes Canary langs to en/de/es/fr
+/// (`offline-canary-model-config.cc:Validate`), so Canary-1B-v2 can't serve
+/// Polish until a released crate carries upstream's relaxed validation (any
+/// 2-letter code from `tokens.txt`, already on master) — the wiring stays
+/// for user-supplied dirs and that day. Sherpa-only (see the `sherpa` Cargo
+/// feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SherpaKind {
+    NemoTransducer,
+    Canary,
+}
+
+/// Sherpa-onnx weights, published as loose ONNX files: the official
+/// `csukuangfj` Parakeet-TDT-v3 int8 export
+/// (`encoder.int8.onnx`/`decoder.int8.onnx`/`joiner.int8.onnx`/`tokens.txt`)
+/// and the community `Sarphix` Canary-1B-v2 int8 export
+/// (`encoder.int8.onnx`/`decoder.int8.onnx`/`tokens.txt`, CC-BY-4.0 like its
+/// `nvidia/canary-1b-v2` source). Lived under `models/sherpa-*` (never
+/// `models/parakeet-*`) so the two runtimes' files can't collide:
+/// `parakeet-rs` wants `encoder-model.int8.onnx` + `vocab.txt`, sherpa wants
+/// `encoder.int8.onnx` + `tokens.txt`. Sherpa-only (see the `sherpa` Cargo
+/// feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_PARAKEET_BASE_URL: &str =
+    "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/";
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_CANARY_BASE_URL: &str =
+    "https://huggingface.co/Sarphix/canary-1b-v2-sherpa-onnx-int8/resolve/main/";
+/// Silero VAD model for sherpa streaming mode (sherpa endpoint owns the
+/// cuts — see `sherpa::spawn_sherpa_streaming_worker`). Downloaded once into
+/// `models/` on first streaming run. Sherpa-only (see the `sherpa` Cargo
+/// feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_VAD_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_VAD_FILE: &str = "silero_vad.onnx";
+
+/// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
+/// Parakeet-v3 int8 (~640 MiB, same weights as the `parakeet-rs` default in
+/// sherpa's container layout). Canary-1B-v2 int8 (~1.4 GiB) is deliberately
+/// absent — see `SherpaKind`. Sherpa-only (see the `sherpa` Cargo feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_CATALOG: &[(&str, &str, &[&str], &str, SherpaKind)] = &[
+    (
+        "sherpa-parakeet-tdt-0.6b-v3-int8",
+        "sherpa-parakeet-tdt-0.6b-v3-int8",
+        &[
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+            "joiner.int8.onnx",
+            "tokens.txt",
+        ],
+        "640 MiB",
+        SherpaKind::NemoTransducer,
+    ),
+];
+
+/// Short alias resolving to the int8 default above.
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_PARAKEET_ALIAS: &str = "sherpa-parakeet";
+
+/// Look up a `SHERPA_CATALOG` entry by spec, accepting the short alias.
+/// Sherpa-only (see the `sherpa` Cargo feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) fn sherpa_entry_for_spec(
+    spec: &str,
+) -> Option<&'static (&'static str, &'static str, &'static [&'static str], &'static str, SherpaKind)>
+{
+    let spec = if spec == SHERPA_PARAKEET_ALIAS {
+        "sherpa-parakeet-tdt-0.6b-v3-int8"
+    } else {
+        spec
+    };
+    SHERPA_CATALOG.iter().find(|(s, ..)| *s == spec)
+}
+
+/// Default Canary source/target language (ISO code, e.g. `pl`): transcription
+/// keeps src == tgt; override with `--sherpa-lang`. Parakeet-TDT auto-detects
+/// per utterance and ignores this. Sherpa-only (see the `sherpa` Cargo
+/// feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const DEFAULT_SHERPA_LANG: &str = "pl";
+
+/// Sherpa streaming VAD defaults (see `VadModelConfig`): Silero threshold,
+/// trailing-silence seconds that close a cut, minimum speech seconds that
+/// open one, and the force-cut ceiling (bounds interim-decode cost the same
+/// way `MAX_UTTERANCE_SAMPLES` bounds offline utterances). Override the
+/// first three with `--sherpa-vad-threshold`/`--sherpa-min-silence`/
+/// `--sherpa-min-speech`. Sherpa-only (see the `sherpa` Cargo feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const DEFAULT_SHERPA_VAD_THRESHOLD: f32 = 0.5;
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const DEFAULT_SHERPA_MIN_SILENCE: f32 = 0.5;
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const DEFAULT_SHERPA_MIN_SPEECH: f32 = 0.25;
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_VAD_MAX_SPEECH: f32 = 20.0;
+/// Silero window at 16 kHz (256/512/768 legal; 512 per sherpa's examples).
+/// Sherpa-only (see the `sherpa` Cargo feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_VAD_WINDOW: i32 = 512;
+/// Interim-partial cadence while speech is active (see
+/// `spawn_sherpa_streaming_worker`); only runs when `--sherpa-partials` is
+/// set, and never past `SHERPA_PARTIAL_MAX_SECS` of buffered audio.
+/// Sherpa-only (see the `sherpa` Cargo feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_PARTIAL_EVERY_SECS: f32 = 1.0;
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) const SHERPA_PARTIAL_MAX_SECS: f32 = 20.0;
 
 /// Default `initial_prompt`: primes Polish orthography/diacritics and English
 /// IT vocabulary, without a long keyword list. It used to carry many domain
@@ -680,6 +803,22 @@ pub(crate) fn parse_linear_rms(s: &str) -> Result<f32, String> {
     }
 }
 
+/// Parse a seconds duration for the sherpa streaming VAD
+/// (`--sherpa-min-silence`/`--sherpa-min-speech`): 0.05..=5.0 s. Sherpa-only
+/// (see the `sherpa` Cargo feature).
+#[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+pub(crate) fn parse_vad_secs(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number 0.05..=5.0 (seconds), got {s:?}"))?;
+    if (0.05..=5.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("expected a number 0.05..=5.0 (seconds), got {s:?}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +1032,47 @@ mod tests {
         assert!(specs.contains("large-v3-turbo-q8_0"));
         #[cfg(not(feature = "whisper"))]
         assert!(!specs.contains("large-v3-turbo-q8_0"));
+    }
+
+    #[test]
+    fn sherpa_catalog_entries_are_self_consistent() {
+        assert_eq!(SHERPA_CATALOG.len(), 1);
+        for (spec, dir, files, _size, _kind) in SHERPA_CATALOG {
+            assert_eq!(*dir, *spec, "dir must equal spec for {spec}");
+            assert!(!files.is_empty(), "{spec} must list at least one file");
+            assert!(
+                files.contains(&"tokens.txt"),
+                "{spec} must download tokens.txt"
+            );
+            assert_eq!(sherpa_entry_for_spec(spec).map(|e| e.0), Some(*spec));
+        }
+        // Transducer ships a joiner (Canary wiring stays for user-supplied
+        // dirs and the day upstream relaxes its lang validation — see
+        // `SherpaKind`).
+        let transducer = sherpa_entry_for_spec("sherpa-parakeet-tdt-0.6b-v3-int8").unwrap();
+        assert!(transducer.2.contains(&"joiner.int8.onnx"));
+        assert_eq!(transducer.4, SherpaKind::NemoTransducer);
+    }
+
+    #[test]
+    fn sherpa_aliases_resolve_to_int8_defaults() {
+        assert_eq!(
+            sherpa_entry_for_spec("sherpa-parakeet").map(|e| e.0),
+            Some("sherpa-parakeet-tdt-0.6b-v3-int8")
+        );
+        assert!(sherpa_entry_for_spec("sherpa-bogus").is_none());
+        assert!(sherpa_entry_for_spec("sherpa-canary").is_none());
+        assert_eq!(DEFAULT_SHERPA_LANG, "pl");
+    }
+
+    #[test]
+    fn parse_vad_secs_accepts_inner_range() {
+        assert_eq!(parse_vad_secs("0.25"), Ok(0.25));
+        assert_eq!(parse_vad_secs("0.5"), Ok(0.5));
+        assert_eq!(DEFAULT_SHERPA_MIN_SILENCE, 0.5);
+        assert_eq!(DEFAULT_SHERPA_MIN_SPEECH, 0.25);
+        assert!(parse_vad_secs("0.01").is_err());
+        assert!(parse_vad_secs("5.1").is_err());
+        assert!(parse_vad_secs("bogus").is_err());
     }
 }

@@ -137,6 +137,49 @@ impl FrameProcessor {
         self.utterance.close(&self.gate)
     }
 
+    /// Feed one raw hw-rate chunk for sherpa streaming mode.
+    ///
+    /// Same resampling, Hp, shared-gain Agc and earshot verdict as
+    /// `process_frame`, so levels and the warm noise floor behave
+    /// identically. The utterance buffer is bypassed (sherpa's VAD owns the
+    /// cuts); the post-AGC whisper-branch samples return directly for the
+    /// sample queue. The verdict only gates the AGC here, never segmentation.
+    #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+    pub(crate) fn process_frame_samples(&mut self, frame_hw_raw: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);
+        let mut out = Vec::new();
+        for (vad16, whisper16) in self.signal.feed(frame_hw_raw) {
+            let mut vad_frame = (*vad16).clone();
+            let mut whisper_frame = (*whisper16).clone();
+            let _pre_agc_rms =
+                self.agc
+                    .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
+            let is_speech = self.vad.verdict(&vad_frame);
+            self.prev_speech = is_speech;
+            out.extend_from_slice(&whisper_frame);
+        }
+        out
+    }
+
+    /// Flush resampler tail audio for sherpa streaming mode (see
+    /// `flush_trailing_speech` for the utterance equivalent): same AGC path
+    /// as `process_frame_samples`, returned as raw samples.
+    #[cfg_attr(not(feature = "sherpa"), allow(dead_code))]
+    pub(crate) fn flush_samples_streaming(&mut self) -> Vec<f32> {
+        let mut out = Vec::new();
+        for (vad16, whisper16) in self.signal.flush() {
+            let mut vad_frame = (*vad16).clone();
+            let mut whisper_frame = (*whisper16).clone();
+            let _pre_agc_rms =
+                self.agc
+                    .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
+            let is_speech = self.vad.verdict(&vad_frame);
+            self.prev_speech = is_speech;
+            out.extend_from_slice(&whisper_frame);
+        }
+        out
+    }
+
 
     /// Discard all in-flight audio for a pause/hold transition: signal-path
     /// queues + resampler/Hp state, Agc gain, VAD staging/latch, and the
@@ -203,6 +246,53 @@ mod tests {
             8.0,
         )
         .unwrap()
+    }
+
+    fn processor_at(hw_rate: u32) -> FrameProcessor {
+        FrameProcessor::new(
+            hw_rate,
+            DenoiserKind::Bypass,
+            0.5,
+            true,
+            GateConfig::new(0.003, 0.25, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG),
+            80,
+            0.0,
+            8.0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn streaming_samples_match_utterance_pair_totals() {
+        // `process_frame_samples` must return exactly the samples the
+        // utterance path would accumulate: same `signal.feed` calls, no
+        // utterance buffer in between. 22050 Hz sine over the full file
+        // length must resample to ~27200 16 kHz samples (same as the
+        // `pl1_short.wav` offline utterance transmitted).
+        use crate::dsp::hw_input_frames;
+        let hw_rate = 22_050;
+        let hw_chunk = hw_input_frames(hw_rate);
+        let total_hw = 37_485;
+        let mut fp = processor_at(hw_rate);
+        let mut out = 0usize;
+        let mut fed = 0usize;
+        while fed + hw_chunk <= total_hw {
+            // 440 Hz sine at 0.1 + DC offset (exercises the AGC path).
+            let chunk: Vec<f32> = (0..hw_chunk)
+                .map(|i| {
+                    let t = (fed + i) as f32 / hw_rate as f32;
+                    0.1 * (2.0 * std::f32::consts::PI * 440.0 * t).sin() + 0.05
+                })
+                .collect();
+            out += fp.process_frame_samples(&chunk).len();
+            fed += hw_chunk;
+        }
+        out += fp.flush_samples_streaming().len();
+        let expected = total_hw as f64 * 16_000.0 / hw_rate as f64;
+        assert!(
+            (out as f64 - expected).abs() < 640.0,
+            "out={out} expected~{expected:.0} (fed {fed}/{total_hw} hw samples)"
+        );
     }
 
     #[test]
