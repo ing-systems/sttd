@@ -99,10 +99,57 @@ pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
 pub(crate) const STRONG_RMS_FACTOR: f32 = 3.0;
 
 /// Whisper model auto-download. The URL is derived from the filename (see
-/// `ensure_available`), so `WHISPER_MODEL_PATH` can point at any
+/// `ensure_available`), so `--model` as an explicit path can point at any
 /// ggml model published in this repo, not just the compiled-in default.
 pub(crate) const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-pub(crate) const DEFAULT_MODEL_PATH: &str = "models/ggml-large-v3-turbo-q8_0.bin";
+pub(crate) const DEFAULT_MODELS_DIR: &str = "models";
+pub(crate) const DEFAULT_MODEL_SPEC: &str = "large-v3-turbo-q8_0";
+
+/// All `--model` symbolic specs (Polish-relevant, no `.en` variants),
+/// with their `ggml-*.bin` filename and upstream download size.
+/// `large-v1` has no quantized build upstream; `tiny`/`base`/`small` use
+/// `q5_1` while `medium`/`large-v2`/`large-v3`/`large-v3-turbo` use `q5_0`.
+pub(crate) const MODEL_CATALOG: &[(&str, &str, &str)] = &[
+    ("tiny", "ggml-tiny.bin", "75 MiB"),
+    ("tiny-q5_1", "ggml-tiny-q5_1.bin", "31 MiB"),
+    ("tiny-q8_0", "ggml-tiny-q8_0.bin", "42 MiB"),
+    ("base", "ggml-base.bin", "142 MiB"),
+    ("base-q5_1", "ggml-base-q5_1.bin", "57 MiB"),
+    ("base-q8_0", "ggml-base-q8_0.bin", "78 MiB"),
+    ("small", "ggml-small.bin", "466 MiB"),
+    ("small-q5_1", "ggml-small-q5_1.bin", "181 MiB"),
+    ("small-q8_0", "ggml-small-q8_0.bin", "252 MiB"),
+    ("medium", "ggml-medium.bin", "1.5 GiB"),
+    ("medium-q5_0", "ggml-medium-q5_0.bin", "514 MiB"),
+    ("medium-q8_0", "ggml-medium-q8_0.bin", "785 MiB"),
+    ("large-v1", "ggml-large-v1.bin", "2.9 GiB"),
+    ("large-v2", "ggml-large-v2.bin", "2.9 GiB"),
+    ("large-v2-q5_0", "ggml-large-v2-q5_0.bin", "1.1 GiB"),
+    ("large-v2-q8_0", "ggml-large-v2-q8_0.bin", "1.5 GiB"),
+    ("large-v3", "ggml-large-v3.bin", "2.9 GiB"),
+    ("large-v3-q5_0", "ggml-large-v3-q5_0.bin", "1.1 GiB"),
+    ("large-v3-turbo", "ggml-large-v3-turbo.bin", "1.5 GiB"),
+    ("large-v3-turbo-q5_0", "ggml-large-v3-turbo-q5_0.bin", "547 MiB"),
+    ("large-v3-turbo-q8_0", "ggml-large-v3-turbo-q8_0.bin", "834 MiB"),
+];
+
+/// Filename for a catalog `spec` (e.g. `base-q5_1` ->
+/// `ggml-base-q5_1.bin`), or `None` when the spec is unknown.
+pub(crate) fn model_file_for_spec(spec: &str) -> Option<&'static str> {
+    MODEL_CATALOG
+        .iter()
+        .find(|(s, _, _)| *s == spec)
+        .map(|(_, f, _)| *f)
+}
+
+/// Comma-separated valid specs for `--model` error messages.
+pub(crate) fn valid_model_specs() -> String {
+    MODEL_CATALOG
+        .iter()
+        .map(|(s, _, _)| *s)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Default `initial_prompt`: primes Polish orthography/diacritics only.
 /// Used to carry a long list of IT vocabulary (Kubernetes, Docker, ...), but
@@ -184,5 +231,27 @@ mod tests {
             n_len_org >= 100,
             "WHISPER_MIN_SAMPLES={WHISPER_MIN_SAMPLES} only yields {n_len_org} 10ms mel frames, whisper.cpp requires >= 100"
         );
+    }
+
+    #[test]
+    fn model_catalog_has_default_and_no_english_variants() {
+        assert_eq!(DEFAULT_MODEL_SPEC, "large-v3-turbo-q8_0");
+        assert_eq!(DEFAULT_MODELS_DIR, "models");
+        assert_eq!(MODEL_CATALOG.len(), 21);
+        for (spec, file, _) in MODEL_CATALOG {
+            assert!(
+                !spec.contains(".en"),
+                "English-only variant must not be listed: {spec}"
+            );
+            assert_eq!(*file, format!("ggml-{spec}.bin"));
+            assert_eq!(model_file_for_spec(spec), Some(*file));
+        }
+        assert_eq!(
+            model_file_for_spec(DEFAULT_MODEL_SPEC),
+            Some("ggml-large-v3-turbo-q8_0.bin")
+        );
+        assert!(model_file_for_spec("tiny-q5_0").is_none());
+        assert!(model_file_for_spec("medium-q5_1").is_none());
+        assert!(model_file_for_spec("bogus").is_none());
     }
 }

@@ -31,8 +31,10 @@
 //! `sttd --file <wav>` runs the same pipeline offline against a WAV file
 //! instead of the microphone, for comparing tuning changes against a fixed
 //! recording. `sttd --list-devices` prints available input devices.
-//! Every tunable is a CLI flag with `STTD_*` / `WHISPER_MODEL_PATH` env
-//! fallback (see `--help`); CLI wins over env.
+//! `sttd --list-models` prints known whisper models with installed/default
+//! markers. Every tunable is a CLI flag with `STTD_*` env
+//! fallback (see `--help`); CLI wins over env. `--model` additionally honors
+//! the legacy `WHISPER_MODEL_PATH` when `STTD_MODEL` is unset.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +50,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 mod cli;
 use cli::Cli;
 mod config;
+use config::{DEFAULT_MODELS_DIR, DEFAULT_MODEL_SPEC, MODEL_CATALOG};
 mod capture;
 use capture::*;
 mod denoise;
@@ -74,11 +77,33 @@ fn main() -> Result<()> {
     if cli.list_devices {
         return print_input_devices();
     }
+    if cli.list_models {
+        print_available_models();
+        return Ok(());
+    }
     if let Some(path) = cli.file.clone() {
         return run_file_mode(&path, &cli);
     }
 
     run_microphone_mode(&cli)
+}
+
+/// Print known whisper models (`MODEL_CATALOG`) with installed/default
+/// markers to stdout: `spec filename remote-size [installed] [*default*]`.
+/// "installed" means `models/<filename>` exists on disk.
+fn print_available_models() {
+    for (spec, file, size) in MODEL_CATALOG {
+        let installed =
+            Path::new(DEFAULT_MODELS_DIR).join(file).exists();
+        let mut markers = String::new();
+        if installed {
+            markers.push_str(" installed");
+        }
+        if *spec == DEFAULT_MODEL_SPEC {
+            markers.push_str(" *default*");
+        }
+        println!("{spec} {file} {size}{markers}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +176,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
     // ---- now the heavy part: resolve/download the model and load it onto
     // the GPU on its own thread. Capture is already running above.
-    let model_path = ensure_available(&cli.model)?;
+    let model_path = resolve_model_input(cli)?;
     eprintln!("[sttd] model: {}", model_path.display());
     let whisper_handle = spawn_whisper_worker(whisper_rx, model_path, whisper_options(cli));
 
@@ -223,7 +248,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     )?;
     let input_frames = fp.required_input_frames();
 
-    let model_path = ensure_available(&cli.model)?;
+    let model_path = resolve_model_input(cli)?;
     eprintln!("[sttd] model: {}", model_path.display());
     let whisper_handle = spawn_whisper_worker(whisper_rx, model_path, whisper_options(cli));
 
@@ -240,6 +265,15 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     drop(whisper_tx);
     whisper_handle.join().ok();
     Ok(())
+}
+
+/// Resolve `--model` (spec or path) to a guaranteed-present file path:
+/// spec mapping first (`resolve_model_path`), then download-if-missing
+/// (`ensure_available`).
+fn resolve_model_input(cli: &Cli) -> Result<std::path::PathBuf> {
+    let input = cli.model_input();
+    let path = resolve_model_path(&input)?;
+    ensure_available(&path)
 }
 
 fn whisper_options(cli: &Cli) -> WhisperOptions {

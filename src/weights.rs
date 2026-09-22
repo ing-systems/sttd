@@ -2,7 +2,28 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config::MODEL_BASE_URL;
+use crate::config::{DEFAULT_MODELS_DIR, MODEL_BASE_URL, model_file_for_spec, valid_model_specs};
+
+/// Resolve a `--model` value to a filesystem path: an explicit path
+/// (contains a path separator or ends in `.bin`) passes through untouched,
+/// otherwise the value must be a catalog spec (see `MODEL_CATALOG`) and maps
+/// to `models/ggml-<spec>.bin`.
+pub(crate) fn resolve_model_path(input: &str) -> Result<PathBuf> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty --model value; expected one of: {}", valid_model_specs());
+    }
+    if trimmed.ends_with(".bin") || trimmed.contains('/') || trimmed.contains('\\') {
+        return Ok(PathBuf::from(trimmed));
+    }
+    if let Some(file) = model_file_for_spec(trimmed) {
+        return Ok(PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{file}")));
+    }
+    anyhow::bail!(
+        "unknown model {trimmed:?}; expected a path (*.bin) or one of: {}",
+        valid_model_specs()
+    );
+}
 
 /// `model`, guaranteed to exist on return: downloads the model into
 /// place if it isn't already there.
@@ -85,11 +106,13 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DEFAULT_MODEL_PATH, MODEL_BASE_URL};
+    use crate::config::MODEL_BASE_URL;
 
     #[test]
     fn default_model_is_quantized_q8() {
-        let file_name = Path::new(DEFAULT_MODEL_PATH)
+        let resolved = resolve_model_path(crate::config::DEFAULT_MODEL_SPEC)
+            .expect("default spec must resolve");
+        let file_name = resolved
             .file_name()
             .and_then(|n| n.to_str())
             .expect("default model path has a filename");
@@ -119,6 +142,54 @@ mod tests {
             "",
         ] {
             assert!(download_url(file_name).is_none(), "must reject {file_name:?}");
+        }
+    }
+
+    #[test]
+    fn specs_resolve_into_models_dir() {
+        for (spec, file) in [
+            ("tiny", "models/ggml-tiny.bin"),
+            ("base-q5_1", "models/ggml-base-q5_1.bin"),
+            ("small", "models/ggml-small.bin"),
+            ("medium-q5_0", "models/ggml-medium-q5_0.bin"),
+            ("large-v3-turbo-q8_0", "models/ggml-large-v3-turbo-q8_0.bin"),
+            ("large-v3-turbo", "models/ggml-large-v3-turbo.bin"),
+        ] {
+            assert_eq!(
+                resolve_model_path(spec).expect("known spec must resolve"),
+                PathBuf::from(file),
+                "spec={spec}"
+            );
+        }
+        assert_eq!(
+            resolve_model_path(crate::config::DEFAULT_MODEL_SPEC)
+                .expect("default spec must resolve"),
+            PathBuf::from("models/ggml-large-v3-turbo-q8_0.bin")
+        );
+    }
+
+    #[test]
+    fn paths_pass_through_untouched() {
+        for path in [
+            "models/custom.bin",
+            "models/ggml-large-v3-turbo-q8_0.bin",
+            "/abs/models/ggml-base.bin",
+            "custom/ggml-tiny.bin",
+        ] {
+            assert_eq!(
+                resolve_model_path(path).expect("path must pass through"),
+                PathBuf::from(path),
+                "path={path}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_specs_are_rejected_with_valid_list() {
+        for bad in ["", "   ", "tiny-q5_0", "medium-q5_1", "large-v1-q8_0", "huge", "tiny.en"] {
+            let err = resolve_model_path(bad).expect_err("must reject");
+            let msg = err.to_string();
+            assert!(msg.contains("large-v3-turbo-q8_0"), "msg={msg}");
         }
     }
 }
