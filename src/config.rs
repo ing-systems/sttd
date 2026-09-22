@@ -115,6 +115,18 @@ pub(crate) const EARLY_SPLIT_QUIET_FRAMES: u32 = 5;
 /// RMS below which a 10 ms frame counts as quiet for the low-energy early
 /// split above (~-50 dBFS, same neighborhood as `DEFAULT_MIN_SPEECH_RMS`).
 pub(crate) const EARLY_SPLIT_QUIET_RMS: f32 = 0.003;
+/// Interim split: past 8 s of open speech, a 300 ms VAD pause already emits
+/// the prefix as its own utterance instead of waiting for the full
+/// `--hangover-ms`. The speaker's continuation starts a fresh utterance
+/// (pre-roll spans the boundary), so long monologues stream out in pieces
+/// while the model works through the backlog instead of one 30 s block.
+pub(crate) const INTERIM_SPLIT_SAMPLES: usize = WHISPER_RATE as usize * 8;
+/// Pause length that triggers the interim split above: 30 x 10 ms frames.
+pub(crate) const INTERIM_SPLIT_SILENCE_FRAMES: u32 = 30;
+/// Inference seconds per audio second above which `transcribe_and_emit`
+/// warns: the model is slower than realtime and the backlog (plus shedding)
+/// will grow. See the `--metrics` `rtf` column for per-utterance data.
+pub(crate) const RTF_WARN_RTF: f64 = 1.0;
 /// Minimum RMS amplitude across an utterance's VAD-flagged speech frames
 /// (silence padding excluded). Catches transient VAD false positives that
 /// pass `ONSET_SPEECH_FRAMES`/`MIN_SPEECH_FRAMES` but carry essentially no
@@ -582,6 +594,16 @@ mod tests {
     fn silence_threshold_is_800ms() {
         assert_eq!(SILENCE_FRAMES_THRESHOLD, 80);
         assert_eq!(SILENCE_FRAMES_THRESHOLD * 10, 800);
+    }
+
+    #[test]
+    fn interim_split_is_8s_with_300ms_pause() {
+        assert_eq!(INTERIM_SPLIT_SAMPLES, WHISPER_RATE as usize * 8);
+        assert_eq!(INTERIM_SPLIT_SILENCE_FRAMES, 30);
+        assert_eq!(INTERIM_SPLIT_SILENCE_FRAMES * 10, 300);
+        assert!(INTERIM_SPLIT_SAMPLES < EARLY_SPLIT_SAMPLES);
+        assert!(INTERIM_SPLIT_SAMPLES < MAX_UTTERANCE_SAMPLES);
+        assert_eq!(RTF_WARN_RTF, 1.0);
     }
 
     #[test]

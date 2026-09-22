@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 
 use crate::config::{
     EARLY_SPLIT_QUIET_FRAMES, EARLY_SPLIT_QUIET_RMS, EARLY_SPLIT_SAMPLES,
-    EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, MAX_UTTERANCE_SAMPLES, MIC_CLIP_RATIO, MIC_CLIP_SAMPLE,
-    MIC_LOW_PEAK, ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES, PREROLL_TRIM_FACTOR,
-    PREROLL_TRIM_FLOOR, RING_FRAMES, SILENCE_FRAMES_THRESHOLD, STRONG_RMS_FACTOR, TAIL_MAX_SAMPLES,
-    TAIL_MIN_SAMPLES,
+    EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, INTERIM_SPLIT_SAMPLES, INTERIM_SPLIT_SILENCE_FRAMES,
+    MAX_UTTERANCE_SAMPLES, MIC_CLIP_RATIO, MIC_CLIP_SAMPLE, MIC_LOW_PEAK, ONSET_SPEECH_FRAMES,
+    PREROLL_SAFETY_FRAMES, PREROLL_TRIM_FACTOR, PREROLL_TRIM_FLOOR, RING_FRAMES,
+    SILENCE_FRAMES_THRESHOLD, STRONG_RMS_FACTOR, TAIL_MAX_SAMPLES, TAIL_MIN_SAMPLES,
 };
 use crate::gate::GateConfig;
 
@@ -240,6 +240,13 @@ impl UtteranceBuffer {
                 // energy dip — in progress: cut here (in quiet) instead of
                 // riding into the hard cap and cutting mid-word. `close`
                 // still trims to last speech + adaptive tail.
+                FrameAction::Flush
+            } else if self.buf.len() >= INTERIM_SPLIT_SAMPLES
+                && self.silence_frames >= INTERIM_SPLIT_SILENCE_FRAMES
+            {
+                // Long monologue with a 300 ms pause in progress: emit the
+                // prefix now instead of growing one 30 s block. The
+                // continuation starts fresh (pre-roll spans the boundary).
                 FrameAction::Flush
             } else {
                 FrameAction::Continue
@@ -507,10 +514,10 @@ mod tests {
     use crate::config::{
         DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
         DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES, EARLY_SPLIT_QUIET_FRAMES,
-        EARLY_SPLIT_SAMPLES, EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, MAX_UTTERANCE_SAMPLES,
-        MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES, RING_FRAMES,
-        SILENCE_FRAMES_THRESHOLD, STRONG_RMS_FACTOR, TAIL_KEEP_SAMPLES, TAIL_MAX_SAMPLES,
-        TAIL_MIN_SAMPLES,
+        EARLY_SPLIT_SAMPLES, EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, INTERIM_SPLIT_SAMPLES,
+        INTERIM_SPLIT_SILENCE_FRAMES, MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES,
+        ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES, RING_FRAMES, SILENCE_FRAMES_THRESHOLD,
+        STRONG_RMS_FACTOR, TAIL_KEEP_SAMPLES, TAIL_MAX_SAMPLES, TAIL_MIN_SAMPLES,
     };
 
     fn gate_for(min_rms: f32, min_density: f32) -> GateConfig {
@@ -998,5 +1005,47 @@ mod tests {
         assert!((clip - 1.0).abs() < 1e-6);
         assert!(MIC_LOW_PEAK > 0.0);
         assert_eq!(EARLY_SPLIT_QUIET_FRAMES, 5);
+    }
+
+    #[test]
+    fn interim_split_emits_prefix_past_8s() {
+        // Past 8 s, a 300 ms VAD pause emits the prefix instead of growing
+        // one 30 s block; the same pause below 8 s is just padding.
+        assert!(INTERIM_SPLIT_SAMPLES < EARLY_SPLIT_SAMPLES);
+        assert_eq!(INTERIM_SPLIT_SILENCE_FRAMES * 10, 300);
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..(INTERIM_SPLIT_SAMPLES / FRAME_16K + 5) {
+            buffer.push_frame(&speech, true);
+        }
+        assert!(buffer.buf.len() >= INTERIM_SPLIT_SAMPLES);
+        assert!(buffer.buf.len() < EARLY_SPLIT_SAMPLES);
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(INTERIM_SPLIT_SILENCE_FRAMES - 1) {
+            assert_eq!(buffer.push_frame(&silence, false), FrameAction::Continue);
+        }
+        assert_eq!(
+            buffer.push_frame(&silence, false),
+            FrameAction::Flush,
+            "300 ms pause past 8 s must emit the prefix early"
+        );
+        let utterance = buffer.close(&gate_for(0.0, 0.0)).unwrap();
+        assert!(utterance.pcm.len() < MAX_UTTERANCE_SAMPLES);
+        assert!(!buffer.is_open());
+    }
+
+    #[test]
+    fn interim_pause_below_window_does_not_split() {
+        // Same 300 ms pause at small sizes stays in-utterance padding.
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..100 {
+            buffer.push_frame(&speech, true);
+        }
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..INTERIM_SPLIT_SILENCE_FRAMES {
+            assert_eq!(buffer.push_frame(&silence, false), FrameAction::Continue);
+        }
+        assert!(buffer.is_open());
     }
 }

@@ -23,7 +23,7 @@
 //! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper,
 //! carried alongside its acoustic evidence (speech-frame count, density, RMS) as an
 //! `Utterance` -> `rtrb` queue (raw samples bounded with counted
-//! sheds; utterances shed oldest-first past `WHISPER_SHED_KEEP`) -> isolated
+//! sheds; utterances shed weakest-first past `WHISPER_SHED_KEEP`) -> isolated
 //! `whisper-rs` inference
 //! thread (GPU/CPU and model per flags, aborted promptly on shutdown):
 //! conditioning (`condition_utterance`:
@@ -246,7 +246,7 @@ fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
 
 /// Push a closed utterance into the bounded whisper ring. Never blocks the
 /// processing loop: a full ring drops the newest with a warn (in practice the
-/// worker-side oldest-first shed keeps the backlog small so this rarely
+/// worker-side weakest-first shed keeps the backlog small so this rarely
 /// fires). A dead worker (`is_abandoned`) is also just a warn.
 fn push_utterance(whisper_tx: &mut Producer<Utterance>, utterance: Utterance) {
     if whisper_tx.is_abandoned() {
@@ -287,7 +287,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // overflow sheds counted samples instead of growing memory without
     // bound). Created inside `open_input_path` once the hw rate is known.
     // Utterance queue is bounded (`WHISPER_QUEUE_CAP`, each utterance seconds
-    // of audio) and the whisper worker sheds oldest-first past
+    // of audio) and the whisper worker sheds weakest-first past
     // `WHISPER_SHED_KEEP` so live speech stays fresh instead of lagging
     // minutes behind.
     let (mut whisper_tx, whisper_rx) =

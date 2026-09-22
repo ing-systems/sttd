@@ -87,9 +87,9 @@ pub(crate) struct WhisperOptions {
     pub(crate) shed_stale: bool,
 }
 
-/// Backlog past which the loaded loop sheds oldest-first (see
-/// `WHISPER_QUEUE` rationale in `run_microphone_mode`): live speech stays
-/// fresh instead of transcribing minutes-late audio.
+/// Backlog past which the loaded loop sheds the weakest utterances (see
+/// `shed_survivors`): live speech stays fresh instead of transcribing
+/// minutes-late noise.
 pub(crate) const WHISPER_SHED_KEEP: usize = 4;
 
 /// Bounded `rtrb` capacity for the utterance queue. utterances are seconds of
@@ -399,55 +399,76 @@ fn whisper_init_and_run(
                     if utterance.pcm.is_empty() {
                         continue;
                     }
-                    // Backlogged GPU: shed oldest-first so the transcript that
-                    // follows is fresh, not minutes late. `utterance` (already
-                    // popped, the oldest) is still transcribed; the remainder
-                    // is trimmed to the newest `WHISPER_SHED_KEEP`.
-                    if shed_stale {
-                        let mut shed = 0usize;
-                        while rx.slots() > WHISPER_SHED_KEEP {
-                            match rx.pop() {
-                                Ok(_) => shed += 1,
-                                Err(_) => break,
-                            }
+                    // Backlogged GPU: shed the weakest utterances (lowest
+                    // density, then lowest rms) so the transcripts that
+                    // follow are the best evidence, not minutes-late noise.
+                    // Survivors transcribe in arrival order so prompt
+                    // context stays chronological (see `shed_survivors`).
+                    let backlog = if shed_stale && rx.slots() > WHISPER_SHED_KEEP {
+                        let mut backlog = vec![utterance];
+                        while let Ok(u) = rx.pop() {
+                            backlog.push(u);
                         }
+                        let scores: Vec<(f32, f32)> = backlog
+                            .iter()
+                            .map(|u| (u.evidence.density(), u.evidence.rms))
+                            .collect();
+                        let keep = shed_survivors(&scores, WHISPER_SHED_KEEP);
+                        let shed = backlog.len() - keep.len();
                         if shed > 0 {
                             log::warn!(
-                                "shed {shed} stale utterance(s): whisper outruns real time"
+                                "shed {shed} low-quality utterance(s): whisper outruns real time \
+                                 (kept {keep} best of {total})",
+                                keep = keep.len(),
+                                total = backlog.len(),
                             );
                         }
-                    }
-                    utterance_no += 1;
-                    let emitted = transcribe_and_emit(
-                        &mut state,
-                        token_beg,
-                        &utterance,
-                        utterance_no,
-                        &prompt,
-                        &mut prompt_tail,
-                        prompt_context_chars,
-                        language,
-                        &gate,
-                        target_rms,
-                        debug_tokens,
-                        beam_size,
-                        temperature,
-                        temperature_inc,
-                        entropy_thold,
-                        logprob_thold,
-                        n_threads,
-                        running,
-                        emitter,
-                        &mut metrics,
-                    );
-                    if should_autopause(autopause_enabled, emitted) {
-                        paused.store(true, Ordering::Release);
-                        was_paused = true;
-                        log::info!(
-                            "autopaused after utt_{utterance_no:06} (--autopause, single-shot)"
+                        let mut survivors = Vec::with_capacity(keep.len());
+                        for (i, u) in backlog.into_iter().enumerate() {
+                            if keep.contains(&i) {
+                                survivors.push(u);
+                            }
+                        }
+                        survivors
+                    } else {
+                        vec![utterance]
+                    };
+                    for utterance in backlog {
+                        if utterance.pcm.is_empty() {
+                            continue;
+                        }
+                        utterance_no += 1;
+                        let emitted = transcribe_and_emit(
+                            &mut state,
+                            token_beg,
+                            &utterance,
+                            utterance_no,
+                            &prompt,
+                            &mut prompt_tail,
+                            prompt_context_chars,
+                            language,
+                            &gate,
+                            target_rms,
+                            debug_tokens,
+                            beam_size,
+                            temperature,
+                            temperature_inc,
+                            entropy_thold,
+                            logprob_thold,
+                            n_threads,
+                            running,
+                            emitter,
+                            &mut metrics,
                         );
-                        if sound_enabled {
-                            crate::sound::play_paused();
+                        if should_autopause(autopause_enabled, emitted) {
+                            paused.store(true, Ordering::Release);
+                            was_paused = true;
+                            log::info!(
+                                "autopaused after utt_{utterance_no:06} (--autopause, single-shot)"
+                            );
+                            if sound_enabled {
+                                crate::sound::play_paused();
+                            }
                         }
                     }
                 }
@@ -906,6 +927,13 @@ fn transcribe_and_emit(
         running,
     );
     let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let (audio_sec, rtf) = infer_rtf(utterance.pcm.len(), infer_ms);
+    if rtf > crate::config::RTF_WARN_RTF {
+        log::warn!(
+            "{tag}: inference slower than realtime (rtf={rtf:.2}, {infer_ms:.0} ms for \
+             {audio_sec:.1} s audio): consider a smaller --model, --threads 0, or GPU"
+        );
+    }
     match result {
         Ok(t) => {
             let trimmed = t.text.trim();
@@ -1442,33 +1470,6 @@ mod tests {
     }
 
     #[test]
-    fn weak_evidence_keeps_strict_gate() {
-        // Regression for the hole 71c05b0 closed: an utterance with barely
-        // enough VAD-flagged speech to survive `close`'s own gates, and RMS
-        // just above the noise floor, must still face the strict confidence
-        // floor — even at the same avg_p (0.478) that the strong-evidence
-        // case above lets through.
-        let evidence = Evidence {
-            speech_frames: MIN_SPEECH_FRAMES,
-            total_frames: 131,
-            rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
-        };
-        let gate = GateConfig::new(
-            DEFAULT_MIN_SPEECH_RMS,
-            DEFAULT_MIN_DENSITY,
-            DEFAULT_MIN_CONFIDENCE,
-            DEFAULT_MIN_CONFIDENCE_STRONG,
-        );
-        let (floor, strength) = gate.floor_for(evidence.speech_frames, evidence.rms);
-        assert_eq!(strength, EvidenceStrength::Weak);
-        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE);
-        assert!(
-            0.478 < floor,
-            "avg_p=0.478 must NOT clear the strict threshold {floor}"
-        );
-    }
-
-    #[test]
     fn verdict_slug_covers_every_disposition() {
         use crate::gate::{EvidenceStrength, TranscriptDropKind, TranscriptVerdict};
         assert_eq!(
@@ -1560,6 +1561,61 @@ mod tests {
         assert!((rtf - 0.25).abs() < 1e-9);
         // Empty audio never divides by zero.
         assert_eq!(infer_rtf(0, 100.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn shed_survivors_keep_best_by_density_then_rms() {
+        // 6 backlogged, keep 4: the two weakest densities drop, order stays
+        // chronological for prompt context.
+        let scores = vec![
+            (0.9, 0.02), // 0 keep
+            (0.1, 0.05), // 1 drop (worst density)
+            (0.8, 0.02), // 2 keep
+            (0.2, 0.01), // 3 drop
+            (0.7, 0.02), // 4 keep
+            (0.6, 0.03), // 5 keep
+        ];
+        assert_eq!(shed_survivors(&scores, 4), vec![0, 2, 4, 5]);
+        // No backlog: everything survives.
+        assert_eq!(shed_survivors(&scores, 10), vec![0, 1, 2, 3, 4, 5]);
+        assert!(shed_survivors(&scores, 0).is_empty());
+    }
+
+    #[test]
+    fn shed_survivors_break_ties_toward_newer() {
+        // Identical quality: the newest two of three survive.
+        let scores = vec![(0.5, 0.02), (0.5, 0.02), (0.5, 0.02)];
+        assert_eq!(shed_survivors(&scores, 2), vec![1, 2]);
+        // Same density: higher rms wins.
+        let scores = vec![(0.5, 0.01), (0.5, 0.03)];
+        assert_eq!(shed_survivors(&scores, 1), vec![1]);
+    }
+
+    #[test]
+    fn weak_evidence_keeps_strict_gate() {
+        // Regression for the hole 71c05b0 closed: an utterance with barely
+        // enough VAD-flagged speech to survive `close`'s own gates, and RMS
+        // just above the noise floor, must still face the strict confidence
+        // floor — even at the same avg_p (0.478) that the strong-evidence
+        // case above lets through.
+        let evidence = Evidence {
+            speech_frames: MIN_SPEECH_FRAMES,
+            total_frames: 131,
+            rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
+        };
+        let gate = GateConfig::new(
+            DEFAULT_MIN_SPEECH_RMS,
+            DEFAULT_MIN_DENSITY,
+            DEFAULT_MIN_CONFIDENCE,
+            DEFAULT_MIN_CONFIDENCE_STRONG,
+        );
+        let (floor, strength) = gate.floor_for(evidence.speech_frames, evidence.rms);
+        assert_eq!(strength, EvidenceStrength::Weak);
+        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE);
+        assert!(
+            0.478 < floor,
+            "avg_p=0.478 must NOT clear the strict threshold {floor}"
+        );
     }
 
     #[test]
