@@ -79,6 +79,7 @@ impl FrameProcessor {
         }
     }
 
+
     /// Discard all in-flight audio for a pause transition: signal-path
     /// queues + resampler state, VAD staging/latch, and the utterance buffer
     /// including pre-roll. Idempotent; discarding an already-empty pipeline

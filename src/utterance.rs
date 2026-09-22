@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::config::{
-    FRAME_16K, MAX_UTTERANCE_SAMPLES, ONSET_SPEECH_FRAMES, RING_FRAMES, SILENCE_FRAMES_THRESHOLD,
-    TAIL_KEEP_SAMPLES,
+    EARLY_SPLIT_SAMPLES, EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, MAX_UTTERANCE_SAMPLES,
+    ONSET_SPEECH_FRAMES, RING_FRAMES, SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
 };
 use crate::gate::GateConfig;
 
@@ -154,6 +154,11 @@ impl UtteranceBuffer {
             self.silence_frames += 1;
             if self.silence_frames > SILENCE_FRAMES_THRESHOLD {
                 FrameAction::Flush
+            } else if self.buf.len() >= EARLY_SPLIT_SAMPLES && self.silence_frames >= EARLY_SPLIT_SILENCE_FRAMES {
+                // Near whisper's 30 s cap with a real pause in progress: cut
+                // here (in silence) instead of riding into the hard cap and
+                // cutting mid-word. `close` still trims to last speech + tail.
+                FrameAction::Flush
             } else {
                 FrameAction::Continue
             }
@@ -265,7 +270,8 @@ mod tests {
     use super::*;
     use crate::config::{
         DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-        DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES, FRAME_16K, MIN_SPEECH_FRAMES,
+        DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES, EARLY_SPLIT_SAMPLES,
+        EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES,
         ONSET_SPEECH_FRAMES, SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
     };
 
@@ -529,6 +535,48 @@ mod tests {
         };
         let utterance = long.close(&gate_for(0.0, 0.0)).unwrap();
         assert_eq!(utterance.pcm.len(), 5_000);
+    }
+
+    #[test]
+    fn near_cap_pause_splits_early_in_silence() {
+        // Past 28 s, a 100 ms pause already closes: the cut lands in silence
+        // instead of riding into the 30 s hard cap mid-word.
+        assert!(EARLY_SPLIT_SAMPLES < MAX_UTTERANCE_SAMPLES);
+        assert_eq!(EARLY_SPLIT_SILENCE_FRAMES * 10, 100);
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..(EARLY_SPLIT_SAMPLES / FRAME_16K + 5) {
+            buffer.push_frame(&speech, true);
+        }
+        assert!(buffer.buf.len() >= EARLY_SPLIT_SAMPLES);
+        assert!(buffer.buf.len() < MAX_UTTERANCE_SAMPLES);
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(EARLY_SPLIT_SILENCE_FRAMES - 1) {
+            assert_eq!(buffer.push_frame(&silence, false), FrameAction::Continue);
+        }
+        assert_eq!(
+            buffer.push_frame(&silence, false),
+            FrameAction::Flush,
+            "100 ms pause past 28 s must close early"
+        );
+        let utterance = buffer.close(&gate_for(0.0, 0.0)).unwrap();
+        assert!(utterance.pcm.len() <= MAX_UTTERANCE_SAMPLES);
+        assert!(!buffer.is_open());
+    }
+
+    #[test]
+    fn short_pause_below_window_does_not_split() {
+        // Same 90 ms pause at small sizes is just in-utterance padding.
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..100 {
+            buffer.push_frame(&speech, true);
+        }
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..9 {
+            assert_eq!(buffer.push_frame(&silence, false), FrameAction::Continue);
+        }
+        assert!(buffer.is_open());
     }
 
     #[test]

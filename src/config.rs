@@ -54,6 +54,13 @@ pub(crate) const TAIL_KEEP_SAMPLES: usize = 3_200; // 200 ms @ 16 kHz
 pub(crate) const WHISPER_MIN_SAMPLES: usize = 16_400;
 /// Force-flush long speech even without silence (whisper is ~30 s max).
 pub(crate) const MAX_UTTERANCE_SAMPLES: usize = WHISPER_RATE as usize * 30;
+/// Soft-split window: past 28 s, a 100 ms+ pause already closes the utterance
+/// (see `UtteranceBuffer`), so the cut lands in silence instead of riding
+/// into the hard 30 s cap mid-word. Must stay below `MAX_UTTERANCE_SAMPLES`
+/// with enough margin for the pause itself.
+pub(crate) const EARLY_SPLIT_SAMPLES: usize = WHISPER_RATE as usize * 28;
+/// Pause length that triggers the early split above: 10 x 10 ms frames.
+pub(crate) const EARLY_SPLIT_SILENCE_FRAMES: u32 = 10;
 /// Minimum RMS amplitude across an utterance's VAD-flagged speech frames
 /// (silence padding excluded). Catches transient VAD false positives that
 /// pass `ONSET_SPEECH_FRAMES`/`MIN_SPEECH_FRAMES` but carry essentially no
