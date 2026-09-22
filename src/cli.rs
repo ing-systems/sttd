@@ -263,6 +263,18 @@ pub(crate) struct Cli {
     )]
     pub(crate) debug_tokens: bool,
 
+    /// Append one JSON object per transcribed utterance to this file
+    /// (tag, audio length, inference time, RTF, acoustic evidence,
+    /// confidence, verdict, text). For offline tuning and regression
+    /// analysis; transcription never depends on it (open errors only warn).
+    #[arg(
+        long,
+        env = "STTD_METRICS",
+        value_name = "PATH",
+        help_heading = "Runtime"
+    )]
+    pub(crate) metrics: Option<PathBuf>,
+
     /// Start microphone mode as a background daemon (fork, detach, pid
     /// file, combined stdout+stderr log). Parent prints the pid/log paths
     /// and exits; the child keeps running past terminal close.
@@ -449,6 +461,7 @@ mod tests {
         assert!(!cli.status);
         assert_eq!(cli.pid_file, None);
         assert_eq!(cli.log_file, None);
+        assert_eq!(cli.metrics, None);
         assert!(!cli.auto_unload);
         assert_eq!(cli.auto_unload, DEFAULT_AUTO_UNLOAD);
         assert_eq!(cli.auto_unload_after, DEFAULT_AUTO_UNLOAD_AFTER_SECS);

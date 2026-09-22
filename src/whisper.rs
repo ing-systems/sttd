@@ -78,6 +78,10 @@ pub(crate) struct WhisperOptions {
     pub(crate) logprob_thold: f32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
+    /// Append per-utterance JSON metrics here when `Some` (see `--metrics`).
+    /// Opened by the worker at startup; open errors only warn, never fail
+    /// transcription.
+    pub(crate) metrics_path: Option<PathBuf>,
     /// Shed oldest-first past `WHISPER_SHED_KEEP` (microphone mode). File
     /// mode sets false: offline decoding must be lossless.
     pub(crate) shed_stale: bool,
@@ -258,6 +262,9 @@ fn whisper_init_and_run(
     let use_gpu = opts.use_gpu;
     let model_spec = opts.model_spec.clone();
     let unload_after = Duration::from_secs(auto_unload_after_secs);
+    // Observability only: a broken metrics path must never take down
+    // transcription, so open errors warn once and disable the log.
+    let mut metrics = open_metrics_log(opts.metrics_path.as_deref());
 
     let mut first_load = true;
     let mut utterance_no: u64 = 0;
@@ -361,6 +368,7 @@ fn whisper_init_and_run(
                 n_threads,
                 running,
                 emitter,
+                &mut metrics,
             );
             if should_autopause(autopause_enabled, emitted) {
                 paused.store(true, Ordering::Release);
@@ -430,6 +438,7 @@ fn whisper_init_and_run(
                         n_threads,
                         running,
                         emitter,
+                        &mut metrics,
                     );
                     if should_autopause(autopause_enabled, emitted) {
                         paused.store(true, Ordering::Release);
@@ -671,6 +680,179 @@ fn snap_tail_cut_forward(tail: &str, cut: usize) -> usize {
     cut
 }
 
+/// Open the `--metrics` JSONL log for appending (creating parent dirs).
+/// Observability only: errors are returned for the caller to warn-and-disable.
+fn open_metrics_log(path: Option<&std::path::Path>) -> Option<std::io::BufWriter<std::fs::File>> {
+    let path = path?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("metrics: failed to create {}: {e:?}", parent.display());
+                return None;
+            }
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(f) => {
+            log::info!(
+                "metrics: appending per-utterance JSONL to {}",
+                path.display()
+            );
+            Some(std::io::BufWriter::new(f))
+        }
+        Err(e) => {
+            log::warn!(
+                "metrics: failed to open {}: {e:?} (metrics disabled)",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Machine-readable verdict for the `--metrics` log (human-readable
+/// `DROPPED(...)` strings stay in the dump dir via `dump_reason`).
+pub(crate) fn verdict_slug(verdict: crate::gate::TranscriptVerdict) -> &'static str {
+    match verdict {
+        crate::gate::TranscriptVerdict::Emit { .. } => "emit",
+        crate::gate::TranscriptVerdict::DropEmpty => "drop:empty",
+        crate::gate::TranscriptVerdict::Drop { kind, .. } => match kind {
+            crate::gate::TranscriptDropKind::LowConfidence => "drop:low-conf",
+            crate::gate::TranscriptDropKind::Hallucination => "drop:hallucination",
+            crate::gate::TranscriptDropKind::Repetition => "drop:repetition",
+        },
+    }
+}
+
+/// Escape a string for embedding in JSON (quotes, backslashes, control
+/// chars); non-ASCII passes through as UTF-8. Stdlib only (no serde).
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Inference seconds per audio second for one utterance: `(audio_sec,
+/// rtf)`. `rtf > 1` means slower than realtime. Pure for tests; the same
+/// pair feeds the `--metrics` row and the slower-than-realtime warn.
+pub(crate) fn infer_rtf(samples: usize, infer_ms: f64) -> (f64, f64) {
+    let audio_sec = samples as f64 / crate::config::WHISPER_RATE as f64;
+    let rtf = if audio_sec > 0.0 {
+        infer_ms / 1000.0 / audio_sec
+    } else {
+        0.0
+    };
+    (audio_sec, rtf)
+}
+
+/// Pick which backlog utterances survive shedding: top `keep` by
+/// (density, rms), ties to newer arrivals; survivors return as
+/// chronological indices. Pure for tests; the worker transcribes the
+/// survivors in order so prompt context stays chronological.
+pub(crate) fn shed_survivors(scores: &[(f32, f32)], keep: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    // Best first: higher density, then higher rms, then newer arrival.
+    order.sort_by(|&a, &b| {
+        let (da, ra) = scores[a];
+        let (db, rb) = scores[b];
+        db.total_cmp(&da)
+            .then_with(|| rb.total_cmp(&ra))
+            .then_with(|| b.cmp(&a))
+    });
+    order.truncate(keep.min(scores.len()));
+    order.sort_unstable();
+    order
+}
+
+/// One `--metrics` JSONL row for a transcribed utterance. Pure over its
+/// inputs (formatting only) so tests don't touch the filesystem or GPU.
+/// `infer_ms` covers `transcribe()` alone (conditioning/gain excluded);
+/// `rtf` is inference seconds per audio second (>1 = slower than realtime).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn format_metrics_row(
+    tag: &str,
+    samples: usize,
+    evidence: &crate::utterance::Evidence,
+    prob: f32,
+    logprob: f32,
+    verdict: crate::gate::TranscriptVerdict,
+    text: &str,
+    infer_ms: f64,
+) -> String {
+    let (audio_sec, rtf) = infer_rtf(samples, infer_ms);
+    format!(
+        "{{\"tag\":\"{}\",\"samples\":{},\"audio_sec\":{:.3},\"infer_ms\":{:.1},\"rtf\":{:.3},\
+         \"speech_frames\":{},\"total_frames\":{},\"density\":{:.3},\"rms\":{:.5},\
+         \"prob\":{:.3},\"logprob\":{:.3},\"verdict\":\"{}\",\"text\":\"{}\"}}",
+        escape_json_string(tag),
+        samples,
+        audio_sec,
+        infer_ms,
+        rtf,
+        evidence.speech_frames,
+        evidence.total_frames,
+        evidence.density(),
+        evidence.rms,
+        prob,
+        logprob,
+        verdict_slug(verdict),
+        escape_json_string(text),
+    )
+}
+
+/// Append one row via `format_metrics_row`, flushing so `--stop`/Ctrl-C
+/// keeps every transcribed utterance even on a hard kill right after.
+/// Write errors disable the log with a single warning (never fail
+/// transcription for observability).
+#[allow(clippy::too_many_arguments)]
+fn write_metrics_row(
+    metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
+    tag: &str,
+    pcm: &[f32],
+    evidence: &crate::utterance::Evidence,
+    prob: f32,
+    logprob: f32,
+    verdict: crate::gate::TranscriptVerdict,
+    text: &str,
+    infer_ms: f64,
+) {
+    use std::io::Write;
+    let Some(w) = metrics else { return };
+    let row = format_metrics_row(
+        tag,
+        pcm.len(),
+        evidence,
+        prob,
+        logprob,
+        verdict,
+        text,
+        infer_ms,
+    );
+    if let Err(e) = writeln!(w, "{row}") {
+        log::warn!("metrics: write failed: {e:?} (metrics disabled)");
+        *metrics = None;
+        return;
+    }
+    if let Err(e) = w.flush() {
+        log::warn!("metrics: flush failed: {e:?} (metrics disabled)");
+        *metrics = None;
+    }
+}
+
 /// One utterance through conditioning, gain, inference, gate and emission.
 /// Tag numbering is owned by the caller so it stays monotonic across reloads.
 /// Returns whether the transcript was actually emitted (vs dropped or failed),
@@ -696,6 +878,7 @@ fn transcribe_and_emit(
     n_threads: i32,
     running: &Arc<AtomicBool>,
     emitter: &mut impl Emitter,
+    metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
 ) -> bool {
     let tag = format!("utt_{utterance_no:06}");
 
@@ -704,7 +887,10 @@ fn transcribe_and_emit(
     let gained = apply_gain(&conditioned, rms_for_gain, target_rms, MAX_GAIN);
     let effective_prompt = build_effective_prompt(base_prompt, prompt_tail);
 
-    match transcribe(
+    // Inference time only (conditioning/gain excluded): feeds the RTF
+    // column of the `--metrics` JSONL log.
+    let t0 = Instant::now();
+    let result = transcribe(
         state,
         token_beg,
         gained.as_ref(),
@@ -718,7 +904,9 @@ fn transcribe_and_emit(
         logprob_thold,
         n_threads,
         running,
-    ) {
+    );
+    let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    match result {
         Ok(t) => {
             let trimmed = t.text.trim();
             let verdict = gate.decide_transcript(
@@ -731,6 +919,17 @@ fn transcribe_and_emit(
             if emitted {
                 push_prompt_context(prompt_tail, trimmed, prompt_context_chars);
             }
+            write_metrics_row(
+                metrics,
+                &tag,
+                &utterance.pcm,
+                &utterance.evidence,
+                t.confidence.prob,
+                t.confidence.logprob,
+                verdict,
+                trimmed,
+                infer_ms,
+            );
             emitter.emit(Emission {
                 tag: &tag,
                 pcm: &utterance.pcm,
@@ -1270,6 +1469,100 @@ mod tests {
     }
 
     #[test]
+    fn verdict_slug_covers_every_disposition() {
+        use crate::gate::{EvidenceStrength, TranscriptDropKind, TranscriptVerdict};
+        assert_eq!(
+            verdict_slug(TranscriptVerdict::Emit {
+                floor: 0.35,
+                strength: EvidenceStrength::Strong
+            }),
+            "emit"
+        );
+        assert_eq!(verdict_slug(TranscriptVerdict::DropEmpty), "drop:empty");
+        for (kind, slug) in [
+            (TranscriptDropKind::LowConfidence, "drop:low-conf"),
+            (TranscriptDropKind::Hallucination, "drop:hallucination"),
+            (TranscriptDropKind::Repetition, "drop:repetition"),
+        ] {
+            assert_eq!(
+                verdict_slug(TranscriptVerdict::Drop {
+                    kind,
+                    floor: 0.6,
+                    strength: EvidenceStrength::Weak
+                }),
+                slug
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_row_is_valid_json_with_rtf() {
+        use crate::gate::{EvidenceStrength, TranscriptVerdict};
+        let evidence = Evidence {
+            speech_frames: 100,
+            total_frames: 200,
+            rms: 0.02,
+        };
+        // 16_000 samples = 1.0 s audio, 250 ms inference -> rtf 0.25.
+        let row = format_metrics_row(
+            "utt_000001",
+            16_000,
+            &evidence,
+            0.9,
+            -0.1,
+            TranscriptVerdict::Emit {
+                floor: 0.35,
+                strength: EvidenceStrength::Strong,
+            },
+            "Dzień dobry",
+            250.0,
+        );
+        assert!(row.contains("\"tag\":\"utt_000001\""), "{row}");
+        assert!(row.contains("\"samples\":16000"), "{row}");
+        assert!(row.contains("\"audio_sec\":1.000"), "{row}");
+        assert!(row.contains("\"infer_ms\":250.0"), "{row}");
+        assert!(row.contains("\"rtf\":0.250"), "{row}");
+        assert!(row.contains("\"verdict\":\"emit\""), "{row}");
+        assert!(row.contains("\"text\":\"Dzień dobry\""), "{row}");
+        assert!(row.starts_with('{') && row.ends_with('}'));
+    }
+
+    #[test]
+    fn metrics_row_escapes_text_for_json() {
+        use crate::gate::{EvidenceStrength, TranscriptVerdict};
+        let evidence = Evidence {
+            speech_frames: 20,
+            total_frames: 100,
+            rms: 0.005,
+        };
+        let row = format_metrics_row(
+            "utt_000002",
+            16_000,
+            &evidence,
+            0.5,
+            -0.7,
+            TranscriptVerdict::DropEmpty,
+            "quote \"here\"\nnewline",
+            0.0,
+        );
+        assert!(
+            row.contains("\"text\":\"quote \\\"here\\\"\\nnewline\""),
+            "{row}"
+        );
+        assert_eq!(escape_json_string("zażółć"), "zażółć");
+    }
+
+    #[test]
+    fn infer_rtf_divides_infer_by_audio() {
+        // 16_000 samples = 1.0 s; 250 ms inference -> rtf 0.25.
+        let (sec, rtf) = infer_rtf(16_000, 250.0);
+        assert!((sec - 1.0).abs() < 1e-9);
+        assert!((rtf - 0.25).abs() < 1e-9);
+        // Empty audio never divides by zero.
+        assert_eq!(infer_rtf(0, 100.0), (0.0, 0.0));
+    }
+
+    #[test]
     fn apply_gain_is_capped() {
         // A near-silent clip (rms=0.0001) must not get amplified by the raw
         // target/rms ratio (500x here) — that would blow quantization noise
@@ -1618,6 +1911,7 @@ mod tests {
             logprob_thold: DEFAULT_LOGPROB_THOLD,
             n_threads: DEFAULT_THREADS,
             use_gpu: false,
+            metrics_path: None,
             shed_stale: false,
         };
         let bad = std::path::PathBuf::from("/nonexistent/ggml-bogus.bin");

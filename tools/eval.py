@@ -23,8 +23,15 @@ Sweep example (cartesian product, `;` between vars, `,` between values)::
       --extra-args --model small --language pl
 
 Output in `--output`: `results.jsonl` (one row per file per combo) and
-`summary.csv` (one row per combo: count, avg/median/p90 WER, empty rates).
-A summary table is also printed to stdout.
+`summary.csv` (one row per combo: count, avg/median/p90 WER, empty rates,
+false-accept rate over empty refs, avg elapsed per file). A summary table
+is also printed to stdout.
+
+Empty-`.txt` files are the silence set: a non-empty hypothesis for one is
+a false accept (`fa: 1`, aggregated as `false_accepts` + `far` =
+false_accepts / empty_ref). `elapsed_s` per row is subprocess wall time
+for that file (model load amortized only across files — treat small-corpus
+absolutes with care, compare combos relatively).
 
 Sequential by design: every `--file` run loads the whisper model (GPU
 VRAM), so parallel jobs would OOM or thrash. Model load dominates small
@@ -41,6 +48,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Must mirror gate::fold_polish_diacritic (lowercased input).
@@ -153,19 +161,23 @@ def run_file(binary, wav, extra_args, env_overrides, timeout):
     })
     env.update(env_overrides)
     cmd = [str(binary), "--file", str(wav), "--stdout"] + extra_args
+    t0 = time.monotonic()
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return {"ok": False, "hyp": "", "utterances": 0,
-                "error": f"timeout after {timeout}s"}
+                "error": f"timeout after {timeout}s",
+                "elapsed_s": round(time.monotonic() - t0, 3)}
+    elapsed = round(time.monotonic() - t0, 3)
     if p.returncode != 0:
         tail = (p.stderr or "").strip().splitlines()[-3:]
         return {"ok": False, "hyp": "", "utterances": 0,
-                "error": f"exit {p.returncode}: " + " | ".join(tail)}
+                "error": f"exit {p.returncode}: " + " | ".join(tail),
+                "elapsed_s": elapsed}
     lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
     return {"ok": True, "hyp": " ".join(lines),
-            "utterances": len(lines), "error": ""}
+            "utterances": len(lines), "error": "", "elapsed_s": elapsed}
 
 
 def percentile(xs, q):
@@ -239,6 +251,7 @@ def main():
             label = ",".join(f"{k}={v}" for k, v in sorted(combo.items())) or "base"
             print(f"[{ci + 1}/{len(combos)}] {label} ({len(wavs)} files)")
             wers, n_empty_ref, n_empty_hyp = [], 0, 0
+            n_false_accepts, elapsed_all = 0, []
             for wav in wavs:
                 ref_path = wav.with_suffix(".txt")
                 if not ref_path.exists():
@@ -247,15 +260,22 @@ def main():
                 ref = ref_path.read_text(encoding="utf-8", errors="replace")
                 run = run_file(binary, wav, extra, combo, args.timeout)
                 s = score_pair(ref, run["hyp"])
-                if not ref.strip():
+                ref_empty = not ref.strip()
+                hyp_empty = not run["hyp"].strip()
+                if ref_empty:
                     n_empty_ref += 1
-                if not run["hyp"].strip():
+                    if not hyp_empty:
+                        n_false_accepts += 1
+                if hyp_empty:
                     n_empty_hyp += 1
                 wers.append(s["wer"])
+                elapsed_all.append(run["elapsed_s"])
                 jf.write(json.dumps({
                     "combo": combo, "label": label, "file": wav.name,
                     "ok": run["ok"], "error": run["error"],
                     "utterances": run["utterances"],
+                    "elapsed_s": run["elapsed_s"],
+                    "fa": 1 if (ref_empty and not hyp_empty) else 0,
                     "wer": round(s["wer"], 4), "s": s["s"], "d": s["d"],
                     "i": s["i"], "n": s["n"],
                     "ref": ref.strip(), "hyp": run["hyp"].strip(),
@@ -264,17 +284,23 @@ def main():
             avg = sum(wers) / n if n else 0.0
             med = percentile(wers, 0.5)
             p90 = percentile(wers, 0.9)
+            far = n_false_accepts / n_empty_ref if n_empty_ref else 0.0
+            avg_elapsed = round(sum(elapsed_all) / len(elapsed_all), 3) if elapsed_all else 0.0
             summaries.append({"label": label, "combo": combo, "count": n,
                               "avg_wer": round(avg, 4), "median_wer": round(med, 4),
                               "p90_wer": round(p90, 4),
-                              "empty_ref": n_empty_ref, "empty_hyp": n_empty_hyp})
+                              "empty_ref": n_empty_ref, "empty_hyp": n_empty_hyp,
+                              "false_accepts": n_false_accepts,
+                              "far": round(far, 4), "avg_elapsed_s": avg_elapsed})
             print(f"  count={n} avg={avg:.3f} median={med:.3f} p90={p90:.3f} "
-                  f"empty_hyp={n_empty_hyp}")
+                  f"empty_hyp={n_empty_hyp} far={far:.3f} avg_elapsed={avg_elapsed:.1f}s")
 
     with open(summary_path, "w", newline="", encoding="utf-8") as cf:
         w = csv.DictWriter(cf, fieldnames=["label", "count", "avg_wer",
                                            "median_wer", "p90_wer",
-                                           "empty_ref", "empty_hyp", "combo"])
+                                           "empty_ref", "empty_hyp",
+                                           "false_accepts", "far",
+                                           "avg_elapsed_s", "combo"])
         w.writeheader()
         for s in summaries:
             w.writerow({**s, "combo": json.dumps(s["combo"], ensure_ascii=False)})

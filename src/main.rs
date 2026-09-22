@@ -770,6 +770,7 @@ fn whisper_options(cli: &Cli, shed_stale: bool) -> WhisperOptions {
         logprob_thold: cli.logprob_thold,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
+        metrics_path: cli.metrics.clone(),
         shed_stale,
     }
 }
