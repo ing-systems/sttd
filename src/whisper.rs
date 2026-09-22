@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
@@ -124,9 +127,41 @@ fn whisper_init_and_run(
 
     let mut ctx_params = WhisperContextParameters::default();
     ctx_params.use_gpu = true;
-    eprintln!("[sttd] loading whisper context (gpu requested)...");
-    let ctx = WhisperContext::new_with_params(path_str, ctx_params)
-        .context("failed to load whisper model")?;
+    match std::fs::metadata(model_path) {
+        Ok(meta) => eprintln!(
+            "[sttd] loading whisper context ({:.1} MiB, gpu requested)...",
+            meta.len() as f64 / 1_048_576.0
+        ),
+        Err(_) => eprintln!("[sttd] loading whisper context (gpu requested)..."),
+    }
+    // `new_with_params` blocks for tens of seconds on a large model with no
+    // callback; tick elapsed time so the wait doesn't look hung.
+    let load_done = Arc::new(AtomicBool::new(false));
+    let ticker = {
+        let done = Arc::clone(&load_done);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut last_printed: u64 = 0;
+            loop {
+                // Short sleeps so joining after the load finishes costs at
+                // most 100 ms; only a whole-second tick is printed.
+                std::thread::sleep(Duration::from_millis(100));
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                let elapsed = start.elapsed().as_secs();
+                if elapsed > last_printed {
+                    last_printed = elapsed;
+                    eprintln!("[sttd] loading whisper context... {elapsed}s");
+                }
+            }
+        })
+    };
+    let ctx_result = WhisperContext::new_with_params(path_str, ctx_params)
+        .context("failed to load whisper model");
+    load_done.store(true, Ordering::Relaxed);
+    let _ = ticker.join();
+    let ctx = ctx_result?;
     let mut state = ctx
         .create_state()
         .context("failed to create whisper state")?;
@@ -668,7 +703,11 @@ mod tests {
         let out = condition_utterance(&pcm);
         assert_eq!(out.len(), pcm.len());
         assert!(out[0].abs() < 0.05, "first={}", out[0]);
-        assert!(out[out.len() - 1].abs() < 0.05, "last={}", out[out.len() - 1]);
+        assert!(
+            out[out.len() - 1].abs() < 0.05,
+            "last={}",
+            out[out.len() - 1]
+        );
         assert!(out.iter().all(|&s| s.abs() <= 0.99 + 1e-6));
         // Short input: fades shorten instead of overlapping.
         let short = vec![0.5f32; 10];
@@ -683,7 +722,9 @@ mod tests {
 
     #[test]
     fn hallucination_filter_catches_known_boilerplate() {
-        assert!(is_hallucination("Napisy stworzone przez społeczność Amara.org"));
+        assert!(is_hallucination(
+            "Napisy stworzone przez społeczność Amara.org"
+        ));
         assert!(is_hallucination("  napisy  "));
         assert!(is_hallucination("..."));
         assert!(is_hallucination(""));
@@ -716,7 +757,9 @@ mod tests {
 
     #[test]
     fn repetition_filter_leaves_real_speech_alone() {
-        assert!(!is_repetition("Zrób commit i wypchnij zmiany do repozytorium."));
+        assert!(!is_repetition(
+            "Zrób commit i wypchnij zmiany do repozytorium."
+        ));
         assert!(!is_repetition(
             "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
         ));
@@ -727,7 +770,9 @@ mod tests {
 
     #[test]
     fn hallucination_filter_leaves_real_sentences_alone() {
-        assert!(!is_hallucination("Zrób commit i wypchnij zmiany do repozytorium."));
+        assert!(!is_hallucination(
+            "Zrób commit i wypchnij zmiany do repozytorium."
+        ));
         assert!(!is_hallucination(
             "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
         ));

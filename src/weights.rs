@@ -73,6 +73,39 @@ pub(crate) fn download_url(file_name: &str) -> Option<String> {
     Some(format!("{MODEL_BASE_URL}{file_name}"))
 }
 
+/// One-line download progress for stderr, e.g.
+/// `[==============>               ]  45.2% (360.0/800.0 MiB)`.
+/// Without a total it degrades to `123.4 MiB downloaded...`.
+pub(crate) fn format_download_progress(downloaded: u64, total: Option<u64>) -> String {
+    const WIDTH: usize = 30;
+    const MIB: f64 = 1_048_576.0;
+    match total {
+        Some(t) if t > 0 => {
+            let frac = (downloaded as f64 / t as f64).clamp(0.0, 1.0);
+            let filled = (frac * WIDTH as f64) as usize;
+            let mut bar = String::with_capacity(WIDTH + 2);
+            bar.push('[');
+            for i in 0..WIDTH {
+                if i < filled {
+                    bar.push('=');
+                } else if i == filled {
+                    bar.push('>');
+                } else {
+                    bar.push(' ');
+                }
+            }
+            bar.push(']');
+            format!(
+                "{bar} {:5.1}% ({:.1}/{:.1} MiB)",
+                frac * 100.0,
+                downloaded as f64 / MIB,
+                t as f64 / MIB
+            )
+        }
+        _ => format!("{:.1} MiB downloaded...", downloaded as f64 / MIB),
+    }
+}
+
 fn download(url: &str, dest: &Path) -> Result<()> {
     let tmp = dest.with_extension("part");
     let resp = ureq::get(url)
@@ -89,8 +122,42 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     let mut reader = resp.into_reader();
     let mut out = std::fs::File::create(&tmp)
         .with_context(|| format!("failed to create {}", tmp.display()))?;
-    let bytes = std::io::copy(&mut reader, &mut out).context("download I/O failed")?;
-    use std::io::Write;
+    // Chunked copy (instead of `std::io::copy`) so a large model download
+    // reports progress. On a tty the bar rewrites one line via `\r`; when
+    // stderr isn't a tty (piped logs) `\r` would smear, so log whole lines
+    // every 64 MiB instead.
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let mut downloaded: u64 = 0;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut last_render = Instant::now() - Duration::from_secs(3600);
+    let mut next_log_at: u64 = 64 * 1_048_576;
+    // Initial 0% so even a fast download shows the bar shape.
+    eprint!("\r[sttd] {}", format_download_progress(0, total));
+    std::io::stderr().flush().ok();
+    loop {
+        let n = reader.read(&mut buf).context("download I/O failed")?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).context("download I/O failed")?;
+        downloaded += n as u64;
+        if tty {
+            if last_render.elapsed() >= Duration::from_millis(200) {
+                eprint!("\r[sttd] {}", format_download_progress(downloaded, total));
+                std::io::stderr().flush().ok();
+                last_render = Instant::now();
+            }
+        } else if downloaded >= next_log_at {
+            eprintln!("[sttd] {}", format_download_progress(downloaded, total));
+            next_log_at += 64 * 1_048_576;
+        }
+    }
+    if tty {
+        eprint!("\r[sttd] {}", format_download_progress(downloaded, total));
+        eprintln!();
+    }
     out.flush().ok();
     drop(out);
     std::fs::rename(&tmp, dest)
@@ -98,7 +165,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     eprintln!(
         "[sttd] downloaded {} ({:.1} MiB)",
         dest.display(),
-        bytes as f64 / 1_048_576.0
+        downloaded as f64 / 1_048_576.0
     );
     Ok(())
 }
@@ -191,5 +258,32 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("large-v3-turbo-q8_0"), "msg={msg}");
         }
+    }
+
+    #[test]
+    fn download_progress_renders_bar_with_known_total() {
+        let total = Some(100 * 1_048_576);
+        let start = format_download_progress(0, total);
+        assert!(start.contains("0.0%"), "start={start}");
+        assert!(start.starts_with('['), "start={start}");
+        let half = format_download_progress(50 * 1_048_576, total);
+        assert!(half.contains("50.0%"), "half={half}");
+        assert!(half.contains("50.0/100.0 MiB"), "half={half}");
+        let done = format_download_progress(100 * 1_048_576, total);
+        assert!(done.contains("100.0%"), "done={done}");
+        // Over-run clamps at 100%.
+        let over = format_download_progress(150 * 1_048_576, total);
+        assert!(over.contains("100.0%"), "over={over}");
+    }
+
+    #[test]
+    fn download_progress_degrades_without_total() {
+        let line = format_download_progress(10 * 1_048_576, None);
+        assert!(line.contains("10.0 MiB downloaded"), "line={line}");
+        let zero_total = format_download_progress(10 * 1_048_576, Some(0));
+        assert!(
+            zero_total.contains("10.0 MiB downloaded"),
+            "zero_total={zero_total}"
+        );
     }
 }
