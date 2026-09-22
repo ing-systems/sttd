@@ -556,11 +556,16 @@ fn whisper_options(cli: &Cli) -> WhisperOptions {
     }
 }
 
-/// Emission policy (dump dir, clipboard, paste), resolved once from `Cli`.
-/// Runs on the main thread before the worker spawns, so a bad dump dir fails
-/// fast like the model load it precedes.
+/// Emission policy (dump dir, clipboard, paste, stdout), resolved once from
+/// `Cli`. Runs on the main thread before the worker spawns, so a bad dump
+/// dir fails fast like the model load it precedes.
 fn make_emitter(cli: &Cli) -> Result<SystemEmitter> {
-    SystemEmitter::new(cli.dump_dir.clone(), cli.copy, cli.paste)
+    SystemEmitter::new(
+        cli.dump_dir.clone(),
+        cli.copy,
+        cli.paste,
+        cli.stdout,
+    )
 }
 
 /// Thresholds for deciding-not-to-emit, resolved once from `Cli` and shared

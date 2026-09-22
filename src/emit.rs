@@ -10,8 +10,8 @@
 //
 // This module owns verdict → action mapping plus every emission side effect,
 // so the whisper loop hands it one `Emission` per utterance and gets back
-// nothing. `SystemEmitter` is the prod adapter (stdout, `wl-copy`, `ydotool`,
-// dump dir); `RecordingEmitter` is the in-memory adapter tests drive the
+// nothing. `SystemEmitter` is the prod adapter (opt-in stdout, `wl-copy`,
+// `ydotool`, dump dir); `RecordingEmitter` is the in-memory adapter tests drive the
 // gate → emission composition through. Inference never sees either.
 
 use std::path::PathBuf;
@@ -45,13 +45,15 @@ pub(crate) trait Emitter {
     fn emit(&mut self, emission: Emission<'_>);
 }
 
-/// Prod adapter: stdout, Wayland clipboard, auto-paste, dump dir. Untested
-/// glue by design — the logic worth testing (verdict → action) is exercised
-/// through `RecordingEmitter`; this only shells out to binaries and files.
+/// Prod adapter: opt-in stdout, Wayland clipboard, auto-paste, dump dir.
+/// Untested glue by design — the logic worth testing (verdict → action) is
+/// exercised through `RecordingEmitter`; this only shells out to binaries
+/// and files.
 pub(crate) struct SystemEmitter {
     dump_dir: Option<PathBuf>,
     clipboard_available: bool,
     paste_available: bool,
+    stdout_enabled: bool,
 }
 
 impl SystemEmitter {
@@ -62,6 +64,7 @@ impl SystemEmitter {
         dump_dir: Option<PathBuf>,
         copy_enabled: bool,
         paste_enabled: bool,
+        stdout_enabled: bool,
     ) -> Result<Self> {
         if let Some(dir) = &dump_dir {
             std::fs::create_dir_all(dir)
@@ -72,6 +75,7 @@ impl SystemEmitter {
             dump_dir,
             clipboard_available: copy_enabled,
             paste_available: paste_enabled,
+            stdout_enabled,
         };
         if !copy_enabled {
             log::info!("clipboard copy disabled (--copy=false)");
@@ -126,7 +130,9 @@ impl Emitter for SystemEmitter {
                      ({strength} evidence, density={:.3})",
                     evidence.density()
                 );
-                println!("{text}");
+                if self.stdout_enabled {
+                    println!("{text}");
+                }
             }
             TranscriptVerdict::Drop {
                 kind,
@@ -295,6 +301,9 @@ pub(crate) struct RecordingEmitter {
     /// Simulate a failed clipboard copy: nothing is pasted, but the
     /// transcript still counts as emitted.
     pub fail_copy: bool,
+    /// Mirror of `--stdout`: when false (the default, like prod),
+    /// an emitted transcript is recorded without printing.
+    pub stdout_enabled: bool,
 }
 
 /// What one `emit` call would have done.
@@ -306,6 +315,7 @@ pub(crate) struct RecordedEmission {
     pub drop_kind: Option<TranscriptDropKind>,
     pub copied: bool,
     pub pasted: bool,
+    pub printed: bool,
     pub wav_samples: usize,
 }
 
@@ -315,6 +325,7 @@ impl RecordingEmitter {
         Self {
             records: Vec::new(),
             fail_copy: false,
+            stdout_enabled: false,
         }
     }
 }
@@ -330,6 +341,7 @@ impl Emitter for RecordingEmitter {
             drop_kind: None,
             copied: false,
             pasted: false,
+            printed: false,
             wav_samples,
         };
         if let TranscriptVerdict::Emit { .. } = emission.verdict {
@@ -338,6 +350,7 @@ impl Emitter for RecordingEmitter {
             // Same AND semantics as the prod adapter: paste only runs on
             // fresh clipboard content, never after a failed copy.
             record.pasted = record.copied;
+            record.printed = self.stdout_enabled;
         } else if let TranscriptVerdict::Drop { kind, .. } = emission.verdict {
             record.drop_kind = Some(kind);
         }
@@ -417,7 +430,48 @@ mod tests {
         assert_eq!(r.text, "Dzień dobry");
         assert!(r.copied);
         assert!(r.pasted);
+        assert!(!r.printed);
         assert_eq!(r.wav_samples, 1600);
+    }
+
+    #[test]
+    fn stdout_print_is_opt_in() {
+        let evidence = strong_evidence();
+        let verdict = gate().decide_transcript(
+            evidence.speech_frames,
+            evidence.rms,
+            "Dzień dobry",
+            0.9,
+        );
+        let pcm = vec![0.01f32; 1600];
+        let mut emitter = RecordingEmitter::new();
+        emit(&mut emitter, "utt_000001", &pcm, "Dzień dobry", verdict, &evidence);
+        assert!(emitter.records[0].emitted);
+        assert!(!emitter.records[0].printed);
+
+        let verdict = gate().decide_transcript(
+            evidence.speech_frames,
+            evidence.rms,
+            "Dzień dobry",
+            0.9,
+        );
+        let mut emitter = RecordingEmitter::new();
+        emitter.stdout_enabled = true;
+        emit(&mut emitter, "utt_000002", &pcm, "Dzień dobry", verdict, &evidence);
+        assert!(emitter.records[0].emitted);
+        assert!(emitter.records[0].printed);
+
+        // Drops never print, even when stdout is enabled.
+        let verdict = gate().decide_transcript(
+            evidence.speech_frames,
+            evidence.rms,
+            "tak tak tak tak tak tak",
+            0.9,
+        );
+        emit(&mut emitter, "utt_000003", &pcm, "tak tak tak tak tak tak", verdict, &evidence);
+        let r = &emitter.records[1];
+        assert!(!r.emitted);
+        assert!(!r.printed);
     }
 
     #[test]
@@ -437,6 +491,7 @@ mod tests {
         assert!(r.emitted);
         assert!(!r.copied);
         assert!(!r.pasted);
+        assert!(!r.printed);
     }
 
     #[test]
@@ -470,6 +525,7 @@ mod tests {
         assert_eq!(r.drop_kind, Some(TranscriptDropKind::LowConfidence));
         assert!(!r.copied);
         assert!(!r.pasted);
+        assert!(!r.printed);
         assert_eq!(r.wav_samples, 1600);
     }
 

@@ -278,8 +278,9 @@ fn whisper_init_and_run(
             );
             // Init succeeded (model + state): signal ready so the main
             // thread knows captures aren't going into a dead queue.
-            // Emission policy (dump dir, clipboard, paste) already resolved
-            // on the main thread inside `SystemEmitter::new`, before spawn.
+            // Emission policy (dump dir, clipboard, paste, stdout) already
+            // resolved on the main thread inside `SystemEmitter::new`, before
+            // spawn.
             let _ = ready.send(Ok(()));
             first_load = false;
         } else {

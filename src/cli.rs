@@ -158,6 +158,20 @@ pub(crate) struct Cli {
     )]
     pub(crate) paste: bool,
 
+    /// Print each accepted transcript to stdout (one line per utterance).
+    /// Opt-in: off by default so transcripts only go to the clipboard,
+    /// auto-paste and the dump dir unless this is enabled.
+    #[arg(
+        long,
+        env = "STTD_STDOUT",
+        default_value_t = false,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Emission"
+    )]
+    pub(crate) stdout: bool,
+
     /// Write each utterance as WAV+TXT into this directory (TXT written
     /// for dropped utterances too, prefixed with the drop reason).
     #[arg(short = 'o', long, env = "STTD_DUMP_DIR", help_heading = "Emission")]
@@ -228,8 +242,9 @@ pub(crate) struct Cli {
     )]
     pub(crate) pid_file: Option<PathBuf>,
 
-    /// Combined stdout+stderr log (append) for `--start`. Transcripts
-    /// (`println!`) and diagnostics (`log`) both land here.
+    /// Combined stdout+stderr log (append) for `--start`. Diagnostics
+    /// (`log`) always land here; transcripts (`println!`) only with
+    /// `--stdout`.
     /// Defaults to `<tmp>/sttd.log`.
     #[arg(
         long,
@@ -369,6 +384,7 @@ mod tests {
         assert_eq!(cli.vad_threshold, DEFAULT_VAD_THRESHOLD);
         assert!(cli.copy);
         assert!(cli.paste);
+        assert!(!cli.stdout);
         assert!(!cli.debug_tokens);
         assert!(cli.start_paused);
         assert!(!cli.autopause);
@@ -394,6 +410,7 @@ mod tests {
             "0.01",
             "--copy",
             "off",
+            "--stdout",
             "--debug-tokens",
             "1",
             "--start-paused",
@@ -411,6 +428,7 @@ mod tests {
         assert_eq!(cli.denoiser, DenoiserKind::DeepFilter);
         assert!((cli.min_rms - 0.01).abs() < 1e-6);
         assert!(!cli.copy);
+        assert!(cli.stdout);
         assert!(cli.debug_tokens);
         assert!(!cli.start_paused);
         assert!(cli.autopause);

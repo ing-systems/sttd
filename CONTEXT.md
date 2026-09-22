@@ -86,8 +86,8 @@ through.
 _Avoid_: false positive, noise, garbage
 
 **Emission**:
-What happens after the transcript gate emits: printing to stdout, clipboard
-copy, auto-paste, and WAV/TXT dump. Owned by the emitter module behind a
+What happens after the transcript gate emits: opt-in stdout print
+(`--stdout`), clipboard copy, auto-paste, and WAV/TXT dump. Owned by the emitter module behind a
 seam; the whisper loop hands it one emission per utterance — tag, raw audio,
 trimmed text, verdict, confidence, acoustic evidence — and gets back nothing.
 _Avoid_: output, sink, side effects (as a name)
