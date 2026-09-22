@@ -42,6 +42,9 @@ mod frontend;
 mod joint;
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
+mod pre_encode;
+#[cfg(feature = "parakeet-burn")]
+#[allow(dead_code)]
 mod quant;
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
