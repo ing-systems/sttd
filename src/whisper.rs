@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::Receiver;
+use rtrb::Consumer;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::config::{
@@ -84,6 +84,12 @@ pub(crate) struct WhisperOptions {
 /// fresh instead of transcribing minutes-late audio.
 pub(crate) const WHISPER_SHED_KEEP: usize = 4;
 
+/// Bounded `rtrb` capacity for the utterance queue. utterances are seconds of
+/// audio; 16 slots is ample (shedding in the worker keeps the backlog at
+/// `WHISPER_SHED_KEEP`), and a full ring drops the newest with a warn rather
+/// than blocking the processing loop.
+pub(crate) const WHISPER_QUEUE_CAP: usize = 16;
+
 /// Query `available_parallelism` for `--threads 0` (auto). Falls back to
 /// `DEFAULT_THREADS` when the query fails.
 pub(crate) fn auto_threads() -> i32 {
@@ -104,7 +110,7 @@ pub(crate) fn resolve_n_threads(requested: i32, auto: i32) -> i32 {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_whisper_worker(
-    rx: Receiver<Utterance>,
+    rx: Consumer<Utterance>,
     model_path: PathBuf,
     opts: WhisperOptions,
     emitter: impl Emitter + Send + 'static,
@@ -128,8 +134,9 @@ pub(crate) fn spawn_whisper_worker(
             // that skip `init_logging`. `Once`-guarded, no-op after first.
             whisper_rs::install_whisper_log_trampoline();
             let mut emitter = emitter;
+            let mut rx = rx;
             if let Err(e) = whisper_loop(
-                &rx,
+                &mut rx,
                 &model_path,
                 &opts,
                 ready_tx,
@@ -154,7 +161,7 @@ pub(crate) fn spawn_whisper_worker(
 /// no indication of what became of it or why.
 #[allow(clippy::too_many_arguments)]
 fn whisper_loop(
-    rx: &Receiver<Utterance>,
+    rx: &mut Consumer<Utterance>,
     model_path: &Path,
     opts: &WhisperOptions,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
@@ -215,7 +222,7 @@ pub(crate) fn should_autopause(autopause_enabled: bool, emitted: bool) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn whisper_init_and_run(
-    rx: &Receiver<Utterance>,
+    rx: &mut Consumer<Utterance>,
     model_path: &Path,
     opts: &WhisperOptions,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
@@ -354,9 +361,12 @@ fn whisper_init_and_run(
         }
 
         // Loaded loop: transcribe until the pause-idle timeout asks for an
-        // unload (`false`), or the sender is gone (`true` = shut down).
+        // unload (`false`), or the producer is gone (`true` = shut down).
+        // `rtrb` has no blocking recv: poll with a short sleep so idle CPU
+        // stays negligible while pause/unload checks run every ~20 ms
+        // instead of the old 1 s tick.
         let disconnected = loop {
-            match rx.recv_timeout(Duration::from_secs(1)) {
+            match rx.pop() {
                 Ok(utterance) => {
                     let now_paused = paused.load(Ordering::Relaxed);
                     if !now_paused {
@@ -375,8 +385,8 @@ fn whisper_init_and_run(
                     // is trimmed to the newest `WHISPER_SHED_KEEP`.
                     if shed_stale {
                         let mut shed = 0usize;
-                        while rx.len() > WHISPER_SHED_KEEP {
-                            match rx.try_recv() {
+                        while rx.slots() > WHISPER_SHED_KEEP {
+                            match rx.pop() {
                                 Ok(_) => shed += 1,
                                 Err(_) => break,
                             }
@@ -416,7 +426,11 @@ fn whisper_init_and_run(
                         }
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(_) => {
+                    if rx.is_abandoned() {
+                        break true;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
                     let now_paused = paused.load(Ordering::Relaxed);
                     if !now_paused {
                         last_unpaused = Instant::now();
@@ -438,7 +452,6 @@ fn whisper_init_and_run(
                         break false;
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break true,
             }
         };
         if disconnected {
@@ -452,21 +465,23 @@ fn whisper_init_and_run(
         // Unloaded wait: never transcribe here, just stash late arrivals and
         // reload eagerly the moment resume is seen — before the next
         // utterance, so the first post-resume speech doesn't pay load
-        // latency twice. Disconnect means shutdown while unloaded: drop the
-        // stash (paused shutdown has nothing worth flushing) and exit so
-        // the join doesn't hang.
+        // latency twice. Abandoned + empty means shutdown while unloaded:
+        // drop the stash (paused shutdown has nothing worth flushing) and
+        // exit so the join doesn't hang.
         loop {
-            match rx.recv_timeout(Duration::from_secs(1)) {
+            match rx.pop() {
                 Ok(utterance) => stash.push(utterance),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    if !stash.is_empty() {
-                        log::warn!(
-                            "dropping {} queued utterance(s) (shut down while model unloaded)",
-                            stash.len()
-                        );
+                Err(_) => {
+                    if rx.is_abandoned() {
+                        if !stash.is_empty() {
+                            log::warn!(
+                                "dropping {} queued utterance(s) (shut down while model unloaded)",
+                                stash.len()
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             }
             if !paused.load(Ordering::Relaxed) {
@@ -1449,7 +1464,7 @@ mod tests {
     fn whisper_worker_signals_init_failure() {
         // Bad model path must propagate via the ready channel instead of
         // silently capturing into a dead queue.
-        let (_tx, rx) = crossbeam_channel::unbounded();
+        let (_tx, rx) = rtrb::RingBuffer::new(WHISPER_QUEUE_CAP);
         let opts = WhisperOptions {
             model_spec: "bogus".to_string(),
             prompt: String::new(),

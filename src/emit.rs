@@ -16,9 +16,10 @@
 
 use std::path::PathBuf;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{unbounded, Sender};
+use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::config::WHISPER_RATE;
 use crate::gate::{TranscriptDropKind, TranscriptVerdict};
@@ -77,7 +78,7 @@ pub(crate) trait Emitter {
 /// Prod adapter: opt-in stdout, Wayland clipboard, auto-paste, dump dir.
 ///
 /// Async by design: `emit()` only clones into an `OwnedEmission` and does a
-/// non-blocking `unbounded` send, so a stuck `wl-copy`/`ydotool`/disk never
+/// non-blocking `rtrb` push, so a stuck `wl-copy`/`ydotool`/disk never
 /// stalls whisper inference. A single `emit` worker thread owns all side
 /// effects in FIFO order; `Drop` closes the channel and joins it, so shutdown
 /// (`whisper_handle.join()`) flushes the queue before the process exits.
@@ -85,9 +86,15 @@ pub(crate) trait Emitter {
 /// exercised through `RecordingEmitter`; this only shells out to binaries
 /// and files.
 pub(crate) struct SystemEmitter {
-    tx: Option<Sender<OwnedEmission>>,
+    tx: Option<Producer<OwnedEmission>>,
     worker: Option<JoinHandle<()>>,
 }
+
+/// Bounded `rtrb` capacity for the emission queue. Emissions are seconds
+/// apart; 512 slots never fills in practice (the 200-rapid-emits test fits),
+/// and a full ring drops the newest with a warn rather than blocking
+/// inference.
+pub(crate) const EMIT_QUEUE_CAP: usize = 512;
 
 /// Mutable worker state: lives on the emit thread only. `clipboard_available`
 /// / `paste_available` flip off on `NotFound`, same as before, but without
@@ -141,12 +148,21 @@ impl SystemEmitter {
             worker.clipboard_available = false;
             worker.paste_available = false;
         }
-        let (tx, rx) = unbounded::<OwnedEmission>();
+        let (tx, mut rx): (Producer<OwnedEmission>, Consumer<OwnedEmission>) =
+            RingBuffer::new(EMIT_QUEUE_CAP);
         let handle = std::thread::Builder::new()
             .name("emit".into())
             .spawn(move || {
-                for owned in rx {
-                    worker.handle(owned);
+                loop {
+                    match rx.pop() {
+                        Ok(owned) => worker.handle(owned),
+                        Err(_) => {
+                            if rx.is_abandoned() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
                 }
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn emit thread: {e}"))?;
@@ -174,11 +190,15 @@ impl Drop for SystemEmitter {
 impl Emitter for SystemEmitter {
     fn emit(&mut self, emission: Emission<'_>) {
         let owned = OwnedEmission::from_borrowed(emission);
-        if let Some(tx) = &self.tx {
-            // Unbounded: never blocks inference. Only fails if the worker
-            // died, which must not take transcription down with it.
-            if let Err(e) = tx.send(owned) {
-                log::warn!("emit queue closed, dropping {}: {e:?}", e.0.tag);
+        if let Some(tx) = self.tx.as_mut() {
+            // Bounded: never blocks inference. Only fails when full or when
+            // the worker died, neither of which must take transcription down.
+            if let Err(rtrb::PushError::Full(back)) = tx.push(owned) {
+                if tx.is_abandoned() {
+                    log::warn!("emit worker gone, dropping {}", back.tag);
+                } else {
+                    log::warn!("emit queue full, dropping {}", back.tag);
+                }
             }
         }
     }
@@ -741,7 +761,7 @@ mod tests {
 
     #[test]
     fn system_emitter_emit_never_blocks_inference() {
-        // `emit()` is a single clone + unbounded send: 200 rapid emits must
+        // `emit()` is a single clone + bounded push: 200 rapid emits must
         // finish well under a whisper inference (seconds), even with disk I/O
         // still draining on the worker.
         let dir = std::env::temp_dir().join(format!("sttd-emit-nb-{}", std::process::id()));

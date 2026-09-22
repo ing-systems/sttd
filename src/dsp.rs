@@ -42,10 +42,11 @@ pub(crate) fn downmix_to_mono_with_channel(
     }
 }
 
-/// Single-pass I16 -> mono f32 with channel select/mix. Avoids the
-/// intermediate f32 buffer the callback used to build before downmixing,
-/// halving per-callback allocs on I16 devices. Same scale as before:
-/// `s / 32768.0`. Same out-of-range rule as the f32 variant: silence.
+/// Single-pass I16 -> mono f32 with channel select/mix. Same scale as the
+/// real-time callback in `capture` inlines per sample (`s / 32768.0`, no
+/// `Vec` there); this allocating variant remains as the tested reference.
+/// Same out-of-range rule as the f32 variant: silence.
+#[allow(dead_code)]
 pub(crate) fn downmix_i16_to_mono_with_channel(
     data: &[i16],
     channels: usize,
@@ -79,8 +80,11 @@ pub(crate) fn downmix_i16_to_mono_with_channel(
     }
 }
 
-/// Single-pass U16 -> mono f32 with channel select/mix. Same scale as
-/// before: `s / 65535.0 * 2.0 - 1.0`. Same out-of-range rule: silence.
+/// Single-pass U16 -> mono f32 with channel select/mix. Same scale as the
+/// real-time callback in `capture` inlines per sample
+/// (`s / 65535.0 * 2.0 - 1.0`, no `Vec` there); this allocating variant
+/// remains as the tested reference. Same out-of-range rule: silence.
+#[allow(dead_code)]
 pub(crate) fn downmix_u16_to_mono_with_channel(
     data: &[u16],
     channels: usize,

@@ -3,12 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
-use crossbeam_channel::Sender;
+use rtrb::Producer;
 
-use crate::dsp::{
-    downmix_i16_to_mono_with_channel, downmix_to_mono_with_channel,
-    downmix_u16_to_mono_with_channel, resolve_channel,
-};
+use crate::dsp::resolve_channel;
 
 // ---------------------------------------------------------------------------
 // Input device: discovery, selection, capture
@@ -132,11 +129,11 @@ pub(crate) fn select_input_device(host: &cpal::Host, wanted: Option<&str>) -> Re
 
 /// Shared capture telemetry, written by the cpal callback / error handler and
 /// read by the main loop's throttled warn line. Atomics only — the callback
-/// must never block or allocate beyond the mono buffer.
+/// must never block or allocate.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StreamTelemetry {
-    /// Chunks dropped because the bounded `raw_rx` was full (capture outruns
-    /// resampling; see `RAW_QUEUE_BOUND`).
+    /// Callbacks that overflowed the raw sample ring (capture outruns
+    /// resampling; see `RAW_RING_SECS` in `main`).
     pub(crate) dropped_chunks: Arc<AtomicUsize>,
     /// `err_fn` invocations (xruns, backend errors).
     pub(crate) errors: Arc<AtomicUsize>,
@@ -146,9 +143,9 @@ pub(crate) struct StreamTelemetry {
 
 /// Build the cpal input stream for the device's native sample format.
 ///
-/// The callback only selects/mixes to mono and `try_send`s to `raw_tx`: it
-/// never calls `unwrap`/`expect`, never blocks, and does no heavy work. On a
-/// full queue the chunk is dropped and counted (`dropped_chunks`) instead of
+/// Real-time callback: per-sample mono mix/convert + `rtrb` push only — no
+/// `Vec`, no allocation, no blocking, no logging. On a full ring the sample
+/// is dropped and the callback counted once in `dropped_chunks` instead of
 /// stalling the audio thread — the main loop reports the total.
 pub(crate) fn build_input_stream(
     device: &cpal::Device,
@@ -156,7 +153,7 @@ pub(crate) fn build_input_stream(
     channels: usize,
     channel: Option<usize>,
     sample_format: cpal::SampleFormat,
-    raw_tx: Sender<Vec<f32>>,
+    raw_tx: Producer<f32>,
     telemetry: &StreamTelemetry,
 ) -> Result<cpal::Stream> {
     // Fail fast on a bad `--channel` rather than capturing silence.
@@ -175,18 +172,54 @@ pub(crate) fn build_input_stream(
         }
     };
 
+    let mut tx_opt = Some(raw_tx);
     match sample_format {
         cpal::SampleFormat::F32 => {
-            let tx = raw_tx.clone();
+            let mut tx = tx_opt.take().expect("raw producer taken once");
             let stream = device.build_input_stream(
                 config,
                 move |data: &[f32], _| {
-                    let mono = downmix_to_mono_with_channel(data, channels, channel);
-                    if let Err(e) = tx.try_send(mono) {
+                    let mut overflowed = false;
+                    if channels <= 1 {
+                        for &s in data {
+                            if tx.push(s).is_err() {
+                                overflowed = true;
+                            }
+                        }
+                    } else {
+                        match channel {
+                            None => {
+                                let inv = 1.0 / channels as f32;
+                                for frame in data.chunks_exact(channels) {
+                                    let mut sum = 0.0f32;
+                                    for &s in frame {
+                                        sum += s;
+                                    }
+                                    if tx.push(sum * inv).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                            Some(i) if i < channels => {
+                                for frame in data.chunks_exact(channels) {
+                                    if tx.push(frame[i]).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                for _ in 0..data.len() / channels.max(1) {
+                                    if tx.push(0.0).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if overflowed {
                         // RT thread: count only, never log/allocate. The main
                         // loop reports `dropped_chunks`.
                         dropped.fetch_add(1, Ordering::Relaxed);
-                        let _ = e;
                     }
                 },
                 err_fn,
@@ -195,15 +228,49 @@ pub(crate) fn build_input_stream(
             Ok(stream)
         }
         cpal::SampleFormat::I16 => {
-            let tx = raw_tx.clone();
+            let mut tx = tx_opt.take().expect("raw producer taken once");
             let stream = device.build_input_stream(
                 config,
                 move |data: &[i16], _| {
-                    // Single alloc: convert + downmix in one pass.
-                    let mono = downmix_i16_to_mono_with_channel(data, channels, channel);
-                    if let Err(e) = tx.try_send(mono) {
+                    let mut overflowed = false;
+                    if channels <= 1 {
+                        for &s in data {
+                            if tx.push(s as f32 / 32768.0).is_err() {
+                                overflowed = true;
+                            }
+                        }
+                    } else {
+                        match channel {
+                            None => {
+                                let inv = 1.0 / channels as f32;
+                                for frame in data.chunks_exact(channels) {
+                                    let mut sum = 0.0f32;
+                                    for &s in frame {
+                                        sum += s as f32 / 32768.0;
+                                    }
+                                    if tx.push(sum * inv).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                            Some(i) if i < channels => {
+                                for frame in data.chunks_exact(channels) {
+                                    if tx.push(frame[i] as f32 / 32768.0).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                for _ in 0..data.len() / channels.max(1) {
+                                    if tx.push(0.0).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if overflowed {
                         dropped.fetch_add(1, Ordering::Relaxed);
-                        let _ = e;
                     }
                 },
                 err_fn,
@@ -212,15 +279,49 @@ pub(crate) fn build_input_stream(
             Ok(stream)
         }
         cpal::SampleFormat::U16 => {
-            let tx = raw_tx.clone();
+            let mut tx = tx_opt.take().expect("raw producer taken once");
             let stream = device.build_input_stream(
                 config,
                 move |data: &[u16], _| {
-                    // Single alloc: convert + downmix in one pass.
-                    let mono = downmix_u16_to_mono_with_channel(data, channels, channel);
-                    if let Err(e) = tx.try_send(mono) {
+                    let mut overflowed = false;
+                    if channels <= 1 {
+                        for &s in data {
+                            if tx.push(s as f32 / 65535.0 * 2.0 - 1.0).is_err() {
+                                overflowed = true;
+                            }
+                        }
+                    } else {
+                        match channel {
+                            None => {
+                                let inv = 1.0 / channels as f32;
+                                for frame in data.chunks_exact(channels) {
+                                    let mut sum = 0.0f32;
+                                    for &s in frame {
+                                        sum += s as f32 / 65535.0 * 2.0 - 1.0;
+                                    }
+                                    if tx.push(sum * inv).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                            Some(i) if i < channels => {
+                                for frame in data.chunks_exact(channels) {
+                                    if tx.push(frame[i] as f32 / 65535.0 * 2.0 - 1.0).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                for _ in 0..data.len() / channels.max(1) {
+                                    if tx.push(0.0).is_err() {
+                                        overflowed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if overflowed {
                         dropped.fetch_add(1, Ordering::Relaxed);
-                        let _ = e;
                     }
                 },
                 err_fn,

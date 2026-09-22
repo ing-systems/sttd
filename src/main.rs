@@ -21,7 +21,7 @@
 //! share of the transmitted frames (long utterances exempt), trimmed to
 //! `TAIL_KEEP_SAMPLES` of trailing silence, is what actually reaches whisper,
 //! carried alongside its acoustic evidence (speech-frame count, density, RMS) as an
-//! `Utterance` -> `crossbeam-channel` queue (raw audio bounded with counted
+//! `Utterance` -> `rtrb` queue (raw samples bounded with counted
 //! sheds; utterances shed oldest-first past `WHISPER_SHED_KEEP`) -> isolated
 //! `whisper-rs` inference
 //! thread (GPU/CPU and model per flags, aborted promptly on shutdown):
@@ -65,7 +65,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, StreamTrait};
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use rtrb::{Consumer, Producer, RingBuffer};
 use signal_hook::consts::{SIGHUP, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::iterator::Signals;
 
@@ -228,10 +228,39 @@ fn format_available_models(selected: Option<&str>, installed: &[bool]) -> String
 // Microphone mode
 // ---------------------------------------------------------------------------
 
-/// Raw 10 ms chunks the callback may backlog: 256 ≈ 2.5 s. Past that the
+/// Seconds of raw mono samples the callback may backlog. Past that the
 /// callback drops (counted) instead of growing memory without bound while
-/// the model loads or the GPU lags.
-pub(crate) const RAW_QUEUE_BOUND: usize = 256;
+/// the model loads or the GPU lags. Sized in `open_input_path` from the hw
+/// rate (`hw_rate * RAW_RING_SECS`).
+pub(crate) const RAW_RING_SECS: usize = 4;
+
+/// Drain every available sample from the `rtrb` consumer into the accumulator.
+/// Main thread only; allocation (accumulator growth) is fine here — only the
+/// cpal callback is real-time.
+fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
+    while let Ok(s) = raw_rx.pop() {
+        accumulator.push(s);
+    }
+}
+
+/// Push a closed utterance into the bounded whisper ring. Never blocks the
+/// processing loop: a full ring drops the newest with a warn (in practice the
+/// worker-side oldest-first shed keeps the backlog small so this rarely
+/// fires). A dead worker (`is_abandoned`) is also just a warn.
+fn push_utterance(whisper_tx: &mut Producer<Utterance>, utterance: Utterance) {
+    if whisper_tx.is_abandoned() {
+        log::warn!("whisper worker gone, dropping utterance");
+        return;
+    }
+    if let Err(rtrb::PushError::Full(_)) = whisper_tx.push(utterance) {
+        log::warn!("whisper queue full, dropping newest utterance");
+    }
+}
+
+/// Occupied slots on the producer side (`Producer::slots` reports free).
+fn producer_occupied<T>(tx: &Producer<T>, cap: usize) -> usize {
+    cap.saturating_sub(tx.slots())
+}
 
 fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // Cheap, fallible audio setup first (device pick, hw config) — *before*
@@ -240,10 +269,10 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // this setup then failed via `?`, the process would tear down mid-init
     // and race whisper.cpp's CUDA cleanup (observed: "CUDA error: driver
     // shutting down" abort on e.g. a mistyped --device). Resolving (and
-    // downloading, ~800 MiB, minutes) before `play()` also keeps the bounded
-    // `raw_rx` from shedding while the main loop hasn't started draining
+    // downloading, ~800 MiB, minutes) before `play()` also keeps the raw ring
+    // from shedding while the main loop hasn't started draining
     // yet. GPU load itself still happens in the background after capture
-    // starts, so only the first ~2.5 s of audio is retained while it loads
+    // starts, so only the first seconds of audio are retained while it loads
     // (the default `--start-paused` discards even that).
     let host = cpal::default_host();
 
@@ -252,20 +281,25 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let model_path = resolve_model_input(cli)?;
     log::info!("model: {}", model_path.display());
 
-    // Raw mono captures (hw rate, f32 in [-1, 1]) from the cpal callback.
-    // Bounded + `try_send` (never blocks) keeps callback lock time minimal;
-    // overflow sheds (counted) instead of growing memory without bound.
-    let (raw_tx, raw_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(RAW_QUEUE_BOUND);
-    // Utterances queue unbounded (each is seconds of audio; MBs at most) and
-    // the whisper worker sheds oldest-first past `WHISPER_SHED_KEEP` so live
-    // speech stays fresh instead of lagging minutes behind.
-    let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
+    // Raw mono samples (hw rate, f32 in [-1, 1]) from the cpal callback via a
+    // realtime-safe `rtrb` sample ring (no allocation in the callback;
+    // overflow sheds counted samples instead of growing memory without
+    // bound). Created inside `open_input_path` once the hw rate is known.
+    // Utterance queue is bounded (`WHISPER_QUEUE_CAP`, each utterance seconds
+    // of audio) and the whisper worker sheds oldest-first past
+    // `WHISPER_SHED_KEEP` so live speech stays fresh instead of lagging
+    // minutes behind.
+    let (mut whisper_tx, whisper_rx) =
+        RingBuffer::<Utterance>::new(crate::whisper::WHISPER_QUEUE_CAP);
     let telemetry = StreamTelemetry::default();
 
     // First open fails fast (bad --device/--channel), like before; later
-    // disconnects rebuild inside the loop (see `device_gone`).
-    let (mut hw_rate, mut stream, mut fp) =
-        open_input_path(&host, cli, raw_tx.clone(), whisper_tx.clone(), &telemetry)?;
+    // disconnects rebuild inside the loop (see `device_gone`). The raw ring
+    // is recreated per open (capacity follows the hw rate); the utterance
+    // ring survives rebuilds (main owns the producer, the worker the
+    // consumer, `FrameProcessor` just returns closed utterances).
+    let (mut hw_rate, mut stream, mut fp, mut raw_rx) =
+        open_input_path(&host, cli, &telemetry)?;
     let mut input_frames = fp.required_input_frames();
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
@@ -334,17 +368,12 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             rebuild_attempts += 1;
             log::warn!("input device lost, rebuild attempt #{rebuild_attempts}...");
             thread::sleep(Duration::from_secs(2));
-            match open_input_path(
-                &host,
-                cli,
-                raw_tx.clone(),
-                whisper_tx.clone(),
-                &telemetry,
-            ) {
-                Ok((new_rate, new_stream, new_fp)) => {
+            match open_input_path(&host, cli, &telemetry) {
+                Ok((new_rate, new_stream, new_fp, new_raw_rx)) => {
                     hw_rate = new_rate;
                     stream = new_stream;
                     fp = new_fp;
+                    raw_rx = new_raw_rx;
                     input_frames = fp.required_input_frames();
                     accumulator.clear();
                     accumulator.reserve(hw_rate as usize * 2);
@@ -392,25 +421,14 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         was_paused = now_paused;
         if now_paused {
             fp.discard_speech_keep_warm();
-            // Park until the next callback chunk (wakes immediately on
-            // audio) instead of drain + `sleep(50ms)`: the noise floor still
-            // learns from every chunk, but resume (SIGUSR2/SIGHUP) is
-            // noticed within ~10 ms instead of ~50 ms.
-            match raw_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(chunk) => {
-                    accumulator.extend_from_slice(&chunk);
-                    while let Ok(chunk) = raw_rx.try_recv() {
-                        accumulator.extend_from_slice(&chunk);
-                    }
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    while let Ok(chunk) = raw_rx.try_recv() {
-                        accumulator.extend_from_slice(&chunk);
-                    }
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    thread::sleep(Duration::from_millis(10));
-                }
+            // Drain the sample ring, then park briefly when empty instead of
+            // drain + `sleep(50ms)`: the noise floor still learns from every
+            // sample, but resume (SIGUSR2/SIGHUP) is noticed within ~10 ms
+            // instead of ~50 ms.
+            drain_raw_into(&mut raw_rx, &mut accumulator);
+            if accumulator.len() < input_frames && !raw_rx.is_abandoned() {
+                thread::sleep(Duration::from_millis(10));
+                drain_raw_into(&mut raw_rx, &mut accumulator);
             }
             while accumulator.len() >= input_frames {
                 fp.observe_pause(&accumulator[..input_frames]);
@@ -424,41 +442,33 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             continue;
         }
         // Drain everything the callback delivered since last iteration.
-        while let Ok(chunk) = raw_rx.try_recv() {
-            accumulator.extend_from_slice(&chunk);
-        }
-        // A full hw frame still isn't available: park until the next chunk
-        // (wakes immediately on audio) instead of `sleep(2ms)` polling. Same
-        // ~2 ms worst-case cadence for the device/whisper checks below, but
-        // audio that arrives mid-wait is processed without the extra 0-2 ms
-        // poll jitter.
-        if accumulator.len() < input_frames {
-            match raw_rx.recv_timeout(Duration::from_millis(2)) {
-                Ok(chunk) => {
-                    accumulator.extend_from_slice(&chunk);
-                    while let Ok(chunk) = raw_rx.try_recv() {
-                        accumulator.extend_from_slice(&chunk);
-                    }
-                }
-                Err(_) => {}
-            }
+        drain_raw_into(&mut raw_rx, &mut accumulator);
+        // A full hw frame still isn't available: park briefly for the next
+        // samples instead of busy-spinning. Same ~2 ms worst-case cadence
+        // for the device/whisper checks below.
+        if accumulator.len() < input_frames && !raw_rx.is_abandoned() {
+            thread::sleep(Duration::from_millis(2));
+            drain_raw_into(&mut raw_rx, &mut accumulator);
         }
 
-        // Raw hw-rate chunks -> FrameProcessor (denoise/VAD + whisper
+        // Raw hw-rate samples -> FrameProcessor (denoise/VAD + whisper
         // branches, all resampling included).
         while accumulator.len() >= input_frames {
-            fp.process_frame(&accumulator[..input_frames]);
+            if let Some(utterance) = fp.process_frame(&accumulator[..input_frames]) {
+                push_utterance(&mut whisper_tx, utterance);
+            }
             accumulator.drain(..input_frames);
         }
 
-        // Backpressure visibility: bounded queues shed under load (callback
+        // Backpressure visibility: bounded rings shed under load (callback
         // must never block, live speech must stay fresh), so report depths
         // plus shed totals — throttled to one line per 5 s. Signal-path
         // pairing depths catch a resampler divergence the others miss.
         if last_queue_warn.elapsed() >= Duration::from_secs(5) {
             last_queue_warn = Instant::now();
-            let raw_depth = raw_rx.len();
-            let whisper_depth = fp.queue_depth();
+            let raw_depth = raw_rx.slots();
+            let whisper_depth =
+                producer_occupied(&whisper_tx, crate::whisper::WHISPER_QUEUE_CAP);
             let (signal_vad, signal_whisper) = fp.signal_pending_depths();
             let raw_dropped = telemetry.dropped_chunks.load(Ordering::Relaxed);
             let stream_errors = telemetry.errors.load(Ordering::Relaxed);
@@ -479,20 +489,29 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     }
 
     // Stop capture before the trailing flush so no new audio races teardown.
+    // Dropping the stream drops the raw producer; the consumer is drained
+    // below only for full frames already accumulated.
     drop(stream);
+    drain_raw_into(&mut raw_rx, &mut accumulator);
+    while accumulator.len() >= input_frames {
+        if let Some(utterance) = fp.process_frame(&accumulator[..input_frames]) {
+            push_utterance(&mut whisper_tx, utterance);
+        }
+        accumulator.drain(..input_frames);
+    }
     // Flush trailing speech, then wait for the whisper thread to actually
     // finish transcribing it (and any earlier backlog) before the process
     // exits — otherwise the last utterance can be silently dropped, and an
     // in-flight CUDA op can race process teardown the same way an early `?`
     // above used to.
-    fp.flush_trailing_speech();
+    if let Some(utterance) = fp.flush_trailing_speech() {
+        push_utterance(&mut whisper_tx, utterance);
+    }
     drop(fp);
-    // Disconnect the utterance queue so the whisper worker sees
-    // `Disconnected` and exits; without this the root sender kept alive here
-    // (cloned into `FrameProcessor` on open/rebuild) holds the channel open
-    // and `join` below hangs forever on Ctrl-C / SIGTERM.
+    // Drop the last utterance producer so the whisper worker sees
+    // `is_abandoned` and exits; without this the `join` below hangs forever
+    // on Ctrl-C / SIGTERM.
     drop(whisper_tx);
-    drop(raw_tx);
     drop(raw_rx);
     whisper_handle
         .join()
@@ -506,15 +525,15 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 /// `--device`/`--channel` aborts before the model loads) and for rebuilds
 /// after `DeviceNotAvailable` (see the main loop). A rebuild re-creates the
 /// resamplers for the (possibly changed) hw rate; utterance state is lost and
-/// warm VAD noise floor is kept.
+/// warm VAD noise floor is kept. The raw `rtrb` ring is created here (capacity
+/// follows the hw rate); the utterance ring lives in the caller and survives
+/// rebuilds.
 #[allow(clippy::too_many_arguments)]
 fn open_input_path(
     host: &cpal::Host,
     cli: &Cli,
-    raw_tx: Sender<Vec<f32>>,
-    whisper_tx: Sender<Utterance>,
     telemetry: &StreamTelemetry,
-) -> Result<(u32, cpal::Stream, FrameProcessor)> {
+) -> Result<(u32, cpal::Stream, FrameProcessor, Consumer<f32>)> {
     let device = select_input_device(host, cli.device.as_deref())?;
     log::info!(
         "input device: {}",
@@ -539,13 +558,14 @@ fn open_input_path(
     // hw -> 16k for whisper with `--denoiser deepfilter`).
     let fp = FrameProcessor::new(
         hw_rate,
-        whisper_tx,
         cli.denoiser,
         cli.vad_threshold,
         cli.vad_adapt,
         gate_config(cli),
         crate::config::hangover_frames(cli.hangover_ms),
     )?;
+    let raw_cap = (hw_rate as usize).saturating_mul(RAW_RING_SECS).max(65536);
+    let (raw_tx, raw_rx) = RingBuffer::<f32>::new(raw_cap);
     let stream = build_input_stream(
         &device,
         &stream_config,
@@ -556,7 +576,7 @@ fn open_input_path(
         telemetry,
     )?;
     stream.play().context("failed to start input stream")?;
-    Ok((hw_rate, stream, fp))
+    Ok((hw_rate, stream, fp, raw_rx))
 }
 
 /// Install the Ctrl-C handler that stops the processing loop. A failed
@@ -646,10 +666,10 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     let model_path = resolve_model_input(cli)?;
     log::info!("model: {}", model_path.display());
 
-    let (whisper_tx, whisper_rx): (Sender<Utterance>, Receiver<Utterance>) = unbounded();
+    let (mut whisper_tx, whisper_rx) =
+        RingBuffer::<Utterance>::new(crate::whisper::WHISPER_QUEUE_CAP);
     let mut fp = FrameProcessor::new(
         wav.sample_rate,
-        whisper_tx.clone(),
         cli.denoiser,
         cli.vad_threshold,
         cli.vad_adapt,
@@ -691,12 +711,16 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
 
     let mut offset = 0usize;
     while offset + input_frames <= wav.samples.len() {
-        fp.process_frame(&wav.samples[offset..offset + input_frames]);
+        if let Some(utterance) = fp.process_frame(&wav.samples[offset..offset + input_frames]) {
+            push_utterance(&mut whisper_tx, utterance);
+        }
         offset += input_frames;
     }
     // A trailing partial chunk (< input_frames samples, at most ~30 ms) is
     // dropped; fine for offline comparison runs.
-    fp.flush_trailing_speech();
+    if let Some(utterance) = fp.flush_trailing_speech() {
+        push_utterance(&mut whisper_tx, utterance);
+    }
 
     drop(fp);
     drop(whisper_tx);

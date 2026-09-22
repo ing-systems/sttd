@@ -37,7 +37,7 @@ impl Evidence {
 /// One utterance that cleared `UtteranceBuffer::close` and is ready for
 /// whisper: the trimmed 16 kHz audio plus the `Evidence` gathered while
 /// buffering it. Evidence that used to be computed and then thrown away at the
-/// `Sender<Vec<f32>>` boundary.
+/// queue boundary.
 pub(crate) struct Utterance {
     pub(crate) pcm: Vec<f32>,
     pub(crate) evidence: Evidence,
