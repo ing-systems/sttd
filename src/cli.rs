@@ -24,26 +24,43 @@ use crate::whisper::Language;
 )]
 pub(crate) struct Cli {
     /// Transcribe a WAV file offline instead of the microphone.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["list_devices", "list_models"])]
+    #[arg(short, long, value_name = "PATH", help_heading = "Input", conflicts_with_all = ["list_devices", "list_models"])]
     pub(crate) file: Option<PathBuf>,
 
-    /// List available input devices and exit.
-    #[arg(long, conflicts_with_all = ["file", "list_models"])]
-    pub(crate) list_devices: bool,
-
-    /// List known whisper models (with installed/default markers) and exit.
-    #[arg(long, conflicts_with_all = ["file", "list_devices"])]
-    pub(crate) list_models: bool,
-
     /// Substring match (case-insensitive) against an input device name.
-    #[arg(long, env = "STTD_DEVICE")]
+    #[arg(short, long, env = "STTD_DEVICE", help_heading = "Input")]
     pub(crate) device: Option<String>,
+
+    /// List available input devices and exit.
+    #[arg(long, help_heading = "Input", conflicts_with_all = ["file", "list_models"])]
+    pub(crate) list_devices: bool,
 
     /// Model spec (e.g. `small`, `large-v3-turbo-q8_0`) or path to a ggml
     /// whisper model file (auto-downloaded if missing). `STTD_MODEL` wins
     /// over the legacy `WHISPER_MODEL_PATH` fallback; CLI wins over both.
-    #[arg(long, env = "STTD_MODEL", value_name = "SPEC|PATH")]
+    #[arg(short, long, env = "STTD_MODEL", value_name = "SPEC|PATH", help_heading = "Model")]
     pub(crate) model: Option<String>,
+
+    /// List known whisper models (with installed/default markers) and exit.
+    #[arg(long, help_heading = "Model", conflicts_with_all = ["file", "list_devices"])]
+    pub(crate) list_models: bool,
+
+    /// Whisper decoding language: `pl` forces Polish, `en` forces English,
+    /// `auto` detects per utterance.
+    #[arg(
+        short,
+        long,
+        env = "STTD_LANGUAGE",
+        value_enum,
+        ignore_case = true,
+        default_value_t = Language::Polish,
+        help_heading = "Model"
+    )]
+    pub(crate) language: Language,
+
+    /// Override the whisper initial prompt.
+    #[arg(short, long, env = "STTD_PROMPT", default_value = DEFAULT_PROMPT, help_heading = "Model")]
+    pub(crate) prompt: String,
 
     /// VAD-branch denoiser.
     #[arg(
@@ -51,57 +68,39 @@ pub(crate) struct Cli {
         env = "STTD_DENOISER",
         value_enum,
         ignore_case = true,
-        default_value_t = DenoiserKind::Bypass
+        default_value_t = DenoiserKind::Bypass,
+        help_heading = "Model"
     )]
     pub(crate) denoiser: DenoiserKind,
 
-    /// Override the whisper initial prompt.
-    #[arg(long, env = "STTD_PROMPT", default_value = DEFAULT_PROMPT)]
-    pub(crate) prompt: String,
-
-    /// Whisper decoding language: `pl` forces Polish, `en` forces English,
-    /// `auto` detects per utterance.
-    #[arg(
-        long,
-        env = "STTD_LANGUAGE",
-        value_enum,
-        ignore_case = true,
-        default_value_t = Language::Polish
-    )]
-    pub(crate) language: Language,
-
-    /// Write each utterance as WAV+TXT into this directory (TXT written
-    /// for dropped utterances too, prefixed with the drop reason).
-    #[arg(long, env = "STTD_DUMP_DIR")]
-    pub(crate) dump_dir: Option<PathBuf>,
+    /// Minimum earshot score for a 16 ms window to count as speech.
+    #[arg(long, env = "STTD_VAD_THRESHOLD", default_value_t = DEFAULT_VAD_THRESHOLD, help_heading = "Acoustic gates")]
+    pub(crate) vad_threshold: f32,
 
     /// Min speech-only RMS to keep an utterance.
-    #[arg(long, env = "STTD_MIN_RMS", default_value_t = DEFAULT_MIN_SPEECH_RMS)]
+    #[arg(long, env = "STTD_MIN_RMS", default_value_t = DEFAULT_MIN_SPEECH_RMS, help_heading = "Acoustic gates")]
     pub(crate) min_rms: f32,
 
     /// Min share of transmitted frames flagged as speech (long utterances exempt).
-    #[arg(long, env = "STTD_MIN_DENSITY", default_value_t = DEFAULT_MIN_DENSITY)]
+    #[arg(long, env = "STTD_MIN_DENSITY", default_value_t = DEFAULT_MIN_DENSITY, help_heading = "Acoustic gates")]
     pub(crate) min_density: f32,
 
+    /// Pre-inference gain target RMS, 0 disables.
+    #[arg(long, env = "STTD_TARGET_RMS", default_value_t = DEFAULT_TARGET_RMS, help_heading = "Acoustic gates")]
+    pub(crate) target_rms: f32,
+
     /// Min avg token confidence, weak acoustic evidence.
-    #[arg(long, env = "STTD_MIN_CONF", default_value_t = DEFAULT_MIN_CONFIDENCE)]
+    #[arg(long, env = "STTD_MIN_CONF", default_value_t = DEFAULT_MIN_CONFIDENCE, help_heading = "Transcript gates")]
     pub(crate) min_conf: f32,
 
     /// Min avg token confidence, strong acoustic evidence.
     #[arg(
         long,
         env = "STTD_MIN_CONF_STRONG",
-        default_value_t = DEFAULT_MIN_CONFIDENCE_STRONG
+        default_value_t = DEFAULT_MIN_CONFIDENCE_STRONG,
+        help_heading = "Transcript gates"
     )]
     pub(crate) min_conf_strong: f32,
-
-    /// Pre-inference gain target RMS, 0 disables.
-    #[arg(long, env = "STTD_TARGET_RMS", default_value_t = DEFAULT_TARGET_RMS)]
-    pub(crate) target_rms: f32,
-
-    /// Minimum earshot score for a 16 ms window to count as speech.
-    #[arg(long, env = "STTD_VAD_THRESHOLD", default_value_t = DEFAULT_VAD_THRESHOLD)]
-    pub(crate) vad_threshold: f32,
 
     /// Copy each accepted transcript to the Wayland clipboard via `wl-copy`.
     /// Gates auto-paste together with `--paste`: paste only runs on fresh
@@ -112,7 +111,8 @@ pub(crate) struct Cli {
         default_value_t = true,
         value_parser = parse_bool,
         num_args = 0..=1,
-        default_missing_value = "true"
+        default_missing_value = "true",
+        help_heading = "Emission"
     )]
     pub(crate) copy: bool,
 
@@ -125,20 +125,15 @@ pub(crate) struct Cli {
         default_value_t = true,
         value_parser = parse_bool,
         num_args = 0..=1,
-        default_missing_value = "true"
+        default_missing_value = "true",
+        help_heading = "Emission"
     )]
     pub(crate) paste: bool,
 
-    /// Dump per-token id/text/p/plog/is_timestamp to stderr.
-    #[arg(
-        long,
-        env = "STTD_DEBUG_TOKENS",
-        default_value_t = false,
-        value_parser = parse_bool,
-        num_args = 0..=1,
-        default_missing_value = "true"
-    )]
-    pub(crate) debug_tokens: bool,
+    /// Write each utterance as WAV+TXT into this directory (TXT written
+    /// for dropped utterances too, prefixed with the drop reason).
+    #[arg(short = 'o', long, env = "STTD_DUMP_DIR", help_heading = "Emission")]
+    pub(crate) dump_dir: Option<PathBuf>,
 
     /// Start microphone mode paused (no audio reaches whisper until
     /// SIGUSR2/SIGHUP). File mode ignores this.
@@ -148,9 +143,22 @@ pub(crate) struct Cli {
         default_value_t = true,
         value_parser = parse_bool,
         num_args = 0..=1,
-        default_missing_value = "true"
+        default_missing_value = "true",
+        help_heading = "Runtime"
     )]
     pub(crate) start_paused: bool,
+
+    /// Dump per-token id/text/p/plog/is_timestamp to stderr.
+    #[arg(
+        long,
+        env = "STTD_DEBUG_TOKENS",
+        default_value_t = false,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Runtime"
+    )]
+    pub(crate) debug_tokens: bool,
 }
 
 impl Cli {
