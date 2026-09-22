@@ -199,7 +199,7 @@ impl AcousticDrop {
 }
 
 /// Transcript disposition for non-empty text (plus the empty case).
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub(crate) enum TranscriptVerdict {
     Emit { floor: f32, strength: EvidenceStrength },
     DropEmpty,

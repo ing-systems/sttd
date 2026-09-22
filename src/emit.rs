@@ -15,8 +15,10 @@
 // gate → emission composition through. Inference never sees either.
 
 use std::path::PathBuf;
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
+use crossbeam_channel::{unbounded, Sender};
 
 use crate::config::WHISPER_RATE;
 use crate::gate::{TranscriptDropKind, TranscriptVerdict};
@@ -40,16 +42,57 @@ pub(crate) struct Emission<'a> {
     pub(crate) evidence: &'a Evidence,
 }
 
+/// Owned handoff across the async emission queue: the whisper thread builds
+/// this (one clone of tag/text/pcm) and sends it without blocking; the emit
+/// worker thread owns all side effects in FIFO order.
+pub(crate) struct OwnedEmission {
+    pub(crate) tag: String,
+    pub(crate) pcm: Vec<f32>,
+    pub(crate) text: String,
+    pub(crate) verdict: TranscriptVerdict,
+    pub(crate) prob: f32,
+    pub(crate) logprob: f32,
+    pub(crate) evidence: Evidence,
+}
+
+impl OwnedEmission {
+    fn from_borrowed(e: Emission<'_>) -> Self {
+        Self {
+            tag: e.tag.to_string(),
+            pcm: e.pcm.to_vec(),
+            text: e.text.to_string(),
+            verdict: e.verdict,
+            prob: e.prob,
+            logprob: e.logprob,
+            evidence: *e.evidence,
+        }
+    }
+}
+
 /// The emission seam: one verdict in, side effects out, nothing back.
 pub(crate) trait Emitter {
     fn emit(&mut self, emission: Emission<'_>);
 }
 
 /// Prod adapter: opt-in stdout, Wayland clipboard, auto-paste, dump dir.
+///
+/// Async by design: `emit()` only clones into an `OwnedEmission` and does a
+/// non-blocking `unbounded` send, so a stuck `wl-copy`/`ydotool`/disk never
+/// stalls whisper inference. A single `emit` worker thread owns all side
+/// effects in FIFO order; `Drop` closes the channel and joins it, so shutdown
+/// (`whisper_handle.join()`) flushes the queue before the process exits.
 /// Untested glue by design — the logic worth testing (verdict → action) is
 /// exercised through `RecordingEmitter`; this only shells out to binaries
 /// and files.
 pub(crate) struct SystemEmitter {
+    tx: Option<Sender<OwnedEmission>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// Mutable worker state: lives on the emit thread only. `clipboard_available`
+/// / `paste_available` flip off on `NotFound`, same as before, but without
+/// touching the inference thread.
+struct EmitterWorker {
     dump_dir: Option<PathBuf>,
     clipboard_available: bool,
     paste_available: bool,
@@ -60,6 +103,7 @@ impl SystemEmitter {
     /// Resolve emission policy once: create the dump dir (fatal, like the
     /// model load it precedes on the main thread) and settle clipboard/paste
     /// availability with one warning each instead of one per utterance.
+    /// Then spawn the worker thread that owns the side effects.
     pub(crate) fn new(
         dump_dir: Option<PathBuf>,
         copy_enabled: bool,
@@ -71,7 +115,7 @@ impl SystemEmitter {
                 .with_context(|| format!("failed to create {}", dir.display()))?;
             log::info!("dumping utterances to {}", dir.display());
         }
-        let mut emitter = Self {
+        let mut worker = EmitterWorker {
             dump_dir,
             clipboard_available: copy_enabled,
             paste_available: paste_enabled,
@@ -90,20 +134,59 @@ impl SystemEmitter {
         // Both `wl-copy` and the paste target only make sense on Wayland; on
         // X.org (or headless/`--file` without a Wayland socket) disable once
         // with a warning rather than failing every utterance.
-        if (emitter.clipboard_available || emitter.paste_available) && !is_wayland_session_env() {
+        if (worker.clipboard_available || worker.paste_available) && !is_wayland_session_env() {
             log::warn!(
                 "auto-paste is enabled but this is not a Wayland session (no WAYLAND_DISPLAY, XDG_SESSION_TYPE!=wayland); disabling clipboard + ydotool paste"
             );
-            emitter.clipboard_available = false;
-            emitter.paste_available = false;
+            worker.clipboard_available = false;
+            worker.paste_available = false;
         }
-        Ok(emitter)
+        let (tx, rx) = unbounded::<OwnedEmission>();
+        let handle = std::thread::Builder::new()
+            .name("emit".into())
+            .spawn(move || {
+                for owned in rx {
+                    worker.handle(owned);
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn emit thread: {e}"))?;
+        Ok(Self {
+            tx: Some(tx),
+            worker: Some(handle),
+        })
+    }
+}
+
+impl Drop for SystemEmitter {
+    fn drop(&mut self) {
+        // Close the channel first so the worker drains and exits, then join.
+        // Flushing here is what guarantees `--stop`/Ctrl-C keeps the trailing
+        // utterance instead of dropping it at process teardown.
+        self.tx.take();
+        if let Some(h) = self.worker.take() {
+            if h.join().is_err() {
+                log::warn!("emit worker panicked");
+            }
+        }
     }
 }
 
 impl Emitter for SystemEmitter {
     fn emit(&mut self, emission: Emission<'_>) {
-        let Emission {
+        let owned = OwnedEmission::from_borrowed(emission);
+        if let Some(tx) = &self.tx {
+            // Unbounded: never blocks inference. Only fails if the worker
+            // died, which must not take transcription down with it.
+            if let Err(e) = tx.send(owned) {
+                log::warn!("emit queue closed, dropping {}: {e:?}", e.0.tag);
+            }
+        }
+    }
+}
+
+impl EmitterWorker {
+    fn handle(&mut self, owned: OwnedEmission) {
+        let OwnedEmission {
             tag,
             pcm,
             text,
@@ -111,7 +194,10 @@ impl Emitter for SystemEmitter {
             prob,
             logprob,
             evidence,
-        } = emission;
+        } = &owned;
+        let tag: &str = tag.as_str();
+        let pcm: &[f32] = pcm.as_slice();
+        let text: &str = text.as_str();
         // WAV dump first, for every utterance (including drops), as before.
         if let Some(dir) = &self.dump_dir {
             let wav_path = dir.join(format!("{tag}.wav"));
@@ -155,14 +241,12 @@ impl Emitter for SystemEmitter {
                         log::info!("{tag}: dropped repetition-loop decode: {text:?}");
                     }
                 }
-                // All fields are `Copy`, so the verdict can be re-spoken for
-                // the dump reason after the match moved it.
                 let reason = TranscriptVerdict::Drop {
-                    kind,
-                    floor,
-                    strength,
+                    kind: *kind,
+                    floor: *floor,
+                    strength: *strength,
                 }
-                .dump_reason(text, prob);
+                .dump_reason(text, *prob);
                 dump_drop_reason(&self.dump_dir, tag, &reason);
                 return;
             }
@@ -414,15 +498,18 @@ mod tests {
     #[test]
     fn confident_transcript_is_emitted_with_copy_and_paste() {
         let evidence = strong_evidence();
-        let verdict = gate().decide_transcript(
-            evidence.speech_frames,
-            evidence.rms,
-            "Dzień dobry",
-            0.9,
-        );
+        let verdict =
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.9);
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
-        emit(&mut emitter, "utt_000001", &pcm, "Dzień dobry", verdict, &evidence);
+        emit(
+            &mut emitter,
+            "utt_000001",
+            &pcm,
+            "Dzień dobry",
+            verdict,
+            &evidence,
+        );
         assert_eq!(emitter.records.len(), 1);
         let r = &emitter.records[0];
         assert_eq!(r.tag, "utt_000001");
@@ -437,27 +524,33 @@ mod tests {
     #[test]
     fn stdout_print_is_opt_in() {
         let evidence = strong_evidence();
-        let verdict = gate().decide_transcript(
-            evidence.speech_frames,
-            evidence.rms,
-            "Dzień dobry",
-            0.9,
-        );
+        let verdict =
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.9);
         let pcm = vec![0.01f32; 1600];
         let mut emitter = RecordingEmitter::new();
-        emit(&mut emitter, "utt_000001", &pcm, "Dzień dobry", verdict, &evidence);
+        emit(
+            &mut emitter,
+            "utt_000001",
+            &pcm,
+            "Dzień dobry",
+            verdict,
+            &evidence,
+        );
         assert!(emitter.records[0].emitted);
         assert!(!emitter.records[0].printed);
 
-        let verdict = gate().decide_transcript(
-            evidence.speech_frames,
-            evidence.rms,
-            "Dzień dobry",
-            0.9,
-        );
+        let verdict =
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.9);
         let mut emitter = RecordingEmitter::new();
         emitter.stdout_enabled = true;
-        emit(&mut emitter, "utt_000002", &pcm, "Dzień dobry", verdict, &evidence);
+        emit(
+            &mut emitter,
+            "utt_000002",
+            &pcm,
+            "Dzień dobry",
+            verdict,
+            &evidence,
+        );
         assert!(emitter.records[0].emitted);
         assert!(emitter.records[0].printed);
 
@@ -468,7 +561,14 @@ mod tests {
             "tak tak tak tak tak tak",
             0.9,
         );
-        emit(&mut emitter, "utt_000003", &pcm, "tak tak tak tak tak tak", verdict, &evidence);
+        emit(
+            &mut emitter,
+            "utt_000003",
+            &pcm,
+            "tak tak tak tak tak tak",
+            verdict,
+            &evidence,
+        );
         let r = &emitter.records[1];
         assert!(!r.emitted);
         assert!(!r.printed);
@@ -477,16 +577,19 @@ mod tests {
     #[test]
     fn paste_only_runs_on_fresh_copy() {
         let evidence = strong_evidence();
-        let verdict = gate().decide_transcript(
-            evidence.speech_frames,
-            evidence.rms,
-            "Dzień dobry",
-            0.9,
-        );
+        let verdict =
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", 0.9);
         let mut emitter = RecordingEmitter::new();
         emitter.fail_copy = true;
         let pcm = vec![0.01f32; 1600];
-        emit(&mut emitter, "utt_000001", &pcm, "Dzień dobry", verdict, &evidence);
+        emit(
+            &mut emitter,
+            "utt_000001",
+            &pcm,
+            "Dzień dobry",
+            verdict,
+            &evidence,
+        );
         let r = &emitter.records[0];
         assert!(r.emitted);
         assert!(!r.copied);
@@ -537,13 +640,9 @@ mod tests {
                 "Napisy stworzone przez społeczność Amara.org",
                 TranscriptDropKind::Hallucination,
             ),
-            (
-                "tak tak tak tak tak tak",
-                TranscriptDropKind::Repetition,
-            ),
+            ("tak tak tak tak tak tak", TranscriptDropKind::Repetition),
         ] {
-            let verdict =
-                gate().decide_transcript(evidence.speech_frames, evidence.rms, text, 0.9);
+            let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, text, 0.9);
             assert!(matches!(verdict, TranscriptVerdict::Drop { kind: k, .. } if k == kind));
             let mut emitter = RecordingEmitter::new();
             let pcm = vec![0.01f32; 1600];
@@ -558,8 +657,7 @@ mod tests {
     #[test]
     fn empty_transcript_drops_but_wav_still_recorded() {
         let evidence = weak_evidence();
-        let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "   ", 0.0);
+        let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, "   ", 0.0);
         assert_eq!(verdict, TranscriptVerdict::DropEmpty);
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
@@ -581,10 +679,103 @@ mod tests {
         assert!(matches!(verdict, TranscriptVerdict::Emit { .. }));
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
-        emit(&mut emitter, "utt_000005", &pcm, "Dzień dobry", verdict, &evidence);
+        emit(
+            &mut emitter,
+            "utt_000005",
+            &pcm,
+            "Dzień dobry",
+            verdict,
+            &evidence,
+        );
         let r = &emitter.records[0];
         assert!(r.emitted);
         assert!(r.copied);
+    }
+
+    #[test]
+    fn system_emitter_drop_flushes_queue() {
+        // Async regression: `emit()` must not lose utterances at shutdown.
+        // `Drop` closes the channel and joins the worker, so WAV+TXT for both
+        // an emit and a drop must exist immediately after drop returns.
+        let dir = std::env::temp_dir().join(format!("sttd-emit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let evidence = strong_evidence();
+        {
+            let mut emitter = SystemEmitter::new(Some(dir.clone()), false, false, false).unwrap();
+            let pcm = vec![0.01f32; 1600];
+            emitter.emit(Emission {
+                tag: "utt_000001",
+                pcm: &pcm,
+                text: "Dzień dobry",
+                verdict: gate().decide_transcript(
+                    evidence.speech_frames,
+                    evidence.rms,
+                    "Dzień dobry",
+                    0.9,
+                ),
+                prob: 0.9,
+                logprob: -0.1,
+                evidence: &evidence,
+            });
+            emitter.emit(Emission {
+                tag: "utt_000002",
+                pcm: &pcm,
+                text: "   ",
+                verdict: TranscriptVerdict::DropEmpty,
+                prob: 0.0,
+                logprob: 0.0,
+                evidence: &evidence,
+            });
+            // No join yet: Drop at scope end must flush.
+        }
+        assert!(dir.join("utt_000001.wav").exists());
+        assert!(dir.join("utt_000001.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("utt_000001.txt")).unwrap(),
+            "Dzień dobry"
+        );
+        assert!(dir.join("utt_000002.wav").exists());
+        assert!(dir.join("utt_000002.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_emitter_emit_never_blocks_inference() {
+        // `emit()` is a single clone + unbounded send: 200 rapid emits must
+        // finish well under a whisper inference (seconds), even with disk I/O
+        // still draining on the worker.
+        let dir = std::env::temp_dir().join(format!("sttd-emit-nb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let evidence = strong_evidence();
+        let mut emitter = SystemEmitter::new(Some(dir.clone()), false, false, false).unwrap();
+        let pcm = vec![0.01f32; 1600];
+        let t0 = std::time::Instant::now();
+        for i in 0..200 {
+            let tag = format!("utt_{i:06}");
+            // Borrow tag for the call; OwnedEmission clones inside.
+            emitter.emit(Emission {
+                tag: &tag,
+                pcm: &pcm,
+                text: "Dzień dobry",
+                verdict: gate().decide_transcript(
+                    evidence.speech_frames,
+                    evidence.rms,
+                    "Dzień dobry",
+                    0.9,
+                ),
+                prob: 0.9,
+                logprob: -0.1,
+                evidence: &evidence,
+            });
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "200 emits took {:?}, worker is blocking inference",
+            t0.elapsed()
+        );
+        drop(emitter);
+        assert!(dir.join("utt_000199.wav").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

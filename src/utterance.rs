@@ -12,6 +12,7 @@ use crate::gate::GateConfig;
 /// real speech" apart from "the model invented something over silence" — the
 /// two cases a single confidence threshold can't separate (see
 /// `confidence_floor`).
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Evidence {
     /// Total VAD-flagged speech frames over the utterance's life (see
     /// `UtteranceBuffer::speech_frames`).
