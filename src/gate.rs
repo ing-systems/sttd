@@ -64,8 +64,11 @@ impl GateConfig {
     }
 
     /// Acoustic gate: takes measurements `UtteranceBuffer` already computed
-    /// (post-trim density, speech-only RMS, transmitted length for the
-    /// long-utterance exemption). Returns the drop reason or `Ok(())`.
+    /// (post-trim energy-weighted density, speech-only RMS, transmitted
+    /// length for the long-utterance exemption). Returns the drop reason
+    /// or `Ok(())`. The density here is energy-weighted (quiet frames
+    /// count fractionally), so it equals frame density for loud speech
+    /// and scores lower for breath/hum flicker at the same frame count.
     pub(crate) fn check_acoustic(
         &self,
         speech_frames: u32,

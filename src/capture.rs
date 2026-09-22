@@ -5,7 +5,109 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use rtrb::Producer;
 
-use crate::dsp::resolve_channel;
+use crate::dsp::{pick_louder_channel, resolve_channel};
+
+/// Probe the loudest input channel: open a short-lived input stream on
+/// `device`/`config`, collect ~`probe_ms` of interleaved audio, and return
+/// the highest-RMS channel index. Returns `None` for mono input, silence,
+/// or too few samples — the caller then falls back to mix. Only used for
+/// `--channel auto`; `mix`/`pick` never probe.
+pub(crate) fn probe_loudest_channel(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    sample_format: cpal::SampleFormat,
+    probe_ms: u64,
+) -> Result<Option<usize>> {
+    if channels <= 1 {
+        return Ok(None);
+    }
+    let collected = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+    let err_collected = Arc::clone(&collected);
+    // Temporary stream: same downmix-scale as the realtime callback in
+    // `build_input_stream`, but appending interleaved f32 into a Mutex Vec
+    // instead of an rtrb ring. Short-lived (hundreds of ms), so a lock per
+    // callback is fine — the realtime path never takes it.
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => {
+            let collected = Arc::clone(&collected);
+            device.build_input_stream(
+                config,
+                move |data: &[f32], _| {
+                    if let Ok(mut v) = collected.lock() {
+                        v.extend_from_slice(data);
+                    }
+                },
+                move |err| {
+                    log::warn!("auto-channel probe stream error: {err}");
+                    let _ = err_collected.lock().map(|mut v| v.clear());
+                },
+                None,
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            let collected = Arc::clone(&collected);
+            device.build_input_stream(
+                config,
+                move |data: &[i16], _| {
+                    if let Ok(mut v) = collected.lock() {
+                        v.extend(data.iter().map(|&s| s as f32 / 32768.0));
+                    }
+                },
+                move |err| {
+                    log::warn!("auto-channel probe stream error: {err}");
+                    let _ = err_collected.lock().map(|mut v| v.clear());
+                },
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let collected = Arc::clone(&collected);
+            device.build_input_stream(
+                config,
+                move |data: &[u16], _| {
+                    if let Ok(mut v) = collected.lock() {
+                        v.extend(data.iter().map(|&s| s as f32 / 65535.0 * 2.0 - 1.0));
+                    }
+                },
+                move |err| {
+                    log::warn!("auto-channel probe stream error: {err}");
+                    let _ = err_collected.lock().map(|mut v| v.clear());
+                },
+                None,
+            )?
+        }
+        fmt => anyhow::bail!("unsupported sample format: {fmt:?}"),
+    };
+    use cpal::traits::StreamTrait;
+    stream
+        .play()
+        .context("failed to start auto-channel probe")?;
+    std::thread::sleep(std::time::Duration::from_millis(probe_ms.max(100)));
+    drop(stream);
+    let data = collected
+        .lock()
+        .map_err(|_| anyhow::anyhow!("probe buffer poisoned"))?;
+    // Whole frames only; need at least ~50 ms to judge.
+    let frames = data.len() / channels.max(1);
+    if frames < 16 {
+        log::warn!("auto-channel probe heard too little audio, falling back to mix");
+        return Ok(None);
+    }
+    let usable = &data[..frames * channels];
+    match pick_louder_channel(usable, channels) {
+        Some(i) => {
+            log::info!(
+                "auto-channel: picked channel {i} of {channels} (loudest in {probe_ms} ms probe)"
+            );
+            Ok(Some(i))
+        }
+        None => {
+            log::warn!("auto-channel probe heard only silence, falling back to mix");
+            Ok(None)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Input device: discovery, selection, capture

@@ -299,8 +299,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // is recreated per open (capacity follows the hw rate); the utterance
     // ring survives rebuilds (main owns the producer, the worker the
     // consumer, `FrameProcessor` just returns closed utterances).
-    let (mut hw_rate, mut stream, mut fp, mut raw_rx) =
-        open_input_path(&host, cli, &telemetry)?;
+    let (mut hw_rate, mut stream, mut fp, mut raw_rx) = open_input_path(&host, cli, &telemetry)?;
     let mut input_frames = fp.required_input_frames();
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
@@ -468,8 +467,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         if last_queue_warn.elapsed() >= Duration::from_secs(5) {
             last_queue_warn = Instant::now();
             let raw_depth = raw_rx.slots();
-            let whisper_depth =
-                producer_occupied(&whisper_tx, crate::whisper::WHISPER_QUEUE_CAP);
+            let whisper_depth = producer_occupied(&whisper_tx, crate::whisper::WHISPER_QUEUE_CAP);
             let (signal_vad, signal_whisper) = fp.signal_pending_depths();
             let raw_dropped = telemetry.dropped_chunks.load(Ordering::Relaxed);
             let stream_errors = telemetry.errors.load(Ordering::Relaxed);
@@ -529,6 +527,9 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 /// warm VAD noise floor is kept. The raw `rtrb` ring is created here (capacity
 /// follows the hw rate); the utterance ring lives in the caller and survives
 /// rebuilds.
+///
+/// `--channel auto` probes the loudest channel once per open (~500 ms) and
+/// uses that pick for the stream; `mix`/numeric picks never probe.
 #[allow(clippy::too_many_arguments)]
 fn open_input_path(
     host: &cpal::Host,
@@ -547,12 +548,24 @@ fn open_input_path(
     let channels = supported.channels() as usize;
     let sample_format = supported.sample_format();
     let stream_config: cpal::StreamConfig = supported.into();
+    // Resolve the effective mono channel: auto probes, the rest is pure.
+    let effective_channel: Option<usize> = match cli.channel {
+        crate::dsp::ChannelSel::Auto => {
+            let picked =
+                probe_loudest_channel(&device, &stream_config, channels, sample_format, 500)?;
+            crate::dsp::resolve_channel_sel(cli.channel, channels, Some(picked))?
+        }
+        sel => crate::dsp::resolve_channel_sel(sel, channels, None).with_context(|| {
+            format!("--channel/STTD_CHANNEL={sel} out of range for {channels}-channel input")
+        })?,
+    };
     log::info!(
-        "hw config: {} Hz, {} ch, {:?}, channel={}",
+        "hw config: {} Hz, {} ch, {:?}, channel={} (requested {})",
         hw_rate,
         channels,
         sample_format,
-        cli.channel.map_or("mix".to_string(), |c| c.to_string()),
+        effective_channel.map_or("mix".to_string(), |c| c.to_string()),
+        cli.channel,
     );
     // `FrameProcessor` owns all resampling (a shared hw -> 16k hop by
     // default, or hw -> 48k -> denoise -> 48k -> 16k for the VAD branch plus
@@ -571,7 +584,7 @@ fn open_input_path(
         &device,
         &stream_config,
         channels,
-        cli.channel,
+        effective_channel,
         sample_format,
         raw_tx,
         telemetry,
@@ -655,13 +668,14 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     // setup (read + validate the WAV, resolve the model path) before the
     // heavy work (denoiser init, GPU load), so a bad file/spec fails fast
     // instead of racing whisper.cpp's CUDA teardown.
-    let wav = read_wav_mono_f32(path)?;
+    let wav = read_wav_mono_f32_with_channel(path, cli.channel)?;
     log::info!(
-        "file: {} ({} Hz, {} samples, {:.1}s)",
+        "file: {} ({} Hz, {} samples, {:.1}s, channel={})",
         path.display(),
         wav.sample_rate,
         wav.samples.len(),
-        wav.samples.len() as f64 / wav.sample_rate as f64
+        wav.samples.len() as f64 / wav.sample_rate as f64,
+        cli.channel,
     );
 
     let model_path = resolve_model_input(cli)?;

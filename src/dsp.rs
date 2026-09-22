@@ -34,10 +34,7 @@ pub(crate) fn downmix_to_mono_with_channel(
             .chunks_exact(channels)
             .map(|frame| frame.iter().sum::<f32>() / channels as f32)
             .collect(),
-        Some(i) if i < channels => data
-            .chunks_exact(channels)
-            .map(|frame| frame[i])
-            .collect(),
+        Some(i) if i < channels => data.chunks_exact(channels).map(|frame| frame[i]).collect(),
         Some(_) => vec![0.0f32; data.len() / channels.max(1)],
     }
 }
@@ -121,9 +118,96 @@ pub(crate) fn downmix_u16_to_mono_with_channel(
     }
 }
 
+/// Which input channel to transcribe: mix, one pick, or auto-pick the
+/// loudest at startup. Parsed from `--channel`/`STTD_CHANNEL` (`mix`,
+/// `auto`, or a channel index `0..`); unset means mix (previous behavior).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChannelSel {
+    /// Average all channels down to mono (default).
+    Mix,
+    /// Transcribe channel `i` verbatim.
+    Pick(usize),
+    /// Measure once at startup and transcribe the loudest channel
+    /// (highest RMS). Falls back to mix on mono input or when the probe
+    /// hears only silence.
+    Auto,
+}
+
+impl std::fmt::Display for ChannelSel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mix => f.write_str("mix"),
+            Self::Pick(i) => write!(f, "{i}"),
+            Self::Auto => f.write_str("auto"),
+        }
+    }
+}
+
+/// Parse `--channel`/`STTD_CHANNEL`: `mix`/empty = mix, `auto` = loudest,
+/// otherwise a channel index. Used as the clap `value_parser` so
+/// `--channel auto`, `STTD_CHANNEL=1` and the unset default all agree.
+pub(crate) fn parse_channel_sel(s: &str) -> Result<ChannelSel, String> {
+    let t = s.trim().to_lowercase();
+    if t.is_empty() || t == "mix" {
+        return Ok(ChannelSel::Mix);
+    }
+    if t == "auto" {
+        return Ok(ChannelSel::Auto);
+    }
+    match t.parse::<usize>() {
+        Ok(i) => Ok(ChannelSel::Pick(i)),
+        Err(_) => Err(format!(
+            "expected mix, auto or a channel index 0.., got {s:?}"
+        )),
+    }
+}
+
+/// Pick the loudest channel (highest RMS) from interleaved f32 audio.
+/// Returns `None` for mono input, empty input, or when every channel is
+/// silent — the caller then falls back to mix, which equals mono anyway.
+pub(crate) fn pick_louder_channel(interleaved: &[f32], channels: usize) -> Option<usize> {
+    if channels <= 1 || interleaved.len() < channels {
+        return None;
+    }
+    let frames = interleaved.len() / channels;
+    if frames == 0 {
+        return None;
+    }
+    let mut best_idx = 0usize;
+    let mut best_energy = -1.0f64;
+    let mut any_signal = false;
+    for ch in 0..channels {
+        let mut sum_sq = 0.0f64;
+        let mut n = 0usize;
+        for f in 0..frames {
+            let s = interleaved[f * channels + ch] as f64;
+            sum_sq += s * s;
+            n += 1;
+        }
+        if n == 0 {
+            continue;
+        }
+        let rms = (sum_sq / n as f64).sqrt();
+        if rms > 1e-9 {
+            any_signal = true;
+        }
+        if sum_sq > best_energy {
+            best_energy = sum_sq;
+            best_idx = ch;
+        }
+    }
+    if !any_signal {
+        return None;
+    }
+    Some(best_idx)
+}
+
 /// Validate `--channel` against the device's channel count: `None` (mix)
 /// always passes, `Some(i)` needs `i < channels`.
-pub(crate) fn resolve_channel(channel: Option<usize>, channels: usize) -> anyhow::Result<Option<usize>> {
+pub(crate) fn resolve_channel(
+    channel: Option<usize>,
+    channels: usize,
+) -> anyhow::Result<Option<usize>> {
     match channel {
         None => Ok(None),
         Some(i) if i < channels.max(1) => Ok(Some(i)),
@@ -131,6 +215,31 @@ pub(crate) fn resolve_channel(channel: Option<usize>, channels: usize) -> anyhow
             "--channel/STTD_CHANNEL={i} out of range for {channels}-channel input (valid: 0..{})",
             channels.max(1) - 1,
         ),
+    }
+}
+
+/// Resolve a `ChannelSel` without probing: `Mix` -> mix, `Pick` ->
+/// validated pick, `Auto` on mono -> mix. `Auto` on multi-channel returns
+/// the loudest-channel probe result when `probe` is `Some`, otherwise an
+/// error telling the caller to probe (see `capture::probe_loudest_channel`
+/// live, `pick_louder_channel` for files). Splitting pure resolution from
+/// I/O this way keeps the helper unit-testable without a microphone.
+pub(crate) fn resolve_channel_sel(
+    sel: ChannelSel,
+    channels: usize,
+    probe: Option<Option<usize>>,
+) -> anyhow::Result<Option<usize>> {
+    match sel {
+        ChannelSel::Mix => Ok(None),
+        ChannelSel::Pick(i) => resolve_channel(Some(i), channels),
+        ChannelSel::Auto if channels.max(1) <= 1 => Ok(None),
+        ChannelSel::Auto => match probe {
+            Some(picked) => Ok(picked),
+            None => anyhow::bail!(
+                "--channel=auto needs a startup probe for {channels}-channel input \
+                 (use capture::probe_loudest_channel live, pick_louder_channel for files)"
+            ),
+        },
     }
 }
 
@@ -201,7 +310,9 @@ impl FftStream {
         }
         let in_sr = SampleRate::try_from(in_rate)
             .map_err(|_| supported_rates_error(in_rate))
-            .with_context(|| format!("unsupported input sample rate for ResamplerFft: {in_rate} Hz"))?;
+            .with_context(|| {
+                format!("unsupported input sample rate for ResamplerFft: {in_rate} Hz")
+            })?;
         let out_sr = SampleRate::try_from(out_rate)
             .map_err(|_| supported_rates_error(out_rate))
             .with_context(|| {
@@ -252,8 +363,9 @@ impl FftStream {
             Some(inner) => {
                 self.pending_in.extend_from_slice(input);
                 while self.pending_in.len() - self.in_head >= self.chunk_in {
-                    self.scratch_in
-                        .copy_from_slice(&self.pending_in[self.in_head..self.in_head + self.chunk_in]);
+                    self.scratch_in.copy_from_slice(
+                        &self.pending_in[self.in_head..self.in_head + self.chunk_in],
+                    );
                     // Scratch buffers are exactly chunk-sized, the only error
                     // condition on mono input. Never panic on the hot path:
                     // skip the chunk and keep the pipeline running.
@@ -289,8 +401,7 @@ impl FftStream {
         if self.inner.is_some() && self.pending_in.len() > self.in_head {
             let remaining = self.pending_in.len() - self.in_head;
             debug_assert!(remaining < self.chunk_in);
-            self.scratch_in[..remaining]
-                .copy_from_slice(&self.pending_in[self.in_head..]);
+            self.scratch_in[..remaining].copy_from_slice(&self.pending_in[self.in_head..]);
             self.scratch_in[remaining..].fill(0.0);
             self.pending_in.clear();
             self.in_head = 0;
@@ -309,9 +420,7 @@ impl FftStream {
 
     fn drain_frames_into(&mut self, out: &mut Vec<Vec<f32>>) {
         while self.pending_out.len() - self.out_head >= self.frame_out {
-            out.push(
-                self.pending_out[self.out_head..self.out_head + self.frame_out].to_vec(),
-            );
+            out.push(self.pending_out[self.out_head..self.out_head + self.frame_out].to_vec());
             self.out_head += self.frame_out;
         }
         self.maybe_compact_out();
@@ -443,6 +552,65 @@ mod tests {
     }
 
     #[test]
+    fn channel_sel_parses_mix_auto_index() {
+        assert_eq!(parse_channel_sel("mix").unwrap(), ChannelSel::Mix);
+        assert_eq!(parse_channel_sel("").unwrap(), ChannelSel::Mix);
+        assert_eq!(parse_channel_sel("auto").unwrap(), ChannelSel::Auto);
+        assert_eq!(parse_channel_sel("AUTO").unwrap(), ChannelSel::Auto);
+        assert_eq!(parse_channel_sel("0").unwrap(), ChannelSel::Pick(0));
+        assert_eq!(parse_channel_sel("1").unwrap(), ChannelSel::Pick(1));
+        assert!(parse_channel_sel("bzdura").is_err());
+        assert_eq!(ChannelSel::Mix.to_string(), "mix");
+        assert_eq!(ChannelSel::Auto.to_string(), "auto");
+        assert_eq!(ChannelSel::Pick(1).to_string(), "1");
+    }
+
+    #[test]
+    fn louder_channel_picks_highest_rms() {
+        // L quiet (0.01), R loud (0.2) -> R.
+        let mut stereo = Vec::new();
+        for _ in 0..160 {
+            stereo.push(0.01);
+            stereo.push(0.2);
+        }
+        assert_eq!(pick_louder_channel(&stereo, 2), Some(1));
+        // Swapped -> L.
+        let mut stereo = Vec::new();
+        for _ in 0..160 {
+            stereo.push(0.2);
+            stereo.push(0.01);
+        }
+        assert_eq!(pick_louder_channel(&stereo, 2), Some(0));
+        // Silence -> mix fallback, mono -> mix fallback.
+        assert_eq!(pick_louder_channel(&vec![0.0f32; 320], 2), None);
+        assert_eq!(pick_louder_channel(&[0.5], 1), None);
+        assert_eq!(pick_louder_channel(&[], 2), None);
+    }
+
+    #[test]
+    fn channel_sel_resolves_without_probe() {
+        assert_eq!(resolve_channel_sel(ChannelSel::Mix, 2, None).unwrap(), None);
+        assert_eq!(
+            resolve_channel_sel(ChannelSel::Pick(1), 2, None).unwrap(),
+            Some(1)
+        );
+        assert!(resolve_channel_sel(ChannelSel::Pick(2), 2, None).is_err());
+        assert_eq!(
+            resolve_channel_sel(ChannelSel::Auto, 1, None).unwrap(),
+            None
+        );
+        assert!(resolve_channel_sel(ChannelSel::Auto, 2, None).is_err());
+        assert_eq!(
+            resolve_channel_sel(ChannelSel::Auto, 2, Some(Some(1))).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_channel_sel(ChannelSel::Auto, 2, Some(None)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn chunk_sizes_yield_480_out() {
         assert_eq!(expected_input_chunk_for(44_100), 441);
         assert_eq!(expected_input_chunk_for(48_000), 480);
@@ -511,7 +679,10 @@ mod tests {
             n48 += s48.flush().len();
             n16 += s16.flush().len();
             for (n, want) in [(n48, 200), (n16, 200)] {
-                assert!((198..=203).contains(&n), "hw={hw}: expected ~{want} frames, got {n}");
+                assert!(
+                    (198..=203).contains(&n),
+                    "hw={hw}: expected ~{want} frames, got {n}"
+                );
             }
             assert!(
                 n48.abs_diff(n16) <= 2,
@@ -533,9 +704,7 @@ mod tests {
         // complete one chunk (256 out), leaving 192 buffered. Without a
         // flush that tail audio would be lost at shutdown.
         let mut s = FftStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K).unwrap();
-        let fed: usize = (0..2)
-            .map(|_| s.feed(&vec![0.1f32; FRAME_48K]).len())
-            .sum();
+        let fed: usize = (0..2).map(|_| s.feed(&vec![0.1f32; FRAME_48K]).len()).sum();
         assert_eq!(fed, 1);
         let flushed = s.flush();
         assert!(!flushed.is_empty(), "flush must recover the tail");

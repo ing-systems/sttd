@@ -11,6 +11,13 @@ use earshot::Detector;
 
 /// Samples earshot requires per prediction, at `WHISPER_RATE` (16 kHz): 16 ms.
 const EARSHOT_WINDOW: usize = 256;
+/// Step between consecutive earshot windows: 128 samples (8 ms, 50%
+/// overlap). Overlapping doubles the prediction rate (~10 windows per 8
+/// frames vs 5 before) so almost every 10 ms frame carries a fresh
+/// verdict, halving onset/offset jitter. Adjacent windows share half
+/// their audio, so a short transient can now appear in two windows —
+/// the 3-window median plus `ONSET_SPEECH_FRAMES` still absorb it.
+const EARSHOT_STEP: usize = 128;
 
 /// Window decisions the median rides over: the output flips only when at
 /// least 2 of the last 3 raw windows agree, so a single flicker window (a
@@ -26,24 +33,28 @@ const MEDIAN_WINDOWS: usize = 3;
 ///
 /// earshot only predicts on exactly `EARSHOT_WINDOW` (256) samples, while the
 /// rest of the pipeline runs on 160-sample (10 ms) frames (`FRAME_16K`), so
-/// incoming samples are staged until a full window is available. 8 frames
-/// (1280 samples) yield exactly 5 windows, landing on frames 2, 4, 5, 7, 8 of
-/// each group of 8; a frame that doesn't complete a window re-reports the
-/// last verdict instead of guessing. Each window's score passes through
-/// hysteresis first (enter at `enter`, hold until below `exit`), then through
-/// a majority vote over the last `MEDIAN_WINDOWS` raw window decisions: a
-/// single positive window marks no frame as speech at all, so
+/// incoming samples are staged until a full window is available. Windows
+/// advance by `EARSHOT_STEP` (128, 50% overlap), so ~10 predictions land per
+/// 8 frames; a frame that doesn't complete a window re-reports the last
+/// verdict instead of guessing. Each frame is high-passed at 60 Hz first
+/// (same cutoff as the whisper-branch conditioning, streaming state) so
+/// mains hum can't inflate scores or the noise floor — the VAD sees what
+/// whisper receives. Each window's score passes through hysteresis first
+/// (enter at `enter`, hold until below `exit`), then through a majority
+/// vote over the last `MEDIAN_WINDOWS` raw window decisions: a single
+/// positive window marks no frame as speech at all, so
 /// `ONSET_SPEECH_FRAMES` (3) always needs evidence from at least two
 /// independent predictions, and a single dropout window inside speech never
 /// breaks the latch either.
 ///
-/// Adds at most two `EARSHOT_WINDOW`s of latency (one prediction window plus
-/// one median step, about 32 ms) before a verdict reflects newly arrived
-/// audio, absorbed by pre-roll and silence hangover the same way the
-/// denoiser's own lookahead is.
+/// Adds at most one `EARSHOT_WINDOW` plus one median step of latency before
+/// a verdict reflects newly arrived audio, absorbed by pre-roll and silence
+/// hangover the same way the denoiser's own lookahead is.
 pub(crate) struct SpeechDetector {
     detector: Box<Detector>,
     /// 16 kHz samples not yet consumed by a full `EARSHOT_WINDOW`.
+    /// With 50% overlap only `EARSHOT_STEP` samples are consumed per
+    /// prediction; the rest stays staged as the next window's first half.
     staging: Vec<f32>,
     threshold: f32,
     /// Smoothed output: majority of `window_history`. Re-reported for frames
@@ -62,10 +73,22 @@ pub(crate) struct SpeechDetector {
     /// Warm background estimate: survives `reset()` on purpose (see below).
     noise: crate::noise::NoiseTracker,
     adapt: bool,
+    /// Streaming one-pole high-pass (60 Hz, same cutoff as the
+    /// whisper-branch conditioning): `y[n] = x[n] - x[n-1] + a * y[n-1]`.
+    /// Runs on every VAD-branch frame before staging so hum is gone before
+    /// it can bias earshot or the noise floor. Zero-state start; `reset()`
+    /// clears it so resume doesn't blend pre-pause audio.
+    hp_a: f32,
+    hp_x_prev: f32,
+    hp_y_prev: f32,
+    hp_init: bool,
 }
 
 impl SpeechDetector {
     pub(crate) fn new(threshold: f32, adapt: bool) -> Self {
+        let hp_a = (-2.0 * std::f32::consts::PI * crate::config::CONDITION_HP_CUTOFF_HZ
+            / crate::config::WHISPER_RATE as f32)
+            .exp();
         Self {
             detector: Detector::default_boxed(),
             staging: Vec::with_capacity(EARSHOT_WINDOW),
@@ -76,6 +99,10 @@ impl SpeechDetector {
             last_score: 0.0,
             noise: crate::noise::NoiseTracker::new(),
             adapt,
+            hp_a,
+            hp_x_prev: 0.0,
+            hp_y_prev: 0.0,
+            hp_init: false,
         }
     }
 
@@ -91,9 +118,11 @@ impl SpeechDetector {
     /// in raw speech only needs `score >= exit` (enter minus hysteresis), and
     /// the reported verdict is the majority of the last `MEDIAN_WINDOWS` raw
     /// decisions. Non-speech frames keep the background estimate warm; speech
-    /// frames freeze it.
+    /// frames freeze it. The frame is high-passed (60 Hz, streaming) before
+    /// anything else so hum never reaches earshot or the floor estimate.
     pub(crate) fn verdict(&mut self, frame_16k: &[f32]) -> bool {
-        self.staging.extend_from_slice(frame_16k);
+        let filtered = self.highpass_frame(frame_16k);
+        self.staging.extend_from_slice(&filtered);
 
         let mut consumed = 0;
         let mut scored = false;
@@ -116,21 +145,48 @@ impl SpeechDetector {
                 score >= enter
             };
             self.push_window(raw);
-            consumed += EARSHOT_WINDOW;
+            consumed += EARSHOT_STEP;
         }
+        // `consumed` advances by the overlap step, so up to
+        // `EARSHOT_WINDOW - 1` samples stay staged as the next window's
+        // first half — never more, so every slice handed to earshot stays
+        // exactly `EARSHOT_WINDOW` long.
         self.staging.drain(..consumed);
 
         // Warm the floor only on background: speech must never raise it.
         // Frames without a fresh score reuse the latched state (same as
         // before) and still count as background when not in speech.
+        // The floor learns from the same high-passed audio earshot sees.
         if !self.in_speech {
             // `scored` frames carry a fresh earshot verdict; unscored frames
             // are 10 ms slices of the same background — both are safe.
             let _ = scored;
-            self.noise.update_background(frame_16k);
+            self.noise.update_background(&filtered);
         }
 
         self.in_speech
+    }
+
+    /// Streaming 60 Hz one-pole high-pass over one 10 ms frame, preserving
+    /// filter state across calls. First sample after `new`/`reset` starts
+    /// from zero state (pre-roll silence is near zero, so no click).
+    fn highpass_frame(&mut self, frame: &[f32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(frame.len());
+        for &x in frame {
+            if !self.hp_init {
+                // Zero-state start: no transient from a stale `x_prev`.
+                self.hp_x_prev = x;
+                self.hp_y_prev = 0.0;
+                self.hp_init = true;
+                out.push(0.0);
+                continue;
+            }
+            let y = x - self.hp_x_prev + self.hp_a * self.hp_y_prev;
+            self.hp_x_prev = x;
+            self.hp_y_prev = y;
+            out.push(y);
+        }
+        out
     }
 
     /// Fold one raw window decision into the median: update the hysteresis
@@ -150,16 +206,19 @@ impl SpeechDetector {
     /// Observe-only background update for pause: RMS -> noise floor, no
     /// earshot, no utterance, no latch change. Cheap (no neural pass) so a
     /// 10 s pause on fan noise actually teaches the threshold instead of
-    /// idling. Never marks speech.
+    /// idling. Never marks speech. High-passed like `verdict` so the floor
+    /// stays consistent with what earshot will see after resume.
     pub(crate) fn observe_background(&mut self, frame_16k: &[f32]) {
-        self.noise.update_background(frame_16k);
+        let filtered = self.highpass_frame(frame_16k);
+        self.noise.update_background(&filtered);
     }
 
     /// Drop staged partial-window samples, the hysteresis latch, the median
-    /// history, and the earshot detector's internal state (ring buffer +
-    /// feature context + RNN state) for a pause transition, so resume starts
-    /// from silence, not pre-pause audio. The noise floor is deliberately
-    /// kept: it is the warm background Faza 2 learns from.
+    /// history, the high-pass state, and the earshot detector's internal
+    /// state (ring buffer + feature context + RNN state) for a pause
+    /// transition, so resume starts from silence, not pre-pause audio. The
+    /// noise floor is deliberately kept: it is the warm background Faza 2
+    /// learns from.
     pub(crate) fn reset(&mut self) {
         self.detector.reset();
         self.staging.clear();
@@ -168,6 +227,9 @@ impl SpeechDetector {
         self.window_history.clear();
         self.window_history.extend(vec![false; MEDIAN_WINDOWS]);
         self.last_score = 0.0;
+        self.hp_x_prev = 0.0;
+        self.hp_y_prev = 0.0;
+        self.hp_init = false;
     }
 }
 
@@ -188,16 +250,20 @@ mod tests {
     }
 
     #[test]
-    fn prediction_cadence_is_5_per_8_frames() {
-        // 8 frames of FRAME_16K (160) samples = 1280 = 5 * EARSHOT_WINDOW
-        // (256): staging must be empty again after the 8th frame, with no
-        // leftover samples carried past a clean group boundary.
+    fn prediction_cadence_overlaps_every_frame() {
+        // 50% overlap (step 128): 8 frames (1280 samples) yield 9 windows
+        // ((1280-256)/128+1) with 128 samples left staged as the next
+        // window's first half — not empty, and bounded below one window.
+        // The point is density: almost every 10 ms frame completes a fresh
+        // prediction instead of 5 per 8.
         let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
         let frame = vec![0.0f32; FRAME_16K];
         for _ in 0..8 {
             vad.verdict(&frame);
         }
-        assert!(vad.staging.is_empty());
+        assert!(vad.staging.len() < EARSHOT_WINDOW);
+        assert_eq!(vad.staging.len(), 128);
+        assert_eq!(EARSHOT_STEP, 128);
     }
 
     #[test]
@@ -311,5 +377,50 @@ mod tests {
         assert_eq!(vad.window_history.len(), MEDIAN_WINDOWS);
         assert!(vad.window_history.iter().all(|&b| !b));
         assert_eq!(MEDIAN_WINDOWS, 3);
+    }
+
+    #[test]
+    fn highpass_attenuates_hum_keeps_speech() {
+        // 50 Hz hum must shrink through the streaming HP; 1 kHz tone must
+        // pass nearly untouched (steady middle, past startup transient).
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
+        let hum: Vec<f32> = (0..1600)
+            .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
+            .collect();
+        let mut filtered = Vec::new();
+        for chunk in hum.chunks(FRAME_16K) {
+            filtered.extend(vad.highpass_frame(chunk));
+        }
+        let rms = |v: &[f32]| {
+            (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+        let before = rms(&hum[400..1200]);
+        let after = rms(&filtered[400..1200]);
+        assert!(after < before * 0.7, "hum before={before} after={after}");
+
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
+        let tone: Vec<f32> = (0..1600)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin() * 0.2)
+            .collect();
+        let mut filtered = Vec::new();
+        for chunk in tone.chunks(FRAME_16K) {
+            filtered.extend(vad.highpass_frame(chunk));
+        }
+        let before = rms(&tone[400..1200]);
+        let after = rms(&filtered[400..1200]);
+        let ratio = after / before;
+        assert!((0.9..=1.1).contains(&ratio), "ratio={ratio}");
+    }
+
+    #[test]
+    fn highpass_state_resets_on_pause() {
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
+        let frame = vec![0.5f32; FRAME_16K];
+        let _ = vad.highpass_frame(&frame);
+        assert!(vad.hp_init);
+        vad.reset();
+        assert!(!vad.hp_init);
+        assert_eq!(vad.hp_x_prev, 0.0);
+        assert_eq!(vad.hp_y_prev, 0.0);
     }
 }

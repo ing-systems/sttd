@@ -10,6 +10,7 @@ use crate::config::{
     DEFAULT_TARGET_RMS, DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
+use crate::dsp::{parse_channel_sel, ChannelSel};
 use crate::whisper::Language;
 
 /// Real-time Polish-English speech-to-text.
@@ -39,11 +40,12 @@ pub(crate) struct Cli {
     pub(crate) list_devices: bool,
 
     /// Input channel to transcribe: `0` = first channel, `1` = second, ...;
-    /// unset mixes all channels down to mono by averaging (previous behavior).
+    /// `mix` averages all channels down to mono (default, previous behavior),
+    /// `auto` measures once at startup and keeps the loudest channel.
     /// Useful when one channel is a noisy webcam capsule and the other a
     /// headset mic.
-    #[arg(long, env = "STTD_CHANNEL", value_name = "N", help_heading = "Input")]
-    pub(crate) channel: Option<usize>,
+    #[arg(long, env = "STTD_CHANNEL", value_name = "MIX|AUTO|N", default_value = "mix", value_parser = parse_channel_sel, help_heading = "Input")]
+    pub(crate) channel: ChannelSel,
 
     /// Model spec (e.g. `small`, `large-v3-turbo-q8_0`) or path to a ggml
     /// whisper model file (auto-downloaded if missing). `STTD_MODEL` wins
@@ -398,7 +400,7 @@ mod tests {
         assert_eq!(cli.prompt, DEFAULT_PROMPT);
         assert_eq!(cli.prompt_context_chars, DEFAULT_PROMPT_CONTEXT_CHARS);
         assert_eq!(cli.hangover_ms, DEFAULT_HANGOVER_MS);
-        assert_eq!(cli.channel, None);
+        assert_eq!(cli.channel, ChannelSel::Mix);
         assert_eq!(cli.language, crate::whisper::Language::Auto);
         assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
         assert_eq!(cli.threads, DEFAULT_THREADS);
@@ -497,8 +499,7 @@ mod tests {
     #[test]
     fn cli_deepfilter_rejected_without_denoise_feature() {
         assert!(Cli::try_parse_from(["sttd", "--denoiser", "deepfilter"]).is_err());
-        let cli =
-            Cli::try_parse_from(["sttd", "--denoiser", "none"]).expect("none must parse");
+        let cli = Cli::try_parse_from(["sttd", "--denoiser", "none"]).expect("none must parse");
         assert_eq!(cli.denoiser, DenoiserKind::Bypass);
     }
 
@@ -506,10 +507,15 @@ mod tests {
     fn cli_channel_and_hangover_parse() {
         let cli = Cli::try_parse_from(["sttd", "--channel", "1", "--hangover-ms", "350"])
             .expect("channel/hangover must parse");
-        assert_eq!(cli.channel, Some(1));
+        assert_eq!(cli.channel, ChannelSel::Pick(1));
         assert_eq!(cli.hangover_ms, 350);
+        let cli = Cli::try_parse_from(["sttd", "--channel", "auto"]).expect("auto must parse");
+        assert_eq!(cli.channel, ChannelSel::Auto);
+        let cli = Cli::try_parse_from(["sttd", "--channel", "mix"]).expect("mix must parse");
+        assert_eq!(cli.channel, ChannelSel::Mix);
         assert!(Cli::try_parse_from(["sttd", "--hangover-ms", "355"]).is_err());
         assert!(Cli::try_parse_from(["sttd", "--hangover-ms", "100"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--channel", "bzdura"]).is_err());
     }
 
     #[test]
@@ -569,8 +575,7 @@ mod tests {
     fn cli_vad_adapt_toggles() {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert!(cli.vad_adapt);
-        let cli =
-            Cli::try_parse_from(["sttd", "--vad-adapt", "off"]).expect("off must parse");
+        let cli = Cli::try_parse_from(["sttd", "--vad-adapt", "off"]).expect("off must parse");
         assert!(!cli.vad_adapt);
     }
 

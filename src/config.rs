@@ -74,6 +74,20 @@ pub(crate) const MIN_SPEECH_FRAMES: u32 = 20; // 200 ms
 /// actually *transmitted*, so a one-word utterance isn't ~70% silence by the
 /// time it reaches the model.
 pub(crate) const TAIL_KEEP_SAMPLES: usize = 3_200; // 200 ms @ 16 kHz
+/// Adaptive tail bounds around `TAIL_KEEP_SAMPLES`: at least 120 ms always
+/// survives (plosive release / reverb), at most 300 ms even when the
+/// hangover tail stays energetic. The exact length is picked per utterance
+/// by scanning the tail for energy (see `UtteranceBuffer::close`): quiet
+/// tails cut at the minimum, loud tails extend toward the maximum.
+pub(crate) const TAIL_MIN_SAMPLES: usize = 1_920; // 120 ms @ 16 kHz
+pub(crate) const TAIL_MAX_SAMPLES: usize = 4_800; // 300 ms @ 16 kHz
+/// Mic-level advisor thresholds (see `UtteranceBuffer::close`): a transmitted
+/// utterance peaking below this is "mic too quiet" (~-34 dBFS), and a
+/// transmitted utterance with more than this share of samples at >= 0.99 is
+/// "mic clipping". Warn-only, never drops.
+pub(crate) const MIC_LOW_PEAK: f32 = 0.02;
+pub(crate) const MIC_CLIP_SAMPLE: f32 = 0.99;
+pub(crate) const MIC_CLIP_RATIO: f32 = 0.005;
 /// Whisper refuses input whose *computed mel length* is under 1000 ms (see
 /// whisper.cpp `whisper_full`: `if (seek_end < seek_start + 100)`). That
 /// length isn't raw sample count / 16: mel framing pads and windows the
@@ -92,6 +106,15 @@ pub(crate) const MAX_UTTERANCE_SAMPLES: usize = WHISPER_RATE as usize * 30;
 pub(crate) const EARLY_SPLIT_SAMPLES: usize = WHISPER_RATE as usize * 28;
 /// Pause length that triggers the early split above: 10 x 10 ms frames.
 pub(crate) const EARLY_SPLIT_SILENCE_FRAMES: u32 = 10;
+/// Low-energy early split: past `EARLY_SPLIT_SAMPLES`, this many consecutive
+/// quiet frames (RMS below `EARLY_SPLIT_QUIET_RMS`, 50 ms) already close the
+/// utterance even when the VAD still says speech. Catches word boundaries
+/// where earshot holds the latch through a dip — the cut lands at the
+/// energy minimum instead of riding into the 30 s hard cap mid-word.
+pub(crate) const EARLY_SPLIT_QUIET_FRAMES: u32 = 5;
+/// RMS below which a 10 ms frame counts as quiet for the low-energy early
+/// split above (~-50 dBFS, same neighborhood as `DEFAULT_MIN_SPEECH_RMS`).
+pub(crate) const EARLY_SPLIT_QUIET_RMS: f32 = 0.003;
 /// Minimum RMS amplitude across an utterance's VAD-flagged speech frames
 /// (silence padding excluded). Catches transient VAD false positives that
 /// pass `ONSET_SPEECH_FRAMES`/`MIN_SPEECH_FRAMES` but carry essentially no
@@ -349,15 +372,12 @@ pub(crate) fn parse_threads(s: &str) -> Result<i32, String> {
 /// Parse `--prompt-context-chars`/`STTD_PROMPT_CONTEXT_CHARS`: 0 disables,
 /// max `MAX_PROMPT_CONTEXT_CHARS`.
 pub(crate) fn parse_context_chars(s: &str) -> Result<usize, String> {
-    let v: usize = s
-        .trim()
-        .parse()
-        .map_err(|_| {
-            format!(
-                "expected an integer 0..={} (0 = off), got {s:?}",
-                MAX_PROMPT_CONTEXT_CHARS
-            )
-        })?;
+    let v: usize = s.trim().parse().map_err(|_| {
+        format!(
+            "expected an integer 0..={} (0 = off), got {s:?}",
+            MAX_PROMPT_CONTEXT_CHARS
+        )
+    })?;
     if v <= MAX_PROMPT_CONTEXT_CHARS {
         Ok(v)
     } else {
@@ -372,9 +392,7 @@ pub(crate) fn parse_context_chars(s: &str) -> Result<usize, String> {
 /// in 10 ms steps (the pipeline's frame cadence — no false precision).
 pub(crate) fn parse_hangover_ms(s: &str) -> Result<u64, String> {
     let v: u64 = s.trim().parse().map_err(|_| {
-        format!(
-            "expected a multiple of 10 in {MIN_HANGOVER_MS}..={MAX_HANGOVER_MS} ms, got {s:?}"
-        )
+        format!("expected a multiple of 10 in {MIN_HANGOVER_MS}..={MAX_HANGOVER_MS} ms, got {s:?}")
     })?;
     if !(MIN_HANGOVER_MS..=MAX_HANGOVER_MS).contains(&v) || !v.is_multiple_of(10) {
         return Err(format!(

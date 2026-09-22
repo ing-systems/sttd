@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::dsp::downmix_to_mono;
+use crate::dsp::{downmix_to_mono, downmix_to_mono_with_channel, pick_louder_channel, ChannelSel};
 
 // ---------------------------------------------------------------------------
 // WAV I/O (utterance dumps + `--file` mode) via `hound`.
@@ -37,9 +37,11 @@ pub(crate) struct WavAudio {
 }
 
 /// WAV reader: integer PCM (8/16/24/32-bit) or IEEE-float32, any sample
-/// rate/channel count, downmixed to mono f32. Anything else (e.g. compressed
-/// WAV) is rejected with a message suggesting an `ffmpeg` conversion.
-pub(crate) fn read_wav_mono_f32(path: &Path) -> Result<WavAudio> {
+/// rate/channel count, honoring `--channel`: `mix` averages, `pick` takes
+/// one channel verbatim, `auto` keeps the loudest channel (highest RMS,
+/// mix fallback on silence/mono). Anything else (e.g. compressed WAV) is
+/// rejected with a message suggesting an `ffmpeg` conversion.
+pub(crate) fn read_wav_mono_f32_with_channel(path: &Path, sel: ChannelSel) -> Result<WavAudio> {
     let mut reader = hound::WavReader::open(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let spec = reader.spec();
@@ -67,7 +69,28 @@ pub(crate) fn read_wav_mono_f32(path: &Path) -> Result<WavAudio> {
             path.display()
         ),
     };
-    let samples = downmix_to_mono(&interleaved, channels);
+    let samples = match sel {
+        ChannelSel::Mix => downmix_to_mono(&interleaved, channels),
+        ChannelSel::Pick(i) => {
+            crate::dsp::resolve_channel(Some(i), channels).with_context(|| {
+                format!(
+                    "--channel={i} out of range for {channels}-channel file {}",
+                    path.display()
+                )
+            })?;
+            downmix_to_mono_with_channel(&interleaved, channels, Some(i))
+        }
+        ChannelSel::Auto => match pick_louder_channel(&interleaved, channels) {
+            Some(i) => {
+                log::info!(
+                    "auto-channel: picked channel {i} of {channels} for {}",
+                    path.display()
+                );
+                downmix_to_mono_with_channel(&interleaved, channels, Some(i))
+            }
+            None => downmix_to_mono(&interleaved, channels),
+        },
+    };
     Ok(WavAudio {
         sample_rate,
         samples,
@@ -93,7 +116,7 @@ mod tests {
             .map(|i| ((i % 100) as f32 / 100.0) - 0.5)
             .collect();
         write_wav_mono16(&path, &pcm, WHISPER_RATE).unwrap();
-        let wav = read_wav_mono_f32(&path).unwrap();
+        let wav = read_wav_mono_f32_with_channel(&path, ChannelSel::Mix).unwrap();
         assert_eq!(wav.sample_rate, WHISPER_RATE);
         assert_eq!(wav.samples.len(), pcm.len());
         for (a, b) in wav.samples.iter().zip(pcm.iter()) {
@@ -118,11 +141,42 @@ mod tests {
             writer.write_sample(-16384i16).unwrap(); // R: -0.5
         }
         writer.finalize().unwrap();
-        let wav = read_wav_mono_f32(&path).unwrap();
+        let wav = read_wav_mono_f32_with_channel(&path, ChannelSel::Mix).unwrap();
         assert_eq!(wav.sample_rate, WHISPER_RATE);
         assert_eq!(wav.samples.len(), 160);
         for s in wav.samples {
             assert!(s.abs() < 1e-6, "{s}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wav_auto_channel_picks_louder() {
+        use crate::dsp::ChannelSel;
+        let dir = test_dir("autoch");
+        let path = dir.join("auto.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: WHISPER_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..160 {
+            writer.write_sample(3277i16).unwrap(); // L: ~0.1 quiet
+            writer.write_sample(16384i16).unwrap(); // R: 0.5 loud
+        }
+        writer.finalize().unwrap();
+        // Auto keeps the loud (R) channel verbatim instead of averaging.
+        let wav = read_wav_mono_f32_with_channel(&path, ChannelSel::Auto).unwrap();
+        assert_eq!(wav.samples.len(), 160);
+        for s in wav.samples {
+            assert!((s - 0.5).abs() < 1e-3, "{s}");
+        }
+        // Explicit pick still works.
+        let wav = read_wav_mono_f32_with_channel(&path, ChannelSel::Pick(0)).unwrap();
+        for s in wav.samples {
+            assert!((s - 0.1).abs() < 1e-3, "{s}");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -142,7 +196,7 @@ mod tests {
             writer.write_sample(0.25f32).unwrap();
         }
         writer.finalize().unwrap();
-        let wav = read_wav_mono_f32(&path).unwrap();
+        let wav = read_wav_mono_f32_with_channel(&path, ChannelSel::Mix).unwrap();
         assert_eq!(wav.samples.len(), 160);
         for s in wav.samples {
             assert!((s - 0.25).abs() < 1e-6, "{s}");
@@ -160,7 +214,7 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.truncate(bytes.len() - 100);
         std::fs::write(&path, &bytes).unwrap();
-        let res = read_wav_mono_f32(&path);
+        let res = read_wav_mono_f32_with_channel(&path, ChannelSel::Mix);
         assert!(res.is_err(), "truncated file must fail");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -170,7 +224,7 @@ mod tests {
         let dir = test_dir("nonwav");
         let path = dir.join("empty.wav");
         std::fs::write(&path, b"not a wav file").unwrap();
-        let res = read_wav_mono_f32(&path);
+        let res = read_wav_mono_f32_with_channel(&path, ChannelSel::Mix);
         assert!(res.is_err(), "non-WAV must fail");
         std::fs::remove_dir_all(&dir).ok();
     }
