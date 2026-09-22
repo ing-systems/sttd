@@ -21,7 +21,7 @@ cpal (hw rate, N ch) -> channel pick/mix -> raw rtrb<f32> ring
 
 Mic and file modes share `FrameProcessor`; only the source differs.
 
-Source files: `src/main.rs:1`, `src/capture.rs:1`, `src/signal.rs:1`, `src/dsp.rs:1`, `src/denoise.rs:1`, `src/vad.rs:1`, `src/noise.rs:1`, `src/utterance.rs:1`, `src/gate.rs:1`, `src/asr.rs:1`, `src/whisper.rs:1`, `src/parakeet.rs:1`, `src/sherpa.rs:1`, `src/emit.rs:1`, `src/config.rs:1`, `src/cli.rs:1`, `src/wav.rs:1`, `src/weights.rs:1`, `src/sound.rs:1`, `src/daemon.rs:1`.
+Source files: `src/main.rs:1`, `src/capture.rs:1`, `src/signal.rs:1`, `src/dsp.rs:1`, `src/denoise.rs:1`, `src/vad.rs:1`, `src/noise.rs:1`, `src/utterance.rs:1`, `src/gate.rs:1`, `src/asr.rs:1`, `src/whisper.rs:1`, `src/parakeet.rs:1`, `src/parakeet_burn/mod.rs:1`, `src/sherpa.rs:1`, `src/emit.rs:1`, `src/config.rs:1`, `src/cli.rs:1`, `src/wav.rs:1`, `src/weights.rs:1`, `src/sound.rs:1`, `src/daemon.rs:1`.
 
 Terminology (`CONTEXT.md`): utterance, utterance buffer, pre-roll, acoustic evidence, evidence strength, VAD verdict, gate, confidence floor, speech density, text token, hallucination, emission, VAD branch, model branch, denoiser, direct hop.
 
@@ -82,7 +82,13 @@ Parakeet-TDT-0.6B-v3 via `parakeet-rs` (`src/parakeet.rs`, default), and sherpa-
 `sherpa-whisper-large-v3-turbo-int8`, Canary-1B-v2
 `sherpa-canary-1b-v2-int8` — Polish Canary needs a native lib newer than
 sherpa-onnx 1.13.8, see `SherpaKind`).
-The first two plus sherpa-offline implement `asr::SpeechModel` (`src/asr.rs:48`);
+A fourth Parakeet runtime — the native Burn port without ONNX Runtime
+(`src/parakeet_burn/mod.rs:1`, `--parakeet-engine burn`, `parakeet-burn` Cargo
+feature) — is in bring-up: frontend/decode/quant/vocab plus one Conformer block
+are implemented and unit-tested, but `transcribe` still bails after mel
+extraction until the encoder/joint land, so ORT remains the transcribing path.
+See `docs/parakeet-burn.md` for the module-by-module status and next steps.
+Whisper, both Parakeet runtimes (ORT + Burn), plus sherpa-offline implement `asr::SpeechModel` (`src/asr.rs:69`);
 everything engine-agnostic — the worker loop, gates, metrics, prompt-context
 tail, audio conditioning — lives in `src/asr.rs` and never branches on which
 engine is loaded.
@@ -90,8 +96,10 @@ engine is loaded.
 * `spawn_asr_worker:196` -> `asr_loop:238` -> `asr_init_and_run:314` on
   thread `asr`. `ready` channel fail-fast on first load; later reloads log +
   retry 5 s. `asr::load_model` dispatches on `weights::ModelRef` to
-  `WhisperModel::load` (`src/whisper.rs:96`) or `ParakeetModel::load`
-  (`src/parakeet.rs:39`), each wrapped in `asr::with_loading_ticker` for a
+  `WhisperModel::load` (`src/whisper.rs:96`), `ParakeetModel::load`
+  (`src/parakeet.rs:39`), or `ParakeetBurnModel::load`
+  (`src/parakeet_burn/mod.rs:78`) when `--parakeet-engine burn` is set, each
+  wrapped in `asr::with_loading_ticker` for a
   per-second "loading... Ns" log on models that take tens of seconds.
 * Outer load/unload loop: one `Box<dyn SpeechModel>` per iteration; scope
   exit (`drop(model)`) frees VRAM/ORT sessions. Loaded loop polls `rx` 20 ms,

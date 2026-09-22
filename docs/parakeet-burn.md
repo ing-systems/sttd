@@ -1,0 +1,55 @@
+# Parakeet Burn port — bring-up status
+
+Native int8 Parakeet-TDT-0.6B-v3 without ONNX Runtime (`src/parakeet_burn/mod.rs:1`).
+`parakeet-rs` (ORT) stays the default engine; this port is selected per run and
+fails fast until it can transcribe end to end, so a half-wired model can never
+silently mistranscribe.
+
+## Selection
+
+* Runtime flag: `--parakeet-engine ort|burn` (`STTD_PARAKEET_ENGINE`, `src/cli.rs:186`), default `ort`. Only meaningful with a Parakeet `--model`; other engines ignore it. Non-Parakeet `--model` + `burn` warns and has no effect (`src/main.rs:1377`).
+* Build gate: `burn` needs `--features parakeet-burn`; `burn` + `--gpu` additionally needs `--features parakeet-burn-cuda` (`src/cli.rs:186-189`, `Cargo.toml:68-79`). Without the feature, `burn` bails with the rebuild command (`src/asr.rs:122-128`).
+* Dispatch: `asr::load_model` (`src/asr.rs:114-131`) routes Parakeet `ModelRef` to `ParakeetBurnModel::load` or the ORT path. Everything engine-agnostic (worker loop, gates, metrics, conditioning) is shared.
+* CUDA note: `burn-cuda` 0.21 (cudarc 0.19.9) rejects the CUDA 13.4 toolkit on this host (`Cargo.toml:73-77`); CPU Burn is unaffected, GPU bring-up waits on a cudarc release with CUDA 13.x support.
+
+## Converted weights
+
+`burn-import` cannot ingest the quantized graph (`DynamicQuantizeLinear`, `MatMulInteger`, `ConvInteger`, `DynamicQuantizeLSTM`), so the converter extracts static int8 weights + scales into safetensors (`src/parakeet_burn/weights.rs:1-11`):
+
+```
+python3 tools/convert-parakeet-int8-to-burn.py --model-dir models/parakeet-tdt-0.6b-v3-int8
+python3 tools/convert-parakeet-int8-to-burn.py --model-dir models/parakeet-tdt-0.6b-v3-int8 --check-only  # inspect, don't write
+```
+
+Outputs next to the ONNX files: `encoder-burn.safetensors` + `decoder_joint-burn.safetensors` + `encoder-manifest.json` (existing `vocab.txt` is reused). Converter keeps `<base>` (U8/I8) + `<base>.scale`/`<base>.zero_point` pairs, plain F32 biases, the frozen relative-position table (`pos_enc.table`, `(9999, 1024)` from the encoder `Constant`), and the per-layer depthwise-bias map (`dw_bias`, traced through `Reshape` to the anonymous `onnx::Conv_*` initializer). `load` refuses to start without the two safetensors and prints the exact command (`src/parakeet_burn/weights.rs:22-44`).
+
+## Module status
+
+| Module | State | Notes |
+|---|---|---|
+| `frontend.rs` | done, tested | mel parity with `parakeet-rs` TDT-v3: preemphasis 0.97, reflect-pad STFT (512/160/400 Hann), 128-bin Slaney mel, `ln(x + 2^-24)`, per-feature norm. CPU/CUDA share bit-identical features. |
+| `vocab.rs` | done, tested | loads same `vocab.txt`, `▁` → space + digit spacing + `<…>` skip mirrors `decoder_tdt.rs`; blank = last id. |
+| `decode.rs` | done, tested | TDT greedy state machine over joint logits (blank = vocab-1, duration skip, max 10 tokens/step). Pure over logits, no weights needed. |
+| `quant.rs` | done, tested | `Uint8Linear` (encoder MatMuls/Convs) + `Int8Linear` (decoder LSTMs) store 8-bit + scale/zp and dequantize at use; swap to native int8 GEMM later changes only `forward`. |
+| `backend.rs` | done, tested | `CpuBackend = burn_ndarray::NdArray`, `CudaBackend` with `parakeet-burn-cuda`; `select_device` is log-only until the encoder threads it through. |
+| `encoder.rs` | manifest done, forward todo | `LAYER_ROLES` (12 roles × 24 layers) + 6 pre-encode ops parsed and validated by `load_manifest`; `BurnEncoder` holds config only. Bring-up order: subsampling → one block → full depth + 8x projection. |
+| `block.rs` | single block done (in tree), stack todo | full Conformer block matching the int8 graph op-for-op in fp32: half-step FFN sandwich, XL relative attention, GLU + depthwise k=9 + Swish conv, 5 norms (eps 1e-5), `pos_window` slicing. `BlockWeights::load` shape-asserts; unit tests + ignored real-layer-0 run (`cargo test --features parakeet-burn -- --ignored`). |
+| `weights.rs` | gate + loaders done | `require_converted_weights` gate, `load_selected` (per-layer subset so bring-up never loads the full 582 MB / 2.4 GB f32), `load_safetensors_f32` inspection path. |
+| `joint.rs` | config only | `JointConfig` (1024 / 2×640 / vocab + 5 durations) matches `decoder_joint-model.int8.onnx` IO; per-step joint compute lands with the decoder. |
+| `model` (`mod.rs`) | stub | `load` builds vocab + frontend then hits the weights gate; `transcribe` extracts mel then bails telling the operator to use `--parakeet-engine ort` today. `uses_prompt() = false`, like the ORT path. |
+
+ONNX reference (read off `encoder-model.int8.onnx`, not assumed): 5654 nodes, 8x subsampling, output `[1, 1024, T/8]`; `DynamicQuantizeLinear` ×223, `MatMulInteger` ×217, `ConvInteger` ×77, `LayerNormalization` ×120 (uniform eps 1e-5, biased variance), `Softmax` ×24; quantized linears carry no bias; FFN activation is Swish; depthwise pads are `[4, 4]`.
+
+## Tests
+
+* Unit (no weights): `cargo test --features parakeet-burn` — frontend, greedy, quant, vocab, backend matmul, manifest validation, layernorm/Swish/GLU/attention/pos-window.
+* Real weights (ignored): `cargo test --features parakeet-burn -- --ignored` — layer-0 `block_forward` runs finite on converted weights (`block.rs`), needs `encoder-burn.safetensors` + `encoder-manifest.json` on disk.
+
+## What's next (ordered)
+
+1. Pre-encode + subsampling forward (2× strided conv + norms, 4x + frame stacking = 8x) with ORT parity test.
+2. 24-layer stack loop over `block_forward` + per-layer parity vs ORT; promote the ignored layer-0 test to a full-depth parity test.
+3. Joint/LSTM per-step compute (`joint.rs`) wired into the `decode.rs` greedy loop, then into `ParakeetBurnModel::transcribe` (replacing the current bail).
+4. Swap the naive `quant::forward` inner matmul for Burn tensor ops (NdArray first, no call-site changes); thread `BurnDevice` through to allocation.
+5. CUDA path (`parakeet-burn-cuda` + `--gpu`) once cudarc supports the installed toolkit; RTF check vs ORT.
+6. End-to-end file-mode parity (`--parakeet-engine burn` vs `ort` on a fixed WAV) before any mic default change.
