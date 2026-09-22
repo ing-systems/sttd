@@ -174,11 +174,13 @@ impl SignalPath {
                 resampler_hw48,
                 resampler_vad,
                 resampler_whisper,
+                denoiser,
                 ..
             } => {
                 resampler_hw48.clear();
                 resampler_vad.clear();
                 resampler_whisper.clear();
+                denoiser.reset();
             }
         }
     }

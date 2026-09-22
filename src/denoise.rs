@@ -78,6 +78,20 @@ impl Denoiser {
         }
     }
 
+    /// Reset overlap-add memory for a pause transition, so the first frames
+    /// after resume aren't blended from pre-pause audio. Norm states are
+    /// kept warm on purpose: they carry the background estimate Faza 2
+    /// (`NoiseTracker`) keeps learning from.
+    pub(crate) fn reset(&mut self) {
+        match self {
+            Denoiser::DeepFilter(tract) => {
+                for state in tract.df_states.iter_mut() {
+                    state.reset();
+                }
+            }
+        }
+    }
+
     /// Denoise one `FRAME_48K`-sample frame (f32, [-1, 1]) into `clean`.
     /// `noisy` and `clean` must both be exactly `FRAME_48K` samples.
     /// Never panics: length mismatches fall back to passthrough so a bad

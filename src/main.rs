@@ -75,6 +75,7 @@ mod emit;
 use emit::SystemEmitter;
 mod frame;
 mod gate;
+mod noise;
 mod signal;
 mod sound;
 use frame::*;
@@ -328,6 +329,11 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let mut whisper_ready_ok = false;
 
     // ---- main processing loop (NOT the audio callback) --------------------
+    let mut was_paused = paused.load(Ordering::Acquire);
+    if was_paused {
+        // Start-paused: drop any callback audio that raced stream start.
+        fp.discard_pending();
+    }
     while running.load(Ordering::Acquire) {
         // Fail fast if the whisper worker died during init instead of
         // capturing deaf: ready Err / disconnect, or early thread exit.
@@ -346,14 +352,34 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
                 }
             }
         }
-        // While paused, discard everything the callback delivered: no
-        // audio reaches FrameProcessor, and its in-flight state was
-        // already dropped, so resume starts clean with no pre-pause
-        // pre-roll. Idempotent: staying paused just keeps discarding.
-        if paused.load(Ordering::Acquire) {
-            while raw_rx.try_recv().is_ok() {}
-            accumulator.clear();
+        // While paused, no utterance may open, but the background keeps
+        // teaching the noise floor: drain the callback into the accumulator
+        // and observe (resample + RMS -> floor, no earshot, no buffering).
+        // Pre-pause speech state was already dropped (`discard_speech_keep_warm`,
+        // idempotent), so resume starts clean with no pre-pause pre-roll
+        // while the threshold stays adapted to the room.
+        let now_paused = paused.load(Ordering::Acquire);
+        if now_paused && !was_paused {
+            // Pause entry edge: full clear (resamplers + detector + utterance,
+            // noise floor preserved) so pre-pause partials can't leak into the
+            // background estimate or the first post-resume utterance.
             fp.discard_pending();
+        }
+        was_paused = now_paused;
+        if now_paused {
+            fp.discard_speech_keep_warm();
+            while let Ok(chunk) = raw_rx.try_recv() {
+                accumulator.extend_from_slice(&chunk);
+            }
+            while accumulator.len() >= input_frames {
+                fp.observe_pause(&accumulator[..input_frames]);
+                accumulator.drain(..input_frames);
+            }
+            // Keep only a partial chunk for continuity; full chunks are always
+            // consumed above, so this just caps a callback burst.
+            if accumulator.len() >= input_frames {
+                accumulator.clear();
+            }
             thread::sleep(Duration::from_millis(50));
             continue;
         }
@@ -560,12 +586,7 @@ fn whisper_options(cli: &Cli) -> WhisperOptions {
 /// `Cli`. Runs on the main thread before the worker spawns, so a bad dump
 /// dir fails fast like the model load it precedes.
 fn make_emitter(cli: &Cli) -> Result<SystemEmitter> {
-    SystemEmitter::new(
-        cli.dump_dir.clone(),
-        cli.copy,
-        cli.paste,
-        cli.stdout,
-    )
+    SystemEmitter::new(cli.dump_dir.clone(), cli.copy, cli.paste, cli.stdout)
 }
 
 /// Thresholds for deciding-not-to-emit, resolved once from `Cli` and shared

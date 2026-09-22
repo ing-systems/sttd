@@ -1,12 +1,12 @@
 use anyhow::Result;
 use crossbeam_channel::Sender;
 
+use crate::denoise::DenoiserKind;
 use crate::dsp::hw_input_frames;
 use crate::gate::GateConfig;
 use crate::signal::SignalPath;
 use crate::utterance::{FrameAction, Utterance, UtteranceBuffer};
 use crate::vad::SpeechDetector;
-use crate::denoise::DenoiserKind;
 
 // ---------------------------------------------------------------------------
 // Frame processing: VAD verdicts + utterance buffer, fed by the signal path
@@ -84,6 +84,24 @@ impl FrameProcessor {
     /// is a no-op.
     pub(crate) fn discard_pending(&mut self) {
         self.signal.clear();
+        self.vad.reset();
+        self.utterance.discard();
+    }
+
+    /// Observe-only background feed for pause: resample + RMS -> noise floor,
+    /// no earshot, no utterance, no latch change. Keeps resamplers continuous
+    /// (no `clear()` here) so the floor estimate has no chunk gaps.
+    pub(crate) fn observe_pause(&mut self, frame_hw_raw: &[f32]) {
+        for (vad16, _) in self.signal.feed(frame_hw_raw) {
+            self.vad.observe_background(&vad16);
+        }
+    }
+
+    /// Drop pre-pause speech state on pause entry without touching warm
+    /// state: VAD inference reset (noise floor preserved, see `vad`) +
+    /// utterance discard (pre-roll included). Resamplers are kept continuous
+    /// for `observe_pause`. Idempotent.
+    pub(crate) fn discard_speech_keep_warm(&mut self) {
         self.vad.reset();
         self.utterance.discard();
     }

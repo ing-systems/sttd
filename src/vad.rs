@@ -30,10 +30,13 @@ pub(crate) struct SpeechDetector {
     /// 16 kHz samples not yet consumed by a full `EARSHOT_WINDOW`.
     staging: Vec<f32>,
     threshold: f32,
-    /// The most recent prediction, re-reported for frames that didn't
-    /// themselves complete a window. Starts `false`: no prediction exists
-    /// yet for the very first frames.
-    latched: bool,
+    /// Hysteresis state: in-speech or not. Re-reported for frames that
+    /// didn't themselves complete a window. Starts `false`.
+    in_speech: bool,
+    /// Last earshot score, for hysteresis across windows.
+    last_score: f32,
+    /// Warm background estimate: survives `reset()` on purpose (see below).
+    noise: crate::noise::NoiseTracker,
 }
 
 impl SpeechDetector {
@@ -42,32 +45,77 @@ impl SpeechDetector {
             detector: Detector::default_boxed(),
             staging: Vec::with_capacity(EARSHOT_WINDOW),
             threshold,
-            latched: false,
+            in_speech: false,
+            last_score: 0.0,
+            noise: crate::noise::NoiseTracker::new(),
         }
     }
 
+    /// Current noise floor (for logging/tuning).
+    #[allow(dead_code)]
+    pub(crate) fn noise_floor(&self) -> f32 {
+        self.noise.floor()
+    }
+
     /// Feed one 10 ms VAD-branch frame (16 kHz, `[-1, 1]`); returns the
-    /// current speech verdict.
+    /// current speech verdict with hysteresis: entering speech needs
+    /// `score >= enter` (base lifted by background), staying in speech only
+    /// needs `score >= exit` (enter minus hysteresis). Non-speech frames
+    /// keep the background estimate warm; speech frames freeze it.
     pub(crate) fn verdict(&mut self, frame_16k: &[f32]) -> bool {
         self.staging.extend_from_slice(frame_16k);
 
         let mut consumed = 0;
+        let mut scored = false;
         while self.staging.len() - consumed >= EARSHOT_WINDOW {
             let window = &self.staging[consumed..consumed + EARSHOT_WINDOW];
             let score = self.detector.predict_f32(window);
-            self.latched = score > self.threshold;
+            self.last_score = score;
+            scored = true;
+            let enter = self.noise.enter_threshold(self.threshold);
+            let exit = self.noise.exit_threshold(self.threshold);
+            if self.in_speech {
+                if score < exit {
+                    self.in_speech = false;
+                }
+            } else if score >= enter {
+                self.in_speech = true;
+            }
             consumed += EARSHOT_WINDOW;
         }
         self.staging.drain(..consumed);
 
-        self.latched
+        // Warm the floor only on background: speech must never raise it.
+        // Frames without a fresh score reuse the latched state (same as
+        // before) and still count as background when not in speech.
+        if !self.in_speech {
+            // `scored` frames carry a fresh earshot verdict; unscored frames
+            // are 10 ms slices of the same background — both are safe.
+            let _ = scored;
+            self.noise.update_background(frame_16k);
+        }
+
+        self.in_speech
     }
 
-    /// Drop staged partial-window samples and the latched verdict for a
-    /// pause transition, so resume starts from silence, not pre-pause audio.
+    /// Observe-only background update for pause: RMS -> noise floor, no
+    /// earshot, no utterance, no latch change. Cheap (no neural pass) so a
+    /// 10 s pause on fan noise actually teaches the threshold instead of
+    /// idling. Never marks speech.
+    pub(crate) fn observe_background(&mut self, frame_16k: &[f32]) {
+        self.noise.update_background(frame_16k);
+    }
+
+    /// Drop staged partial-window samples, the hysteresis latch, and the
+    /// earshot detector's internal state (ring buffer + feature context +
+    /// RNN state) for a pause transition, so resume starts from silence,
+    /// not pre-pause audio. The noise floor is deliberately kept: it is the
+    /// warm background Faza 2 learns from.
     pub(crate) fn reset(&mut self) {
+        self.detector.reset();
         self.staging.clear();
-        self.latched = false;
+        self.in_speech = false;
+        self.last_score = 0.0;
     }
 }
 
@@ -123,7 +171,7 @@ mod tests {
         let frame = vec![0.0f32; FRAME_16K];
         // Frame 1: 160 samples staged, no window completed (160 < 256).
         let v1 = vad.verdict(&frame);
-        assert_eq!(v1, vad.latched);
+        assert_eq!(v1, vad.in_speech);
         assert_eq!(vad.staging.len(), FRAME_16K);
     }
 
@@ -148,6 +196,6 @@ mod tests {
         assert!(!vad.staging.is_empty());
         vad.reset();
         assert!(vad.staging.is_empty());
-        assert!(!vad.latched);
+        assert!(!vad.in_speech);
     }
 }
