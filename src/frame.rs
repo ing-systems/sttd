@@ -56,6 +56,13 @@ impl FrameProcessor {
         self.hw_input_frames
     }
 
+    /// Utterances waiting on the whisper thread. Unbounded by design (speech
+    /// must not be dropped under load); the main loop warns when it grows,
+    /// so a slow GPU shows up in the log instead of silent memory growth.
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.whisper_tx.len()
+    }
+
     /// Process one raw hw-rate chunk (`required_input_frames()` samples).
     pub(crate) fn process_frame(&mut self, frame_hw_raw: &[f32]) {
         debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);

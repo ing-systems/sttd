@@ -53,7 +53,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -330,6 +330,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let mut whisper_ready_ok = false;
 
     // ---- main processing loop (NOT the audio callback) --------------------
+    let mut last_queue_warn = Instant::now();
     let mut was_paused = paused.load(Ordering::Acquire);
     if was_paused {
         // Start-paused: drop any callback audio that raced stream start.
@@ -400,6 +401,20 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
         if !got_audio && accumulator.len() < input_frames {
             thread::sleep(Duration::from_millis(2));
+        }
+
+        // Backpressure visibility: both queues are unbounded (the cpal
+        // callback must never block, speech must not be dropped), so report
+        // instead of shedding — throttled to one line per 5 s.
+        if last_queue_warn.elapsed() >= Duration::from_secs(5) {
+            last_queue_warn = Instant::now();
+            let raw_depth = raw_rx.len();
+            let whisper_depth = fp.queue_depth();
+            if raw_depth > 64 || whisper_depth > 4 {
+                log::warn!(
+                    "queues growing (raw_rx={raw_depth}, whisper={whisper_depth}):                      capture outruns resampling or whisper outruns real time"
+                );
+            }
         }
     }
 
