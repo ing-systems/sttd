@@ -25,6 +25,11 @@ use crate::dsp::FftStream;
 /// audio for the utterance buffer. Always 160 samples each.
 pub(crate) type PairedFrames = (Vec<f32>, Vec<f32>);
 
+/// Warn threshold for unpaired frames waiting in `SignalPath` queues (see
+/// `pending_depths`). Both branches average 100 frames/s, so steady state is
+/// 0-2; anything above means resamplers diverged or the consumer stalled.
+pub(crate) const SIGNAL_PENDING_WARN: usize = 8;
+
 /// Owns all resampling / denoising state. Fed one raw hw-rate chunk at a
 /// time; returns the completed VAD/whisper pairs in order, so the VAD verdict
 /// always describes the whisper audio it is attached to.
@@ -32,6 +37,9 @@ pub(crate) struct SignalPath {
     vad_path: VadPath,
     pending_vad: VecDeque<Vec<f32>>,
     pending_whisper: VecDeque<Vec<f32>>,
+    fed_chunks: u64,
+    paired_frames: u64,
+    max_pending: usize,
 }
 
 /// The VAD branch's signal path, chosen once at startup from `--denoiser`
@@ -99,7 +107,24 @@ impl SignalPath {
             vad_path,
             pending_vad: VecDeque::new(),
             pending_whisper: VecDeque::new(),
+            fed_chunks: 0,
+            paired_frames: 0,
+            max_pending: 0,
         })
+    }
+
+    /// Frames currently waiting unpaired per branch: `(vad, whisper)`. After
+    /// every `feed`/`flush` one side is empty (see `drain_paired`); a growing
+    /// non-zero side means the branches diverged.
+    pub(crate) fn pending_depths(&self) -> (usize, usize) {
+        (self.pending_vad.len(), self.pending_whisper.len())
+    }
+
+    /// Totals for lockstep monitoring: `(fed_chunks, paired_frames,
+    /// max_pending)`. `max_pending` is the largest pre-drain queue seen so
+    /// far (either branch).
+    pub(crate) fn stats(&self) -> (u64, u64, usize) {
+        (self.fed_chunks, self.paired_frames, self.max_pending)
     }
 
     /// Feed one raw hw-rate chunk; returns every completed `(vad16,
@@ -108,6 +133,7 @@ impl SignalPath {
     /// running ahead waits in its queue. Both average 100 frames/s, so the
     /// queues stay bounded at a frame or two.
     pub(crate) fn feed(&mut self, frame_hw_raw: &[f32]) -> Vec<PairedFrames> {
+        self.fed_chunks += 1;
         match &mut self.vad_path {
             VadPath::Direct { resampler } => {
                 for frame16 in resampler.feed(frame_hw_raw) {
@@ -130,6 +156,7 @@ impl SignalPath {
                     .extend(resampler_whisper.feed(frame_hw_raw));
             }
         }
+        self.note_pending();
         self.drain_paired()
     }
 
@@ -159,15 +186,20 @@ impl SignalPath {
                 self.pending_whisper.extend(resampler_whisper.flush());
             }
         }
+        self.note_pending();
         self.drain_paired()
     }
 
     /// Drop in-flight audio: paired-frame queues + resampler partial-chunk
     /// state, so the first frames after resume aren't blended from pre-pause
-    /// audio. Idempotent.
+    /// audio. Idempotent. Also resets pairing counters so post-resume
+    /// `stats()` start clean.
     pub(crate) fn clear(&mut self) {
         self.pending_vad.clear();
         self.pending_whisper.clear();
+        self.fed_chunks = 0;
+        self.paired_frames = 0;
+        self.max_pending = 0;
         match &mut self.vad_path {
             VadPath::Direct { resampler } => resampler.clear(),
             VadPath::Denoised {
@@ -185,6 +217,11 @@ impl SignalPath {
         }
     }
 
+    fn note_pending(&mut self) {
+        let pending = self.pending_vad.len().max(self.pending_whisper.len());
+        self.max_pending = self.max_pending.max(pending);
+    }
+
     fn drain_paired(&mut self) -> Vec<PairedFrames> {
         let mut out = Vec::new();
         while let (Some(vad16), Some(whisper16)) =
@@ -194,6 +231,7 @@ impl SignalPath {
             debug_assert_eq!(whisper16.len(), FRAME_16K);
             out.push((vad16, whisper16));
         }
+        self.paired_frames += out.len() as u64;
         out
     }
 }
@@ -272,5 +310,45 @@ mod tests {
         // And the path still works after clear.
         let silence = vec![0.0f32; hw_chunk];
         let _ = signal.feed(&silence);
+    }
+
+    #[test]
+    fn counters_track_feed_and_pair_in_lockstep() {
+        for hw in [16_000, 44_100, 48_000] {
+            let mut signal = SignalPath::new(hw, DenoiserKind::Bypass).unwrap();
+            let hw_chunk = hw_input_frames(hw);
+            let silence = vec![0.0f32; hw_chunk];
+            for _ in 0..200 {
+                let _ = signal.feed(&silence);
+            }
+            let (fed, paired, max_pending) = signal.stats();
+            assert_eq!(fed, 200, "hw={hw}");
+            // FFT chunking shifts the count by a frame or two, same
+            // tolerance as `branches_stay_in_lockstep`.
+            assert!(
+                (198..=203).contains(&paired),
+                "hw={hw}: paired={paired} for 200 fed"
+            );
+            assert!(
+                max_pending <= 4,
+                "hw={hw}: steady state bursts must stay small, got {max_pending}"
+            );
+            let (vad, whisper) = signal.pending_depths();
+            assert!(
+                vad <= 2 && whisper <= 2,
+                "hw={hw}: pending depths must stay bounded, got ({vad}, {whisper})"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_resets_counters() {
+        let mut signal = SignalPath::new(48_000, DenoiserKind::Bypass).unwrap();
+        let hw_chunk = hw_input_frames(48_000);
+        let _ = signal.feed(&vec![0.1f32; hw_chunk]);
+        signal.clear();
+        assert_eq!(signal.stats(), (0, 0, 0));
+        assert_eq!(signal.pending_depths(), (0, 0));
+        assert_eq!(SIGNAL_PENDING_WARN, 8);
     }
 }

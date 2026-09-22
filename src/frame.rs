@@ -63,6 +63,13 @@ impl FrameProcessor {
         self.whisper_tx.len()
     }
 
+    /// Unpaired frames currently waiting inside `SignalPath`, per branch
+    /// `(vad, whisper)`. Exposed for the main-loop backpressure warn so a
+    /// resampler divergence shows up in the log instead of silent drift.
+    pub(crate) fn signal_pending_depths(&self) -> (usize, usize) {
+        self.signal.pending_depths()
+    }
+
     /// Process one raw hw-rate chunk (`required_input_frames()` samples).
     pub(crate) fn process_frame(&mut self, frame_hw_raw: &[f32]) {
         debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);

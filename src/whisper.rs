@@ -502,7 +502,9 @@ fn transcribe_and_emit(
     let tag = format!("utt_{utterance_no:06}");
 
     let conditioned = condition_utterance(&utterance.pcm);
-    let gained = apply_gain(&conditioned, utterance.evidence.rms, target_rms, MAX_GAIN);
+    let rms_for_gain =
+        conditioned_speech_rms(&utterance.pcm, &conditioned, utterance.evidence.rms);
+    let gained = apply_gain(&conditioned, rms_for_gain, target_rms, MAX_GAIN);
 
     match transcribe(
         state,
@@ -598,9 +600,48 @@ pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Overall RMS of a buffer (speech + silence tail together). Helper for
+/// `conditioned_speech_rms`; `f64` accumulation so long utterances don't lose
+/// precision.
+fn overall_rms(pcm: &[f32]) -> f32 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = pcm.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    (sum_sq / pcm.len() as f64).sqrt() as f32
+}
+
+/// Estimate speech-only RMS *after* conditioning from the pre-conditioning
+/// speech-only `rms` `UtteranceBuffer::close` measured.
+///
+/// `condition_utterance` (DC removal, 60 Hz high-pass, fades, peak safety)
+/// changes overall level — e.g. a DC offset or 50 Hz hum inflates the raw
+/// RMS but is gone after conditioning. Scaling the speech-only RMS by the
+/// overall `conditioned / raw` ratio keeps the `apply_gain` estimate anchored
+/// to what whisper actually receives, without recomputing over `pcm` (which
+/// would dilute it with the silence tail).
+///
+/// Falls back to the raw `speech_rms` when either overall level is
+/// zero/non-finite, so silence/empty input disables gain exactly as before.
+pub(crate) fn conditioned_speech_rms(
+    raw_pcm: &[f32],
+    conditioned_pcm: &[f32],
+    speech_rms: f32,
+) -> f32 {
+    if speech_rms <= 0.0 {
+        return speech_rms;
+    }
+    let raw = overall_rms(raw_pcm);
+    let cond = overall_rms(conditioned_pcm);
+    if raw <= 0.0 || cond <= 0.0 || !raw.is_finite() || !cond.is_finite() {
+        return speech_rms;
+    }
+    speech_rms * (cond / raw)
+}
+
 /// Apply gain toward `target_rms`, computed from the speech-only `rms`
-/// `UtteranceBuffer::close` already measured (not recomputed over `pcm`, which
-/// includes the padded silence tail). Only ever amplifies (gain >= 1.0) and
+/// post-conditioning estimate (see `conditioned_speech_rms`, not recomputed
+/// over `pcm`, which includes the padded silence tail). Only ever amplifies (gain >= 1.0) and
 /// never attenuates: a clip reaching this point already cleared the acoustic
 /// gates, so there's no silence here to accidentally boost. Caps at
 /// `max_gain`, and backs off further if that gain would clip the loudest
@@ -1043,6 +1084,55 @@ mod tests {
     #[test]
     fn condition_empty_stays_empty() {
         assert!(condition_utterance(&[]).is_empty());
+    }
+
+    #[test]
+    fn conditioned_rms_follows_hum_removal() {
+        // 50 Hz hum + DC offset inflates raw RMS but conditioning removes
+        // most of it: the speech estimate for gain must shrink accordingly,
+        // otherwise quiet hum would steal gain meant for speech.
+        let hum_dc: Vec<f32> = (0..16_000)
+            .map(|i| {
+                0.1 + (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2
+            })
+            .collect();
+        let conditioned = condition_utterance(&hum_dc);
+        let speech_rms = 0.15;
+        let adjusted = conditioned_speech_rms(&hum_dc, &conditioned, speech_rms);
+        assert!(
+            adjusted < speech_rms,
+            "hum/DC removal must lower the estimate: {adjusted} vs {speech_rms}"
+        );
+        assert!(adjusted > 0.0);
+    }
+
+    #[test]
+    fn conditioned_rms_keeps_speech_band() {
+        // 1 kHz tone passes conditioning nearly untouched: the estimate must
+        // stay within ±15% (fades + HP cost a little even in-band).
+        let tone: Vec<f32> = (0..16_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin() * 0.2)
+            .collect();
+        let conditioned = condition_utterance(&tone);
+        let speech_rms = 0.14;
+        let adjusted = conditioned_speech_rms(&tone, &conditioned, speech_rms);
+        let ratio = adjusted / speech_rms;
+        assert!(
+            (0.85..=1.15).contains(&ratio),
+            "speech-band ratio must stay near 1.0, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn conditioned_rms_falls_back_on_silence() {
+        // Zero/empty overall levels must not scale or NaN: gain stays
+        // disabled via the original speech_rms.
+        assert_eq!(conditioned_speech_rms(&[], &[], 0.01), 0.01);
+        assert_eq!(
+            conditioned_speech_rms(&vec![0.0; 160], &vec![0.0; 160], 0.01),
+            0.01
+        );
+        assert_eq!(conditioned_speech_rms(&vec![0.1; 160], &vec![0.1; 160], 0.0), 0.0);
     }
 
     #[test]

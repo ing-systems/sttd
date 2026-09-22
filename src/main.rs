@@ -405,14 +405,20 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
         // Backpressure visibility: both queues are unbounded (the cpal
         // callback must never block, speech must not be dropped), so report
-        // instead of shedding — throttled to one line per 5 s.
+        // instead of shedding — throttled to one line per 5 s. Signal-path
+        // pairing depths catch a resampler divergence the other two miss.
         if last_queue_warn.elapsed() >= Duration::from_secs(5) {
             last_queue_warn = Instant::now();
             let raw_depth = raw_rx.len();
             let whisper_depth = fp.queue_depth();
-            if raw_depth > 64 || whisper_depth > 4 {
+            let (signal_vad, signal_whisper) = fp.signal_pending_depths();
+            if raw_depth > 64
+                || whisper_depth > 4
+                || signal_vad > crate::signal::SIGNAL_PENDING_WARN
+                || signal_whisper > crate::signal::SIGNAL_PENDING_WARN
+            {
                 log::warn!(
-                    "queues growing (raw_rx={raw_depth}, whisper={whisper_depth}):                      capture outruns resampling or whisper outruns real time"
+                    "queues growing (raw_rx={raw_depth}, whisper={whisper_depth}, signal_vad={signal_vad}, signal_whisper={signal_whisper}): capture outruns resampling, branches diverged, or whisper outruns real time"
                 );
             }
         }
