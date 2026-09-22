@@ -75,6 +75,8 @@ pub(crate) fn spawn_whisper_worker(
     model_path: PathBuf,
     opts: WhisperOptions,
     emitter: impl Emitter + Send + 'static,
+    paused: Arc<AtomicBool>,
+    paused_unload_after_secs: u64,
 ) -> (
     JoinHandle<()>,
     std::sync::mpsc::Receiver<Result<(), String>>,
@@ -84,7 +86,15 @@ pub(crate) fn spawn_whisper_worker(
         .name("whisper".into())
         .spawn(move || {
             let mut emitter = emitter;
-            if let Err(e) = whisper_loop(&rx, &model_path, &opts, ready_tx, &mut emitter) {
+            if let Err(e) = whisper_loop(
+                &rx,
+                &model_path,
+                &opts,
+                ready_tx,
+                &mut emitter,
+                &paused,
+                paused_unload_after_secs,
+            ) {
                 eprintln!("[sttd] whisper worker failed: {e:?}");
             }
         })
@@ -102,10 +112,21 @@ fn whisper_loop(
     opts: &WhisperOptions,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &mut impl Emitter,
+    paused: &Arc<AtomicBool>,
+    paused_unload_after_secs: u64,
 ) -> Result<()> {
-    // Run init; report the outcome once via `ready` so the main thread can
-    // fail fast instead of capturing into a dead queue.
-    match whisper_init_and_run(rx, model_path, opts, &ready, emitter) {
+    // `whisper_init_and_run` signals the *first* load outcome via `ready`
+    // itself (later reloads only log); an `Err` return here therefore always
+    // means initial init failed, and re-sending is a harmless duplicate.
+    match whisper_init_and_run(
+        rx,
+        model_path,
+        opts,
+        &ready,
+        emitter,
+        paused,
+        paused_unload_after_secs,
+    ) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = ready.send(Err(e.to_string()));
@@ -114,17 +135,206 @@ fn whisper_loop(
     }
 }
 
+/// Whether the model should be unloaded right now: paused continuously for
+/// at least `unload_after`, which must be non-zero (`0` disables unloading).
+/// Pure over its inputs so tests don't need a GPU or threads.
+pub(crate) fn should_unload(paused: bool, paused_for: Duration, unload_after: Duration) -> bool {
+    if !paused || unload_after.is_zero() {
+        return false;
+    }
+    paused_for >= unload_after
+}
+
 fn whisper_init_and_run(
     rx: &Receiver<Utterance>,
     model_path: &Path,
     opts: &WhisperOptions,
     ready: &std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &mut impl Emitter,
+    paused: &Arc<AtomicBool>,
+    paused_unload_after_secs: u64,
 ) -> Result<()> {
     let path_str = model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
 
+    let prompt = opts.prompt.clone();
+    let language = opts.language;
+    let gate = opts.gate.clone();
+    let target_rms = opts.target_rms;
+    let debug_tokens = opts.debug_tokens;
+    let unload_after = Duration::from_secs(paused_unload_after_secs);
+
+    let mut first_load = true;
+    let mut utterance_no: u64 = 0;
+    // Utterances that arrive while the model is unloaded (resume raced the
+    // reload, or shutdown raced it): replayed in order after the next load.
+    // In practice this stays empty while paused, since the main loop
+    // discards audio instead of sending utterances.
+    let mut stash: Vec<Utterance> = Vec::new();
+
+    // Outer loop owns one loaded model per iteration. `ctx` + `state` are
+    // created and dropped inside the iteration (no self-referential struct),
+    // so unload is a plain scope exit that frees VRAM, and reload is the
+    // next iteration. All load/unload runs on this one thread, synchronously,
+    // so fast pause/resume toggles collapse to whatever the flag reads at
+    // the 1 s tick — a second load can never start mid-load.
+    loop {
+        let ctx = match load_whisper_context(path_str, model_path) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                if first_load {
+                    // Fail fast: captures would go into a dead queue.
+                    // `whisper_loop` re-sends as well (harmless duplicate).
+                    let _ = ready.send(Err(format!("{e:#}")));
+                    return Err(e);
+                }
+                eprintln!("[sttd] model reload failed: {e:?}; retrying in 5s");
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
+        let mut state = match ctx
+            .create_state()
+            .context("failed to create whisper state")
+        {
+            Ok(state) => state,
+            Err(e) => {
+                if first_load {
+                    let _ = ready.send(Err(format!("{e:#}")));
+                    return Err(e);
+                }
+                eprintln!("[sttd] model reload failed: {e:?}; retrying in 5s");
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
+        let token_beg = ctx.token_beg();
+
+        let model_name = ctx
+            .model_type_readable()
+            .unwrap_or_else(|_| "unknown".to_string());
+        if first_load {
+            eprintln!(
+                "[sttd] whisper ready (model={model_name}, lang={}, beam=5, threads=8, gpu=true)",
+                language.as_str()
+            );
+            // Init succeeded (model + state): signal ready so the main
+            // thread knows captures aren't going into a dead queue.
+            // Emission policy (dump dir, clipboard, paste) already resolved
+            // on the main thread inside `SystemEmitter::new`, before spawn.
+            let _ = ready.send(Ok(()));
+            first_load = false;
+        } else {
+            eprintln!("[sttd] whisper ready (model={model_name}, reloaded after pause)");
+        }
+        // A pause that raced the (tens of seconds) load gets a full fresh
+        // timeout rather than an instant unload.
+        let mut last_unpaused = Instant::now();
+
+        for utterance in stash.drain(..) {
+            if utterance.pcm.is_empty() {
+                continue;
+            }
+            utterance_no += 1;
+            transcribe_and_emit(
+                &mut state,
+                token_beg,
+                &utterance,
+                utterance_no,
+                &prompt,
+                language,
+                &gate,
+                target_rms,
+                debug_tokens,
+                emitter,
+            );
+        }
+
+        // Loaded loop: transcribe until the pause-idle timeout asks for an
+        // unload (`false`), or the sender is gone (`true` = shut down).
+        let disconnected = loop {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(utterance) => {
+                    if !paused.load(Ordering::Relaxed) {
+                        last_unpaused = Instant::now();
+                    }
+                    if utterance.pcm.is_empty() {
+                        continue;
+                    }
+                    utterance_no += 1;
+                    transcribe_and_emit(
+                        &mut state,
+                        token_beg,
+                        &utterance,
+                        utterance_no,
+                        &prompt,
+                        language,
+                        &gate,
+                        target_rms,
+                        debug_tokens,
+                        emitter,
+                    );
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !paused.load(Ordering::Relaxed) {
+                        last_unpaused = Instant::now();
+                    }
+                    if should_unload(
+                        paused.load(Ordering::Relaxed),
+                        last_unpaused.elapsed(),
+                        unload_after,
+                    ) {
+                        eprintln!(
+                            "[sttd] paused {}s, unloading whisper model to free VRAM...",
+                            unload_after.as_secs()
+                        );
+                        break false;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break true,
+            }
+        };
+        if disconnected {
+            return Ok(());
+        }
+        // Scope exit frees VRAM: state (borrows ctx) first, then ctx.
+        drop(state);
+        drop(ctx);
+        eprintln!("[sttd] whisper model unloaded (paused, VRAM freed)");
+
+        // Unloaded wait: never transcribe here, just stash late arrivals and
+        // reload eagerly the moment resume is seen — before the next
+        // utterance, so the first post-resume speech doesn't pay load
+        // latency twice. Disconnect means shutdown while unloaded: drop the
+        // stash (paused shutdown has nothing worth flushing) and exit so
+        // the join doesn't hang.
+        loop {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(utterance) => stash.push(utterance),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    if !stash.is_empty() {
+                        eprintln!(
+                            "[sttd] dropping {} queued utterance(s) (shut down while model unloaded)",
+                            stash.len()
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+            if !paused.load(Ordering::Relaxed) {
+                eprintln!("[sttd] resumed, reloading whisper model...");
+                break;
+            }
+        }
+    }
+}
+
+/// Blocking model load with a per-second progress tick (large models take
+/// tens of seconds with no callback). Returns only the context; the caller
+/// creates its state in the same scope so both drop together on unload.
+fn load_whisper_context(path_str: &str, model_path: &Path) -> Result<WhisperContext> {
     let mut ctx_params = WhisperContextParameters::default();
     ctx_params.use_gpu = true;
     match std::fs::metadata(model_path) {
@@ -157,76 +367,61 @@ fn whisper_init_and_run(
             }
         })
     };
-    let ctx_result = WhisperContext::new_with_params(path_str, ctx_params)
-        .context("failed to load whisper model");
+    let ctx_result =
+        WhisperContext::new_with_params(path_str, ctx_params).context("failed to load whisper model");
     load_done.store(true, Ordering::Relaxed);
     let _ = ticker.join();
-    let ctx = ctx_result?;
-    let mut state = ctx
-        .create_state()
-        .context("failed to create whisper state")?;
-    let token_beg = ctx.token_beg();
+    ctx_result
+}
 
-    let model_name = ctx
-        .model_type_readable()
-        .unwrap_or_else(|_| "unknown".to_string());
-    eprintln!(
-        "[sttd] whisper ready (model={model_name}, lang={}, beam=5, threads=8, gpu=true)",
-        opts.language.as_str()
-    );
+/// One utterance through conditioning, gain, inference, gate and emission.
+/// Tag numbering is owned by the caller so it stays monotonic across reloads.
+#[allow(clippy::too_many_arguments)]
+fn transcribe_and_emit(
+    state: &mut whisper_rs::WhisperState,
+    token_beg: whisper_rs::WhisperToken,
+    utterance: &Utterance,
+    utterance_no: u64,
+    prompt: &str,
+    language: Language,
+    gate: &crate::gate::GateConfig,
+    target_rms: f32,
+    debug_tokens: bool,
+    emitter: &mut impl Emitter,
+) {
+    let tag = format!("utt_{utterance_no:06}");
 
-    let prompt = opts.prompt.clone();
-    let language = opts.language;
-    let gate = opts.gate.clone();
-    let target_rms = opts.target_rms;
-    let debug_tokens = opts.debug_tokens;
-    // Init succeeded (model + state): signal ready so the main thread knows
-    // captures aren't going into a dead queue. Emission policy (dump dir,
-    // clipboard, paste) already resolved on the main thread inside
-    // `SystemEmitter::new`, before the worker spawned.
-    let _ = ready.send(Ok(()));
+    let conditioned = condition_utterance(&utterance.pcm);
+    let gained = apply_gain(&conditioned, utterance.evidence.rms, target_rms, MAX_GAIN);
 
-    let mut utterance_no: u64 = 0;
-    for utterance in rx.iter() {
-        if utterance.pcm.is_empty() {
-            continue;
+    match transcribe(
+        state,
+        token_beg,
+        gained.as_ref(),
+        prompt,
+        language,
+        debug_tokens,
+    ) {
+        Ok(t) => {
+            let trimmed = t.text.trim();
+            let verdict = gate.decide_transcript(
+                utterance.evidence.speech_frames,
+                utterance.evidence.rms,
+                trimmed,
+                t.confidence.prob,
+            );
+            emitter.emit(Emission {
+                tag: &tag,
+                pcm: &utterance.pcm,
+                text: trimmed,
+                verdict,
+                prob: t.confidence.prob,
+                logprob: t.confidence.logprob,
+                evidence: &utterance.evidence,
+            });
         }
-        utterance_no += 1;
-        let tag = format!("utt_{utterance_no:06}");
-
-        let conditioned = condition_utterance(&utterance.pcm);
-        let gained = apply_gain(&conditioned, utterance.evidence.rms, target_rms, MAX_GAIN);
-
-        match transcribe(
-            &mut state,
-            token_beg,
-            gained.as_ref(),
-            &prompt,
-            language,
-            debug_tokens,
-        ) {
-            Ok(t) => {
-                let trimmed = t.text.trim();
-                let verdict = gate.decide_transcript(
-                    utterance.evidence.speech_frames,
-                    utterance.evidence.rms,
-                    trimmed,
-                    t.confidence.prob,
-                );
-                emitter.emit(Emission {
-                    tag: &tag,
-                    pcm: &utterance.pcm,
-                    text: trimmed,
-                    verdict,
-                    prob: t.confidence.prob,
-                    logprob: t.confidence.logprob,
-                    evidence: &utterance.evidence,
-                });
-            }
-            Err(e) => eprintln!("[sttd] {tag}: transcription failed: {e:?}"),
-        }
+        Err(e) => eprintln!("[sttd] {tag}: transcription failed: {e:?}"),
     }
-    Ok(())
 }
 
 /// Condition an utterance for whisper: DC removal, gentle one-pole
@@ -779,6 +974,36 @@ mod tests {
     }
 
     #[test]
+    fn unload_predicate_requires_pause_and_timeout() {
+        use std::time::Duration;
+        // Disabled.
+        assert!(!should_unload(true, Duration::from_secs(3600), Duration::ZERO));
+        // Unpaused silence never unloads.
+        assert!(!should_unload(
+            false,
+            Duration::from_secs(3600),
+            Duration::from_secs(180)
+        ));
+        // Paused but under the timeout.
+        assert!(!should_unload(
+            true,
+            Duration::from_secs(179),
+            Duration::from_secs(180)
+        ));
+        // Boundary unloads.
+        assert!(should_unload(
+            true,
+            Duration::from_secs(180),
+            Duration::from_secs(180)
+        ));
+        assert!(should_unload(
+            true,
+            Duration::from_secs(3600),
+            Duration::from_secs(180)
+        ));
+    }
+
+    #[test]
     fn whisper_worker_signals_init_failure() {
         // Bad model path must propagate via the ready channel instead of
         // silently capturing into a dead queue.
@@ -796,8 +1021,14 @@ mod tests {
             debug_tokens: false,
         };
         let bad = std::path::PathBuf::from("/nonexistent/ggml-bogus.bin");
-        let (handle, ready) =
-            spawn_whisper_worker(rx, bad, opts, crate::emit::RecordingEmitter::new());
+        let (handle, ready) = spawn_whisper_worker(
+            rx,
+            bad,
+            opts,
+            crate::emit::RecordingEmitter::new(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            0,
+        );
         match ready.recv_timeout(std::time::Duration::from_secs(120)) {
             Ok(Ok(())) => panic!("bad model path must not signal ready"),
             Ok(Err(e)) => assert!(

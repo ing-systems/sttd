@@ -35,7 +35,11 @@
 //! instead of the microphone, for comparing tuning changes against a fixed
 //! recording. `sttd --list-devices` prints available input devices.
 //! `sttd --list-models` prints known whisper models with installed/default
-//! markers. Every tunable is a CLI flag with `STTD_*` env
+//! markers. `sttd --start` forks microphone mode into the background
+//! (pid file, combined log); `--stop`/`--status` manage it via the pid
+//! file. While paused longer than `--paused-unload-after` the whisper
+//! model is unloaded to free VRAM and reloaded eagerly on resume.
+//! Every tunable is a CLI flag with `STTD_*` env
 //! fallback (see `--help`); CLI wins over env. `--model` additionally honors
 //! the legacy `WHISPER_MODEL_PATH` when `STTD_MODEL` is unset.
 
@@ -49,7 +53,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use signal_hook::consts::{SIGHUP, SIGUSR1, SIGUSR2};
+use signal_hook::consts::{SIGHUP, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::iterator::Signals;
 
 mod cli;
@@ -58,6 +62,7 @@ mod config;
 use config::{DEFAULT_MODELS_DIR, DEFAULT_MODEL_SPEC, MODEL_CATALOG};
 mod capture;
 use capture::*;
+mod daemon;
 mod denoise;
 mod dsp;
 mod emit;
@@ -83,6 +88,12 @@ use whisper::*;
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.stop {
+        return daemon::run_stop(&cli.pid_file_path());
+    }
+    if cli.status {
+        std::process::exit(daemon::run_status(&cli.pid_file_path()));
+    }
     if cli.list_devices {
         return print_input_devices();
     }
@@ -92,6 +103,9 @@ fn main() -> Result<()> {
     }
     if let Some(path) = cli.file.clone() {
         return run_file_mode(&path, &cli);
+    }
+    if cli.start {
+        daemon::daemonize_start(&cli.pid_file_path(), &cli.log_file_path())?;
     }
 
     run_microphone_mode(&cli)
@@ -195,11 +209,14 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         }
     }
 
-    // USR1/USR2/HUP drive the pause flag; a failed install isn't fatal,
-    // pause/resume via signals is then simply unavailable.
+    // USR1/USR2/HUP drive the pause flag, TERM requests a graceful shutdown
+    // (same flag as Ctrl-C, so `--stop`/`kill` flushes trailing speech); a
+    // failed install isn't fatal, pause/resume via signals is then simply
+    // unavailable.
     {
         let paused = Arc::clone(&paused);
-        if let Err(e) = install_pause_handlers(paused) {
+        let running = Arc::clone(&running);
+        if let Err(e) = install_pause_handlers(paused, running) {
             eprintln!("[sttd] warning: {e:?} (signal pause/resume unavailable)");
         }
     }
@@ -212,6 +229,8 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         model_path,
         whisper_options(cli),
         make_emitter(cli)?,
+        Arc::clone(&paused),
+        cli.paused_unload_after,
     );
     let mut whisper_ready_ok = false;
 
@@ -285,12 +304,15 @@ fn install_ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
     ctrlc::set_handler(cb).context("failed to install Ctrl-C handler")
 }
 
-/// Install the pause/resume signal handlers: `SIGUSR1` pauses, `SIGUSR2`
-/// resumes, `SIGHUP` toggles. The handler thread only flips the shared
-/// flag; the main loop does the actual discarding, so the transition is
-/// idempotent (pause-while-paused / resume-while-running are no-ops).
-fn install_pause_handlers(paused: Arc<AtomicBool>) -> Result<()> {
-    let mut signals = Signals::new([SIGUSR1, SIGUSR2, SIGHUP])
+/// Install the pause/resume/shutdown signal handlers: `SIGUSR1` pauses,
+/// `SIGUSR2` resumes, `SIGHUP` toggles, `SIGTERM` requests a graceful
+/// shutdown (same `running` flag as Ctrl-C, so `--stop`/`kill` flushes
+/// trailing speech instead of dying mid-CUDA-op). The handler thread only
+/// flips shared flags; the main loop does the actual discarding, so the
+/// transition is idempotent (pause-while-paused / resume-while-running are
+/// no-ops, double TERM is one shutdown).
+fn install_pause_handlers(paused: Arc<AtomicBool>, running: Arc<AtomicBool>) -> Result<()> {
+    let mut signals = Signals::new([SIGUSR1, SIGUSR2, SIGHUP, SIGTERM])
         .context("failed to register pause/resume signals")?;
     thread::spawn(move || {
         for sig in signals.forever() {
@@ -310,6 +332,10 @@ fn install_pause_handlers(paused: Arc<AtomicBool>) -> Result<()> {
                     } else {
                         eprintln!("[sttd] paused (SIGHUP toggle)");
                     }
+                }
+                SIGTERM => {
+                    eprintln!("[sttd] shutting down (SIGTERM)");
+                    running.store(false, Ordering::Release);
                 }
                 _ => {}
             }
@@ -354,6 +380,10 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         model_path,
         whisper_options(cli),
         make_emitter(cli)?,
+        // File mode has no pause signalling; a permanently-clear flag plus
+        // the real timeout can never trigger an unload mid-file.
+        Arc::new(AtomicBool::new(false)),
+        cli.paused_unload_after,
     );
     // Fail fast on model-load/dump-dir errors before processing the file:
     // no realtime capture to keep bounded here, so blocking wait is fine.

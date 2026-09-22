@@ -4,8 +4,8 @@ use clap::Parser;
 
 use crate::config::{
     DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_TARGET_RMS,
-    DEFAULT_VAD_THRESHOLD, parse_bool,
+    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PAUSED_UNLOAD_AFTER_SECS,
+    DEFAULT_PROMPT, DEFAULT_TARGET_RMS, DEFAULT_VAD_THRESHOLD, parse_bool,
 };
 use crate::denoise::DenoiserKind;
 use crate::whisper::Language;
@@ -24,7 +24,7 @@ use crate::whisper::Language;
 )]
 pub(crate) struct Cli {
     /// Transcribe a WAV file offline instead of the microphone.
-    #[arg(short, long, value_name = "PATH", help_heading = "Input", conflicts_with_all = ["list_devices", "list_models"])]
+    #[arg(short, long, value_name = "PATH", help_heading = "Input", conflicts_with_all = ["list_devices", "list_models", "start", "stop", "status"])]
     pub(crate) file: Option<PathBuf>,
 
     /// Substring match (case-insensitive) against an input device name.
@@ -32,7 +32,7 @@ pub(crate) struct Cli {
     pub(crate) device: Option<String>,
 
     /// List available input devices and exit.
-    #[arg(long, help_heading = "Input", conflicts_with_all = ["file", "list_models"])]
+    #[arg(long, help_heading = "Input", conflicts_with_all = ["file", "list_models", "start", "stop", "status"])]
     pub(crate) list_devices: bool,
 
     /// Model spec (e.g. `small`, `large-v3-turbo-q8_0`) or path to a ggml
@@ -42,7 +42,7 @@ pub(crate) struct Cli {
     pub(crate) model: Option<String>,
 
     /// List known whisper models (with installed/default markers) and exit.
-    #[arg(long, help_heading = "Model", conflicts_with_all = ["file", "list_devices"])]
+    #[arg(long, help_heading = "Model", conflicts_with_all = ["file", "list_devices", "start", "stop", "status"])]
     pub(crate) list_models: bool,
 
     /// Whisper decoding language: `pl` forces Polish, `en` forces English,
@@ -159,6 +159,61 @@ pub(crate) struct Cli {
         help_heading = "Runtime"
     )]
     pub(crate) debug_tokens: bool,
+
+    /// Start microphone mode as a background daemon (fork, detach, pid
+    /// file, combined stdout+stderr log). Parent prints the pid/log paths
+    /// and exits; the child keeps running past terminal close.
+    #[arg(
+        long,
+        env = "STTD_START",
+        default_value_t = false,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Runtime",
+        conflicts_with_all = ["file", "list_devices", "list_models", "stop", "status"]
+    )]
+    pub(crate) start: bool,
+
+    /// PID file written by `--start` and read by `--stop`/`--status`.
+    /// Defaults to `<tmp>/sttd.pid`.
+    #[arg(long, env = "STTD_PID_FILE", value_name = "PATH", help_heading = "Runtime")]
+    pub(crate) pid_file: Option<PathBuf>,
+
+    /// Combined stdout+stderr log (append) for `--start`. Transcripts
+    /// (`println!`) and diagnostics (`eprintln!`) both land here.
+    /// Defaults to `<tmp>/sttd.log`.
+    #[arg(long, env = "STTD_LOG_FILE", value_name = "PATH", help_heading = "Runtime")]
+    pub(crate) log_file: Option<PathBuf>,
+
+    /// Stop the background daemon: SIGTERM its pid (graceful flush),
+    /// wait, then SIGKILL on timeout. Reads `--pid-file`.
+    #[arg(
+        long,
+        help_heading = "Runtime",
+        conflicts_with_all = ["file", "list_devices", "list_models", "start", "status"]
+    )]
+    pub(crate) stop: bool,
+
+    /// Check whether the background daemon is running. Reads `--pid-file`;
+    /// exit code 0 iff running.
+    #[arg(
+        long,
+        help_heading = "Runtime",
+        conflicts_with_all = ["file", "list_devices", "list_models", "start", "stop"]
+    )]
+    pub(crate) status: bool,
+
+    /// While paused longer than this (seconds), unload the whisper model
+    /// to free VRAM; reloaded eagerly on resume. `0` disables unloading.
+    #[arg(
+        long,
+        env = "STTD_PAUSED_UNLOAD_AFTER",
+        default_value_t = DEFAULT_PAUSED_UNLOAD_AFTER_SECS,
+        value_name = "SECS",
+        help_heading = "Runtime"
+    )]
+    pub(crate) paused_unload_after: u64,
 }
 
 impl Cli {
@@ -166,6 +221,16 @@ impl Cli {
     /// via clap) > legacy `WHISPER_MODEL_PATH` > compiled-in default spec.
     pub(crate) fn model_input(&self) -> String {
         effective_model_input(self.model.as_deref(), std::env::var("WHISPER_MODEL_PATH").ok())
+    }
+
+    /// Effective pid-file path: `--pid-file`/`STTD_PID_FILE` or `<tmp>/sttd.pid`.
+    pub(crate) fn pid_file_path(&self) -> PathBuf {
+        self.pid_file.clone().unwrap_or_else(crate::daemon::default_pid_file)
+    }
+
+    /// Effective log path: `--log-file`/`STTD_LOG_FILE` or `<tmp>/sttd.log`.
+    pub(crate) fn log_file_path(&self) -> PathBuf {
+        self.log_file.clone().unwrap_or_else(crate::daemon::default_log_file)
     }
 }
 
@@ -216,6 +281,12 @@ mod tests {
         assert!(!cli.debug_tokens);
         assert!(cli.start_paused);
         assert_eq!(cli.denoiser, DenoiserKind::Bypass);
+        assert!(!cli.start);
+        assert!(!cli.stop);
+        assert!(!cli.status);
+        assert_eq!(cli.pid_file, None);
+        assert_eq!(cli.log_file, None);
+        assert_eq!(cli.paused_unload_after, DEFAULT_PAUSED_UNLOAD_AFTER_SECS);
     }
 
     #[test]
@@ -254,6 +325,37 @@ mod tests {
     #[test]
     fn cli_list_models_conflicts_with_file() {
         assert!(Cli::try_parse_from(["sttd", "--list-models", "--file", "a.wav"]).is_err());
+    }
+
+    #[test]
+    fn cli_start_conflicts_with_file_and_stop_and_status() {
+        assert!(Cli::try_parse_from(["sttd", "--start", "--file", "a.wav"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--start", "--stop"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--start", "--status"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--start", "--list-devices"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--start", "--list-models"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--stop", "--status"]).is_err());
+    }
+
+    #[test]
+    fn cli_daemon_paths_and_unload_timeout_parse() {
+        let cli = Cli::try_parse_from([
+            "sttd",
+            "--pid-file",
+            "/tmp/custom.pid",
+            "--log-file",
+            "/tmp/custom.log",
+            "--paused-unload-after",
+            "0",
+        ])
+        .expect("daemon paths must parse");
+        assert_eq!(cli.pid_file.as_deref(), Some(std::path::Path::new("/tmp/custom.pid")));
+        assert_eq!(cli.log_file.as_deref(), Some(std::path::Path::new("/tmp/custom.log")));
+        assert_eq!(cli.paused_unload_after, 0);
+        // Defaults resolve into tmp when unset.
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert!(cli.pid_file_path().ends_with("sttd.pid"));
+        assert!(cli.log_file_path().ends_with("sttd.log"));
     }
 
     #[test]

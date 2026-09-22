@@ -123,6 +123,11 @@ pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;
 /// evidence.
 pub(crate) const STRONG_RMS_FACTOR: f32 = 3.0;
 
+/// While paused longer than this (seconds), the whisper worker unloads the
+/// model to free VRAM and reloads it on resume (see `whisper`). Default
+/// 180 s. Override with `STTD_PAUSED_UNLOAD_AFTER`; `0` disables unloading.
+pub(crate) const DEFAULT_PAUSED_UNLOAD_AFTER_SECS: u64 = 180;
+
 /// Whisper model auto-download. The URL is derived from the filename (see
 /// `ensure_available`), so `--model` as an explicit path can point at any
 /// ggml model published in this repo, not just the compiled-in default.
