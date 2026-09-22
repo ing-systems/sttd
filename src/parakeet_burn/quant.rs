@@ -85,6 +85,19 @@ impl Int8Linear {
     }
 }
 
+/// Transpose row-major `[rows][cols]` u8 -> `[cols][rows]`. Applied at
+/// load to ONNX `MatMul` `(K, N)` weights (see `Uint8Linear` docs).
+pub(crate) fn transpose_u8(d: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(d.len(), rows * cols);
+    let mut t = vec![0u8; d.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            t[c * rows + r] = d[r * cols + c];
+        }
+    }
+    t
+}
+
 /// Dynamically quantize activations to int8 (mirrors ONNX
 /// `DynamicQuantizeLinear`: per-row scale, no zero-point).
 pub(crate) fn dynamic_quantize_row(x: &[f32]) -> (Vec<i8>, f32) {
@@ -94,6 +107,12 @@ pub(crate) fn dynamic_quantize_row(x: &[f32]) -> (Vec<i8>, f32) {
 /// One asymmetrically-quantized uint8 Linear (encoder MatMuls/Convs,
 /// decoder embed + joint):
 /// `y = (((w_u8 - zp) * scale)) @ x + bias`, zp scalar-or-per-row.
+///
+/// Storage is ALWAYS `[out][in]` row-major. ONNX `MatMul` weights are
+/// `(K, N) = (in, out)` — transpose them with `transpose_u8` at load
+/// (a no-op only for square shapes, which is why square-only tests
+/// never caught a missing transpose). ONNX 1x1 `Conv` weights are
+/// `[out][in][1]` and already match.
 #[derive(Debug, Clone)]
 pub(crate) struct Uint8Linear {
     pub(crate) weight_u8: Vec<u8>,
@@ -188,5 +207,25 @@ mod tests {
         assert!((y[1] - 0.24).abs() < 1e-4, "y={y:?}");
         // dequant_row broadcasts the scalar scale/zp.
         assert_eq!(lin.dequant_row(1).len(), 2);
+    }
+
+    #[test]
+    fn transpose_u8_fixes_matmul_layout() {
+        // ONNX (K=3, N=2) storage; forward reads [out][in], so load must
+        // transpose. Non-square on purpose: a missing transpose still
+        // runs for square shapes and only scrambles values.
+        let kn: Vec<u8> = vec![1, 2, 3, 4, 5, 6]; // rows K, cols N
+        let oi = transpose_u8(&kn, 3, 2);
+        assert_eq!(oi, vec![1, 3, 5, 2, 4, 6]);
+        let lin = Uint8Linear {
+            weight_u8: oi,
+            scale: vec![1.0, 1.0],
+            zero_point: vec![0.0, 0.0],
+            bias: None,
+            in_dim: 3,
+            out_dim: 2,
+        };
+        // y[0] = 1*x0 + 3*x1 + 5*x2 (column 0 of the (K,N) store).
+        assert_eq!(lin.forward(&[1.0, 1.0, 1.0]), vec![9.0, 12.0]);
     }
 }

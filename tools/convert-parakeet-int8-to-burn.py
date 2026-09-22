@@ -97,6 +97,30 @@ def convert_one(onnx_path: Path, out_path: Path) -> dict:
             continue  # shape constants, not weights
         else:
             print(f"  skip {name}: dtype {arr.dtype} shape {arr.shape}")
+
+    # Frozen large F32 constants baked into Constant nodes (not
+    # initializers): the encoder's relative-position table
+    # (Constant_1723, (1, 9999, 1024)). Without this the Rust side would
+    # have to regenerate NeMo's sinusoid convention; the exact table
+    # removes a whole class of parity risk. Threshold keeps tiny scalars
+    # (scales-as-constants, pads) out.
+    n_const = 0
+    for node in model.graph.node:
+        if node.op_type != "Constant":
+            continue
+        for attr in node.attribute:
+            if attr.name != "value":
+                continue
+            arr = np.ascontiguousarray(numpy_helper.to_array(attr.t))
+            if arr.dtype != np.float32 or arr.size <= 10_000:
+                continue
+            if arr.shape == (1, 9999, 1024):
+                out["pos_enc.table"] = arr.reshape(9999, 1024)
+            else:
+                out[f"const/{node.name}"] = arr
+            n_const += 1
+    if n_const:
+        print(f"  kept {n_const} large F32 constant(s)")
     save_file(out, str(out_path))
     return {"u8": n_u8, "i8": n_i8, "fp": n_fp, "tensors": len(out)}
 
@@ -181,11 +205,37 @@ def emit_encoder_manifest(onnx_path: Path, out_path: Path) -> dict:
             norms.setdefault(m.group(1), []).append(init.name)
     pos_bias = sorted(n for n in shapes if re.match(r"^layers\.\d+\.self_attn\.pos_bias_[uv]$", n))
 
+    # Depthwise-conv biases are anonymous F32 initializers (onnx::Conv_*):
+    # trace each layer's *bias_add through its Reshape to the initializer.
+    init_names = set(shapes)
+    out2node = {}
+    for node in model.graph.node:
+        for o in node.output:
+            out2node[o] = node
+    dw_bias: dict[str, str] = {}
+    for node in model.graph.node:
+        m = re.match(r"^/layers\.(\d+)/conv/depthwise_conv/.*bias_add$", node.name)
+        if not m:
+            continue
+        layer = m.group(1)
+        for inp in node.input:
+            cur = inp
+            seen = 0
+            while cur in out2node and out2node[cur].op_type == "Reshape" and seen < 3:
+                data_in = out2node[cur].input[0]
+                cur = data_in
+                seen += 1
+            if cur in init_names:
+                dw_bias[f"layers.{layer}/conv/depthwise_bias"] = cur
+    if len(dw_bias) != len(set(re.match(r"^layers\.(\d+)", e["role"]).group(1) for e in entries if e["role"].startswith("layers."))):
+        print(f"  manifest: dw_bias mapped for {len(dw_bias)} layers (expected 24)")
+
     manifest = {
         "model": onnx_path.name,
         "quant_ops": entries,
         "norms": norms,
         "pos_bias": pos_bias,
+        "dw_bias": dw_bias,
     }
     out_path.write_text(json.dumps(manifest, indent=1) + "\n")
     return {"roles": len(entries), "norm_groups": len(norms), "pos_bias": len(pos_bias)}

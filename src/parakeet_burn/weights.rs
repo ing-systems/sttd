@@ -43,7 +43,131 @@ pub(crate) fn require_converted_weights(dir: &Path) -> Result<()> {
     )
 }
 
-/// Load one safetensors file into `(name, shape, f32-data)` rows,
+/// A single converted tensor, still in its stored dtype (dequantize at
+/// use, so 8-bit weights stay 8-bit in RAM).
+#[derive(Debug, Clone)]
+pub(crate) enum RawTensor {
+    F32 {
+        shape: Vec<usize>,
+        data: Vec<f32>,
+    },
+    U8 {
+        shape: Vec<usize>,
+        data: Vec<u8>,
+        scale: Vec<f32>,
+        zp: Vec<f32>,
+    },
+    I8 {
+        shape: Vec<usize>,
+        data: Vec<i8>,
+        scale: Vec<f32>,
+        zp: Vec<f32>,
+    },
+}
+
+impl RawTensor {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            RawTensor::F32 { .. } => "F32",
+            RawTensor::U8 { .. } => "U8",
+            RawTensor::I8 { .. } => "I8",
+        }
+    }
+}
+
+/// Load only `want` (exact weight names; `.scale`/`.zero_point`
+/// companions are pulled in automatically via `aux_pair`, which fails
+/// loudly when a companion is absent) from a converted safetensors file. The full 582 MB encoder
+/// stays on disk: a single layer is ~30 MB, so per-layer bring-up never
+/// needs the 2.4 GB a full-f32 load would take.
+#[allow(dead_code)]
+pub(crate) fn load_selected(
+    path: &Path,
+    want: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashMap<String, RawTensor>> {
+    let bytes = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let st = safetensors::SafeTensors::deserialize(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let mut out = std::collections::HashMap::new();
+    for name in st.names() {
+        if !want.contains(name) {
+            continue;
+        }
+        // Companions ride along with their weight via `aux_pair` below;
+        // loading one standalone would misread e.g. a U8 `.zero_point`
+        // as a weight needing its own `.scale` (same skip as
+        // `load_safetensors_f32`).
+        if name.ends_with(".scale") || name.ends_with(".zero_point") {
+            continue;
+        }
+        let v = st
+            .tensor(name)
+            .with_context(|| format!("missing tensor {name} in {}", path.display()))?;
+        let shape: Vec<usize> = v.shape().to_vec();
+        match v.dtype() {
+            safetensors::Dtype::F32 => {
+                let raw = v.data();
+                let (chunks, _) = raw.as_chunks::<4>();
+                out.insert(
+                    name.to_string(),
+                    RawTensor::F32 {
+                        shape,
+                        data: chunks.iter().map(|c| f32::from_le_bytes(*c)).collect(),
+                    },
+                );
+            }
+            safetensors::Dtype::U8 => {
+                let (scales, zps) = aux_pair(&st, path, name)?;
+                out.insert(
+                    name.to_string(),
+                    RawTensor::U8 {
+                        shape,
+                        data: v.data().to_vec(),
+                        scale: scales,
+                        zp: zps,
+                    },
+                );
+            }
+            safetensors::Dtype::I8 => {
+                let (scales, zps) = aux_pair(&st, path, name)?;
+                out.insert(
+                    name.to_string(),
+                    RawTensor::I8 {
+                        shape,
+                        data: v.data().iter().map(|&b| b as i8).collect(),
+                        scale: scales,
+                        zp: zps,
+                    },
+                );
+            }
+            other => anyhow::bail!(
+                "unsupported dtype {other:?} for tensor {name} in {}",
+                path.display()
+            ),
+        }
+    }
+    let missing: Vec<&String> = want
+        .iter()
+        .filter(|n| {
+            !n.ends_with(".scale")
+                && !n.ends_with(".zero_point")
+                && !out.contains_key(*n)
+        })
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "tensors missing from {}: {}",
+            path.display(),
+            missing
+                .iter()
+                .take(8)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(out)
+}
 ///
 /// dequantizing 8-bit weights and passing through `F32`/`F16`/`BF16`.
 /// Written by `tools/convert-parakeet-int8-to-burn.py` from the int8 ONNX:

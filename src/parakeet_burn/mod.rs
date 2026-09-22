@@ -27,6 +27,9 @@
 mod backend;
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
+mod block;
+#[cfg(feature = "parakeet-burn")]
+#[allow(dead_code)]
 mod decode;
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
