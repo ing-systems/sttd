@@ -6,7 +6,7 @@ use crate::config::{
     parse_beam_size, parse_bool, parse_threads, DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS,
     DEFAULT_BEAM_SIZE, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
     DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_PROMPT, DEFAULT_TARGET_RMS,
-    DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_THRESHOLD,
+    DEFAULT_THREADS, DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::whisper::Language;
@@ -104,6 +104,11 @@ pub(crate) struct Cli {
     /// Minimum earshot score for a 16 ms window to count as speech.
     #[arg(long, env = "STTD_VAD_THRESHOLD", default_value_t = DEFAULT_VAD_THRESHOLD, help_heading = "Acoustic gates")]
     pub(crate) vad_threshold: f32,
+
+    /// Adapt the VAD threshold to the background noise floor with hysteresis
+    /// (`off` = single fixed threshold, pre-adapt behavior).
+    #[arg(long, env = "STTD_VAD_ADAPT", default_value_t = DEFAULT_VAD_ADAPT, value_parser = parse_bool, num_args = 0..=1, default_missing_value = "true", help_heading = "Acoustic gates")]
+    pub(crate) vad_adapt: bool,
 
     /// Min speech-only RMS to keep an utterance.
     #[arg(long, env = "STTD_MIN_RMS", default_value_t = DEFAULT_MIN_SPEECH_RMS, help_heading = "Acoustic gates")]
@@ -382,6 +387,7 @@ mod tests {
         assert_eq!(cli.min_conf_strong, DEFAULT_MIN_CONFIDENCE_STRONG);
         assert_eq!(cli.target_rms, DEFAULT_TARGET_RMS);
         assert_eq!(cli.vad_threshold, DEFAULT_VAD_THRESHOLD);
+        assert_eq!(cli.vad_adapt, DEFAULT_VAD_ADAPT);
         assert!(cli.copy);
         assert!(cli.paste);
         assert!(!cli.stdout);
@@ -488,6 +494,15 @@ mod tests {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert!(cli.pid_file_path().ends_with("sttd.pid"));
         assert!(cli.log_file_path().ends_with("sttd.log"));
+    }
+
+    #[test]
+    fn cli_vad_adapt_toggles() {
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert!(cli.vad_adapt);
+        let cli =
+            Cli::try_parse_from(["sttd", "--vad-adapt", "off"]).expect("off must parse");
+        assert!(!cli.vad_adapt);
     }
 
     #[test]

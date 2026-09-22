@@ -32,13 +32,14 @@ impl FrameProcessor {
         whisper_tx: Sender<Utterance>,
         denoiser_kind: DenoiserKind,
         vad_threshold: f32,
+        vad_adapt: bool,
         gate: GateConfig,
     ) -> Result<Self> {
         let hw_input_frames = hw_input_frames(hw_rate);
         let signal = SignalPath::new(hw_rate, denoiser_kind)?;
 
         // Minimum earshot score for a window to count as speech (see `vad`).
-        let vad = SpeechDetector::new(vad_threshold);
+        let vad = SpeechDetector::new(vad_threshold, vad_adapt);
 
         Ok(Self {
             hw_input_frames,

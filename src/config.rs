@@ -116,6 +116,11 @@ pub(crate) const DENSITY_LONG_EXEMPT_SAMPLES: usize = WHISPER_RATE as usize * 3;
 /// voice threshold. Override with `STTD_VAD_THRESHOLD` while tuning against
 /// real mic noise.
 pub(crate) const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
+/// Whether the VAD uses the warm noise floor + hysteresis (see `noise`) or a
+/// single fixed threshold (pre-adapt behavior). Kill-switch for the field:
+/// `STTD_VAD_ADAPT=0` restores the old single-threshold verdict while keeping
+/// the pause-state reset fix.
+pub(crate) const DEFAULT_VAD_ADAPT: bool = true;
 /// `speech_frames` (see `Evidence`) required to count as "strong" acoustic
 /// evidence: 500 ms of VAD-flagged speech, well past `MIN_SPEECH_FRAMES`.
 pub(crate) const STRONG_SPEECH_FRAMES: u32 = 50;

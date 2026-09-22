@@ -275,6 +275,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         whisper_tx,
         cli.denoiser,
         cli.vad_threshold,
+        cli.vad_adapt,
         gate_config(cli),
     )?;
     let input_frames = fp.required_input_frames();
@@ -509,6 +510,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         whisper_tx.clone(),
         cli.denoiser,
         cli.vad_threshold,
+        cli.vad_adapt,
         gate_config(cli),
     )?;
     let input_frames = fp.required_input_frames();

@@ -37,10 +37,11 @@ pub(crate) struct SpeechDetector {
     last_score: f32,
     /// Warm background estimate: survives `reset()` on purpose (see below).
     noise: crate::noise::NoiseTracker,
+    adapt: bool,
 }
 
 impl SpeechDetector {
-    pub(crate) fn new(threshold: f32) -> Self {
+    pub(crate) fn new(threshold: f32, adapt: bool) -> Self {
         Self {
             detector: Detector::default_boxed(),
             staging: Vec::with_capacity(EARSHOT_WINDOW),
@@ -48,6 +49,7 @@ impl SpeechDetector {
             in_speech: false,
             last_score: 0.0,
             noise: crate::noise::NoiseTracker::new(),
+            adapt,
         }
     }
 
@@ -72,8 +74,14 @@ impl SpeechDetector {
             let score = self.detector.predict_f32(window);
             self.last_score = score;
             scored = true;
-            let enter = self.noise.enter_threshold(self.threshold);
-            let exit = self.noise.exit_threshold(self.threshold);
+            let (enter, exit) = if self.adapt {
+                (
+                    self.noise.enter_threshold(self.threshold),
+                    self.noise.exit_threshold(self.threshold),
+                )
+            } else {
+                (self.threshold, self.threshold)
+            };
             if self.in_speech {
                 if score < exit {
                     self.in_speech = false;
@@ -126,7 +134,7 @@ mod tests {
 
     #[test]
     fn silence_is_not_speech() {
-        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD);
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
         let silence = vec![0.0f32; FRAME_16K];
         // A full second of silence: enough frames to complete several
         // earshot windows regardless of how staging aligns.
@@ -140,7 +148,7 @@ mod tests {
         // 8 frames of FRAME_16K (160) samples = 1280 = 5 * EARSHOT_WINDOW
         // (256): staging must be empty again after the 8th frame, with no
         // leftover samples carried past a clean group boundary.
-        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD);
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
         let frame = vec![0.0f32; FRAME_16K];
         for _ in 0..8 {
             vad.verdict(&frame);
@@ -155,7 +163,7 @@ mod tests {
         // must never let more than EARSHOT_WINDOW - 1 samples build up
         // between windows, which is what guarantees every slice handed to
         // earshot is exactly EARSHOT_WINDOW long.
-        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD);
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
         let frame = vec![0.0f32; FRAME_16K];
         for _ in 0..40 {
             vad.verdict(&frame);
@@ -167,7 +175,7 @@ mod tests {
     fn latches_between_windows() {
         // Force a verdict with a single frame, then confirm a same-verdict
         // frame that completes no new window still reports it.
-        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD);
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
         let frame = vec![0.0f32; FRAME_16K];
         // Frame 1: 160 samples staged, no window completed (160 < 256).
         let v1 = vad.verdict(&frame);
@@ -180,7 +188,7 @@ mod tests {
         // A threshold of exactly 1.0 can never be exceeded by an in-range
         // score, so silence (and any real, non-clipping audio) always reads
         // as not-speech.
-        let mut vad = SpeechDetector::new(1.0);
+        let mut vad = SpeechDetector::new(1.0, true);
         let silence = vec![0.0f32; FRAME_16K];
         for _ in 0..20 {
             assert!(!vad.verdict(&silence));
@@ -188,8 +196,25 @@ mod tests {
     }
 
     #[test]
+    fn adapt_off_keeps_single_threshold() {
+        // Kill-switch path: adapt=false must behave like the pre-adapt
+        // single-threshold verdict — silence never opens, threshold 1.0 never
+        // fires, and pause observe still warms the floor for a later re-enable.
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, false);
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..20 {
+            assert!(!vad.verdict(&silence));
+        }
+        vad.observe_background(&silence);
+        let mut never = SpeechDetector::new(1.0, false);
+        for _ in 0..20 {
+            assert!(!never.verdict(&silence));
+        }
+    }
+
+    #[test]
     fn reset_drops_staging_and_latch() {
-        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD);
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD, true);
         let frame = vec![0.0f32; FRAME_16K];
         // One frame stages 160 samples without completing a window.
         vad.verdict(&frame);
