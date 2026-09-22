@@ -42,6 +42,14 @@ anyhow = "1"
 ctrlc = "3"
 hound = "3.5"
 signal-hook = { version = "0.3", features = ["iterator"] }
+# Burn backend for the native Parakeet port (see src/parakeet_burn/).
+# Pinned to 0.21 (stable, has burn-ndarray + burn-cuda + CubeCL).
+# All optional: only built with `parakeet-burn` / `parakeet-burn-cuda`.
+burn = { version = "0.21", default-features = false, features = ["std"], optional = true }
+burn-ndarray = { version = "0.21", default-features = false, features = ["std"], optional = true }
+burn-cuda = { version = "0.21", default-features = false, features = ["std"], optional = true }
+realfft = { version = "3", optional = true }
+safetensors = { version = "0.4", optional = true }
 
 [features]
 default = []
@@ -56,6 +64,18 @@ whisper = ["dep:whisper-rs"]
 # toolchain whisper.cpp is built against here, so it may not load; CPU
 # stays the safe default and the loader falls back to it if CUDA fails.
 parakeet-cuda = ["parakeet-rs/cuda"]
+# Native Burn port of Parakeet-TDT int8 (see src/parakeet_burn/). Off by
+# default: `parakeet-rs` (ORT) stays the default engine. When enabled,
+# `--parakeet-engine burn` selects the Burn path (NdArray CPU backend);
+# `parakeet-burn-cuda` additionally enables the CubeCL CUDA backend for
+# `--gpu` (requires CUDA on PATH; falls back to CPU like the ORT path).
+# NOTE (2026-09): burn-cuda 0.21 (cudarc 0.19.9) rejects the CUDA 13.4
+# toolkit on this host (`Unsupported cuda toolkit version`), so
+# `parakeet-burn-cuda` only compiles where CUDA <= 12.x is installed.
+# The CPU Burn path is unaffected; GPU bring-up resumes with a cudarc
+# release that supports CUDA 13.x.
+parakeet-burn = ["dep:burn", "dep:burn-ndarray", "dep:realfft", "dep:safetensors"]
+parakeet-burn-cuda = ["parakeet-burn", "dep:burn-cuda"]
 # Sherpa-onnx engine family (see src/sherpa.rs): offline Nemo-transducer
 # (Parakeet-TDT-v3), Canary-1B-v2 (Sarphix int8 export of nvidia/canary-1b-v2,
 # `sherpa-canary-1b-v2-int8` — Polish needs a native lib newer than 1.13.8,

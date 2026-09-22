@@ -183,6 +183,21 @@ pub(crate) struct Cli {
     )]
     pub(crate) gpu: bool,
 
+    /// Parakeet runtime: `ort` (parakeet-rs + ONNX Runtime, default) or
+    /// `burn` (native Burn port, no ONNX Runtime — requires the
+    /// `parakeet-burn` Cargo feature; `burn` + `--gpu` additionally needs
+    /// `parakeet-burn-cuda`). Only meaningful with a Parakeet `--model`;
+    /// other engines ignore it.
+    #[arg(
+        long,
+        env = "STTD_PARAKEET_ENGINE",
+        value_enum,
+        ignore_case = true,
+        default_value_t = ParakeetEngine::Ort,
+        help_heading = "Model"
+    )]
+    pub(crate) parakeet_engine: ParakeetEngine,
+
     /// Sherpa decode mode: `offline` reuses the utterance pipeline
     /// (pre-roll + hangover cuts), `streaming` feeds sherpa's Silero VAD
     /// which owns the cuts. Only meaningful with a sherpa `--model`.
@@ -479,6 +494,18 @@ pub(crate) struct Cli {
     pub(crate) sound: bool,
 }
 
+/// Parakeet runtime selector (see `--parakeet-engine`). `Ort` is the
+/// parakeet-rs + ONNX Runtime path (default, always available). `Burn` is
+/// the native Burn port without ONNX Runtime (see `parakeet_burn`,
+/// requires the `parakeet-burn` Cargo feature).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ParakeetEngine {
+    #[value(name = "ort")]
+    Ort,
+    #[value(name = "burn")]
+    Burn,
+}
+
 impl Cli {
     /// Raw `--model` value with env precedence resolved: CLI (`STTD_MODEL`
     /// via clap) > legacy `WHISPER_MODEL_PATH` > compiled-in default spec.
@@ -568,6 +595,7 @@ mod tests {
         assert_eq!(cli.channel, ChannelSel::Mix);
         assert_eq!(cli.threads, 0);
         assert_eq!(cli.gpu, DEFAULT_USE_GPU);
+        assert_eq!(cli.parakeet_engine, ParakeetEngine::Ort);
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
         assert_eq!(cli.min_density, DEFAULT_MIN_DENSITY);
         assert_eq!(cli.min_conf, DEFAULT_MIN_CONFIDENCE);

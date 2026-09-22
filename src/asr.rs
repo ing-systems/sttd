@@ -112,6 +112,21 @@ pub(crate) fn load_model(model: &ModelRef, opts: &AsrOptions) -> Result<Box<dyn 
         #[cfg(feature = "whisper")]
         ModelRef::Whisper(path) => Ok(Box::new(crate::whisper::WhisperModel::load(path, opts)?)),
         ModelRef::Parakeet { dir, .. } => {
+            if opts.parakeet_engine == crate::cli::ParakeetEngine::Burn {
+                #[cfg(feature = "parakeet-burn")]
+                {
+                    return Ok(Box::new(crate::parakeet_burn::ParakeetBurnModel::load(
+                        dir, opts,
+                    )?));
+                }
+                #[cfg(not(feature = "parakeet-burn"))]
+                {
+                    anyhow::bail!(
+                        "--parakeet-engine burn needs the `parakeet-burn` Cargo feature \
+                         (rebuild with `--features parakeet-burn`); falling back to `--parakeet-engine ort`"
+                    );
+                }
+            }
             Ok(Box::new(crate::parakeet::ParakeetModel::load(dir, opts)?))
         }
         #[cfg(feature = "sherpa")]
@@ -190,6 +205,9 @@ pub(crate) struct AsrOptions {
     pub(crate) logprob_thold: f32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
+    /// Parakeet runtime: ORT vs native Burn (see `--parakeet-engine`).
+    /// Only read when a Parakeet model loads; other engines ignore it.
+    pub(crate) parakeet_engine: crate::cli::ParakeetEngine,
     /// Canary src == tgt / sherpa-whisper language (ISO code, `--sherpa-lang`);
     /// the transducer auto-detects per utterance and ignores it. Sherpa-only
     /// (see the `sherpa` Cargo feature).
@@ -1652,6 +1670,7 @@ mod tests {
             logprob_thold: crate::config::DEFAULT_LOGPROB_THOLD,
             n_threads: DEFAULT_THREADS,
             use_gpu: false,
+            parakeet_engine: crate::cli::ParakeetEngine::Ort,
             #[cfg(feature = "sherpa")]
             sherpa_lang: crate::config::DEFAULT_SHERPA_LANG.to_string(),
             metrics_path: None,

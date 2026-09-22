@@ -1,3 +1,9 @@
+[build]
+# Optimize for the host CPU by default (AVX2/VNNI/etc.): this is a local
+# real-time binary, not a portable release. Applies to Rust + C++ (whisper.cpp)
+# code compiled here; the prebuilt ORT library ships as-is.
+rustflags = ["-C", "target-cpu=native"]
+
 [env]
 WHISPER_DONT_GENERATE_BINDINGS = "1"
 # ggml defaults to sm 52/61/70/75 (ggml/src/CMakeLists.txt), which CUDA 13.4
