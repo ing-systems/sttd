@@ -34,8 +34,9 @@
 //! `sttd --file <wav>` runs the same pipeline offline against a WAV file
 //! instead of the microphone, for comparing tuning changes against a fixed
 //! recording. `sttd --list-devices` prints available input devices.
-//! `sttd --list-models` prints known whisper models with installed/default
-//! markers. `sttd --start` forks microphone mode into the background
+//! `sttd --list-models` prints known whisper models as an aligned table
+//! with a leading marker (`*` = currently selected via `--model`/`STTD_MODEL`,
+//! `I` = installed on disk). `sttd --start` forks microphone mode into the
 //! (pid file, combined log); `--stop`/`--status` manage it via the pid
 //! file. While paused longer than `--paused-unload-after` the whisper
 //! model is unloaded to free VRAM and reloaded eagerly on resume.
@@ -59,7 +60,7 @@ use signal_hook::iterator::Signals;
 mod cli;
 use cli::Cli;
 mod config;
-use config::{DEFAULT_MODELS_DIR, DEFAULT_MODEL_SPEC, MODEL_CATALOG};
+use config::{DEFAULT_MODELS_DIR, MODEL_CATALOG, model_file_for_spec};
 mod capture;
 use capture::*;
 mod daemon;
@@ -98,7 +99,7 @@ fn main() -> Result<()> {
         return print_input_devices();
     }
     if cli.list_models {
-        print_available_models();
+        print_available_models(&cli);
         return Ok(());
     }
     if let Some(path) = cli.file.clone() {
@@ -111,22 +112,91 @@ fn main() -> Result<()> {
     run_microphone_mode(&cli)
 }
 
-/// Print known whisper models (`MODEL_CATALOG`) with installed/default
-/// markers to stdout: `spec filename remote-size [installed] [*default*]`.
-/// "installed" means `models/<filename>` exists on disk.
-fn print_available_models() {
-    for (spec, file, size) in MODEL_CATALOG {
-        let installed =
-            Path::new(DEFAULT_MODELS_DIR).join(file).exists();
-        let mut markers = String::new();
-        if installed {
-            markers.push_str(" installed");
+/// Print known whisper models (`MODEL_CATALOG`) as an aligned table with a
+/// two-character leading marker: `*` = currently selected (effective
+/// `--model` after CLI > `STTD_MODEL` > legacy `WHISPER_MODEL_PATH` >
+/// compiled-in default), `I` = installed (`models/<filename>` exists on
+/// disk). A row can carry both (`*I`).
+fn print_available_models(cli: &Cli) {
+    let input = cli.model_input();
+    let selected = selected_spec_for_input(&input);
+    let installed: Vec<bool> = MODEL_CATALOG
+        .iter()
+        .map(|(_, file, _)| Path::new(DEFAULT_MODELS_DIR).join(file).exists())
+        .collect();
+    print!("{}", format_available_models(selected, &installed));
+    if selected.is_none() {
+        let trimmed = input.trim();
+        if !trimmed.is_empty() {
+            println!("selected: {trimmed} (not in catalog)");
         }
-        if *spec == DEFAULT_MODEL_SPEC {
-            markers.push_str(" *default*");
-        }
-        println!("{spec} {file} {size}{markers}");
     }
+}
+
+/// Map a `--model` input value (spec or path, see `resolve_model_path`) to
+/// the catalog spec it selects, if any. Exact spec matches win; otherwise
+/// the path's basename is compared against catalog filenames
+/// (`models/custom.bin` matching `ggml-*.bin` selects that row, a truly
+/// custom file selects nothing).
+fn selected_spec_for_input(input: &str) -> Option<&'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if model_file_for_spec(trimmed).is_some() {
+        return MODEL_CATALOG
+            .iter()
+            .find(|(s, _, _)| *s == trimmed)
+            .map(|(s, _, _)| *s);
+    }
+    let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    MODEL_CATALOG
+        .iter()
+        .find(|(_, f, _)| *f == basename)
+        .map(|(s, _, _)| *s)
+}
+
+/// Render the `--list-models` table: header plus one row per catalog entry,
+/// `SPEC`/`FILE` left-aligned, `SIZE` right-aligned, leading `*`/`I` marker.
+fn format_available_models(selected: Option<&str>, installed: &[bool]) -> String {
+    let spec_w = MODEL_CATALOG
+        .iter()
+        .map(|(s, _, _)| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("SPEC".len());
+    let file_w = MODEL_CATALOG
+        .iter()
+        .map(|(_, f, _)| f.len())
+        .max()
+        .unwrap_or(0)
+        .max("FILE".len());
+    let size_w = MODEL_CATALOG
+        .iter()
+        .map(|(_, _, s)| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("SIZE".len());
+    let mut out = String::new();
+    out.push_str(&format!(
+        "   {0:<1$}  {2:<3$}  {4:>5$}\n",
+        "SPEC", spec_w, "FILE", file_w, "SIZE", size_w
+    ));
+    for (i, (spec, file, size)) in MODEL_CATALOG.iter().enumerate() {
+        let is_selected = selected == Some(*spec);
+        let is_installed = installed.get(i).copied().unwrap_or(false);
+        let marker = match (is_selected, is_installed) {
+            (true, true) => "*I",
+            (true, false) => "* ",
+            (false, true) => "I ",
+            (false, false) => "  ",
+        };
+        out.push_str(&format!(
+            "{marker} {0:<1$}  {2:<3$}  {4:>5$}\n",
+            spec, spec_w, file, file_w, size, size_w
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -451,4 +521,110 @@ fn gate_config(cli: &Cli) -> gate::GateConfig {
         cli.min_conf,
         cli.min_conf_strong,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_spec_matches_spec_exactly() {
+        assert_eq!(selected_spec_for_input("small"), Some("small"));
+        assert_eq!(
+            selected_spec_for_input("large-v3-turbo-q8_0"),
+            Some("large-v3-turbo-q8_0")
+        );
+        assert_eq!(selected_spec_for_input("  small  "), Some("small"));
+    }
+
+    #[test]
+    fn selected_spec_matches_path_basename() {
+        assert_eq!(
+            selected_spec_for_input("models/ggml-small.bin"),
+            Some("small")
+        );
+        assert_eq!(
+            selected_spec_for_input("/abs/models/ggml-base.bin"),
+            Some("base")
+        );
+        assert_eq!(selected_spec_for_input("ggml-tiny.bin"), Some("tiny"));
+        assert_eq!(
+            selected_spec_for_input(r"models\ggml-small.bin"),
+            Some("small")
+        );
+    }
+
+    #[test]
+    fn selected_spec_rejects_custom_and_empty() {
+        assert_eq!(selected_spec_for_input("models/custom.bin"), None);
+        assert_eq!(selected_spec_for_input("bogus"), None);
+        assert_eq!(selected_spec_for_input(""), None);
+        assert_eq!(selected_spec_for_input("   "), None);
+    }
+
+    #[test]
+    fn models_table_marks_selected_and_installed() {
+        let installed = vec![false; MODEL_CATALOG.len()];
+        let table = format_available_models(Some("small"), &installed);
+        let small_row = table
+            .lines()
+            .find(|l| l.contains("ggml-small.bin"))
+            .expect("small row must exist");
+        assert!(small_row.starts_with("* "), "row={small_row:?}");
+        assert!(!small_row.contains("installed"), "row={small_row:?}");
+        assert!(!small_row.contains("default"), "row={small_row:?}");
+        // No other row carries `*`.
+        for line in table.lines().skip(1) {
+            if line.contains("ggml-small.bin") {
+                continue;
+            }
+            assert!(!line.starts_with('*'), "line={line:?}");
+        }
+    }
+
+    #[test]
+    fn models_table_combines_selected_and_installed() {
+        let mut installed = vec![false; MODEL_CATALOG.len()];
+        let idx = MODEL_CATALOG
+            .iter()
+            .position(|(s, _, _)| *s == "base")
+            .expect("base must exist");
+        installed[idx] = true;
+        let table = format_available_models(Some("base"), &installed);
+        let base_row = table
+            .lines()
+            .find(|l| l.contains("ggml-base.bin"))
+            .expect("base row must exist");
+        assert!(base_row.starts_with("*I"), "row={base_row:?}");
+        let other_idx = MODEL_CATALOG
+            .iter()
+            .position(|(s, _, _)| *s == "tiny")
+            .expect("tiny must exist");
+        assert!(!installed[other_idx]);
+        let tiny_row = table
+            .lines()
+            .find(|l| l.contains("ggml-tiny.bin ") || l.ends_with("ggml-tiny.bin"))
+            .expect("tiny row must exist");
+        assert!(tiny_row.starts_with("  "), "row={tiny_row:?}");
+    }
+
+    #[test]
+    fn models_table_aligns_columns() {
+        let installed = vec![false; MODEL_CATALOG.len()];
+        let table = format_available_models(Some("tiny"), &installed);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), MODEL_CATALOG.len() + 1);
+        assert!(lines[0].contains("SPEC"));
+        assert!(lines[0].contains("FILE"));
+        assert!(lines[0].contains("SIZE"));
+        // Fixed-width columns: every line the same display width, and the
+        // SIZE field ends at the same offset (right-aligned).
+        let widths: Vec<usize> = lines.iter().map(|l| l.len()).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "widths={widths:?}");
+        let size_end = lines[0].len();
+        for line in &lines {
+            assert_eq!(line.len(), size_end);
+            assert_eq!(line[..2].chars().count(), 2);
+        }
+    }
 }
