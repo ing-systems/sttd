@@ -6,7 +6,7 @@ use crate::config::{
     parse_bool, parse_fraction, parse_hangover_ms, parse_linear_rms, parse_threads,
     DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_HANGOVER_MS,
     DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS, DEFAULT_THREADS,
+    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS,
     DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
 #[cfg(feature = "whisper")]
@@ -159,8 +159,8 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_LOGPROB_THOLD", default_value_t = DEFAULT_LOGPROB_THOLD, value_parser = parse_logprob_thold, value_name = "LP", help_heading = "Model", allow_negative_numbers = true)]
     pub(crate) logprob_thold: f32,
 
-    /// Decoder thread count; `0` = auto (`available_parallelism`).
-    #[arg(long, env = "STTD_THREADS", default_value_t = DEFAULT_THREADS, value_parser = parse_threads, value_name = "N", help_heading = "Model")]
+    /// Decoder thread count; `0` = auto (physical cores).
+    #[arg(long, env = "STTD_THREADS", default_value_t = 0, value_parser = parse_threads, value_name = "N", help_heading = "Model")]
     pub(crate) threads: i32,
 
     /// Load the model onto the GPU (`off`/`0` = CPU-only).
@@ -499,7 +499,7 @@ mod tests {
         }
         assert_eq!(cli.hangover_ms, DEFAULT_HANGOVER_MS);
         assert_eq!(cli.channel, ChannelSel::Mix);
-        assert_eq!(cli.threads, DEFAULT_THREADS);
+        assert_eq!(cli.threads, 0);
         assert_eq!(cli.gpu, DEFAULT_USE_GPU);
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
         assert_eq!(cli.min_density, DEFAULT_MIN_DENSITY);

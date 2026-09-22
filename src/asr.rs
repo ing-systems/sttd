@@ -204,12 +204,31 @@ pub(crate) const ASR_SHED_KEEP: usize = 4;
 /// than blocking the processing loop.
 pub(crate) const ASR_QUEUE_CAP: usize = 16;
 
-/// Query `available_parallelism` for `--threads 0` (auto). Falls back to
-/// `DEFAULT_THREADS` when the query fails.
+/// Query physical cores for `--threads 0` (auto). Falls back to
+/// `available_parallelism` and then `DEFAULT_THREADS` when the query fails.
 pub(crate) fn auto_threads() -> i32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(DEFAULT_THREADS)
+    pick_auto_threads(
+        num_cpus::get_physical(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
+    )
+}
+
+/// Pick an auto thread count from a physical-core count and a logical-core
+/// count (`0` = query failed). Prefers physical (ORT `intra_op` guidance:
+/// one thread per physical core); falls back to logical, then
+/// `DEFAULT_THREADS`. Pure over its inputs so tests don't touch the
+/// scheduler. Always >= 1.
+pub(crate) fn pick_auto_threads(physical: usize, logical: usize) -> i32 {
+    let n = if physical > 0 {
+        physical
+    } else if logical > 0 {
+        logical
+    } else {
+        DEFAULT_THREADS.max(1) as usize
+    };
+    (n.min(i32::MAX as usize) as i32).max(1)
 }
 
 /// Resolve a `--threads` value: `0` means auto, anything else is used as-is.
@@ -1595,6 +1614,10 @@ mod tests {
         // defensively so the model never gets 0 threads.
         assert_eq!(resolve_n_threads(0, 0), 1);
         assert!(auto_threads() >= 1);
+        // Physical preferred; logical fallback; then DEFAULT_THREADS.
+        assert_eq!(pick_auto_threads(6, 12), 6);
+        assert_eq!(pick_auto_threads(0, 12), 12);
+        assert_eq!(pick_auto_threads(0, 0), DEFAULT_THREADS);
     }
 
     #[cfg(feature = "whisper")]

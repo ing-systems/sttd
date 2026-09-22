@@ -269,9 +269,9 @@ pub(crate) const DEFAULT_ENTROPY_THOLD: f32 = 2.4;
 /// with `STTD_LOGPROB_THOLD`. Whisper-only (see the `whisper` Cargo feature).
 #[cfg_attr(not(feature = "whisper"), allow(dead_code))]
 pub(crate) const DEFAULT_LOGPROB_THOLD: f32 = -1.0;
-/// Decoder thread count (`set_n_threads`). Default 8 (historical value);
-/// `0` means auto = `available_parallelism` at startup. Override with
-/// `STTD_THREADS`.
+/// Decoder thread-count fallback (`set_n_threads` / ORT `intra_op`) when auto
+/// detection fails. `0` (`--threads 0`, the CLI default) means auto =
+/// physical cores at startup. Override with `STTD_THREADS`.
 pub(crate) const DEFAULT_THREADS: i32 = 8;
 /// Whether to load the model onto the GPU (`use_gpu`). Default true.
 /// Override with `STTD_GPU=0` / `--gpu off` for CPU-only machines.
@@ -585,7 +585,7 @@ pub(crate) fn parse_logprob_thold(s: &str) -> Result<f32, String> {
 }
 
 /// Parse `--threads`/`STTD_THREADS`: must be >= 0, where `0` means auto
-/// (`available_parallelism` at startup).
+/// (physical cores at startup).
 pub(crate) fn parse_threads(s: &str) -> Result<i32, String> {
     let v: i32 = s
         .trim()

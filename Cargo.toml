@@ -27,6 +27,7 @@ whisper-rs = { version = "0.13", features = ["cuda", "whisper-cpp-log"], optiona
 # those messages are simply dropped, which is fine here.
 parakeet-rs = "0.3"
 rtrb = "0.4"
+num_cpus = "1.17"
 ureq = "2"
 anyhow = "1"
 ctrlc = "3"
