@@ -5485,6 +5485,7 @@ dependencies = [
  "resampler",
  "rtrb",
  "safetensors 0.4.5",
+ "serde_json",
  "sherpa-onnx",
  "signal-hook",
  "ureq 2.12.1",

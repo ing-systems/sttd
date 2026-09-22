@@ -101,6 +101,96 @@ def convert_one(onnx_path: Path, out_path: Path) -> dict:
     return {"u8": n_u8, "i8": n_i8, "fp": n_fp, "tensors": len(out)}
 
 
+def _attr(node, name, default=None):
+    for a in node.attribute:
+        if a.name == name:
+            if a.type == 7:  # INTS
+                return list(a.ints)
+            if a.type == 2:  # INT
+                return a.i
+    return default
+
+
+def emit_encoder_manifest(onnx_path: Path, out_path: Path) -> dict:
+    """Map every quantized encoder node to its (layer, role).
+
+    Node names carry NeMo role paths (`/layers.N/self_attn/linear_q/...`,
+    `/pre_encode/conv/conv.0/...`); weight initializers are anonymous
+    (`onnx::..._quantized`). The manifest joins them so the Rust loader
+    (`src/parakeet_burn/encoder.rs`) can fetch each role's int8 weight by
+    name. Conv entries also carry kernel/stride/groups/pads.
+    """
+    onnx, np, numpy_helper, _ = _import_onnx()
+    import json
+    import re
+
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    shapes = {}
+    init_names = set()
+    for init in model.graph.initializer:
+        init_names.add(init.name)
+        try:
+            shapes[init.name] = list(numpy_helper.to_array(init, base_dir=str(onnx_path.parent)).shape)
+        except Exception:
+            shapes[init.name] = None
+
+    entries = []
+    counts: dict[str, int] = {}
+    for node in model.graph.node:
+        if node.op_type not in ("MatMulInteger", "ConvInteger"):
+            continue
+        m = re.match(r"^/(layers\.\d+/.+|pre_encode/.+)/[^/]+$", node.name)
+        if not m:
+            print(f"  manifest: unmapped quant node {node.name}")
+            continue
+        role = m.group(1)
+        # The activation input is *also* `_quantized`-suffixed: disambiguate
+        # by initializer membership (activations are graph edges, weights
+        # are initializers).
+        weight = next(
+            (i for i in node.input if i.endswith("_quantized") and i in init_names),
+            None,
+        )
+        base = weight[: -len("_quantized")] if weight else None
+        entry: dict = {
+            "role": role,
+            "node": node.name,
+            "kind": "matmul" if node.op_type == "MatMulInteger" else "conv",
+            "weight": base,
+            # shapes[] is keyed by full initializer name (with suffix).
+            "weight_shape": shapes.get(weight) if weight else None,
+        }
+        if node.op_type == "ConvInteger":
+            entry["conv"] = {
+                "kernel": _attr(node, "kernel_shape"),
+                "strides": _attr(node, "strides"),
+                "pads": _attr(node, "pads"),
+                "group": _attr(node, "group", 1),
+                "dilations": _attr(node, "dilations"),
+            }
+        entries.append(entry)
+        counts[role.split("/")[1] if role.startswith("layers.") else "pre_encode"] = (
+            counts.get(role.split("/")[1] if role.startswith("layers.") else "pre_encode", 0) + 1
+        )
+
+    # Per-layer norm + pos-bias names (already named in safetensors).
+    norms: dict[str, list[str]] = {}
+    for init in model.graph.initializer:
+        m = re.match(r"^(layers\.\d+\.norm_\w+)\.(weight|bias)$", init.name)
+        if m:
+            norms.setdefault(m.group(1), []).append(init.name)
+    pos_bias = sorted(n for n in shapes if re.match(r"^layers\.\d+\.self_attn\.pos_bias_[uv]$", n))
+
+    manifest = {
+        "model": onnx_path.name,
+        "quant_ops": entries,
+        "norms": norms,
+        "pos_bias": pos_bias,
+    }
+    out_path.write_text(json.dumps(manifest, indent=1) + "\n")
+    return {"roles": len(entries), "norm_groups": len(norms), "pos_bias": len(pos_bias)}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", required=True, help="e.g. models/parakeet-tdt-0.6b-v3-int8")
@@ -134,6 +224,13 @@ def main() -> int:
                 f"   wrote {dst} ({stats['tensors']} tensors: "
                 f"{stats['u8']} u8, {stats['i8']} i8, {stats['fp']} fp)"
             )
+            if "encoder" in src.name:
+                manifest_path = dst.with_name("encoder-manifest.json")
+                mstats = emit_encoder_manifest(src, manifest_path)
+                print(
+                    f"   wrote {manifest_path} ({mstats['roles']} roles, "
+                    f"{mstats['norm_groups']} norm groups, {mstats['pos_bias']} pos-bias)"
+                )
     if args.check_only:
         print("check-only: no files written")
     else:
