@@ -14,10 +14,27 @@ pub(crate) const WHISPER_RATE: u32 = 16_000;
 /// Samples per 10 ms frame at 16 kHz.
 pub(crate) const FRAME_16K: usize = 160;
 
-/// Pre-roll ring buffer length: 300 ms = 30 x 10 ms frames. Prepended to
-/// every utterance at onset so a quiet/unvoiced word start isn't clipped by
-/// VAD's inherent onset latency.
+/// Pre-roll ring buffer length: 300 ms = 30 x 10 ms frames. Caps how much
+/// run-up *may* be prepended at onset so a quiet/unvoiced word start isn't
+/// clipped by VAD's inherent onset latency. How much of it is *actually*
+/// prepended is adaptive (see `PREROLL_SAFETY_FRAMES`): a loud onset trims
+/// the leading silence down to a safety margin instead of dragging the full
+/// 300 ms of quiet into every utterance.
 pub(crate) const RING_FRAMES: usize = 30;
+/// Safety margin kept in front of the first energetic pre-roll frame when
+/// trimming (see `UtteranceBuffer::preroll_trim_skip`): 100 ms of run-up
+/// survives even a loud onset, covering VAD/earshot onset latency plus
+/// plosive pre-voicing. The 5 ms conditioning fades land inside it.
+pub(crate) const PREROLL_SAFETY_FRAMES: usize = 10;
+/// Fraction of the onset burst's RMS used as the pre-roll trim threshold:
+/// a pre-roll frame at least this loud (relative to the onset that opened
+/// the utterance) counts as energetic and stops the trim. -20 dB below the
+/// onset: silence and room noise fall below it, speech doesn't.
+pub(crate) const PREROLL_TRIM_FACTOR: f32 = 0.1;
+/// Absolute floor for the pre-roll trim threshold (linear RMS, ~-54 dBFS):
+/// keeps the relative rule above from collapsing to zero on a very quiet
+/// onset, where it would otherwise trim real (if faint) run-up.
+pub(crate) const PREROLL_TRIM_FLOOR: f32 = 0.002;
 
 /// Silence hangover before cutting an utterance: 800 ms = 80 x 10 ms frames.
 /// This only decides *when* to close an utterance; how much of that silence

@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 
 use crate::config::{
     EARLY_SPLIT_SAMPLES, EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, MAX_UTTERANCE_SAMPLES,
-    ONSET_SPEECH_FRAMES, RING_FRAMES, SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
+    ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES, PREROLL_TRIM_FACTOR, PREROLL_TRIM_FLOOR,
+    RING_FRAMES, SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
 };
 use crate::gate::GateConfig;
 
@@ -165,7 +166,19 @@ impl UtteranceBuffer {
                 if self.onset_run < ONSET_SPEECH_FRAMES {
                     return FrameAction::Continue;
                 }
-                self.buf.extend(self.preroll.iter().copied());
+                // Adaptive pre-roll: prepend the run-up, but trim leading
+                // silence down to a safety margin when the onset is loud
+                // (see `preroll_trim_skip`). A quiet onset keeps the full
+                // ring, as before.
+                let skip = self.preroll_trim_skip(frame);
+                if skip > 0 {
+                    log::debug!(
+                        "preroll trim: {} -> {} samples",
+                        self.preroll.len(),
+                        self.preroll.len() - skip
+                    );
+                }
+                self.buf.extend(self.preroll.iter().skip(skip).copied());
             }
             self.buf.extend_from_slice(frame);
             self.samples_at_last_speech = self.buf.len();
@@ -192,6 +205,65 @@ impl UtteranceBuffer {
             } else {
                 FrameAction::Continue
             }
+        }
+    }
+
+    /// Leading samples of `preroll` to skip when an utterance opens with
+    /// `current` (the `ONSET_SPEECH_FRAMES`-th consecutive speech frame).
+    ///
+    /// The ring always holds the run-up (up to `RING_FRAMES` of audio), but
+    /// a loud onset doesn't need all 300 ms of it: scan the ring in 10 ms
+    /// frames for the first one at least as loud as the onset burst itself
+    /// (`PREROLL_TRIM_FACTOR` of its RMS, floored at `PREROLL_TRIM_FLOOR`),
+    /// then keep `PREROLL_SAFETY_FRAMES` of run-up in front of it. A quiet
+    /// onset lowers the threshold to the floor instead, so faint run-up
+    /// survives; a short ring (startup) is kept whole.
+    ///
+    /// Only whole leading frames are skipped; a trailing partial frame (if
+    /// the ring ever isn't frame-aligned) is always kept, as is the onset
+    /// tail itself — it scores far above its own fractional threshold.
+    fn preroll_trim_skip(&self, current: &[f32]) -> usize {
+        let n = self.preroll.len();
+        if n <= PREROLL_SAFETY_FRAMES * FRAME_16K {
+            return 0;
+        }
+        // Onset-burst RMS: the tail of the ring (the earlier onset frames,
+        // already recorded) plus the current frame that opens the utterance.
+        let tail_samples =
+            ((ONSET_SPEECH_FRAMES as usize).saturating_sub(1) * FRAME_16K).min(n);
+        let mut sum_sq = 0.0f64;
+        let mut count = 0usize;
+        for i in (n - tail_samples)..n {
+            let s = self.preroll[i] as f64;
+            sum_sq += s * s;
+            count += 1;
+        }
+        for &s in current {
+            let s = s as f64;
+            sum_sq += s * s;
+            count += 1;
+        }
+        if count == 0 {
+            return 0;
+        }
+        let onset_rms = (sum_sq / count as f64).sqrt() as f32;
+        let threshold = (onset_rms * PREROLL_TRIM_FACTOR).max(PREROLL_TRIM_FLOOR);
+        let n_frames = n / FRAME_16K;
+        let mut first_hit: Option<usize> = None;
+        for f in 0..n_frames {
+            let mut frame_sum_sq = 0.0f64;
+            for i in (f * FRAME_16K)..((f + 1) * FRAME_16K) {
+                let s = self.preroll[i] as f64;
+                frame_sum_sq += s * s;
+            }
+            if (frame_sum_sq / FRAME_16K as f64).sqrt() as f32 >= threshold {
+                first_hit = Some(f);
+                break;
+            }
+        }
+        match first_hit {
+            Some(first) => (first.saturating_sub(PREROLL_SAFETY_FRAMES) * FRAME_16K).min(n),
+            None => 0,
         }
     }
 
@@ -302,7 +374,8 @@ mod tests {
         DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
         DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES, EARLY_SPLIT_SAMPLES,
         EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES,
-        ONSET_SPEECH_FRAMES, SILENCE_FRAMES_THRESHOLD, TAIL_KEEP_SAMPLES,
+        ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES, RING_FRAMES, SILENCE_FRAMES_THRESHOLD,
+        TAIL_KEEP_SAMPLES,
     };
 
     fn gate_for(min_rms: f32, min_density: f32) -> GateConfig {
@@ -419,6 +492,55 @@ mod tests {
         );
         assert!(buffer.buf[..preroll_samples].iter().all(|&s| s == 0.25));
         assert!(buffer.buf[preroll_samples..].iter().all(|&s| s == 0.5));
+    }
+
+    #[test]
+    fn loud_onset_trims_silence_to_safety_margin() {
+        // Full 300 ms ring of true silence, then a loud onset: only the
+        // safety margin of silence plus the onset itself may be prepended,
+        // not the whole ring.
+        let mut buffer = UtteranceBuffer::new();
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..RING_FRAMES {
+            buffer.push_frame(&silence, false);
+        }
+        let speech = vec![0.5f32; FRAME_16K];
+        for _ in 0..(ONSET_SPEECH_FRAMES - 1) {
+            buffer.push_frame(&speech, true);
+        }
+        assert!(buffer.buf.is_empty());
+        buffer.push_frame(&speech, true);
+        assert!(buffer.is_open());
+        let expected_frames = PREROLL_SAFETY_FRAMES + ONSET_SPEECH_FRAMES as usize;
+        assert_eq!(buffer.buf.len(), expected_frames * FRAME_16K);
+        let safety_samples = PREROLL_SAFETY_FRAMES * FRAME_16K;
+        assert!(buffer.buf[..safety_samples].iter().all(|&s| s == 0.0));
+        assert!(buffer.buf[safety_samples..].iter().all(|&s| s == 0.5));
+    }
+
+    #[test]
+    fn trim_adapts_to_onset_energy() {
+        // Same noisy background (0.01) on both sides: a loud onset treats it
+        // as silence and trims to the safety margin, a quiet onset treats it
+        // as run-up worth keeping and takes the whole ring.
+        fn open_len(background: f32, onset: f32) -> usize {
+            let mut buffer = UtteranceBuffer::new();
+            let bg = vec![background; FRAME_16K];
+            for _ in 0..RING_FRAMES {
+                buffer.push_frame(&bg, false);
+            }
+            let speech = vec![onset; FRAME_16K];
+            for _ in 0..ONSET_SPEECH_FRAMES {
+                buffer.push_frame(&speech, true);
+            }
+            assert!(buffer.is_open());
+            buffer.buf.len()
+        }
+        assert_eq!(
+            open_len(0.01, 0.5),
+            (PREROLL_SAFETY_FRAMES + ONSET_SPEECH_FRAMES as usize) * FRAME_16K
+        );
+        assert_eq!(open_len(0.01, 0.02), (RING_FRAMES + 1) * FRAME_16K);
     }
 
     #[test]
