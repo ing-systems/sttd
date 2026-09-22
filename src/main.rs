@@ -33,7 +33,9 @@
 //!
 //! `sttd --file <wav>` runs the same pipeline offline against a WAV file
 //! instead of the microphone, for comparing tuning changes against a fixed
-//! recording. `sttd --list-devices` prints available input devices.
+//! recording. `sttd --list-devices` prints available input devices as an
+//! aligned table with a leading marker (`*` = system default, `>` = matches
+//! `--device`/`STTD_DEVICE`).
 //! `sttd --list-models` prints known whisper models as an aligned table
 //! with a leading marker (`*` = currently selected via `--model`/`STTD_MODEL`,
 //! `I` = installed on disk). `sttd --start` forks microphone mode into the
@@ -97,7 +99,7 @@ fn main() -> Result<()> {
         std::process::exit(daemon::run_status(&cli.pid_file_path()));
     }
     if cli.list_devices {
-        return print_input_devices();
+        return print_input_devices(cli.device.as_deref());
     }
     if cli.list_models {
         print_available_models(&cli);

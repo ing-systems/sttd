@@ -31,7 +31,8 @@ pub(crate) struct Cli {
     #[arg(short, long, env = "STTD_DEVICE", help_heading = "Input")]
     pub(crate) device: Option<String>,
 
-    /// List available input devices and exit.
+    /// List available input devices as an aligned table (`*` = system
+    /// default, `>` = matches `--device`) and exit.
     #[arg(long, help_heading = "Input", conflicts_with_all = ["file", "list_models", "start", "stop", "status"])]
     pub(crate) list_devices: bool,
 
