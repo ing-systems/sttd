@@ -212,6 +212,30 @@ impl FrameProcessor {
         }
     }
 
+    /// Discard all in-flight audio for a pause transition: paired-frame
+    /// queues, resampler partial-chunk state, VAD staging/latch, and the
+    /// utterance buffer including pre-roll. Idempotent; discarding an
+    /// already-empty pipeline is a no-op.
+    pub(crate) fn discard_pending(&mut self) {
+        self.pending_vad.clear();
+        self.pending_whisper.clear();
+        match &mut self.vad_path {
+            VadPath::Direct { resampler } => resampler.clear(),
+            VadPath::Denoised {
+                resampler_hw48,
+                resampler_vad,
+                resampler_whisper,
+                ..
+            } => {
+                resampler_hw48.clear();
+                resampler_vad.clear();
+                resampler_whisper.clear();
+            }
+        }
+        self.vad.reset();
+        self.utterance.discard();
+    }
+
     /// Flush any trailing speech. Call once at shutdown / end of input.
     /// Zero-pads each resampler's trailing partial chunk (see
     /// `FftStream::flush`) so tail audio stuck in an incomplete FFT chunk

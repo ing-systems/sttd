@@ -139,6 +139,18 @@ pub(crate) struct Cli {
         default_missing_value = "true"
     )]
     pub(crate) debug_tokens: bool,
+
+    /// Start microphone mode paused (no audio reaches whisper until
+    /// SIGUSR2/SIGHUP). File mode ignores this.
+    #[arg(
+        long,
+        env = "STTD_START_PAUSED",
+        default_value_t = true,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub(crate) start_paused: bool,
 }
 
 impl Cli {
@@ -194,6 +206,7 @@ mod tests {
         assert!(cli.copy);
         assert!(cli.paste);
         assert!(!cli.debug_tokens);
+        assert!(cli.start_paused);
         assert_eq!(cli.denoiser, DenoiserKind::Bypass);
     }
 
@@ -209,12 +222,15 @@ mod tests {
             "off",
             "--debug-tokens",
             "1",
+            "--start-paused",
+            "off",
         ])
         .expect("flags must parse");
         assert_eq!(cli.denoiser, DenoiserKind::DeepFilter);
         assert!((cli.min_rms - 0.01).abs() < 1e-6);
         assert!(!cli.copy);
         assert!(cli.debug_tokens);
+        assert!(!cli.start_paused);
     }
 
     #[test]

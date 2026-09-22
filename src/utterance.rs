@@ -264,6 +264,14 @@ impl UtteranceBuffer {
         self.speech_energy_sum_sq = 0.0;
         self.speech_sample_count = 0;
     }
+
+    /// Discard everything for a pause transition: like `reset`, but also
+    /// drops `preroll` so the first utterance after resume can't prepend
+    /// pre-pause audio.
+    pub(crate) fn discard(&mut self) {
+        self.reset();
+        self.preroll.clear();
+    }
 }
 
 #[cfg(test)]
@@ -525,5 +533,26 @@ mod tests {
         };
         let utterance = long.close(0.0, 0.0).unwrap();
         assert_eq!(utterance.pcm.len(), 5_000);
+    }
+
+    #[test]
+    fn discard_drops_open_utterance_and_preroll() {
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..25 {
+            buffer.push_frame(&speech, true);
+        }
+        assert!(buffer.is_open());
+        buffer.discard();
+        assert!(!buffer.is_open());
+        // After discard the next onset must not prepend pre-pause audio:
+        // feed a fresh onset and check the buffer holds only the new
+        // frames, with no 0.3-valued pre-roll from before the discard.
+        let fresh = vec![0.7f32; FRAME_16K];
+        for _ in 0..ONSET_SPEECH_FRAMES {
+            buffer.push_frame(&fresh, true);
+        }
+        assert!(buffer.is_open());
+        assert!(buffer.buf.iter().all(|&s| s == 0.7));
     }
 }

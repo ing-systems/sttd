@@ -47,6 +47,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use signal_hook::consts::{SIGHUP, SIGUSR1, SIGUSR2};
+use signal_hook::iterator::Signals;
 
 mod cli;
 use cli::Cli;
@@ -170,15 +172,30 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
     // ---- build + start the cpal input stream (callback does NOT unwrap) ---
     let running = Arc::new(AtomicBool::new(true));
+    let paused = Arc::new(AtomicBool::new(cli.start_paused));
     let stream = build_input_stream(&device, &stream_config, channels, sample_format, raw_tx)?;
     stream.play().context("failed to start input stream")?;
-    eprintln!("[sttd] listening... Ctrl-C to stop");
+    if cli.start_paused {
+        eprintln!("[sttd] starting paused (SIGUSR2/SIGHUP to resume)");
+    } else {
+        eprintln!("[sttd] listening... Ctrl-C to stop");
+    }
+    eprintln!("[sttd] pause: SIGUSR1, resume: SIGUSR2, toggle: SIGHUP");
 
     // Ctrl-C sets the flag; the loop below flushes trailing speech first.
     {
         let running = Arc::clone(&running);
         if let Err(e) = install_ctrlc_handler(move || running.store(false, Ordering::Release)) {
             eprintln!("[sttd] warning: {e:?} (Ctrl-C will terminate immediately)");
+        }
+    }
+
+    // USR1/USR2/HUP drive the pause flag; a failed install isn't fatal,
+    // pause/resume via signals is then simply unavailable.
+    {
+        let paused = Arc::clone(&paused);
+        if let Err(e) = install_pause_handlers(paused) {
+            eprintln!("[sttd] warning: {e:?} (signal pause/resume unavailable)");
         }
     }
 
@@ -207,6 +224,17 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
                     anyhow::bail!("whisper worker exited before signaling ready");
                 }
             }
+        }
+        // While paused, discard everything the callback delivered: no
+        // audio reaches FrameProcessor, and its in-flight state was
+        // already dropped, so resume starts clean with no pre-pause
+        // pre-roll. Idempotent: staying paused just keeps discarding.
+        if paused.load(Ordering::Acquire) {
+            while raw_rx.try_recv().is_ok() {}
+            accumulator.clear();
+            fp.discard_pending();
+            thread::sleep(Duration::from_millis(50));
+            continue;
         }
         // Drain everything the callback delivered since last iteration.
         let mut got_audio = false;
@@ -246,6 +274,39 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 /// losing only the trailing-speech flush.
 fn install_ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
     ctrlc::set_handler(cb).context("failed to install Ctrl-C handler")
+}
+
+/// Install the pause/resume signal handlers: `SIGUSR1` pauses, `SIGUSR2`
+/// resumes, `SIGHUP` toggles. The handler thread only flips the shared
+/// flag; the main loop does the actual discarding, so the transition is
+/// idempotent (pause-while-paused / resume-while-running are no-ops).
+fn install_pause_handlers(paused: Arc<AtomicBool>) -> Result<()> {
+    let mut signals = Signals::new([SIGUSR1, SIGUSR2, SIGHUP])
+        .context("failed to register pause/resume signals")?;
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            match sig {
+                SIGUSR1 => {
+                    paused.store(true, Ordering::Release);
+                    eprintln!("[sttd] paused (SIGUSR1)");
+                }
+                SIGUSR2 => {
+                    paused.store(false, Ordering::Release);
+                    eprintln!("[sttd] resumed (SIGUSR2)");
+                }
+                SIGHUP => {
+                    let was_paused = paused.fetch_xor(true, Ordering::AcqRel);
+                    if was_paused {
+                        eprintln!("[sttd] resumed (SIGHUP toggle)");
+                    } else {
+                        eprintln!("[sttd] paused (SIGHUP toggle)");
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

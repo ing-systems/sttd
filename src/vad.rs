@@ -62,6 +62,13 @@ impl SpeechDetector {
 
         self.latched
     }
+
+    /// Drop staged partial-window samples and the latched verdict for a
+    /// pause transition, so resume starts from silence, not pre-pause audio.
+    pub(crate) fn reset(&mut self) {
+        self.staging.clear();
+        self.latched = false;
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +137,17 @@ mod tests {
         for _ in 0..20 {
             assert!(!vad.verdict(&silence));
         }
+    }
+
+    #[test]
+    fn reset_drops_staging_and_latch() {
+        let mut vad = SpeechDetector::new(DEFAULT_VAD_THRESHOLD);
+        let frame = vec![0.0f32; FRAME_16K];
+        // One frame stages 160 samples without completing a window.
+        vad.verdict(&frame);
+        assert!(!vad.staging.is_empty());
+        vad.reset();
+        assert!(vad.staging.is_empty());
+        assert!(!vad.latched);
     }
 }

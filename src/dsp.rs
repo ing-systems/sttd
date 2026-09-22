@@ -160,6 +160,14 @@ impl FftStream {
         }
         frames
     }
+
+    /// Drop buffered partial-chunk/partial-frame state for a pause
+    /// transition, so the first frames after resume aren't blended from
+    /// pre-pause audio.
+    pub(crate) fn clear(&mut self) {
+        self.pending_in.clear();
+        self.pending_out.clear();
+    }
 }
 
 fn supported_rates_error(rate: u32) -> anyhow::Error {
@@ -291,5 +299,15 @@ mod tests {
         // (256 more out) = 512 samples = 3 frames; the last 32 samples are
         // a partial frame and stay dropped.
         assert_eq!(fed + flushed.len(), 3);
+    }
+
+    #[test]
+    fn clear_drops_partial_chunk_state() {
+        let mut s = FftStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K).unwrap();
+        // One 480-frame feed completes no full chunk (768 needed), so the
+        // input sits in pending_in; after clear, flush must find nothing.
+        assert!(s.feed(&vec![0.1f32; FRAME_48K]).is_empty());
+        s.clear();
+        assert!(s.flush().is_empty());
     }
 }
