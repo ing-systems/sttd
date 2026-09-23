@@ -7,6 +7,84 @@ use rtrb::Producer;
 
 use crate::dsp::{pick_louder_channel, resolve_channel};
 
+/// Capture buffer requested from cpal, in frames. The backend-default size
+/// can silently drop a large share of capture periods, heard as crackling.
+/// Mirrors Murmure's `CAPTURE_BUFFER_FRAMES`.
+pub(crate) const CAPTURE_BUFFER_FRAMES: u32 = 4096;
+
+/// Clone of `config` asking for the fixed capture buffer.
+fn fixed_buffer_config(config: &cpal::StreamConfig) -> cpal::StreamConfig {
+    let mut fixed = config.clone();
+    fixed.buffer_size = cpal::BufferSize::Fixed(CAPTURE_BUFFER_FRAMES);
+    fixed
+}
+
+/// Build with the fixed capture buffer first, falling back to the backend
+/// default when the device rejects it. `build` runs up to twice, so callbacks
+/// it captures must be rebuildable (e.g. `Arc` clones) — the realtime
+/// `rtrb` producer path cannot use this (see `supports_fixed_buffer`).
+fn build_with_buffer_fallback<S>(
+    base: &cpal::StreamConfig,
+    mut build: impl FnMut(&cpal::StreamConfig) -> Result<S, cpal::BuildStreamError>,
+) -> Result<S, cpal::BuildStreamError> {
+    let fixed = fixed_buffer_config(base);
+    build(&fixed).or_else(|e| {
+        log::debug!(
+            "fixed capture buffer ({CAPTURE_BUFFER_FRAMES} frames) rejected: {e}, falling back to default"
+        );
+        build(base)
+    })
+}
+
+/// Whether `device` accepts the fixed capture buffer for `sample_format`:
+/// one throwaway probe build with no-op callbacks. Lets `build_input_stream`
+/// pick the winning config *before* moving the realtime `rtrb` producer into
+/// its callback — `Producer` is not `Clone`, so a failed fixed-buffer build
+/// could not be retried afterwards.
+fn supports_fixed_buffer(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+) -> bool {
+    let fixed = fixed_buffer_config(config);
+    let ok = match sample_format {
+        cpal::SampleFormat::F32 => device
+            .build_input_stream(
+                &fixed,
+                |_: &[f32], _| {},
+                |_: cpal::StreamError| {},
+                None,
+            )
+            .is_ok(),
+        cpal::SampleFormat::I16 => device
+            .build_input_stream(
+                &fixed,
+                |_: &[i16], _| {},
+                |_: cpal::StreamError| {},
+                None,
+            )
+            .is_ok(),
+        cpal::SampleFormat::U16 => device
+            .build_input_stream(
+                &fixed,
+                |_: &[u16], _| {},
+                |_: cpal::StreamError| {},
+                None,
+            )
+            .is_ok(),
+        _ => false,
+    };
+    log::debug!(
+        "capture buffer: {}",
+        if ok {
+            format!("fixed {CAPTURE_BUFFER_FRAMES} frames")
+        } else {
+            "backend default (fixed rejected)".to_string()
+        }
+    );
+    ok
+}
+
 /// Probe the loudest input channel: open a short-lived input stream on
 /// `device`/`config`, collect ~`probe_ms` of interleaved audio, and return
 /// the highest-RMS channel index. Returns `None` for mono input, silence,
@@ -30,52 +108,61 @@ pub(crate) fn probe_loudest_channel(
     // callback is fine — the realtime path never takes it.
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
-            let collected = Arc::clone(&collected);
-            device.build_input_stream(
-                config,
-                move |data: &[f32], _| {
-                    if let Ok(mut v) = collected.lock() {
-                        v.extend_from_slice(data);
-                    }
-                },
-                move |err| {
-                    log::warn!("auto-channel probe stream error: {err}");
-                    let _ = err_collected.lock().map(|mut v| v.clear());
-                },
-                None,
-            )?
+            build_with_buffer_fallback(config, |cfg| {
+                let collected = Arc::clone(&collected);
+                let err_collected = Arc::clone(&err_collected);
+                device.build_input_stream(
+                    cfg,
+                    move |data: &[f32], _| {
+                        if let Ok(mut v) = collected.lock() {
+                            v.extend_from_slice(data);
+                        }
+                    },
+                    move |err| {
+                        log::warn!("auto-channel probe stream error: {err}");
+                        let _ = err_collected.lock().map(|mut v| v.clear());
+                    },
+                    None,
+                )
+            })?
         }
         cpal::SampleFormat::I16 => {
-            let collected = Arc::clone(&collected);
-            device.build_input_stream(
-                config,
-                move |data: &[i16], _| {
-                    if let Ok(mut v) = collected.lock() {
-                        v.extend(data.iter().map(|&s| s as f32 / 32768.0));
-                    }
-                },
-                move |err| {
-                    log::warn!("auto-channel probe stream error: {err}");
-                    let _ = err_collected.lock().map(|mut v| v.clear());
-                },
-                None,
-            )?
+            build_with_buffer_fallback(config, |cfg| {
+                let collected = Arc::clone(&collected);
+                let err_collected = Arc::clone(&err_collected);
+                device.build_input_stream(
+                    cfg,
+                    move |data: &[i16], _| {
+                        if let Ok(mut v) = collected.lock() {
+                            v.extend(data.iter().map(|&s| s as f32 / 32768.0));
+                        }
+                    },
+                    move |err| {
+                        log::warn!("auto-channel probe stream error: {err}");
+                        let _ = err_collected.lock().map(|mut v| v.clear());
+                    },
+                    None,
+                )
+            })?
         }
         cpal::SampleFormat::U16 => {
-            let collected = Arc::clone(&collected);
-            device.build_input_stream(
-                config,
-                move |data: &[u16], _| {
-                    if let Ok(mut v) = collected.lock() {
-                        v.extend(data.iter().map(|&s| s as f32 / 65535.0 * 2.0 - 1.0));
-                    }
-                },
-                move |err| {
-                    log::warn!("auto-channel probe stream error: {err}");
-                    let _ = err_collected.lock().map(|mut v| v.clear());
-                },
-                None,
-            )?
+            build_with_buffer_fallback(config, |cfg| {
+                let collected = Arc::clone(&collected);
+                let err_collected = Arc::clone(&err_collected);
+                device.build_input_stream(
+                    cfg,
+                    move |data: &[u16], _| {
+                        if let Ok(mut v) = collected.lock() {
+                            v.extend(data.iter().map(|&s| s as f32 / 65535.0 * 2.0 - 1.0));
+                        }
+                    },
+                    move |err| {
+                        log::warn!("auto-channel probe stream error: {err}");
+                        let _ = err_collected.lock().map(|mut v| v.clear());
+                    },
+                    None,
+                )
+            })?
         }
         fmt => anyhow::bail!("unsupported sample format: {fmt:?}"),
     };
@@ -275,6 +362,16 @@ pub(crate) fn build_input_stream(
     };
 
     let mut tx_opt = Some(raw_tx);
+    // Fixed capture buffer when the device accepts it. Probed up front: the
+    // realtime producer below moves into its callback and cannot be rebuilt
+    // for a retry, unlike the probe path above.
+    let fixed;
+    let config: &cpal::StreamConfig = if supports_fixed_buffer(device, config, sample_format) {
+        fixed = fixed_buffer_config(config);
+        &fixed
+    } else {
+        config
+    };
     match sample_format {
         cpal::SampleFormat::F32 => {
             let mut tx = tx_opt.take().expect("raw producer taken once");
@@ -526,5 +623,57 @@ mod tests {
         assert!(device_name_matches("HDA Intel PCH", "intel"));
         assert!(device_name_matches("USB Mic", "USB"));
         assert!(!device_name_matches("USB Mic", "webcam"));
+    }
+
+    #[test]
+    fn fixed_buffer_config_requests_4096_frames() {
+        let base = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: cpal::SampleRate(48_000),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let fixed = fixed_buffer_config(&base);
+        assert_eq!(fixed.buffer_size, cpal::BufferSize::Fixed(CAPTURE_BUFFER_FRAMES));
+        assert_eq!(CAPTURE_BUFFER_FRAMES, 4096);
+        assert_eq!(fixed.channels, 2);
+        assert_eq!(fixed.sample_rate.0, 48_000);
+    }
+
+    #[test]
+    fn buffer_fallback_uses_fixed_first_then_default() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let base = cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(16_000),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let calls = AtomicUsize::new(0);
+        let out = build_with_buffer_fallback(&base, |cfg| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                assert_eq!(cfg.buffer_size, cpal::BufferSize::Fixed(CAPTURE_BUFFER_FRAMES));
+                Err(cpal::BuildStreamError::StreamConfigNotSupported)
+            } else {
+                assert_eq!(cfg.buffer_size, cpal::BufferSize::Default);
+                Ok(())
+            }
+        });
+        assert!(out.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn buffer_fallback_propagates_when_both_rejected() {
+        let base = cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(16_000),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let out: Result<(), cpal::BuildStreamError> =
+            build_with_buffer_fallback(&base, |_| Err(cpal::BuildStreamError::DeviceNotAvailable));
+        assert!(matches!(
+            out,
+            Err(cpal::BuildStreamError::DeviceNotAvailable)
+        ));
     }
 }
