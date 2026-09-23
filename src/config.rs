@@ -166,6 +166,11 @@ pub(crate) const CONDITION_FADE_SAMPLES: usize = 80;
 /// (`+-1e-4`, same level as `pad_with_dither`), not digital zero — long
 /// true-zero runs are a hallucination trigger for the mel front-end.
 pub(crate) const INFERENCE_PAD_SAMPLES: usize = 4_000;
+/// How many newest utterance pairs (`utt_NNNNNN.wav` + `.txt`) `--dump-dir`
+/// keeps: each handled utterance prunes older pairs past this count, so a
+/// long session cannot grow the directory without bound. Worst case ~100 MB
+/// (100 × 30 s × 32 KB/s); typically far less.
+pub(crate) const DUMP_KEEP_FILES: usize = 100;
 /// Minimum average whisper token probability for a transcript to be kept,
 /// used when the utterance's *acoustic* evidence (see `Evidence`) is weak.
 /// whisper.cpp declares `no_speech_thold` but never reads it (`whisper.h`:

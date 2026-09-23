@@ -338,6 +338,32 @@ fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
     }
 }
 
+/// Discard capture around sound-cue playback so cue tones are never
+/// transcribed. Full pipeline hold, drain, wait out the longest cue
+/// (`sound::CUE_QUIET_MS`), drain again. Skipped when an utterance is already
+/// open — in-flight speech wins over a cue, never the reverse.
+///
+/// Callers: resume edge + first worker-ready (both unpaused + sound only).
+/// Steady-state never sleeps. Reload-while-unpaused is not covered: the
+/// worker's post-reload jingle has no signal the main loop can key on, so a
+/// 300 ms tone can still reach an otherwise-idle pipeline there (likely
+/// gate-dropped as non-speech-shaped audio).
+fn cue_guard(
+    fp: &mut FrameProcessor,
+    raw_rx: &mut Consumer<f32>,
+    accumulator: &mut Vec<f32>,
+) {
+    if fp.has_open_utterance() {
+        return;
+    }
+    fp.hold_pipeline();
+    drain_raw_into(raw_rx, accumulator);
+    accumulator.clear();
+    thread::sleep(Duration::from_millis(crate::sound::CUE_QUIET_MS));
+    drain_raw_into(raw_rx, accumulator);
+    accumulator.clear();
+}
+
 /// Push a closed utterance into the bounded whisper ring. Never blocks the
 /// processing loop: a full ring drops the newest with a warn (in practice the
 /// worker-side weakest-first shed keeps the backlog small so this rarely
@@ -522,7 +548,15 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         // Fail fast if the whisper worker died during init instead of
         // capturing deaf: ready Err / disconnect, or early thread exit.
         match whisper_ready.try_recv() {
-            Ok(Ok(())) => whisper_ready_ok = true,
+            Ok(Ok(())) => {
+                // First load done: the worker plays the ready jingle when
+                // unpaused, on a detached thread whose device-open latency
+                // means it goes audible just after this signal arrives.
+                if !whisper_ready_ok && cli.sound && !paused.load(Ordering::Acquire) {
+                    cue_guard(&mut fp, &mut raw_rx, &mut accumulator);
+                }
+                whisper_ready_ok = true;
+            }
             Ok(Err(e)) => anyhow::bail!("whisper worker failed to start: {e}"),
             Err(std::sync::mpsc::TryRecvError::Disconnected) if !whisper_ready_ok => {
                 anyhow::bail!("whisper worker exited before signaling ready")
@@ -546,6 +580,15 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             // utterance, noise floor preserved) so pre-pause partials can't
             // leak into the first post-resume utterance.
             fp.hold_pipeline();
+        }
+        if !now_paused && was_paused {
+            // Resume edge: the signal blip already fired and the worker's
+            // ready jingle follows within ~50 ms, both while the mic is
+            // live — discard the window so cue tones are never transcribed
+            // (Murmure sleeps past its start beep for the same reason).
+            if cli.sound {
+                cue_guard(&mut fp, &mut raw_rx, &mut accumulator);
+            }
         }
         was_paused = now_paused;
         if now_paused {

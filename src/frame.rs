@@ -80,6 +80,13 @@ impl FrameProcessor {
         self.vad.noise_floor()
     }
 
+    /// Whether an utterance is currently buffered (opened, not yet closed).
+    /// The beep-leak guard (`main::cue_guard`) skips its discard when speech
+    /// is in flight so a cue never cuts real audio.
+    pub(crate) fn has_open_utterance(&self) -> bool {
+        self.utterance.is_open()
+    }
+
     /// Adopt a floor learned by a previous `FrameProcessor` (device rebuild).
     /// Without this, a rebuild silently drops back to `NoiseTracker`'s
     /// default (0.001), running the VAD at the un-lifted base threshold for

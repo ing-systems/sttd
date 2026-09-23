@@ -265,6 +265,8 @@ pub(crate) struct Cli {
 
     /// Write each utterance as WAV+TXT into this directory (TXT written
     /// for dropped utterances too, prefixed with the drop reason).
+    /// Owner-only permissions (0700/0600 on unix); only the newest 100
+    /// utterance pairs are kept, older ones pruned.
     #[arg(short = 'o', long, env = "STTD_DUMP_DIR", help_heading = "Emission")]
     pub(crate) dump_dir: Option<PathBuf>,
 

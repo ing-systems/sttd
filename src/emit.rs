@@ -14,14 +14,14 @@
 // `ydotool`, dump dir); `RecordingEmitter` is the in-memory adapter tests drive the
 // gate → emission composition through. Inference never sees either.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::config::WHISPER_RATE;
+use crate::config::{DUMP_KEEP_FILES, WHISPER_RATE};
 use crate::gate::{TranscriptDropKind, TranscriptVerdict};
 use crate::utterance::Evidence;
 use crate::wav::write_wav_mono16;
@@ -120,9 +120,13 @@ impl SystemEmitter {
         stdout_enabled: bool,
     ) -> Result<Self> {
         if let Some(dir) = &dump_dir {
-            std::fs::create_dir_all(dir)
+            ensure_owner_only_dir(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
-            log::info!("dumping utterances to {}", dir.display());
+            log::info!(
+                "dumping utterances to {} (owner-only, newest {} kept)",
+                dir.display(),
+                DUMP_KEEP_FILES
+            );
         }
         let mut worker = EmitterWorker {
             dump_dir,
@@ -208,6 +212,15 @@ impl Emitter for SystemEmitter {
 
 impl EmitterWorker {
     fn handle(&mut self, owned: OwnedEmission) {
+        self.handle_inner(&owned);
+        // Bound the directory: newest pairs win, oldest are deleted. Runs
+        // for every utterance (emits and drops alike).
+        if let Some(dir) = &self.dump_dir {
+            prune_dump_dir(dir);
+        }
+    }
+
+    fn handle_inner(&mut self, owned: &OwnedEmission) {
         let OwnedEmission {
             tag,
             pcm,
@@ -308,7 +321,7 @@ impl EmitterWorker {
         }
         if let Some(dir) = &self.dump_dir {
             let txt_path = dir.join(format!("{tag}.txt"));
-            if let Err(e) = std::fs::write(&txt_path, text) {
+            if let Err(e) = write_owner_only_text(&txt_path, text) {
                 log::warn!("failed to write {}: {e:?}", txt_path.display());
             }
         }
@@ -331,9 +344,107 @@ fn fmt_prob(p: Option<f32>) -> String {
 fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
     if let Some(dir) = dump_dir {
         let txt_path = dir.join(format!("{tag}.txt"));
-        if let Err(e) = std::fs::write(&txt_path, reason) {
+        if let Err(e) = write_owner_only_text(&txt_path, reason) {
             log::warn!("failed to write {}: {e:?}", txt_path.display());
         }
+    }
+}
+
+/// Create/truncate `path` with owner-only permissions (0600 on unix). Mic
+/// audio and transcripts are sensitive; `File::create` honors umask (often
+/// 0644) and keeps a pre-existing path's mode — neither is acceptable here.
+pub(crate) fn owner_only_file(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .with_context(|| format!("failed to create {}", path.display()))
+}
+
+/// Write `contents` to `path` with owner-only permissions (see
+/// `owner_only_file`).
+fn write_owner_only_text(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut file = owner_only_file(path)?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    Ok(())
+}
+
+/// Ensure `dir` exists with owner-only permissions (0700 on unix), like
+/// Murmure's recordings dir. Creation errors propagate (fatal at startup);
+/// a chmod failure only warns — transcription never depends on it.
+fn ensure_owner_only_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir)
+            .with_context(|| format!("failed to stat {}", dir.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o700 {
+            if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+                log::warn!("failed to chmod 0700 {}: {e:?}", dir.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delete utterance pairs past `DUMP_KEEP_FILES`, newest-first by tag name
+/// (`utt_%06d` sorts chronologically). Observability hygiene only: I/O
+/// errors warn and keep going, never fail transcription.
+fn prune_dump_dir(dir: &Path) {
+    let stems = match dump_stems(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("dump prune: failed to list {}: {e:?}", dir.display());
+            return;
+        }
+    };
+    for stem in stems_to_prune(stems, DUMP_KEEP_FILES) {
+        for ext in ["wav", "txt"] {
+            let path = dir.join(format!("{stem}.{ext}"));
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    log::warn!("dump prune: failed to remove {}: {e:?}", path.display());
+                }
+            }
+        }
+    }
+}
+
+fn dump_stems(dir: &Path) -> Result<Vec<String>> {
+    let mut stems = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("utt_") && name.ends_with(".wav") {
+            stems.push(name.trim_end_matches(".wav").to_string());
+        }
+    }
+    stems.sort();
+    Ok(stems)
+}
+
+/// Pure selection: which stems to delete keeping the newest `keep`.
+/// Newest-first ordering comes from the caller-sorted names.
+fn stems_to_prune(mut stems: Vec<String>, keep: usize) -> Vec<String> {
+    stems.sort();
+    if stems.len() > keep {
+        stems.truncate(stems.len() - keep);
+        stems
+    } else {
+        Vec::new()
     }
 }
 
@@ -855,5 +966,76 @@ mod tests {
         assert!(!is_wayland_session(Some("x11"), Some("")));
         assert!(!is_wayland_session(None, None));
         assert!(!is_wayland_session(Some(""), Some("  ")));
+    }
+
+    #[test]
+    fn prune_keeps_newest_and_drops_oldest() {
+        let stems: Vec<String> = (0..5).map(|i| format!("utt_{i:06}")).collect();
+        assert!(stems_to_prune(stems.clone(), 5).is_empty());
+        assert!(stems_to_prune(stems.clone(), 10).is_empty());
+        assert_eq!(
+            stems_to_prune(stems.clone(), 2),
+            vec!["utt_000000".to_string(), "utt_000001".to_string(), "utt_000002".to_string()]
+        );
+        assert!(stems_to_prune(Vec::new(), 2).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dump_dir_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sttd-emit-perms-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        ensure_owner_only_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "dir mode={mode:o}");
+        let txt = dir.join("utt_000001.txt");
+        write_owner_only_text(&txt, "Dzień dobry").unwrap();
+        let mode = std::fs::metadata(&txt).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "file mode={mode:o}");
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), "Dzień dobry");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dump_retention_prunes_oldest_pairs() {
+        use crate::config::DUMP_KEEP_FILES;
+        let dir = std::env::temp_dir().join(format!("sttd-emit-retain-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let evidence = strong_evidence();
+        {
+            let mut emitter =
+                SystemEmitter::new(Some(dir.clone()), false, false, false).unwrap();
+            let pcm = vec![0.01f32; 1600];
+            for i in 0..(DUMP_KEEP_FILES + 5) {
+                let tag = format!("utt_{i:06}");
+                emitter.emit(Emission {
+                    tag: &tag,
+                    pcm: &pcm,
+                    text: "Dzień dobry",
+                    verdict: gate().decide_transcript(
+                        evidence.speech_frames,
+                        evidence.rms,
+                        "Dzień dobry",
+                        Some(0.9),
+                    ),
+                    prob: Some(0.9),
+                    logprob: Some(-0.1),
+                    evidence: &evidence,
+                });
+            }
+            // Drop at scope end flushes the async queue.
+        }
+        let wavs: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "wav"))
+            .collect();
+        assert_eq!(wavs.len(), DUMP_KEEP_FILES, "kept={}", wavs.len());
+        assert!(!dir.join("utt_000000.wav").exists());
+        assert!(!dir.join("utt_000000.txt").exists());
+        let newest = format!("utt_{:06}.wav", DUMP_KEEP_FILES + 4);
+        assert!(dir.join(newest).exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

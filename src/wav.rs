@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::dsp::{downmix_to_mono, downmix_to_mono_with_channel, pick_louder_channel, ChannelSel};
+use crate::emit::owner_only_file;
 
 // ---------------------------------------------------------------------------
 // WAV I/O (utterance dumps + `--file` mode) via `hound`.
@@ -15,7 +16,12 @@ pub(crate) fn write_wav_mono16(path: &Path, pcm_f32: &[f32], sample_rate: u32) -
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(path, spec)
+    // Owner-only file (mic audio is sensitive): 0600 on unix instead of
+    // `WavWriter::create`'s umask default. `create` would also clobber an
+    // existing file's mode; opening first preserves nothing — a pre-existing
+    // path is truncated with fresh restricted perms, same as the TXT dumps.
+    let file = owner_only_file(path)?;
+    let mut writer = hound::WavWriter::new(file, spec)
         .with_context(|| format!("failed to create {}", path.display()))?;
     for &s in pcm_f32 {
         let clamped = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;

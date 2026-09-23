@@ -28,6 +28,11 @@ const CUE_GAIN: f32 = 0.2;
 const FADE_MS: u64 = 10;
 /// Silence between the two `ready` tones.
 const READY_GAP_MS: u64 = 50;
+/// Quiet window the capture side discards around cue playback so cue tones
+/// are never transcribed (see `main::cue_guard`). Covers the longest cue
+/// (ready: 100 + 50 gap + 150 = 300 ms) plus output-device open latency on
+/// the detached cue thread.
+pub(crate) const CUE_QUIET_MS: u64 = 500;
 
 /// One cue tone: sine frequency + duration.
 struct Note {
@@ -279,5 +284,12 @@ mod tests {
         let rate = 48_000;
         let seq = sequence_buffer(&[(440.0, 150)], READY_GAP_MS, rate);
         assert_eq!(seq, tone_buffer(440.0, 150, rate));
+    }
+
+    #[test]
+    fn cue_quiet_window_covers_longest_cue() {
+        // Longest cue is ready: 100 + 50 gap + 150 = 300 ms of audible tone
+        // (plus device-open latency on the detached cue thread).
+        assert!(CUE_QUIET_MS >= 300, "CUE_QUIET_MS={CUE_QUIET_MS}");
     }
 }
