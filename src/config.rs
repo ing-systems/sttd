@@ -159,6 +159,13 @@ pub(crate) const AGC_RELEASE_MS: f32 = 200.0;
 /// 5 ms at 16 kHz. Lands in pre-roll/tail silence, killing trim/resampler
 /// clicks that whisper can decode as a token.
 pub(crate) const CONDITION_FADE_SAMPLES: usize = 80;
+/// Dithered edge pad added around each conditioned utterance before inference
+/// (see `asr::pad_edges_with_dither`): 250 ms per side at 16 kHz, mirroring
+/// Murmure's `INFERENCE_SILENCE_PAD_SECS`. Gives the encoder context past the
+/// first/last word so edge tokens are not clipped. Content is quiet dither
+/// (`+-1e-4`, same level as `pad_with_dither`), not digital zero — long
+/// true-zero runs are a hallucination trigger for the mel front-end.
+pub(crate) const INFERENCE_PAD_SAMPLES: usize = 4_000;
 /// Minimum average whisper token probability for a transcript to be kept,
 /// used when the utterance's *acoustic* evidence (see `Evidence`) is weak.
 /// whisper.cpp declares `no_speech_thold` but never reads it (`whisper.h`:

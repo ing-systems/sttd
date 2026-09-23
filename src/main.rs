@@ -79,6 +79,7 @@ mod capture;
 use capture::*;
 mod daemon;
 mod denoise;
+mod dictionary;
 mod dsp;
 mod emit;
 use emit::SystemEmitter;
@@ -1017,6 +1018,28 @@ fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
         use_gpu: cli.gpu,
         metrics_path: cli.metrics.clone(),
         shed_stale,
+        dictionary: load_dictionary_or_warn(cli),
+    }
+}
+
+/// Load `--dictionary` once at startup. A broken path warns and disables
+/// correction (never fails transcription); success logs the entry count.
+fn load_dictionary_or_warn(cli: &Cli) -> Vec<String> {
+    let Some(path) = cli.dictionary.as_deref() else {
+        return Vec::new();
+    };
+    match crate::dictionary::load_dictionary(path) {
+        Ok(words) => {
+            log::info!("dictionary: {} entr(y/ies) from {}", words.len(), path.display());
+            words
+        }
+        Err(e) => {
+            log::warn!(
+                "dictionary: failed to load {}: {e:?} (correction disabled)",
+                path.display()
+            );
+            Vec::new()
+        }
     }
 }
 

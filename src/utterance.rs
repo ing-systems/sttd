@@ -43,6 +43,12 @@ impl Evidence {
 pub(crate) struct Utterance {
     pub(crate) pcm: Vec<f32>,
     pub(crate) evidence: Evidence,
+    /// True when this utterance continues a split prefix (interim 8s, early
+    /// 28s, or 30s hard-cap cut) rather than ending on a hangover pause.
+    /// The ASR worker uses it to strip text repeated across the split seam
+    /// (see `asr::remove_split_overlap`); hangover closes leave it false so
+    /// distinct sentences are never merged.
+    pub(crate) split_continuation: bool,
 }
 
 /// Whether `UtteranceBuffer::push_frame` wants the caller to close the
@@ -103,6 +109,10 @@ pub(crate) struct UtteranceBuffer {
     /// open. Drives the low-energy early split past `EARLY_SPLIT_SAMPLES`
     /// — a word-boundary dip the VAD latch may ride through.
     quiet_run: u32,
+    /// Set when the pending `Flush` came from a split (interim/early/hard
+    /// cap) rather than a hangover close. Consumed by `close` into
+    /// `Utterance::split_continuation`, then cleared by `reset`.
+    pending_split: bool,
 }
 
 impl Default for UtteranceBuffer {
@@ -119,6 +129,7 @@ impl Default for UtteranceBuffer {
             speech_sample_count: 0,
             speech_frame_rms: Vec::new(),
             quiet_run: 0,
+            pending_split: false,
         }
     }
 }
@@ -241,6 +252,7 @@ impl UtteranceBuffer {
             self.silence_frames = 0;
             if self.buf.len() >= MAX_UTTERANCE_SAMPLES {
                 self.quiet_run = 0;
+                self.pending_split = true;
                 FrameAction::Flush
             } else if self.buf.len() >= EARLY_SPLIT_SAMPLES && frame_rms < EARLY_SPLIT_QUIET_RMS {
                 // Word-boundary dip inside a long utterance: count it even
@@ -250,6 +262,7 @@ impl UtteranceBuffer {
                 // never accumulate past 1.
                 self.quiet_run += 1;
                 if self.quiet_run >= EARLY_SPLIT_QUIET_FRAMES {
+                    self.pending_split = true;
                     FrameAction::Flush
                 } else {
                     FrameAction::Continue
@@ -276,6 +289,7 @@ impl UtteranceBuffer {
                 self.quiet_run = 0;
             }
             if self.silence_frames > self.hangover_frames {
+                self.pending_split = false;
                 FrameAction::Flush
             } else if self.buf.len() >= EARLY_SPLIT_SAMPLES
                 && (self.silence_frames >= EARLY_SPLIT_SILENCE_FRAMES
@@ -285,6 +299,7 @@ impl UtteranceBuffer {
                 // energy dip — in progress: cut here (in quiet) instead of
                 // riding into the hard cap and cutting mid-word. `close`
                 // still trims to last speech + adaptive tail.
+                self.pending_split = true;
                 FrameAction::Flush
             } else if self.buf.len() >= INTERIM_SPLIT_SAMPLES
                 && self.silence_frames >= INTERIM_SPLIT_SILENCE_FRAMES
@@ -292,6 +307,7 @@ impl UtteranceBuffer {
                 // Long monologue with a 300 ms pause in progress: emit the
                 // prefix now instead of growing one 30 s block. The
                 // continuation starts fresh (pre-roll spans the boundary).
+                self.pending_split = true;
                 FrameAction::Flush
             } else {
                 FrameAction::Continue
@@ -456,6 +472,7 @@ impl UtteranceBuffer {
                 total_frames,
                 rms,
             },
+            split_continuation: self.pending_split,
         };
         self.reset();
         Some(utterance)
@@ -473,6 +490,7 @@ impl UtteranceBuffer {
         self.speech_sample_count = 0;
         self.speech_frame_rms.clear();
         self.quiet_run = 0;
+        self.pending_split = false;
     }
 
     /// Discard everything for a pause transition: like `reset`, but also
@@ -1155,6 +1173,42 @@ mod tests {
         let utterance = buffer.close(&gate_for(0.0, 0.0)).unwrap();
         assert!(utterance.pcm.len() < MAX_UTTERANCE_SAMPLES);
         assert!(!buffer.is_open());
+        assert!(
+            utterance.split_continuation,
+            "interim split prefix must mark the continuation"
+        );
+    }
+
+    #[test]
+    fn hangover_close_is_not_a_continuation() {
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..25 {
+            buffer.push_frame(&speech, true);
+        }
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..SILENCE_FRAMES_THRESHOLD {
+            buffer.push_frame(&silence, false);
+        }
+        assert_eq!(buffer.push_frame(&silence, false), FrameAction::Flush);
+        let utterance = buffer.close(&gate_for(0.0, 0.0)).unwrap();
+        assert!(!utterance.split_continuation);
+    }
+
+    #[test]
+    fn early_split_marks_continuation() {
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..(EARLY_SPLIT_SAMPLES / FRAME_16K + 5) {
+            buffer.push_frame(&speech, true);
+        }
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(EARLY_SPLIT_QUIET_FRAMES - 1) {
+            assert_eq!(buffer.push_frame(&silence, false), FrameAction::Continue);
+        }
+        assert_eq!(buffer.push_frame(&silence, false), FrameAction::Flush);
+        let utterance = buffer.close(&gate_for(0.0, 0.0)).unwrap();
+        assert!(utterance.split_continuation);
     }
 
     #[test]

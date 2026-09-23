@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rtrb::Consumer;
 
-use crate::config::{CONDITION_FADE_SAMPLES, DEFAULT_THREADS, RTF_WARN_RTF, WHISPER_RATE};
+use crate::config::{
+    CONDITION_FADE_SAMPLES, DEFAULT_THREADS, INFERENCE_PAD_SAMPLES, RTF_WARN_RTF, WHISPER_RATE,
+};
 use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
 use crate::utterance::Utterance;
@@ -182,6 +184,9 @@ pub(crate) struct AsrOptions {
     pub(crate) logprob_thold: f32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
+    /// Custom vocabulary for post-gate correction (see `dictionary`).
+    /// Empty = off. Loaded once at startup, fixed for the process lifetime.
+    pub(crate) dictionary: Vec<String>,
     /// Append per-utterance JSON metrics here when `Some` (see `--metrics`).
     /// Opened by the worker at startup; open errors only warn, never fail
     /// transcription.
@@ -375,6 +380,7 @@ fn asr_init_and_run(
     let prompt_context_chars = opts.prompt_context_chars;
     let shed_stale = opts.shed_stale;
     let gate = opts.gate.clone();
+    let dictionary = opts.dictionary.clone();
     let unload_after = Duration::from_secs(auto_unload_after_secs);
     // Observability only: a broken metrics path must never take down
     // transcription, so open errors warn once and disable the log.
@@ -387,6 +393,11 @@ fn asr_init_and_run(
     // conversation); only emits feed it, drops never do. Fresh per process —
     // file mode gets a new worker per run.
     let mut prompt_tail = String::new();
+    // Previous emission's final text for split-seam dedup (see
+    // `remove_split_overlap`): only emits update it, drops never do, and it
+    // survives reloads like `prompt_tail` so a split prefix is not lost to
+    // an unload racing the continuation.
+    let mut prev_emit_text = String::new();
     // Utterances that arrive while the model is unloaded (resume raced the
     // reload, or shutdown raced it): replayed in order after the next load.
     // In practice this stays empty while paused, since the main loop
@@ -464,6 +475,8 @@ fn asr_init_and_run(
                 running,
                 emitter,
                 &mut metrics,
+                &dictionary,
+                &mut prev_emit_text,
             );
             if should_autopause(autopause_enabled, emitted) {
                 paused.store(true, Ordering::Release);
@@ -599,6 +612,8 @@ fn asr_init_and_run(
                             running,
                             emitter,
                             &mut metrics,
+                            &dictionary,
+                            &mut prev_emit_text,
                         );
                         if should_autopause(autopause_enabled, emitted) {
                             paused.store(true, Ordering::Release);
@@ -989,12 +1004,20 @@ fn transcribe_and_emit(
     running: &Arc<AtomicBool>,
     emitter: &mut impl Emitter,
     metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
+    dictionary: &[String],
+    prev_emit_text: &mut String,
 ) -> bool {
     let tag = format!("utt_{utterance_no:06}");
 
     // Levels already normalized frame-wise by `Agc` (VAD-gated, shared-gain);
     // no per-utterance static gain here — that path is deleted.
     let conditioned = condition_utterance(&utterance.pcm);
+    // Edge context past the first/last word so edge tokens are not clipped
+    // (dithered, not digital zero — see `INFERENCE_PAD_SAMPLES`). The WAV
+    // dump still uses raw `utterance.pcm`; metrics/RTF count what the model
+    // actually decoded (padded length, plus each engine's short-input floor
+    // via `decoded_sample_count`).
+    let padded = pad_edges_with_dither(&conditioned, INFERENCE_PAD_SAMPLES);
     let uses_prompt = model.uses_prompt();
     let effective_prompt = if uses_prompt {
         build_effective_prompt(base_prompt, prompt_tail)
@@ -1002,12 +1025,12 @@ fn transcribe_and_emit(
         String::new()
     };
 
-    // Inference time only (conditioning excluded): feeds the RTF column of
-    // the `--metrics` JSONL log.
+    // Inference time only (conditioning + edge pad excluded): feeds the RTF
+    // column of the `--metrics` JSONL log.
     let t0 = Instant::now();
-    let result = model.transcribe(&conditioned, &effective_prompt, running);
+    let result = model.transcribe(&padded, &effective_prompt, running);
     let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let decoded_samples = model.decoded_sample_count(conditioned.len());
+    let decoded_samples = model.decoded_sample_count(padded.len());
     let (audio_sec, rtf) = infer_rtf(decoded_samples, infer_ms);
     log::info!(
         "{tag}: transcribe took {infer_ms:.0} ms ({audio_sec:.1} s audio, rtf={rtf:.2})"
@@ -1020,20 +1043,51 @@ fn transcribe_and_emit(
     }
     match result {
         Ok(t) => {
-            let trimmed = t.text.trim();
+            let raw_trimmed = t.text.trim();
+            // Split-seam dedup before the gate: a continuation re-decodes the
+            // boundary words, so strip the overlap vs the previous emission.
+            // Drops never feed the tail, so a stale prefix cannot eat real
+            // words after a dropped utterance.
+            let deduped = if utterance.split_continuation && !prev_emit_text.is_empty() {
+                let d = remove_split_overlap(prev_emit_text, raw_trimmed);
+                if d.len() != raw_trimmed.len() {
+                    log::debug!("{tag}: split-seam dedup stripped {} chars", raw_trimmed.len() - d.len());
+                }
+                d
+            } else {
+                raw_trimmed.to_string()
+            };
+            let deduped_trimmed = deduped.trim();
             let prob = t.confidence.as_ref().map(|c| c.prob);
             let logprob = t.confidence.as_ref().map(|c| c.logprob);
             let verdict = gate.decide_transcript(
                 utterance.evidence.speech_frames,
                 utterance.evidence.rms,
-                trimmed,
+                deduped_trimmed,
                 prob,
             );
             let emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit { .. });
+            // Post-gate dictionary polish only: drops stay drops, so a
+            // near-miss key cannot resurrect boilerplate. `None` confidences
+            // = Phase A ungated (see `dictionary`).
+            let final_text = if emitted && !dictionary.is_empty() {
+                let corrected =
+                    crate::dictionary::correct_transcription(deduped_trimmed, dictionary, None);
+                if corrected != deduped_trimmed {
+                    log::debug!("{tag}: dictionary {deduped_trimmed:?} -> {corrected:?}");
+                }
+                corrected
+            } else {
+                deduped_trimmed.to_string()
+            };
+            let final_trimmed = final_text.trim();
             // Only prompt-consuming engines grow the conversational tail —
             // see `SpeechModel::uses_prompt`.
             if emitted && uses_prompt {
-                push_prompt_context(prompt_tail, trimmed, prompt_context_chars);
+                push_prompt_context(prompt_tail, final_trimmed, prompt_context_chars);
+            }
+            if emitted {
+                *prev_emit_text = final_trimmed.to_string();
             }
             write_metrics_row(
                 metrics,
@@ -1043,13 +1097,13 @@ fn transcribe_and_emit(
                 prob,
                 logprob,
                 verdict,
-                trimmed,
+                final_trimmed,
                 infer_ms,
             );
             emitter.emit(Emission {
                 tag: &tag,
                 pcm: &utterance.pcm,
-                text: trimmed,
+                text: final_trimmed,
                 verdict,
                 prob,
                 logprob,
@@ -1127,6 +1181,66 @@ pub(crate) fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
         out.push(n);
     }
     out
+}
+
+/// Words compared on each side for split-seam dedup (see
+/// `remove_split_overlap`): mirrors Murmure's `MERGE_WINDOW_WORDS`.
+pub(crate) const MERGE_WINDOW_WORDS: usize = 6;
+
+/// Wrap conditioned audio with `INFERENCE_PAD_SAMPLES` of quiet dither on
+/// each side (see `config::INFERENCE_PAD_SAMPLES` for why dither, not zero).
+/// Empty input stays empty (callers skip empty utterances before here).
+pub(crate) fn pad_edges_with_dither(pcm_16k: &[f32], pad_samples: usize) -> Vec<f32> {
+    if pcm_16k.is_empty() || pad_samples == 0 {
+        return pcm_16k.to_vec();
+    }
+    let mut out = Vec::with_capacity(pcm_16k.len() + pad_samples * 2);
+    let mut seed: u32 = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_mul(0x85EB_CA6B);
+    let mut next_dither = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32 - 0.5) * 2e-4 // +-1e-4
+    };
+    for _ in 0..pad_samples {
+        out.push(next_dither());
+    }
+    out.extend_from_slice(pcm_16k);
+    for _ in 0..pad_samples {
+        out.push(next_dither());
+    }
+    out
+}
+
+/// Strip text repeated across a split seam: longest normalized word overlap
+/// (up to `MERGE_WINDOW_WORDS`) between the tail of `prev` and the head of
+/// `cur` is dropped from `cur`. Comparison reuses `gate::normalize_transcript`
+/// (lowercase + Polish fold + punctuation spacing), so `marché/marche` and
+/// case differences still match. Returns `cur` trimmed when there is no
+/// overlap, empty, or either side is empty.
+pub(crate) fn remove_split_overlap(prev: &str, cur: &str) -> String {
+    let prev_words: Vec<&str> = prev.split_whitespace().collect();
+    let cur_words: Vec<&str> = cur.split_whitespace().collect();
+    if prev_words.is_empty() || cur_words.is_empty() {
+        return cur.trim().to_string();
+    }
+    let max_overlap = MERGE_WINDOW_WORDS
+        .min(prev_words.len())
+        .min(cur_words.len());
+    let mut matched = 0;
+    for len in (1..=max_overlap).rev() {
+        let prev_tail = &prev_words[prev_words.len() - len..];
+        let cur_head = &cur_words[..len];
+        let tails_match = prev_tail
+            .iter()
+            .zip(cur_head.iter())
+            .all(|(a, b)| crate::gate::normalize_transcript(a) == crate::gate::normalize_transcript(b));
+        if tails_match {
+            matched = len;
+            break;
+        }
+    }
+    cur_words[matched..].join(" ")
 }
 
 #[cfg(test)]
@@ -1644,6 +1758,7 @@ mod tests {
             use_gpu: false,
             metrics_path: None,
             shed_stale: false,
+            dictionary: Vec::new(),
         };
         let bad = ModelRef::Whisper(std::path::PathBuf::from("/nonexistent/ggml-bogus.bin"));
         let (handle, ready) = spawn_asr_worker(
@@ -1667,5 +1782,67 @@ mod tests {
             Err(e) => panic!("ready channel must send once, got {e:?}"),
         }
         handle.join().expect("worker thread must exit");
+    }
+
+    #[test]
+    fn edge_pad_wraps_with_dither_and_preserves_middle() {
+        use crate::config::INFERENCE_PAD_SAMPLES;
+        let pcm = vec![0.5f32; 1_600];
+        let padded = pad_edges_with_dither(&pcm, INFERENCE_PAD_SAMPLES);
+        assert_eq!(padded.len(), pcm.len() + INFERENCE_PAD_SAMPLES * 2);
+        assert_eq!(&padded[INFERENCE_PAD_SAMPLES..INFERENCE_PAD_SAMPLES + pcm.len()], &pcm[..]);
+        assert!(padded[..INFERENCE_PAD_SAMPLES].iter().all(|&s| s.abs() <= 1e-4));
+        assert!(padded[INFERENCE_PAD_SAMPLES + pcm.len()..].iter().all(|&s| s.abs() <= 1e-4));
+        assert!(padded[..INFERENCE_PAD_SAMPLES].iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn edge_pad_empty_and_zero_are_noop() {
+        assert!(pad_edges_with_dither(&[], 4000).is_empty());
+        let pcm = vec![0.1f32; 100];
+        assert_eq!(pad_edges_with_dither(&pcm, 0), pcm);
+    }
+
+    #[test]
+    fn split_overlap_strips_longest_seam() {
+        assert_eq!(
+            remove_split_overlap("bonjour le monde", "monde entier ici"),
+            "entier ici"
+        );
+        assert_eq!(
+            remove_split_overlap("je vais au marché", "au marché acheter du pain"),
+            "acheter du pain"
+        );
+        assert_eq!(
+            remove_split_overlap("podaj zolc", "żółć proszę"),
+            "proszę"
+        );
+        assert_eq!(
+            remove_split_overlap("Dzień dobry świecie", "DZIEŃ DOBRY ŚWIECIE i hej"),
+            "i hej"
+        );
+    }
+
+    #[test]
+    fn split_overlap_no_match_and_edges() {
+        assert_eq!(
+            remove_split_overlap("bonjour le monde", "autre chose"),
+            "autre chose"
+        );
+        assert_eq!(remove_split_overlap("", "bonjour"), "bonjour");
+        assert_eq!(remove_split_overlap("bonjour", ""), "");
+        assert_eq!(
+            remove_split_overlap("je vais au marché", "au marché"),
+            ""
+        );
+    }
+
+    #[test]
+    fn split_overlap_caps_at_window_size() {
+        let prev = "zero un deux trois quatre cinq six";
+        assert_eq!(remove_split_overlap(prev, "un deux trois quatre cinq six sept"), "sept");
+        let long_prev = "un deux trois quatre cinq six sept";
+        let long_cur = "un deux trois quatre cinq six sept huit";
+        assert_eq!(remove_split_overlap(long_prev, long_cur), long_cur);
     }
 }

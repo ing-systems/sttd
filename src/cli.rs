@@ -73,6 +73,12 @@ pub(crate) struct Cli {
     #[arg(long, help_heading = "Model", conflicts_with_all = ["file", "list_devices", "start", "stop", "status"])]
     pub(crate) list_models: bool,
 
+    /// Custom vocabulary file for post-gate transcript correction (one phrase
+    /// per line, canonical casing preserved; e.g. proper nouns). Applied only
+    /// to accepted transcripts, never to drops. Empty/unset = off.
+    #[arg(long, env = "STTD_DICTIONARY", value_name = "PATH", help_heading = "Model")]
+    pub(crate) dictionary: Option<PathBuf>,
+
     /// Whisper decoding language: `pl` forces Polish, `en` forces English,
     /// `auto` detects per utterance. Whisper-only (requires the `whisper`
     /// Cargo feature).
@@ -520,6 +526,7 @@ mod tests {
         assert_eq!(cli.pid_file, None);
         assert_eq!(cli.log_file, None);
         assert_eq!(cli.metrics, None);
+        assert_eq!(cli.dictionary, None);
         assert!(!cli.auto_unload);
         assert_eq!(cli.auto_unload, DEFAULT_AUTO_UNLOAD);
         assert_eq!(cli.auto_unload_after, DEFAULT_AUTO_UNLOAD_AFTER_SECS);
