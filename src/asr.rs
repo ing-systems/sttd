@@ -1019,12 +1019,13 @@ fn transcribe_and_emit(
     // Levels already normalized frame-wise by `Agc` (VAD-gated, shared-gain);
     // no per-utterance static gain here — that path is deleted.
     let conditioned = condition_utterance(&utterance.pcm);
-    // Edge context past the first/last word so edge tokens are not clipped
-    // (dithered, not digital zero — see `INFERENCE_PAD_SAMPLES`). The WAV
+    // Trailing context past the last word so final tokens are not clipped
+    // (dithered, not digital zero — see `INFERENCE_PAD_SAMPLES`). No leading
+    // pad: the utterance already starts with pre-roll. The WAV
     // dump still uses raw `utterance.pcm`; metrics/RTF count what the model
     // actually decoded (padded length, plus each engine's short-input floor
     // via `decoded_sample_count`).
-    let padded = pad_edges_with_dither(&conditioned, INFERENCE_PAD_SAMPLES);
+    let padded = pad_trailing_with_dither(&conditioned, INFERENCE_PAD_SAMPLES);
     let uses_prompt = model.uses_prompt();
     let effective_prompt = if uses_prompt {
         build_effective_prompt(base_prompt, prompt_tail)
@@ -1208,27 +1209,21 @@ pub(crate) fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
 /// `remove_split_overlap`): mirrors Murmure's `MERGE_WINDOW_WORDS`.
 pub(crate) const MERGE_WINDOW_WORDS: usize = 6;
 
-/// Wrap conditioned audio with `INFERENCE_PAD_SAMPLES` of quiet dither on
-/// each side (see `config::INFERENCE_PAD_SAMPLES` for why dither, not zero).
+/// Append `pad_samples` of quiet dither after conditioned audio
+/// (see `config::INFERENCE_PAD_SAMPLES` for why dither, not zero).
 /// Empty input stays empty (callers skip empty utterances before here).
-pub(crate) fn pad_edges_with_dither(pcm_16k: &[f32], pad_samples: usize) -> Vec<f32> {
+pub(crate) fn pad_trailing_with_dither(pcm_16k: &[f32], pad_samples: usize) -> Vec<f32> {
     if pcm_16k.is_empty() || pad_samples == 0 {
         return pcm_16k.to_vec();
     }
-    let mut out = Vec::with_capacity(pcm_16k.len() + pad_samples * 2);
+    let mut out = Vec::with_capacity(pcm_16k.len() + pad_samples);
+    out.extend_from_slice(pcm_16k);
     let mut seed: u32 = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_mul(0x85EB_CA6B);
-    let mut next_dither = move || {
+    for _ in 0..pad_samples {
         seed ^= seed << 13;
         seed ^= seed >> 17;
         seed ^= seed << 5;
-        (seed as f32 / u32::MAX as f32 - 0.5) * 2e-4 // +-1e-4
-    };
-    for _ in 0..pad_samples {
-        out.push(next_dither());
-    }
-    out.extend_from_slice(pcm_16k);
-    for _ in 0..pad_samples {
-        out.push(next_dither());
+        out.push((seed as f32 / u32::MAX as f32 - 0.5) * 2e-4); // +-1e-4
     }
     out
 }
@@ -1807,22 +1802,21 @@ mod tests {
     }
 
     #[test]
-    fn edge_pad_wraps_with_dither_and_preserves_middle() {
+    fn trailing_pad_appends_dither_and_preserves_start() {
         use crate::config::INFERENCE_PAD_SAMPLES;
         let pcm = vec![0.5f32; 1_600];
-        let padded = pad_edges_with_dither(&pcm, INFERENCE_PAD_SAMPLES);
-        assert_eq!(padded.len(), pcm.len() + INFERENCE_PAD_SAMPLES * 2);
-        assert_eq!(&padded[INFERENCE_PAD_SAMPLES..INFERENCE_PAD_SAMPLES + pcm.len()], &pcm[..]);
-        assert!(padded[..INFERENCE_PAD_SAMPLES].iter().all(|&s| s.abs() <= 1e-4));
-        assert!(padded[INFERENCE_PAD_SAMPLES + pcm.len()..].iter().all(|&s| s.abs() <= 1e-4));
-        assert!(padded[..INFERENCE_PAD_SAMPLES].iter().any(|&s| s != 0.0));
+        let padded = pad_trailing_with_dither(&pcm, INFERENCE_PAD_SAMPLES);
+        assert_eq!(padded.len(), pcm.len() + INFERENCE_PAD_SAMPLES);
+        assert_eq!(&padded[..pcm.len()], &pcm[..]);
+        assert!(padded[pcm.len()..].iter().all(|&s| s.abs() <= 1e-4));
+        assert!(padded[pcm.len()..].iter().any(|&s| s != 0.0));
     }
 
     #[test]
-    fn edge_pad_empty_and_zero_are_noop() {
-        assert!(pad_edges_with_dither(&[], 4000).is_empty());
+    fn trailing_pad_empty_and_zero_are_noop() {
+        assert!(pad_trailing_with_dither(&[], 4000).is_empty());
         let pcm = vec![0.1f32; 100];
-        assert_eq!(pad_edges_with_dither(&pcm, 0), pcm);
+        assert_eq!(pad_trailing_with_dither(&pcm, 0), pcm);
     }
 
     #[test]
