@@ -3,8 +3,8 @@
 // ---------------------------------------------------------------------------
 //
 // Two speech models exist (`whisper`: whisper.cpp via whisper-rs; `parakeet`:
-// NVIDIA Parakeet-TDT-0.6B-v3 via direct `ort` sessions, see `ort_engine`),
-// selected once at startup by `--model` (see `weights::ModelRef`) and fixed
+// NVIDIA Parakeet-TDT-0.6B-v3 via direct `ort` sessions, see `parakeet_core`),
+// selected once at startup by `--model` (see `model_store::ModelRef`) and fixed
 // for the process's lifetime.
 // This module owns everything that doesn't change between them: the worker
 // thread and its load/unload/pause/shed loop, the transcript gate call,
@@ -34,7 +34,7 @@ use crate::config::{
 use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
 use crate::utterance::Utterance;
-use crate::weights::ModelRef;
+use crate::model_store::ModelRef;
 #[cfg(feature = "whisper")]
 use crate::whisper::Language;
 

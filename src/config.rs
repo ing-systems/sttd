@@ -316,7 +316,7 @@ pub(crate) const MODEL_BASE_URL: &str =
 /// flip depending on the working directory. Setting the variable when *running*
 /// `sttd` does nothing — an explicit `--model <path>` is the escape hatch, and
 /// a missing asset is downloaded into this directory (root-owned in a packaged
-/// install, see `weights::ensure_available`).
+/// install, see `model_store::ensure_available`).
 pub(crate) const DEFAULT_MODELS_DIR: &str = env!("STTD_MODELS_DIR");
 pub(crate) const DEFAULT_MODEL_SPEC: &str = "parakeet";
 
@@ -400,7 +400,7 @@ pub(crate) fn valid_model_specs() -> String {
 /// (phrase-boosting; without it transcription works but boosting stays off).
 /// The ONNX weights come from the istupakov export; `tokenizer.json` comes
 /// from the upstream NVIDIA checkpoint (the export has none). Mel features
-/// are computed in Rust (`ort_engine::frontend`), so no `nemo128.onnx` and
+/// are computed in Rust (`parakeet_core::frontend`), so no `nemo128.onnx` and
 /// no `config.json`/`preprocessor_config.json` are needed.
 pub(crate) const PARAKEET_BASE_URL: &str =
     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/";

@@ -16,13 +16,13 @@ resampler = "0.5"
 biquad = "0.6"
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"], optional = true }
 ndarray = { version = "0.15", optional = true }
-# ort_engine's ndarray: must match `ort`'s own ndarray (0.17), otherwise
+# parakeet_core's ndarray: must match `ort`'s own ndarray (0.17), otherwise
 # `TensorRef::from_array_view` types mismatch. Renamed because `denoise`
 # needs 0.15 for `deep_filter`.
 ndarray17 = { package = "ndarray", version = "0.17" }
 earshot = { version = "1.2", features = ["alloc"] }
 whisper-rs = { version = "0.13", features = ["cuda", "whisper-cpp-log"], optional = true }
-# Parakeet engine (see src/parakeet.rs + src/ort_engine/): direct `ort`
+# Parakeet engine (see src/parakeet.rs + src/parakeet_core/): direct `ort`
 # sessions (vendored Murmure decoder) + Rust mel frontend (from
 # `parakeet-rs`). Default features pull in `ort`'s `download-binaries`, so
 # the ONNX Runtime native library is fetched by the build script the same

@@ -91,7 +91,7 @@ pub(crate) struct WhisperModel {
 
 impl WhisperModel {
     /// Load a whisper.cpp model from `model_path` (a `ggml-*.bin` file,
-    /// already guaranteed present by `weights::ensure_available`) and every
+    /// already guaranteed present by `model_store::ensure_available`) and every
     /// decode parameter `AsrOptions` carries.
     pub(crate) fn load(model_path: &Path, opts: &AsrOptions) -> Result<Self> {
         // Belt-and-braces: `main` already installs this in `init_logging`,

@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// ort_engine frontend: 16 kHz mel features without ONNX.
+// parakeet_core frontend: 16 kHz mel features without ONNX.
 //
 // Ported from `parakeet-rs` 0.3.7 `src/audio.rs` + `src/config.rs`
 // (MIT OR Apache-2.0, Copyright altunenes): STFT via `realfft`, Slaney mel

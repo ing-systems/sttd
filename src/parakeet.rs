@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------------------
 // Parakeet engine: NVIDIA Parakeet-TDT-0.6B-v3 `SpeechModel` impl.
 //
-// Wraps `ort_engine::ParakeetModel` (FastConformer-TDT, 0.6B params, 25
+// Wraps `parakeet_core::ParakeetModel` (FastConformer-TDT, 0.6B params, 25
 // European languages with per-utterance auto-detection): direct `ort`
 // sessions with dictionary phrase-boosting on the greedy TDT decode (see
-// `ort_engine`). Unlike `parakeet-rs` (removed), this engine reports
+// `parakeet_core`). Unlike `parakeet-rs` (removed), this engine reports
 // per-word confidences, so the dictionary fuzzy correction runs gated
 // (Phase B) instead of ungated.
 //
@@ -21,17 +21,17 @@ use anyhow::{Context, Result};
 
 use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
 use crate::config::PARAKEET_MIN_SAMPLES;
-use crate::ort_engine::ParakeetModel as OrtModel;
+use crate::parakeet_core::ParakeetModel as CoreModel;
 
 pub(crate) struct ParakeetModel {
-    inner: OrtModel,
+    inner: CoreModel,
     ready_line: String,
 }
 
 impl ParakeetModel {
     /// Load a Parakeet model from `dir` (already guaranteed to hold an
     /// encoder, a decoder_joint and `vocab.txt` by
-    /// `weights::ensure_available`). `tokenizer.json` in the same directory
+    /// `model_store::ensure_available`). `tokenizer.json` in the same directory
     /// enables dictionary phrase-boosting; without it transcription works
     /// but boosting stays off (warned once). The startup dictionary is
     /// synced here — it is fixed for the process lifetime, and
@@ -51,7 +51,7 @@ impl ParakeetModel {
         }
         log::info!("loading parakeet model ({})...", dir.display());
         let mut inner = with_loading_ticker("parakeet model", || {
-            OrtModel::new(dir, true, tokenizer_opt.as_deref(), intra_threads)
+            CoreModel::new(dir, true, tokenizer_opt.as_deref(), intra_threads)
                 .map_err(|e| anyhow::anyhow!("failed to load parakeet model: {e}"))
                 .context("failed to load parakeet model")
         })?;

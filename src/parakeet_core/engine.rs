@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// ort_engine inference: encoder + TDT decoder_joint over direct `ort`
+// parakeet_core inference: encoder + TDT decoder_joint over direct `ort`
 // sessions, with dictionary phrase-boosting on the greedy decode.
 //
 // Ported from Murmure `src-tauri/src/engine/engine.rs`

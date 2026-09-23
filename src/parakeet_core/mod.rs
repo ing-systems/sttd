@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// ort_engine: Parakeet-TDT-0.6B-v3 inference over direct `ort` sessions.
+// parakeet_core: Parakeet-TDT-0.6B-v3 inference over direct `ort` sessions.
 //
 // Vendored from Murmure (`src-tauri/src/engine/`, AGPL-3.0-or-later,
 // Copyright al1x-ai.com contributors) with two changes:

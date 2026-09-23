@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// ort_engine types: session handles, vocab, boost state, results.
+// parakeet_core types: session handles, vocab, boost state, results.
 // Ported from Murmure `src-tauri/src/engine/types.rs` (AGPL-3.0-or-later).
 // Dropped: the `nemo128` preprocessor `Session` (see `frontend`), the
 // token/word/segment timestamp hierarchy and `TimestampGranularity`

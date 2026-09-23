@@ -97,13 +97,13 @@ use utterance::*;
 mod vad;
 mod wav;
 use wav::*;
-mod weights;
-use weights::*;
+mod model_store;
+use model_store::*;
 mod asr;
 use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
 #[cfg(feature = "whisper")]
 mod whisper;
-mod ort_engine;
+mod parakeet_core;
 mod parakeet;
 
 // ---------------------------------------------------------------------------

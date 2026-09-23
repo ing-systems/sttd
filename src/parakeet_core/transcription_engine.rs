@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// ort_engine transcription result: text plus per-word confidences.
+// parakeet_core transcription result: text plus per-word confidences.
 // Adapted from Murmure `src-tauri/src/engine/transcription_engine.rs`
 // (AGPL-3.0-or-later): segments dropped, confidences kept — they gate
 // sttd's dictionary fuzzy correction (Phase B).

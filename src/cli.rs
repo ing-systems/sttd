@@ -521,11 +521,11 @@ mod tests {
             DEFAULT_MODEL_SPEC
         );
         // Default spec resolves to the Parakeet model directory.
-        let resolved = crate::weights::resolve_model(DEFAULT_MODEL_SPEC)
+        let resolved = crate::model_store::resolve_model(DEFAULT_MODEL_SPEC)
             .expect("default spec must resolve");
         assert_eq!(
             resolved,
-            crate::weights::ModelRef::Parakeet {
+            crate::model_store::ModelRef::Parakeet {
                 dir: PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"),
                 assets: &[
                     "encoder-model.int8.onnx",

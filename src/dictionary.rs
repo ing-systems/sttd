@@ -9,7 +9,7 @@
 // near-miss dictionary key cannot resurrect boilerplate.
 //
 // Phase A (this spike): exact normalized restore + strict fuzzy, ungated.
-// `parakeet-rs 0.3` is gone: `ort_engine` reports per-word confidences, so
+// `parakeet-rs 0.3` is gone: `parakeet_core` reports per-word confidences, so
 // the production path (`asr::transcribe_and_emit`) passes a gated map and
 // Phase B is live — confident words are never fuzzy-corrected. Callers
 // without confidences (whisper, tests) pass `None` for the ungated form.

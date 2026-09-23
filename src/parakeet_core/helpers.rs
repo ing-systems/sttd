@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// ort_engine helpers: accent fold, boost word variants, BPE tokenization,
+// parakeet_core helpers: accent fold, boost word variants, BPE tokenization,
 // per-word confidences. Ported from Murmure
 // `src-tauri/src/engine/helpers.rs` (AGPL-3.0-or-later); timestamp builders
 // dropped (sttd needs text + confidences only).
