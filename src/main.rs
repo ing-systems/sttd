@@ -106,8 +106,6 @@ use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
 #[cfg(feature = "whisper")]
 mod whisper;
 mod parakeet;
-#[cfg(feature = "parakeet-burn")]
-mod parakeet_burn;
 #[cfg(feature = "sherpa")]
 mod sherpa;
 
@@ -1373,9 +1371,6 @@ fn warn_unused_sherpa_flags(cli: &Cli, model: &ModelRef) {
 /// remain.
 fn validate_parakeet_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
     if !matches!(model, ModelRef::Parakeet { .. }) {
-        if cli.parakeet_engine == crate::cli::ParakeetEngine::Burn {
-            log::warn!("--parakeet-engine burn is set but --model is not a Parakeet model (no effect)");
-        }
         return Ok(());
     }
     #[cfg(feature = "whisper")]
@@ -1451,7 +1446,6 @@ fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
         logprob_thold: cli.logprob_thold,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
-        parakeet_engine: cli.parakeet_engine,
         #[cfg(feature = "sherpa")]
         sherpa_lang: cli.sherpa_lang.clone(),
         metrics_path: cli.metrics.clone(),
