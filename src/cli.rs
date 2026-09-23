@@ -289,7 +289,7 @@ pub(crate) struct Cli {
     #[arg(
         long,
         env = "STTD_COPY",
-        default_value_t = true,
+        default_value_t = false,
         value_parser = parse_bool,
         num_args = 0..=1,
         default_missing_value = "true",
@@ -303,7 +303,7 @@ pub(crate) struct Cli {
     #[arg(
         long,
         env = "STTD_PASTE",
-        default_value_t = true,
+        default_value_t = false,
         value_parser = parse_bool,
         num_args = 0..=1,
         default_missing_value = "true",
@@ -312,8 +312,7 @@ pub(crate) struct Cli {
     pub(crate) paste: bool,
 
     /// Print each accepted transcript to stdout (one line per utterance).
-    /// Opt-in: off by default so transcripts only go to the clipboard,
-    /// auto-paste and the dump dir unless this is enabled.
+    /// Opt-in: off by default.
     #[arg(
         long,
         env = "STTD_STDOUT",
@@ -603,8 +602,8 @@ mod tests {
         assert_eq!(cli.target_rms, DEFAULT_TARGET_RMS);
         assert_eq!(cli.vad_threshold, DEFAULT_VAD_THRESHOLD);
         assert_eq!(cli.vad_adapt, DEFAULT_VAD_ADAPT);
-        assert!(cli.copy);
-        assert!(cli.paste);
+        assert!(!cli.copy);
+        assert!(!cli.paste);
         assert!(!cli.stdout);
         assert!(cli.start_paused);
         assert!(!cli.autopause);

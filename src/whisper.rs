@@ -622,6 +622,6 @@ mod tests {
         assert_eq!(DEFAULT_ENTROPY_THOLD, 2.4);
         assert_eq!(DEFAULT_LOGPROB_THOLD, -1.0);
         assert_eq!(crate::config::DEFAULT_THREADS, 8);
-        assert!(DEFAULT_USE_GPU);
+        assert!(!DEFAULT_USE_GPU);
     }
 }

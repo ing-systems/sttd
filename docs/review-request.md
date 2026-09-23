@@ -79,7 +79,7 @@ Terminology (`CONTEXT.md`): utterance, utterance buffer, pre-roll, acoustic evid
 
 * `Emitter::emit(Emission{tag,pcm,text,verdict,prob,logprob,evidence})`.
 * `SystemEmitter:88` async: `emit:191` clone to `OwnedEmission` + `rtrb:512` (full/gone=warn, never blocks). Worker FIFO; Drop joins so shutdown flushes.
-* `handle:208`: WAV first every utterance (`hound`, 16k); DropEmpty->DROPPED(empty) TXT; Drop->log+dump_reason TXT; Emit->log, opt-in stdout (`--stdout` default off), `wl-copy --sensitive` if `--copy` (default on), `ydotool Ctrl+V` only if copied and `--paste` (default on), TXT if `--dump-dir`. Missing binaries / non-Wayland disables once.
+* `handle:208`: WAV first every utterance (`hound`, 16k); DropEmpty->DROPPED(empty) TXT; Drop->log+dump_reason TXT; Emit->log, opt-in stdout (`--stdout` default off), `wl-copy --sensitive` if `--copy` (default off), `ydotool Ctrl+V` only if copied and `--paste` (default off), TXT if `--dump-dir`. Missing binaries / non-Wayland disables once.
 * Prompt default `src/config.rs:321` short PL/EN (long keyword lists removed — leaks into low-signal decodes).
 
 ## 9. Runtime

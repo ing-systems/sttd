@@ -1706,10 +1706,17 @@ mod tests {
     #[cfg(all(feature = "sherpa", feature = "whisper"))]
     #[test]
     fn unsupported_sherpa_flags_lists_whisper_only_tunables() {
-        let cli = Cli::try_parse_from(["sttd", "--beam-size", "8", "--min-conf", "0.4"])
-            .expect("flags must parse");
+        let cli = Cli::try_parse_from([
+            "sttd",
+            "--beam-size",
+            "8",
+            "--min-conf",
+            "0.4",
+            "--gpu",
+        ])
+        .expect("flags must parse");
         // --beam-size/--min-conf are ignored by sherpa, and so is --gpu
-        // (CPU-only static build, on by default).
+        // (CPU-only static build).
         let flags = unsupported_sherpa_flags(&cli);
         assert!(flags.contains(&"--beam-size"), "flags={flags:?}");
         assert!(flags.contains(&"--min-conf"), "flags={flags:?}");
@@ -1727,9 +1734,12 @@ mod tests {
         assert!(flags.contains(&"--min-conf"), "flags={flags:?}");
         assert!(!flags.contains(&"--gpu"), "flags={flags:?}");
         assert_eq!(flags.len(), 1, "flags={flags:?}");
-        // ...but the on-by-default --gpu warns like Parakeet without CUDA.
-        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        // ...an explicit --gpu still warns like Parakeet without CUDA.
+        let cli = Cli::try_parse_from(["sttd", "--gpu"]).expect("defaults must parse");
         assert!(unsupported_sherpa_flags(&cli).contains(&"--gpu"));
+        // ...while the default (off) stays quiet.
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert!(!unsupported_sherpa_flags(&cli).contains(&"--gpu"));
     }
 
     #[cfg(feature = "sherpa")]
@@ -1746,18 +1756,17 @@ mod tests {
 
     #[test]
     fn unsupported_parakeet_flags_are_empty_for_plain_cli_without_gpu() {
-        // `--gpu` defaults to true (DEFAULT_USE_GPU), and without the
-        // `parakeet-cuda` feature that's *always* unsupported regardless of
-        // whether the user typed the flag — see the next test. Isolate that
-        // from the "did the user set a tunable" checks with `--gpu off`.
-        let cli = Cli::try_parse_from(["sttd", "--gpu", "off"]).expect("defaults must parse");
+        // `--gpu` defaults to false (DEFAULT_USE_GPU), so a plain CLI is
+        // clean without `parakeet-cuda`; only an explicit `--gpu` warns —
+        // see the next test.
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert!(unsupported_parakeet_flags(&cli).is_empty());
     }
 
     #[cfg(not(feature = "parakeet-cuda"))]
     #[test]
-    fn unsupported_parakeet_flags_flags_default_gpu_without_cuda_feature() {
-        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+    fn unsupported_parakeet_flags_flags_explicit_gpu_without_cuda_feature() {
+        let cli = Cli::try_parse_from(["sttd", "--gpu"]).expect("defaults must parse");
         assert_eq!(unsupported_parakeet_flags(&cli), vec!["--gpu"]);
     }
 

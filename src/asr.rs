@@ -380,7 +380,7 @@ pub(crate) fn should_autopause(autopause_enabled: bool, emitted: bool) -> bool {
 /// in a loop) stays a side effect in the caller.
 ///
 /// Utterances queued just before a pause is noticed must not survive it:
-/// with `--copy`/`--paste` on by default, transcribing them on resume types
+/// with `--copy`/`--paste` enabled, transcribing them on resume types
 /// stale content into whatever window has focus, possibly minutes later.
 /// Firing only on the edge (not on every paused tick) means a long pause
 /// drains once, not on a busy-loop.
@@ -532,7 +532,7 @@ fn asr_init_and_run(
                     // Pause edge: drop whatever is already queued. Without
                     // this, utterances closed just before the pause was
                     // noticed survive it and transcribe (and, with --copy/
-                    // --paste on by default, get typed into whatever window
+                    // --paste enabled, get typed into whatever window
                     // has focus) on resume — possibly minutes later.
                     // Consistent with the shutdown-while-paused drain a few
                     // lines below, and with `hold_pipeline`'s own discard
