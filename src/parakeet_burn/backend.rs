@@ -37,15 +37,14 @@ pub(crate) fn cpu_device() -> <CpuBackend as burn::tensor::backend::BackendTypes
     <CpuBackend as burn::tensor::backend::BackendTypes>::Device::default()
 }
 
-/// Parse the tensor-path selector (see `use_tensor_path`). Pure for tests.
+/// Tensor path is the default since Phase 7 (parity proven on goldens
+/// + file-mode); `STTD_BURN_TENSOR=0` (or `=false`) selects the scalar
+/// fallback for debugging regressions. Pure for tests.
 pub(crate) fn parse_tensor_flag(v: Option<&str>) -> bool {
-    matches!(v, Some("1") | Some("true"))
+    !matches!(v, Some("0") | Some("false"))
 }
 
-/// Scalar int8 loops stay the default path during bring-up; `STTD_BURN_TENSOR=1`
-/// (or `=true`) selects the tensor variants once a phase wires them in.
-/// Phase 7 flips the default. Read once at load in Phase 2 (never in
-/// tests: env vars are process-global and test threads run in parallel).
+/// Read once at load (never in tests: env vars are process-global).
 pub(crate) fn use_tensor_path() -> bool {
     parse_tensor_flag(std::env::var("STTD_BURN_TENSOR").ok().as_deref())
 }
@@ -82,12 +81,14 @@ mod tests {
 
     #[test]
     fn tensor_flag_parsing() {
+        // Tensor is the default since Phase 7; only explicit 0/false
+        // opts out to the scalar fallback.
+        assert!(super::parse_tensor_flag(None));
         assert!(super::parse_tensor_flag(Some("1")));
         assert!(super::parse_tensor_flag(Some("true")));
-        assert!(!super::parse_tensor_flag(None));
+        assert!(super::parse_tensor_flag(Some("yes")));
         assert!(!super::parse_tensor_flag(Some("0")));
         assert!(!super::parse_tensor_flag(Some("false")));
-        assert!(!super::parse_tensor_flag(Some("yes")));
     }
 
     #[test]

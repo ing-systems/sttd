@@ -139,13 +139,13 @@ mod model {
             })?;
 
             // Tensor-path selector, read once (never in tests: env vars
-            // are process-global). Scalar stays the default during
-            // bring-up; Phase 7 flips it. The scalar fallback remains
-            // available via STTD_BURN_TENSOR=0 for debugging regressions.
+            // are process-global). Tensor is the default since Phase 7
+            // (goldens + file-mode proven); STTD_BURN_TENSOR=0 keeps the
+            // scalar fallback for debugging regressions.
             let tensor = super::backend::use_tensor_path();
             let cpu = super::backend::cpu_device();
-            if tensor {
-                log::info!("burn parakeet: tensor path enabled (STTD_BURN_TENSOR=1)");
+            if !tensor {
+                log::info!("burn parakeet: scalar path forced (STTD_BURN_TENSOR=0)");
             }
             Ok(Self {
                 vocab,

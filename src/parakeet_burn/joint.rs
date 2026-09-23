@@ -100,6 +100,11 @@ fn sigmoid(x: f32) -> f32 {
 
 impl LstmLayer {
     /// One step: `(h_new, c_new)` from `(x, h_prev, c_prev)`.
+    /// Stays scalar by decision (Phase 6): steps are state-sequential
+    /// so only the tiny intra-step matmuls ([1,640]x[640,2560]) would
+    /// parallelize — Flex call overhead dominates at that shape, and
+    /// the joint projections around it are already tensorized. The
+    /// embed lookup stays scalar for the same reason (one row gather).
     pub(crate) fn step(&self, x: &[f32], h: &[f32], c: &[f32]) -> (Vec<f32>, Vec<f32>) {
         assert_eq!(x.len(), self.in_dim);
         assert_eq!(h.len(), self.hid);
