@@ -19,88 +19,22 @@
 //   table[5000-T .. 5000+T-1], distance-0 at window index T-1;
 //   B[i,j] = (q_i + v) . P[(j-i) + (T-1)] (sign voted off ORT's own
 //   Add_2 = AC + shift(BD); the table is position-reversed, see
-//   `pos_window`), scores / sqrt(128). QK^T/BD/AV run in fp32 — the
+//   `relative_position_window`), scores / sqrt(128). QK^T/BD/AV run in fp32 — the
 //   graph uses plain `MatMul` there (only the projections quantize).
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 
-use super::backend::CpuBackend;
-use super::encoder::EncoderManifest;
-use super::igemm::{sigmoid, Epilogue};
-use super::quant::Uint8Linear;
-use super::tensor::TensorCtx;
+use super::runtime::CpuBackend;
+use super::manifest::EncoderManifest;
+use super::int_gemm::{sigmoid, Epilogue};
+use super::ops::{glu, layernorm_batch, softmax_rows, swish_inplace, LayerNormP};
+use super::quant_linear::Uint8Linear;
+use super::tensor_ctx::TensorCtx;
 use super::weights::RawTensor;
 
 use rayon::prelude::*;
-
-/// LayerNorm params (gamma/beta, eps fixed 1e-5 per graph).
-#[derive(Debug, Clone)]
-pub(crate) struct LayerNormP {
-    pub(crate) gamma: Vec<f32>,
-    pub(crate) beta: Vec<f32>,
-}
-
-pub(crate) const LN_EPS: f32 = 1e-5;
-
-pub(crate) fn layernorm_row(x: &[f32], p: &LayerNormP) -> Vec<f32> {
-    // Stays scalar by decision (Phase 4): the mean/variance sums span
-    // 1024+ elements and a sequential f32 sum rounds enough to matter
-    // downstream (~1e-6 normalized error amplifies 4096-wide through
-    // the FFN to ~1.0 — bisected during bring-up). f32 tensor
-    // reductions (parallel order) regress this; f64 tensor layernorm
-    // would cost more traffic than the scalar loop saves. The op is
-    // memory-bound O(T*D) beside the matmuls, so nothing is lost.
-    assert_eq!(x.len(), p.gamma.len());
-    // f64 accumulators: the mean/variance sums span 1024 elements, and a
-    // sequential f32 sum rounds enough to matter downstream (a ~1e-6
-    // normalized error amplifies 4096-wide through the FFN to ~1.0 at
-    // ref_max 600 — bisected via the staged parity test below). ORT's own
-    // vectorized reduction lands within 1e-7 of this.
-    let n = x.len() as f64;
-    let mean: f64 = x.iter().map(|&v| v as f64).sum::<f64>() / n;
-    let var: f64 = x.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
-    let inv = 1.0 / (var + LN_EPS as f64).sqrt();
-    x.iter()
-        .enumerate()
-        .map(|(i, &v)| ((v as f64 - mean) * inv * p.gamma[i] as f64 + p.beta[i] as f64) as f32)
-        .collect()
-}
-
-pub(crate) fn layernorm_batch(x: &[Vec<f32>], p: &LayerNormP) -> Vec<Vec<f32>> {
-    // Rows are independent (same per-row f64 math as `layernorm_row`, same
-    // order within a row): rayon only spreads rows over threads, so this
-    // is bit-exact vs the serial loop.
-    x.par_iter().map(|r| layernorm_row(r, p)).collect()
-}
-
-// Swish/GLU/add/scale stay scalar *per element* by decision (Phase 4):
-// each element is computed exactly (same libm exp the graph was verified
-// against — no SIMD-exp tensor twins, which would drift); independent
-// rows additionally run in parallel via rayon (same intra-row order, so
-// bit-exact vs the serial loops). Serial exp was the bottleneck for
-// short utterances (a 4096-wide swish row costs ~3x its own matmul).
-pub(crate) fn swish_inplace(v: &mut [f32]) {
-    for x in v.iter_mut() {
-        *x = *x * sigmoid(*x);
-    }
-}
-
-pub(crate) fn softmax_rows(scores: &mut [Vec<f32>]) {
-    scores.par_iter_mut().for_each(|row| {
-        let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let mut s = 0.0f32;
-        for x in row.iter_mut() {
-            *x = (*x - m).exp();
-            s += *x;
-        }
-        let inv = 1.0 / s;
-        for x in row.iter_mut() {
-            *x *= inv;
-        }
-    });
-}
 
 /// Depthwise conv (groups == channels): `w[c][k]`, symmetric padding.
 #[derive(Debug, Clone)]
@@ -114,7 +48,7 @@ pub(crate) struct DwConv {
     pub(crate) pad_left: usize,
     pub(crate) pad_right: usize,
     /// Lazily-built dequantized weight + bias tensors (same rationale as
-    /// `quant::CachedT`: the `[C,1,K]` store is tiny but `from_data` per
+    /// `quant_linear::CachedT`: the `[C,1,K]` store is tiny but `from_data` per
     /// call still costs an allocation + copy per block per forward).
     pub(crate) cache: std::sync::OnceLock<(
         burn::tensor::Tensor<CpuBackend, 3>,
@@ -124,7 +58,7 @@ pub(crate) struct DwConv {
 
 impl DwConv {
     pub(crate) fn forward(&self, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        use super::quant::dynamic_quantize_u8;
+        use super::quant_linear::dynamic_quantize_u8;
         let t = x.len();
         let c = self.channels;
         assert!(x.iter().all(|r| r.len() == c));
@@ -158,7 +92,7 @@ impl DwConv {
     }
 
     /// Build the cached weight + bias tensors now (load-time warming).
-    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
+    pub(crate) fn prime_cache(&self, device: &super::runtime::CpuDevice) {
         let _ = self.cached(device);
     }
 
@@ -167,7 +101,7 @@ impl DwConv {
     /// `(q - zp) * scale`, pure reorder into the conv layout).
     fn cached(
         &self,
-        device: &super::backend::CpuDevice,
+        device: &super::runtime::CpuDevice,
     ) -> &(
         burn::tensor::Tensor<CpuBackend, 3>,
         burn::tensor::Tensor<CpuBackend, 1>,
@@ -202,10 +136,10 @@ impl DwConv {
     pub(crate) fn forward_t(
         &self,
         x: &[Vec<f32>],
-        device: &super::backend::CpuDevice,
+        device: &super::runtime::CpuDevice,
     ) -> Vec<Vec<f32>> {
         use burn::tensor::{module::conv1d, ops::ConvOptions, Tensor, TensorData};
-        use super::quant::dynamic_quantize_u8;
+        use super::quant_linear::dynamic_quantize_u8;
         let t = x.len();
         assert!(t >= 1, "dw forward_t: empty input");
         let c = self.channels;
@@ -254,7 +188,7 @@ impl DwConv {
     /// write (`v * sigmoid(v)` — the exact expression `swish_inplace`
     /// applies afterwards), saving a full pass over the `[T][C]` output.
     pub(crate) fn forward_par(&self, x: &[Vec<f32>], swish: bool) -> Vec<Vec<f32>> {
-        use super::quant::dynamic_quantize_u8;
+        use super::quant_linear::dynamic_quantize_u8;
         let t = x.len();
         let c = self.channels;
         assert!(x.iter().all(|r| r.len() == c));
@@ -295,20 +229,13 @@ impl DwConv {
     /// Dispatch: exact parallel integer `forward_par` on the tensor path,
     /// exact serial integer `forward` on the scalar path. (`forward_t`,
     /// the Flex grouped-conv twin, is kept for its parity test only.)
-    pub(crate) fn dispatch(&self, x: &[Vec<f32>], ctx: &super::tensor::TensorCtx) -> Vec<Vec<f32>> {
+    pub(crate) fn dispatch(&self, x: &[Vec<f32>], ctx: &super::tensor_ctx::TensorCtx) -> Vec<Vec<f32>> {
         if ctx.enabled {
             self.forward_par(x, false)
         } else {
             self.forward(x)
         }
     }
-}
-
-/// GLU gate: split 2d in halves, `a * sigmoid(b)`.
-pub(crate) fn glu(v: &[f32]) -> Vec<f32> {
-    assert!(v.len() % 2 == 0);
-    let (a, b) = v.split_at(v.len() / 2);
-    a.iter().zip(b.iter()).map(|(&x, &g)| x * sigmoid(g)).collect()
 }
 
 /// Full per-layer weights (dequantized lazily inside the linears).
@@ -379,7 +306,7 @@ fn take_linear(
     // `[out][in]` store `forward` reads; 1x1 convs (out, in, 1) already
     // match and pass through.
     let (k, n, store) = match shape.as_slice() {
-        [k, n] => (*k, *n, super::quant::transpose_u8(data, *k, *n)),
+        [k, n] => (*k, *n, super::quant_linear::transpose_u8(data, *k, *n)),
         [n, k, 1] => (*k, *n, data.clone()),
         _ => anyhow::bail!("{role}: unexpected weight shape {shape:?}"),
     };
@@ -498,29 +425,29 @@ impl BlockWeights {
 
 impl BlockWeights {
     /// Build every cached tensor in this layer now (load-time warming —
-    /// see `Uint8Linear::warm`): the 11 quantized linears plus the
+    /// see `Uint8Linear::prime_cache`): the 11 quantized linears plus the
     /// depthwise conv. Each warms independently (no shared state), so the
     /// encoder warms all layers in parallel via rayon's pool.
-    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
-        self.ffn1_l1.warm(device);
-        self.ffn1_l2.warm(device);
-        self.ffn2_l1.warm(device);
-        self.ffn2_l2.warm(device);
-        self.wq.warm(device);
-        self.wk.warm(device);
-        self.wv.warm(device);
-        self.wpos.warm(device);
-        self.wout.warm(device);
-        self.pw1.warm(device);
-        self.pw2.warm(device);
-        self.dw.warm(device);
+    pub(crate) fn prime_cache(&self, device: &super::runtime::CpuDevice) {
+        self.ffn1_l1.prime_cache(device);
+        self.ffn1_l2.prime_cache(device);
+        self.ffn2_l1.prime_cache(device);
+        self.ffn2_l2.prime_cache(device);
+        self.wq.prime_cache(device);
+        self.wk.prime_cache(device);
+        self.wv.prime_cache(device);
+        self.wpos.prime_cache(device);
+        self.wout.prime_cache(device);
+        self.pw1.prime_cache(device);
+        self.pw2.prime_cache(device);
+        self.dw.prime_cache(device);
     }
 }
 
 /// Slice the relative window for length T from the full table:
 /// rows [5000-T .. 5000+T-1] (length 2T-1, distance 0 at index T-1).
 /// Table layout (verified): `table[i]` = PE(4999-i), interleaved sin/cos.
-pub(crate) fn pos_window(table: &[Vec<f32>], t: usize) -> Vec<Vec<f32>> {
+pub(crate) fn relative_position_window(table: &[Vec<f32>], t: usize) -> Vec<Vec<f32>> {
     assert!(table.len() >= 9999);
     assert!(t >= 1 && 5000 - t + (2 * t - 1) <= table.len());
     table[5000 - t..5000 + t - 1].to_vec()
@@ -561,19 +488,19 @@ fn split_heads(x: &[Vec<f32>], n_heads: usize, d_head: usize) -> Vec<Vec<Vec<f32
 
 /// Pre-softmax relative scores `[T][H][T]`: AC + XL-shifted BD, scaled.
 /// B[i,j] = (q_i + u) . k_j + (q_i + v) . P[(j-i) + (T-1)].
-/// Split out of `rel_attention` so parity tests can compare scores
+/// Split out of `relative_attention` so parity tests can compare scores
 /// directly against the graph's pre-softmax `Div` output.
-pub(crate) fn rel_scores(
+pub(crate) fn relative_scores(
     x: &[Vec<f32>],
     w: &BlockWeights,
-    pos_window: &[Vec<f32>],
+    relative_position_window: &[Vec<f32>],
     ctx: &TensorCtx,
 ) -> Vec<Vec<Vec<f32>>> {
     let t = x.len();
     let (h, dh) = (w.n_heads, w.d_head);
     let q = split_heads(&linear_batch(&w.wq, x, ctx), h, dh);
     let k = split_heads(&linear_batch(&w.wk, x, ctx), h, dh);
-    let p = split_heads(&linear_batch(&w.wpos, pos_window, ctx), h, dh);
+    let p = split_heads(&linear_batch(&w.wpos, relative_position_window, ctx), h, dh);
     assert_eq!(p.len(), 2 * t - 1);
     let scale = 1.0 / (dh as f32).sqrt();
     let mut out = Vec::with_capacity(t);
@@ -652,7 +579,7 @@ fn attention_core_into(
                 for d in 0..d_head {
                     ac += qu[d] * kj[d];
                 }
-                // Same window index as `rel_scores` (see its docs).
+                // Same window index as `relative_scores` (see its docs).
                 let kk = (j as isize - i as isize + t as isize - 1) as usize;
                 let pj = &p[kk][hh * d_head..(hh + 1) * d_head];
                 let mut bd = 0.0f32;
@@ -688,36 +615,36 @@ fn attention_core_into(
 }
 /// Relative multi-head attention (Transformer-XL shift):
 /// B[i,j] = (q_i + v) . P[(j-i) + (T-1)], scores / sqrt(dh).
-/// Scores come from `rel_scores`; this adds softmax + value mixing.
+/// Scores come from `relative_scores`; this adds softmax + value mixing.
 /// Scalar reference / `STTD_BURN_TENSOR=0` path; the tensor path goes
-/// through [`rel_attention_into`].
-pub(crate) fn rel_attention(
+/// through [`relative_attention_into`].
+pub(crate) fn relative_attention(
     x: &[Vec<f32>],
     w: &BlockWeights,
-    pos_window: &[Vec<f32>],
+    relative_position_window: &[Vec<f32>],
     ctx: &TensorCtx,
 ) -> Vec<Vec<f32>> {
     if ctx.enabled {
         let t = x.len();
         let mut out = vec![vec![0.0f32; w.n_heads * w.d_head]; t];
-        rel_attention_into(x, w, pos_window, ctx, &mut out, None);
+        relative_attention_into(x, w, relative_position_window, ctx, &mut out, None);
         return out;
     }
-    rel_attention_scalar(x, w, pos_window, ctx)
+    relative_attention_scalar(x, w, relative_position_window, ctx)
 }
 
-/// Exact scalar core of [`rel_attention`] (softmax + value mixing over
-/// `rel_scores`), used as the reference the fused core is pinned to.
-fn rel_attention_scalar(
+/// Exact scalar core of [`relative_attention`] (softmax + value mixing over
+/// `relative_scores`), used as the reference the fused core is pinned to.
+fn relative_attention_scalar(
     x: &[Vec<f32>],
     w: &BlockWeights,
-    pos_window: &[Vec<f32>],
+    relative_position_window: &[Vec<f32>],
     ctx: &TensorCtx,
 ) -> Vec<Vec<f32>> {
     let t = x.len();
     let (h, dh) = (w.n_heads, w.d_head);
     let v = split_heads(&linear_batch(&w.wv, x, ctx), h, dh);
-    let scores = rel_scores(x, w, pos_window, ctx);
+    let scores = relative_scores(x, w, relative_position_window, ctx);
     // scores is [T][H][T]; softmax over keys per (frame, head).
     let mut heads_out = Vec::with_capacity(h);
     for hh in 0..h {
@@ -745,16 +672,16 @@ fn rel_attention_scalar(
     linear_batch(&w.wout, &merged, ctx)
 }
 
-/// [`rel_attention`] writing straight into `out`: `None` overwrites,
+/// [`relative_attention`] writing straight into `out`: `None` overwrites,
 /// `Some(scale)` accumulates `out += scale * attn`. The tensor path runs
 /// the shared-A Q/K/V projections (one activation quantization for all
 /// three — exact, they see the same input), the fused
 /// [`attention_core_into`], and the out-projection with the residual add
 /// fused into its GEMM epilogue.
-pub(crate) fn rel_attention_into(
+pub(crate) fn relative_attention_into(
     x: &[Vec<f32>],
     w: &BlockWeights,
-    pos_window: &[Vec<f32>],
+    relative_position_window: &[Vec<f32>],
     ctx: &TensorCtx,
     out: &mut [Vec<f32>],
     add: Option<f32>,
@@ -764,7 +691,7 @@ pub(crate) fn rel_attention_into(
     let d = h * dh;
     assert_eq!(out.len(), t);
     if !ctx.enabled {
-        let a = rel_attention_scalar(x, w, pos_window, ctx);
+        let a = relative_attention_scalar(x, w, relative_position_window, ctx);
         match add {
             None => {
                 for (o, s) in out.iter_mut().zip(&a) {
@@ -792,8 +719,8 @@ pub(crate) fn rel_attention_into(
     proj(&w.wq, &mut q);
     proj(&w.wk, &mut k);
     proj(&w.wv, &mut v);
-    let mut p = vec![vec![0.0f32; d]; pos_window.len()];
-    w.wpos.forward_batch_into(pos_window, ctx, &mut p, Epilogue::None);
+    let mut p = vec![vec![0.0f32; d]; relative_position_window.len()];
+    w.wpos.forward_batch_into(relative_position_window, ctx, &mut p, Epilogue::None);
     let mut merged = vec![vec![0.0f32; d]; t];
     attention_core_into(
         &q,
@@ -886,10 +813,10 @@ pub(crate) fn conv_block_into(
 }
 
 /// One full block: half-step FFN sandwich + final norm.
-pub(crate) fn block_forward(
+pub(crate) fn conformer_forward(
     x: &[Vec<f32>],
     w: &BlockWeights,
-    pos_window: &[Vec<f32>],
+    relative_position_window: &[Vec<f32>],
     ctx: &TensorCtx,
 ) -> Vec<Vec<f32>> {
     let mut h = x.to_vec();
@@ -906,7 +833,7 @@ pub(crate) fn block_forward(
             0.5,
         );
         let na = layernorm_batch(&h, &w.norm_att);
-        rel_attention_into(&na, w, pos_window, ctx, &mut h, Some(1.0));
+        relative_attention_into(&na, w, relative_position_window, ctx, &mut h, Some(1.0));
         let nc = layernorm_batch(&h, &w.norm_conv);
         conv_block_into(&nc, w, ctx, &mut h, 1.0);
         let n2 = layernorm_batch(&h, &w.norm_ff2);
@@ -916,7 +843,7 @@ pub(crate) fn block_forward(
     let mut f = ffn(&layernorm_batch(&h, &w.norm_ff1), &w.ffn1_l1, &w.ffn1_l2, ctx);
     scale_inplace(&mut f, 0.5);
     add_inplace(&mut h, &f);
-    let a = rel_attention(&layernorm_batch(&h, &w.norm_att), w, pos_window, ctx);
+    let a = relative_attention(&layernorm_batch(&h, &w.norm_att), w, relative_position_window, ctx);
     add_inplace(&mut h, &a);
     let c = conv_block(&layernorm_batch(&h, &w.norm_conv), w, ctx);
     add_inplace(&mut h, &c);
@@ -929,7 +856,8 @@ pub(crate) fn block_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parakeet_burn::quant::Uint8Linear;
+    use super::super::ops::layernorm_row;
+    use crate::parakeet_burn::quant_linear::Uint8Linear;
 
     #[test]
     fn layernorm_matches_biased_definition() {
@@ -1020,7 +948,7 @@ mod tests {
 
     #[test]
     fn dw_tensor_matches_scalar() {
-        use super::super::backend::cpu_device;
+        use super::super::runtime::cpu_device;
         // 2 channels, k=3, non-trivial taps/scales/biases, mixed signs.
         let dw = DwConv {
             weight_u8: vec![3, 250, 7, 200, 10, 44],
@@ -1056,10 +984,10 @@ mod tests {
     }
 
     #[test]
-    fn pos_window_slices_centered_distances() {
+    fn relative_position_window_slices_centered_distances() {
         // synthetic table[i] = i: window for T=4 is rows 4996..5002.
         let table: Vec<Vec<f32>> = (0..9999).map(|i| vec![i as f32]).collect();
-        let w = pos_window(&table, 4);
+        let w = relative_position_window(&table, 4);
         assert_eq!(w.len(), 7);
         assert_eq!(w[0][0], 4996.0);
         assert_eq!(w[3][0], 4999.0); // distance 0 at index T-1
@@ -1075,7 +1003,7 @@ mod tests {
         // correct kk = (j-i)+(T-1). Row 0 must therefore prefer key 1
         // (output near v1 = 0); the flipped sign would put P[0] = 10 on
         // key 1 and prefer key 0 instead. This pins the shift direction
-        // voted off ORT's Add_2 (see `rel_scores`).
+        // voted off ORT's Add_2 (see `relative_scores`).
         let eye = Uint8Linear {
             weight_u8: vec![1],
             scale: vec![1.0],
@@ -1140,7 +1068,7 @@ mod tests {
         };
         let x = vec![vec![1.0], vec![0.0]];
         let pw = vec![vec![10.0], vec![20.0], vec![30.0]];
-        let y = rel_attention(&x, &w, &pw, &TensorCtx::scalar());
+        let y = relative_attention(&x, &w, &pw, &TensorCtx::scalar());
         assert_eq!(y.len(), 2);
         // Row 0: scores [1+20, 0+30] -> attends to key 1 (v=0).
         assert!(y[0][0] < 0.1, "y={y:?}");
@@ -1152,17 +1080,17 @@ mod tests {
         // fast path the whole comparison is bit-exact (shared-A Q/K/V
         // quantize identically, the fused core replicates the scalar
         // accumulation order).
-        let yt = rel_attention(
+        let yt = relative_attention(
             &x,
             &w,
             &pw,
             &TensorCtx {
-                device: super::super::backend::cpu_device(),
+                device: super::super::runtime::cpu_device(),
                 enabled: true,
             },
         );
         assert_eq!(yt.len(), 2);
-        let exact = crate::parakeet_burn::igemm::has_fast_path();
+        let exact = crate::parakeet_burn::int_gemm::has_avx512_int_gemm();
         for (a, b) in y.iter().zip(yt.iter()) {
             if exact {
                 assert_eq!(a, b, "scalar={y:?} tensor={yt:?}");
@@ -1172,8 +1100,8 @@ mod tests {
         }
         // Full block preserves shape and stays finite.
         let table: Vec<Vec<f32>> = (0..9999).map(|i| vec![i as f32]).collect();
-        let win = pos_window(&table, 2);
-        let z = block_forward(&vec![vec![1.0], vec![0.0]], &w, &win, &TensorCtx::scalar());
+        let win = relative_position_window(&table, 2);
+        let z = conformer_forward(&vec![vec![1.0], vec![0.0]], &w, &win, &TensorCtx::scalar());
         assert_eq!(z.len(), 2);
         assert!(z.iter().all(|r| r.len() == 1 && r.iter().all(|v| v.is_finite())));
     }
@@ -1200,7 +1128,7 @@ mod tests {
                 .collect();
             let pu: Vec<Vec<f32>> = (0..h).map(|_| (0..dh).map(|_| rnd()).collect()).collect();
             let pv: Vec<Vec<f32>> = (0..h).map(|_| (0..dh).map(|_| rnd()).collect()).collect();
-            // Scalar reference: the exact code `rel_scores` + `softmax_rows`
+            // Scalar reference: the exact code `relative_scores` + `softmax_rows`
             // + AV run (same per-head slice copies, same orders).
             let scale = 1.0 / (dh as f32).sqrt();
             let mut want = vec![vec![0.0f32; d]; t];
@@ -1243,13 +1171,13 @@ mod tests {
     }
 
     fn load_layer0(dir: &std::path::Path) -> (BlockWeights, Vec<Vec<f32>>) {
-        use super::super::encoder::EncoderManifest;
+        use super::super::manifest::EncoderManifest;
         use super::super::weights::load_selected;
         let json = std::fs::read_to_string(dir.join("encoder-manifest.json")).unwrap();
         let manifest: EncoderManifest =
-            crate::parakeet_burn::encoder::load_manifest(&json).unwrap();
+            crate::parakeet_burn::manifest::load_manifest(&json).unwrap();
         let mut want = std::collections::HashSet::new();
-        for suffix in crate::parakeet_burn::encoder::LAYER_ROLES {
+        for suffix in crate::parakeet_burn::manifest::LAYER_ROLES {
             let role = format!("layers.0/{suffix}");
             let e = manifest.role(&role).unwrap();
             want.insert(e.weight.clone());
@@ -1302,9 +1230,9 @@ mod tests {
             ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
         };
         let x: Vec<Vec<f32>> = (0..8).map(|_| (0..1024).map(|_| rnd()).collect()).collect();
-        let win = pos_window(&table, 8);
+        let win = relative_position_window(&table, 8);
         assert_eq!(win.len(), 15);
-        let y = block_forward(&x, &bw, &win, &TensorCtx::scalar());
+        let y = conformer_forward(&x, &bw, &win, &TensorCtx::scalar());
         assert_eq!(y.len(), 8);
         assert!(y.iter().all(|r| r.len() == 1024 && r.iter().all(|v| v.is_finite())));
         // norm_out invariant: (y - beta) / gamma has ~zero mean and
@@ -1349,8 +1277,8 @@ mod tests {
         };
         let x = f32mat("blk_in_T1024", 8, 1024);
         let want = f32mat("blk_ref", 8, 1024);
-        let win = pos_window(&table, 8);
-        let y = block_forward(&x, &bw, &win, &TensorCtx::scalar());
+        let win = relative_position_window(&table, 8);
+        let y = conformer_forward(&x, &bw, &win, &TensorCtx::scalar());
         let (mut max_abs, mut sum_abs) = (0.0f32, 0.0f32);
         let mut ref_max = 0.0f32;
         for (yr, wr) in y.iter().zip(want.iter()) {
@@ -1435,8 +1363,8 @@ mod tests {
             }
         }
         check("ffn1", &f1, &sub(&add0, &x));
-        let win = pos_window(&table, 8);
-        let a = rel_attention(&layernorm_batch(&add0, &bw.norm_att), &bw, &win, &ctx);
+        let win = relative_position_window(&table, 8);
+        let a = relative_attention(&layernorm_batch(&add0, &bw.norm_att), &bw, &win, &ctx);
         check("attn", &a, &sub(&add1, &add0));
         let c = conv_block(&layernorm_batch(&add1, &bw.norm_conv), &bw, &ctx);
         check("conv", &c, &sub(&add2, &add1));
@@ -1447,7 +1375,7 @@ mod tests {
             }
         }
         check("ffn2", &f2, &sub(&add3, &add2));
-        // Pre-softmax scores: ORT's Div is [H,T,T]; `rel_scores` returns
+        // Pre-softmax scores: ORT's Div is [H,T,T]; `relative_scores` returns
         // [T,H,T], transposed here for the comparison.
         let div_v = sst.tensor("self_attn_Div").unwrap();
         assert_eq!(div_v.shape(), &[8, 8, 8]);
@@ -1456,7 +1384,7 @@ mod tests {
             .chunks(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        let sc = rel_scores(&layernorm_batch(&add0, &bw.norm_att), &bw, &win, &ctx);
+        let sc = relative_scores(&layernorm_batch(&add0, &bw.norm_att), &bw, &win, &ctx);
         let mut flat_htt = vec![0.0f32; 512];
         for i in 0..8 {
             for hh in 0..8 {
@@ -1477,7 +1405,7 @@ mod tests {
     }
 
     /// Tensor-path layer-0 parity: same golden as `ort_layer0_parity`,
-    /// but through `block_forward` with the tensor linears. Compared
+    /// but through `conformer_forward` with the tensor linears. Compared
     /// against ORT (same 0.1% bound — policy (b) allows re-baselining
     /// here if Flex summation order exceeds it while transcripts stay
     /// word-exact) and against the scalar twin (tight: f32 order only).
@@ -1504,13 +1432,13 @@ mod tests {
         };
         let x = f32mat("blk_in_T1024", 8, 1024);
         let want = f32mat("blk_ref", 8, 1024);
-        let win = pos_window(&table, 8);
+        let win = relative_position_window(&table, 8);
         let tctx = TensorCtx {
-            device: super::super::backend::cpu_device(),
+            device: super::super::runtime::cpu_device(),
             enabled: true,
         };
-        let y = block_forward(&x, &bw, &win, &tctx);
-        let ys = block_forward(&x, &bw, &win, &TensorCtx::scalar());
+        let y = conformer_forward(&x, &bw, &win, &tctx);
+        let ys = conformer_forward(&x, &bw, &win, &TensorCtx::scalar());
         let (mut max_abs, mut sum_abs) = (0.0f32, 0.0f32);
         let (mut max_vs, mut ref_max) = (0.0f32, 0.0f32);
         for ((yt, ys), wr) in y.iter().zip(ys.iter()).zip(want.iter()) {

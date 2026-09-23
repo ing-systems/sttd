@@ -45,7 +45,7 @@ pub(crate) fn parse_tensor_flag(v: Option<&str>) -> bool {
 }
 
 /// Read once at load (never in tests: env vars are process-global).
-pub(crate) fn use_tensor_path() -> bool {
+pub(crate) fn tensor_path_enabled() -> bool {
     parse_tensor_flag(std::env::var("STTD_BURN_TENSOR").ok().as_deref())
 }
 /// Size rayon's process-wide thread pool from `--threads` (already
@@ -63,7 +63,7 @@ pub(crate) fn use_tensor_path() -> bool {
 /// `STTD_BURN_PIN=0` disables it. If `--threads` exceeds the physical
 /// core count, pinning is skipped (two pinned workers must not share a
 /// CPU) and logged.
-pub(crate) fn cap_thread_pool(n_threads: usize) {
+pub(crate) fn size_thread_pool(n_threads: usize) {
     use std::sync::Once;
     static CAP: Once = Once::new();
     let want = n_threads.max(1);
@@ -197,13 +197,13 @@ mod tests {
         // what must hold either way is that repeated calls never panic and
         // never change an existing size. (The winning-first case —
         // `--threads` actually sizing the pool — is what the binary
-        // relies on, and it calls `cap_thread_pool` before any parallel
+        // relies on, and it calls `size_thread_pool` before any parallel
         // work; it is not observable from a shared test process.)
         let before = rayon::current_num_threads();
-        super::cap_thread_pool(4);
+        super::size_thread_pool(4);
         // Reloads re-call this: the Once gate makes every later call a
         // no-op that must never panic, even with a different request.
-        super::cap_thread_pool(2);
+        super::size_thread_pool(2);
         assert_eq!(rayon::current_num_threads(), before);
     }
 

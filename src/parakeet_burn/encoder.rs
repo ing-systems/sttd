@@ -7,15 +7,15 @@
 // `Softmax` x24.
 //
 // Bring-up order (each step landed with a parity test against ORT):
-//  1. subsampling conv block — done (`pre_encode.rs`, golden-verified).
-//  2. one Conformer block — done (`block.rs`, golden-verified).
+//  1. subsampling conv block — done (`subsampler.rs`, golden-verified).
+//  2. one Conformer block — done (`conformer_block.rs`, golden-verified).
 //  3. full depth (`BurnEncoder::forward` below) — done, isolated
 //     per-layer parity flat at ~2-15%; chained drift is
 //     activation-requantization accumulation (exact match waits on
-//     `quant::forward` replicating `DynamicQuantizeLinear`).
+//     `quant_linear::forward` replicating `DynamicQuantizeLinear`).
 //
 // Length masking is a no-op for full-length offline utterances (same as
-// `block.rs`); the graph's final transpose is just a reshape to
+// `conformer_block.rs`); the graph's final transpose is just a reshape to
 // `[1, 1024, T']`, so `forward` returns `[T'][1024]` rows matching every
 // `/layers.N/norm_out` intermediate.
 
@@ -23,9 +23,9 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
-use super::block::{block_forward, pos_window, BlockWeights};
-use super::pre_encode::{pre_encode_want, PreEncodeWeights};
-use super::tensor::TensorCtx;
+use super::conformer_block::{conformer_forward, relative_position_window, BlockWeights};
+use super::subsampler::PreEncodeWeights;
+use super::tensor_ctx::TensorCtx;
 use super::weights::RawTensor;
 
 /// One Conformer block config (FastConformer-TDT-0.6B-v3 shapes, read off
@@ -75,14 +75,14 @@ impl Default for EncoderConfig {
 
 /// Subsampling: 2 x strided conv = 4x, + frame stacking = 8x total
 /// (matches the TDT `encoder_stride = 8` in `decoder_tdt.rs`).
-pub(crate) fn subsampled_frames(n_mel_frames: usize) -> usize {
+pub(crate) fn coarse_subsampled_frames(n_mel_frames: usize) -> usize {
     n_mel_frames / 8
 }
 
 /// Full encoder stack: pre-encode subsampling + 24 Conformer blocks.
 ///
 /// Layout (verified against `encoder-model.int8.onnx`): mel `[T][128]`
-/// -> pre-encode `[T'][1024]` -> one `block_forward` per layer (each
+/// -> pre-encode `[T'][1024]` -> one `conformer_forward` per layer (each
 /// ending in its own `norm_out`) -> `[T'][1024]` rows. The graph's final
 /// `Transpose_2` only reshapes to `[1, 1024, T']` for the joint; the row
 /// layout here matches every `/layers.N/norm_out` intermediate
@@ -135,13 +135,13 @@ impl BurnEncoder {
 
     /// Build every cached tensor in the stack now (load-time warming):
     /// pre-encode first, then all 24 layers in parallel over rayon's
-    /// pool (each layer warms independently — see `BlockWeights::warm`).
+    /// pool (each layer warms independently — see `BlockWeights::prime_cache`).
     /// Without this the first utterance pays the full dequant + `from_data`
     /// build (~4 s); warmed, every forward reuses the tensors.
-    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
+    pub(crate) fn prime_cache(&self, device: &super::runtime::CpuDevice) {
         use rayon::prelude::*;
-        self.pre.warm(device);
-        self.blocks.par_iter().for_each(|b| b.warm(device));
+        self.pre.prime_cache(device);
+        self.blocks.par_iter().for_each(|b| b.prime_cache(device));
     }
 
     /// Mel `[T][128]` -> encoder states `[T'][1024]`. Empty in, empty out.
@@ -150,9 +150,9 @@ impl BurnEncoder {
         if h.is_empty() {
             return Ok(h);
         }
-        let win = pos_window(&self.pos_table, h.len());
+        let win = relative_position_window(&self.pos_table, h.len());
         for b in &self.blocks {
-            h = block_forward(&h, b, &win, ctx);
+            h = conformer_forward(&h, b, &win, ctx);
         }
         Ok(h)
     }
@@ -161,9 +161,9 @@ impl BurnEncoder {
 /// Exact tensor names `weights::load_selected` must fetch for a full
 /// `BurnEncoder::load`: pre-encode set + per-layer linears/norms/biases +
 /// the frozen position table. Keeps the full 582 MB file on disk for
-/// callers that only need one layer (see `block.rs` tests).
-pub(crate) fn encoder_want(manifest: &EncoderManifest) -> Result<HashSet<String>> {
-    let mut want = pre_encode_want(manifest)?;
+/// callers that only need one layer (see `conformer_block.rs` tests).
+pub(crate) fn required_tensors(manifest: &EncoderManifest) -> Result<HashSet<String>> {
+    let mut want = super::subsampler::required_tensors(manifest)?;
     for layer in 0..manifest.n_layers() {
         for suffix in LAYER_ROLES {
             let role = format!("layers.{layer}/{suffix}");
@@ -196,188 +196,18 @@ pub(crate) fn encoder_want(manifest: &EncoderManifest) -> Result<HashSet<String>
     Ok(want)
 }
 
-/// One quantized op from `encoder-manifest.json` (see
-/// `tools/convert-parakeet-int8-to-burn.py::emit_encoder_manifest`):
-/// a NeMo role path (`layers.3/self_attn/linear_q`) joined to its int8
-/// weight base name in the converted safetensors.
-#[derive(Debug, Clone)]
-pub(crate) struct RoleEntry {
-    pub(crate) role: String,
-    pub(crate) kind: String,
-    /// Weight base name in `*-burn.safetensors` (`<base>` + `.scale` +
-    /// `.zero_point`); `None` only for a malformed manifest (rejected by
-    /// `load_manifest`).
-    pub(crate) weight: String,
-    pub(crate) weight_shape: Vec<usize>,
-    /// `conv.group` for `kind == "conv"` (scalar in the manifest's `conv`
-    /// attr); `None` for matmuls. Lets loaders assert depthwise vs dense
-    /// at load instead of trusting role names.
-    pub(crate) group: Option<usize>,
-}
-
-/// The 12 quantized roles every Conformer layer carries (verified against
-/// the int8 graph: 24 layers x these, no exceptions).
-pub(crate) const LAYER_ROLES: &[&str] = &[
-    "self_attn/linear_q",
-    "self_attn/linear_k",
-    "self_attn/linear_v",
-    "self_attn/linear_pos",
-    "self_attn/linear_out",
-    "feed_forward1/linear1",
-    "feed_forward1/linear2",
-    "feed_forward2/linear1",
-    "feed_forward2/linear2",
-    "conv/pointwise_conv1",
-    "conv/depthwise_conv",
-    "conv/pointwise_conv2",
-];
-
-/// Validated encoder manifest: role -> entry for all 24 layers plus the
-/// 6 pre_encode ops. The forward pass looks weights up here, so a missing
-/// or misshapen role fails at load, never mid-utterance.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct EncoderManifest {
-    pub(crate) roles: std::collections::HashMap<String, RoleEntry>,
-    /// Depthwise-conv bias map: `layers.N/conv/depthwise_bias` role ->
-    /// anonymous F32 initializer name (traced through `Reshape` by the
-    /// converter; see `tools/convert-parakeet-int8-to-burn.py`). Absent
-    /// for hand-written manifests; `BlockWeights::load` then falls back
-    /// to the role name itself.
-    pub(crate) dw_bias: std::collections::HashMap<String, String>,
-}
-
-impl EncoderManifest {
-    pub(crate) fn role(&self, role: &str) -> Option<&RoleEntry> {
-        self.roles.get(role)
-    }
-
-    pub(crate) fn dw_bias_init(&self, layer: usize) -> Option<String> {
-        self.dw_bias
-            .get(&format!("layers.{layer}/conv/depthwise_bias"))
-            .cloned()
-    }
-
-    pub(crate) fn n_layers(&self) -> usize {
-        self.roles
-            .keys()
-            .filter_map(|r| {
-                r.strip_prefix("layers.")
-                    .and_then(|s| s.split('/').next())
-                    .and_then(|n| n.parse::<usize>().ok())
-            })
-            .max()
-            .map_or(0, |m| m + 1)
-    }
-}
-
-/// Parse + validate `encoder-manifest.json`: every layer in
-/// `0..n_layers` must carry all of `LAYER_ROLES` with a named,
-/// non-empty weight shape; pre_encode's 6 ops must be present.
-pub(crate) fn load_manifest(json: &str) -> anyhow::Result<EncoderManifest> {
-    let v: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| anyhow::anyhow!("burn encoder manifest: invalid JSON: {e}"))?;
-    let ops = v
-        .get("quant_ops")
-        .and_then(|o| o.as_array())
-        .ok_or_else(|| anyhow::anyhow!("burn encoder manifest: missing quant_ops"))?;
-    let mut roles = std::collections::HashMap::new();
-    for op in ops {
-        let role = op
-            .get("role")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| anyhow::anyhow!("burn encoder manifest: entry without role"))?;
-        let weight = op
-            .get("weight")
-            .and_then(|w| w.as_str())
-            .ok_or_else(|| anyhow::anyhow!("burn encoder manifest: {role} without weight"))?;
-        let shape = op
-            .get("weight_shape")
-            .and_then(|s| s.as_array())
-            .ok_or_else(|| anyhow::anyhow!("burn encoder manifest: {role} without weight_shape"))?;
-        let mut dims = Vec::with_capacity(shape.len());
-        for d in shape {
-            dims.push(d.as_u64().ok_or_else(|| {
-                anyhow::anyhow!("burn encoder manifest: {role} has non-integer dim")
-            })? as usize);
-        }
-        if dims.is_empty() || dims.contains(&0) {
-            anyhow::bail!("burn encoder manifest: {role} has empty weight_shape");
-        }
-        let kind = op.get("kind").and_then(|k| k.as_str()).unwrap_or("matmul");
-        let group = op
-            .get("conv")
-            .and_then(|c| c.get("group"))
-            .and_then(|g| g.as_u64())
-            .map(|g| g as usize);
-        roles.insert(
-            role.to_string(),
-            RoleEntry {
-                role: role.to_string(),
-                kind: kind.to_string(),
-                weight: weight.to_string(),
-                weight_shape: dims,
-                group,
-            },
-        );
-    }
-    let manifest = EncoderManifest { roles, dw_bias: parse_dw_bias(&v)? };
-    // Pre-encode's 6 ops (5 convs + out proj) must be present.
-    for role in [
-        "pre_encode/conv/conv.0",
-        "pre_encode/conv/conv.2",
-        "pre_encode/conv/conv.3",
-        "pre_encode/conv/conv.5",
-        "pre_encode/conv/conv.6",
-        "pre_encode/out",
-    ] {
-        if !manifest.roles.contains_key(role) {
-            anyhow::bail!("burn encoder manifest: missing {role}");
-        }
-    }
-    let n = manifest.n_layers();
-    if n == 0 {
-        anyhow::bail!("burn encoder manifest: no layers.N roles");
-    }
-    for layer in 0..n {
-        for suffix in LAYER_ROLES {
-            let role = format!("layers.{layer}/{suffix}");
-            if !manifest.roles.contains_key(&role) {
-                anyhow::bail!("burn encoder manifest: missing {role}");
-            }
-        }
-    }
-    Ok(manifest)
-}
-
-/// Parse the optional top-level `dw_bias` map (role -> initializer).
-/// Missing or malformed = empty map; `BlockWeights::load` falls back to
-/// the role name, so hand-written test manifests keep working.
-fn parse_dw_bias(v: &serde_json::Value) -> anyhow::Result<std::collections::HashMap<String, String>> {
-    let mut out = std::collections::HashMap::new();
-    let Some(map) = v.get("dw_bias") else {
-        return Ok(out);
-    };
-    let map = map
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("burn encoder manifest: dw_bias is not an object"))?;
-    for (k, val) in map {
-        let init = val.as_str().ok_or_else(|| {
-            anyhow::anyhow!("burn encoder manifest: dw_bias[{k}] is not a string")
-        })?;
-        out.insert(k.clone(), init.to_string());
-    }
-    Ok(out)
-}
+use super::manifest::{EncoderManifest, LAYER_ROLES};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::manifest::load_manifest;
 
     #[test]
     fn subsampling_matches_tdt_stride_8() {
         // 101 mel frames (1 s) -> 12 encoder frames (floor).
-        assert_eq!(subsampled_frames(101), 12);
-        assert_eq!(subsampled_frames(800), 100);
+        assert_eq!(coarse_subsampled_frames(101), 12);
+        assert_eq!(coarse_subsampled_frames(800), 100);
     }
 
     #[test]
@@ -498,9 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn encoder_want_covers_full_stack() {
+    fn required_tensors_covers_full_stack() {
         let m = load_manifest(&mini_manifest(None)).expect("mini manifest loads");
-        let want = encoder_want(&m).expect("want set builds");
+        let want = required_tensors(&m).expect("want set builds");
         // Mini manifest shares `w_pre` across all 6 pre-encode roles
         // (deduped to weight + scale + zp + out bias = 4) while layer
         // roles are distinct (12 x3 + 10 norms + 2 pos-bias + 1 dw bias
@@ -527,7 +357,7 @@ mod tests {
         let json = std::fs::read_to_string(dir.join("encoder-manifest.json")).unwrap();
         let manifest = load_manifest(&json).unwrap();
         assert_eq!(manifest.n_layers(), 24);
-        let want = encoder_want(&manifest).unwrap();
+        let want = required_tensors(&manifest).unwrap();
         let tensors =
             load_selected(&dir.join("encoder-burn.safetensors"), &want).unwrap();
         let enc = BurnEncoder::load(&tensors, &manifest).unwrap();
@@ -597,14 +427,14 @@ mod tests {
         // so error never compounds. Tensor bounds match scalar per
         // policy (b) — loosened only if Flex summation order exceeds
         // them while transcripts stay word-exact.
-        let win = super::super::block::pos_window(&enc.pos_table, 8);
+        let win = super::super::conformer_block::relative_position_window(&enc.pos_table, 8);
         let tctx = TensorCtx {
-            device: super::super::backend::cpu_device(),
+            device: super::super::runtime::cpu_device(),
             enabled: true,
         };
         for (tag, ctx) in [("scalar", sctx), ("tensor", tctx)] {
             // Sanity per path: pre-encode output matches the golden
-            // block input (same 5% fp32-vs-int8 bound as `pre_encode.rs`;
+            // block input (same 5% fp32-vs-int8 bound as `subsampler.rs`;
             // this also covers the pre-encode out-projection tensor twin).
             let own_pre = enc.pre.forward(&mel, &ctx).unwrap();
             let mut pre_max = 0.0f32;
@@ -622,7 +452,7 @@ mod tests {
             let mut prev = pre_ref.clone();
             for (layer, b) in enc.blocks.iter().enumerate() {
                 let want = f32mat(&format!("layer{layer}_ref"), 8, 1024);
-                let got = super::super::block::block_forward(&prev, b, &win, &ctx);
+                let got = super::super::conformer_block::conformer_forward(&prev, b, &win, &ctx);
             let (mut max_abs, mut sum_abs) = (0.0f32, 0.0f32);
             let mut ref_max = 0.0f32;
             for (yr, wr) in got.iter().zip(want.iter()) {
@@ -668,20 +498,19 @@ mod tests {
     #[ignore]
     fn profile_breakdown() {
         use std::time::Instant;
-        use super::super::block::{
-            block_forward, conv_block, ffn, layernorm_batch, pos_window, rel_attention,
-        };
+        use super::super::conformer_block::{conformer_forward, conv_block, ffn, relative_position_window, relative_attention};
+        use super::super::ops::layernorm_batch;
         use super::super::weights::load_selected;
         let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
 
         // Match the production pool before timing: the binary resolves
         // `--threads 0` to physical cores and pins workers by default, so
         // these numbers are comparable to `sttd --parakeet-engine burn`.
-        super::super::backend::cap_thread_pool(num_cpus::get_physical());
+        super::super::runtime::size_thread_pool(num_cpus::get_physical());
         eprintln!(
             "profile: rayon threads = {} (pin={})",
             rayon::current_num_threads(),
-            super::super::backend::parse_pin_flag(
+            super::super::runtime::parse_pin_flag(
                 std::env::var("STTD_BURN_PIN").ok().as_deref()
             )
         );
@@ -691,14 +520,14 @@ mod tests {
         let manifest = load_manifest(&json).unwrap();
         let t0 = Instant::now();
         let tensors =
-            load_selected(&dir.join("encoder-burn.safetensors"), &encoder_want(&manifest).unwrap())
+            load_selected(&dir.join("encoder-burn.safetensors"), &required_tensors(&manifest).unwrap())
                 .unwrap();
         let enc = BurnEncoder::load(&tensors, &manifest).unwrap();
-        eprintln!("profile: encoder load+warm = {:.0} ms", ms(t0));
+        eprintln!("profile: encoder load+prime_cache = {:.0} ms", ms(t0));
         // Steady-state only: the binary warms at load (see `mod.rs`), so
         // the first forward must not pay cache builds in these numbers.
-        let cpu = super::super::backend::cpu_device();
-        enc.warm(&cpu);
+        let cpu = super::super::runtime::cpu_device();
+        enc.prime_cache(&cpu);
 
         let bytes =
             std::fs::read("src/parakeet_burn/testdata/encoder_full_golden.safetensors").unwrap();
@@ -715,7 +544,7 @@ mod tests {
 
         let sctx = TensorCtx::scalar();
         let tctx = TensorCtx {
-            device: super::super::backend::cpu_device(),
+            device: super::super::runtime::cpu_device(),
             enabled: true,
         };
         for (tag, ctx) in [("scalar", sctx), ("tensor", tctx)] {
@@ -726,9 +555,9 @@ mod tests {
                 let _ = enc.pre.forward(&mel, &ctx).unwrap();
                 pre_ms = pre_ms.min(ms(t));
             }
-            let win = pos_window(&enc.pos_table, pre.len());
+            let win = relative_position_window(&enc.pos_table, pre.len());
             let b = &enc.blocks[0];
-            // Stage breakdown on layer 0 (replicates `block_forward` staging).
+            // Stage breakdown on layer 0 (replicates `conformer_forward` staging).
             let mut stage = |f: &dyn Fn()| {
                 let mut best = f64::INFINITY;
                 for _ in 0..5 {
@@ -749,7 +578,7 @@ mod tests {
                 // NOTE: attention input here is norm(pre), not norm(pre+f1)
                 // as in the real chain — timing only, values discarded.
                 let na = layernorm_batch(&pre, &b.norm_att);
-                let _ = rel_attention(&na, b, &win, &ctx);
+                let _ = relative_attention(&na, b, &win, &ctx);
             });
             let conv_ms = stage(&|| {
                 let nc = layernorm_batch(&pre, &b.norm_conv);
@@ -766,7 +595,7 @@ mod tests {
                 let t1 = Instant::now();
                 let mut h = pre.clone();
                 for b in &enc.blocks {
-                    h = block_forward(&h, b, &win, &ctx);
+                    h = conformer_forward(&h, b, &win, &ctx);
                 }
                 blocks_ms = blocks_ms.min(ms(t1));
             }
@@ -793,7 +622,7 @@ mod tests {
             (0..32).map(|_| (0..1024).map(|_| rnd()).collect()).collect();
         let x4096_32: Vec<Vec<f32>> =
             (0..32).map(|_| (0..4096).map(|_| rnd()).collect()).collect();
-        let dev = super::super::backend::cpu_device();
+        let dev = super::super::runtime::cpu_device();
         for (name, lin, xs) in [
             ("ffn1_l1 1024->4096", &b.ffn1_l1, &x1024),
             ("ffn1_l2 4096->1024", &b.ffn1_l2, &x4096),
@@ -831,7 +660,7 @@ mod tests {
             let t = Instant::now();
             let reps = 50;
             for _ in 0..reps {
-                let _ = super::super::igemm::quantize_rows_i16(&flat);
+                let _ = super::super::int_gemm::quantize_rows_i16(&flat);
             }
             eprintln!(
                 "profile quantize 32x1024: {:.3} ms/call (50 reps)",
@@ -841,7 +670,7 @@ mod tests {
                 x4096_32.iter().flat_map(|r| r.iter().copied()).collect();
             let t = Instant::now();
             for _ in 0..reps {
-                let _ = super::super::igemm::quantize_rows_i16(&flat4);
+                let _ = super::super::int_gemm::quantize_rows_i16(&flat4);
             }
             eprintln!(
                 "profile quantize 32x4096: {:.3} ms/call (50 reps)",
@@ -852,7 +681,7 @@ mod tests {
         // Elementwise microbench: swish over FFN-width rows (T=8 x 4096)
         // isolates the libm exp cost inside ffn1/ffn2 timings above.
         {
-            use super::super::block::swish_inplace;
+            use super::super::ops::swish_inplace;
             let mut rows = x4096.clone();
             let t = Instant::now();
             let reps = 20;
@@ -880,16 +709,16 @@ mod tests {
         {
             let b = &enc.blocks[0];
             let pre = enc.pre.forward(&mel, &sctx).unwrap();
-            let win = pos_window(&enc.pos_table, pre.len());
+            let win = relative_position_window(&enc.pos_table, pre.len());
             let natt = layernorm_batch(&pre, &b.norm_att);
             let t = Instant::now();
             for _ in 0..10 {
-                let _ = rel_attention(&natt, b, &win, &sctx);
+                let _ = relative_attention(&natt, b, &win, &sctx);
             }
             let s_ms = ms(t) / 10.0;
             let t = Instant::now();
             for _ in 0..10 {
-                let _ = rel_attention(&natt, b, &win, &tctx);
+                let _ = relative_attention(&natt, b, &win, &tctx);
             }
             let t_ms = ms(t) / 10.0;
             eprintln!("profile attn T=8/layer: scalar={s_ms:.2}ms tensor={t_ms:.2}ms");
@@ -921,7 +750,7 @@ mod tests {
                 }
                 let pre = enc.pre.forward(&mel256, &ctx).unwrap();
                 assert_eq!(pre.len(), 32);
-                let win = pos_window(&enc.pos_table, pre.len());
+                let win = relative_position_window(&enc.pos_table, pre.len());
                 let b = &enc.blocks[0];
                 let mut stage = |f: &dyn Fn()| {
                     let mut best = f64::INFINITY;
@@ -934,7 +763,7 @@ mod tests {
                 };
                 let attn_ms = stage(&|| {
                     let na = layernorm_batch(&pre, &b.norm_att);
-                    let _ = rel_attention(&na, b, &win, &ctx);
+                    let _ = relative_attention(&na, b, &win, &ctx);
                 });
                 let conv_ms = stage(&|| {
                     let nc = layernorm_batch(&pre, &b.norm_conv);
@@ -950,7 +779,7 @@ mod tests {
                     let t1 = Instant::now();
                     h = pre.clone();
                     for b in &enc.blocks {
-                        h = block_forward(&h, b, &win, &ctx);
+                        h = conformer_forward(&h, b, &win, &ctx);
                     }
                     full_ms = full_ms.min(ms(t1));
                 }
@@ -963,7 +792,7 @@ mod tests {
 
         // Frontend on 2.5 s synthetic audio.
         {
-            let fe = super::super::frontend::MelFrontend::tdt_v3();
+            let fe = super::super::mel_frontend::MelFrontend::tdt_v3();
             let mut seed: u64 = 0xFE;
             let pcm: Vec<f32> = (0..40_000)
                 .map(|_| {
@@ -988,8 +817,8 @@ mod tests {
 
         // Joint decode on the real T=8 encoder output (e2e tripwire: tokens).
         {
-            use super::super::joint::{BurnJoint, joint_want};
-            let want = joint_want();
+            use super::super::joint::{BurnJoint, required_tensors};
+            let want = required_tensors();
             let jt = load_selected(&dir.join("decoder_joint-burn.safetensors"), &want).unwrap();
             let mut joint = BurnJoint::load(&jt, 8193).unwrap();
             let enc_out = enc.forward(&mel, &tctx).unwrap();
@@ -1041,8 +870,8 @@ mod tests {
         // Vec<i16> is only 2B-aligned, so every `_mm512_loadu` splits.
         // If aligned buffers win clearly, the hot path allocates them.
         {
-            use super::super::igemm::linear_i16;
-            use super::super::igemm::widen_weights;
+            use super::super::int_gemm::int_gemm;
+            use super::super::int_gemm::widen_weights;
             let (t, k, n) = (32usize, 1024usize, 1024usize);
             let wu: Vec<u8> = (0..n * k).map(|i| (i * 37 % 256) as u8).collect();
             let bw = widen_weights(&wu, n, k, &[100.0]);
@@ -1078,10 +907,10 @@ mod tests {
             for _ in 0..10 {
                 let mut out = vec![0.0f32; t * n];
                 let t0 = Instant::now();
-                linear_i16(sp, t, k, &bw, n, &sw, None, 0.05, &mut out);
+                int_gemm(sp, t, k, &bw, n, &sw, None, 0.05, &mut out);
                 best_split = best_split.min(ms(t0));
                 let t0 = Instant::now();
-                linear_i16(aa, t, k, &bw, n, &sw, None, 0.05, &mut out);
+                int_gemm(aa, t, k, &bw, n, &sw, None, 0.05, &mut out);
                 best_al = best_al.min(ms(t0));
             }
             eprintln!("profile gemm T32/K1024/N1024: split={best_split:.3}ms aligned={best_al:.3}ms");

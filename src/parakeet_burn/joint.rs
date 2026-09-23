@@ -28,10 +28,10 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
-use super::backend::{CpuBackend, CpuDevice};
-use super::decode::{JointStep, TdtGreedy};
-use super::quant::Uint8Linear;
-use super::tensor::TensorCtx;
+use super::runtime::{CpuBackend, CpuDevice};
+use super::tdt_greedy::{JointStep, TdtGreedy};
+use super::quant_linear::Uint8Linear;
+use super::tensor_ctx::TensorCtx;
 use super::weights::RawTensor;
 
 /// Joint config resolved from converted weights at load.
@@ -162,7 +162,7 @@ impl LstmLayer {
     /// is enabled (their f32 inputs are never quantized, so `igemm`
     /// does not apply — but at 61 µs per matmul Flex is already fast
     /// enough here that no integer path is needed).
-    pub(crate) fn warm(&self, device: &CpuDevice) {
+    pub(crate) fn prime_cache(&self, device: &CpuDevice) {
         let _ = (self.wf(), self.rf());
         let _ = self.t_cached(device);
     }
@@ -380,7 +380,7 @@ fn take_matmul(
     Ok(Uint8Linear {
         // ONNX MatMul weight (K, N) = (in, out): transpose to the
         // `[out][in]` store `forward` reads (see `Uint8Linear` docs).
-        weight_u8: super::quant::transpose_u8(data, in_dim, out_dim),
+        weight_u8: super::quant_linear::transpose_u8(data, in_dim, out_dim),
         scale: vec![scalar(scale, &format!("{wname}.scale"))?; out_dim],
         zero_point: vec![scalar(zp, &format!("{wname}.zero_point"))?; out_dim],
         bias: Some(bias),
@@ -446,7 +446,7 @@ fn take_lstm(
 }
 
 /// Exact tensor names `weights::load_selected` must fetch for `load`.
-pub(crate) fn joint_want() -> HashSet<String> {
+pub(crate) fn required_tensors() -> HashSet<String> {
     [
         "decoder.prediction.embed.weight",
         "onnx::LSTM_205",
@@ -528,12 +528,12 @@ impl BurnJoint {
 
     /// Build every cached tensor / dequantized twin now (load-time
     /// warming): the 3 joint projections plus both LSTM layers.
-    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
-        self.enc.warm(device);
-        self.pred.warm(device);
-        self.out.warm(device);
-        self.l0.warm(device);
-        self.l1.warm(device);
+    pub(crate) fn prime_cache(&self, device: &super::runtime::CpuDevice) {
+        self.enc.prime_cache(device);
+        self.pred.prime_cache(device);
+        self.out.prime_cache(device);
+        self.l0.prime_cache(device);
+        self.l1.prime_cache(device);
     }
 
     /// Overwrite the running states (tests seed ORT states to isolate
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn joint_want_lists_fixed_names() {
-        let want = joint_want();
+        let want = required_tensors();
         // 13 base names; `.scale`/`.zero_point` companions ride along
         // via `load_selected`.
         assert_eq!(want.len(), 13);
@@ -722,7 +722,7 @@ mod tests {
     fn ort_joint_parity() {
         use super::super::weights::load_selected;
         let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
-        let want = joint_want();
+        let want = required_tensors();
         let tensors =
             load_selected(&dir.join("decoder_joint-burn.safetensors"), &want).unwrap();
         let mut joint = BurnJoint::load(&tensors, 8193).unwrap();
@@ -855,7 +855,7 @@ mod tests {
     fn tensor_joint_step_matches_scalar() {
         use super::super::weights::load_selected;
         let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
-        let want = joint_want();
+        let want = required_tensors();
         let tensors =
             load_selected(&dir.join("decoder_joint-burn.safetensors"), &want).unwrap();
         let mut joint = BurnJoint::load(&tensors, 8193).unwrap();
@@ -868,7 +868,7 @@ mod tests {
             })
             .collect();
         let tctx = TensorCtx {
-            device: super::super::backend::cpu_device(),
+            device: super::super::runtime::cpu_device(),
             enabled: true,
         };
         let (ss, _) = {

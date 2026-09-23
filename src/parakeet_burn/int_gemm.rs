@@ -17,7 +17,7 @@
 // `forward_batch` bit-for-bit while running several times faster than
 // the f32 Flex matmul.
 //
-// Weights arrive pre-widened (`Uint8Linear::w_i16`, built once at warm);
+// Weights arrive pre-widened (`Uint8Linear::w_i16`, built once at prime_cache);
 // activations widen inside `quantize_from_rows`, which replicates the
 // probe-pinned `dynamic_quantize_u8` math exactly (same min/max window,
 // same zp, same q) and then subtracts zp as i16. AVX-512 twins of the
@@ -32,7 +32,7 @@ use rayon::prelude::*;
 /// AVX-512 integer path needs zmm word ops (`vpmaddwd`): F + BW. Checked
 /// once per call (a static load); machines without it run the scalar
 /// integer path, which is equally exact and merely slower.
-pub(crate) fn has_fast_path() -> bool {
+pub(crate) fn has_avx512_int_gemm() -> bool {
     std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
 }
@@ -64,7 +64,7 @@ pub(crate) fn widen_weights(w: &[u8], out_dim: usize, in_dim: usize, zp: &[f32])
 /// below is the reference on non-AVX-512 hosts.
 pub(crate) fn quantize_rows_i16(xs: &[f32]) -> (Vec<i16>, f32, i64) {
     assert!(!xs.is_empty());
-    if has_fast_path() {
+    if has_avx512_int_gemm() {
         // SAFETY: gated on the runtime AVX-512F+BW check.
         return unsafe { quantize_rows_i16_avx512(xs) };
     }
@@ -206,7 +206,7 @@ pub(crate) fn quantize_from_rows(xs: &[Vec<f32>]) -> (Vec<i16>, f32, i64) {
     let total: usize = xs.iter().map(|r| r.len()).sum();
     assert!(total > 0);
     debug_assert!(xs.iter().all(|r| r.len() == xs[0].len()));
-    if has_fast_path() {
+    if has_avx512_int_gemm() {
         // SAFETY: gated on the runtime AVX-512F+BW check.
         return unsafe { quantize_from_rows_avx512(xs) };
     }
@@ -342,7 +342,7 @@ pub(crate) fn quantize_u8_3d(x: &[Vec<Vec<f32>>]) -> (Vec<u8>, f32, u8) {
         !x.is_empty() && !x[0].is_empty() && !x[0][0].is_empty(),
         "quantize_u8_3d: empty input"
     );
-    if has_fast_path() {
+    if has_avx512_int_gemm() {
         // SAFETY: gated on the runtime AVX-512F+BW check.
         return unsafe { quantize_u8_3d_avx512(x) };
     }
@@ -350,7 +350,7 @@ pub(crate) fn quantize_u8_3d(x: &[Vec<Vec<f32>>]) -> (Vec<u8>, f32, u8) {
         .iter()
         .flat_map(|c| c.iter().flat_map(|r| r.iter().copied()))
         .collect();
-    super::quant::dynamic_quantize_u8(&flat)
+    super::quant_linear::dynamic_quantize_u8(&flat)
 }
 
 #[target_feature(enable = "avx512f,avx512bw")]
@@ -409,7 +409,7 @@ pub(crate) enum Epilogue<'a> {
     BiasRelu(&'a [f32]),
     /// GLU over the row halves: `out[o] = y[o] * sigmoid(y[o + n/2])`.
     /// Not a per-element epilogue — output width is `n/2`, handled by
-    /// [`linear_i16_rows`].
+    /// [`int_gemm_rows`].
     Glu,
 }
 
@@ -443,7 +443,7 @@ fn apply_epi(y: f32, o: usize, slot: usize, out: &mut [f32], epi: Epilogue<'_>) 
                 v
             }
         }
-        Epilogue::Glu => unreachable!("Glu is handled by linear_i16_rows"),
+        Epilogue::Glu => unreachable!("Glu is handled by int_gemm_rows"),
     }
 }
 
@@ -462,7 +462,7 @@ fn apply_epi(y: f32, o: usize, slot: usize, out: &mut [f32], epi: Epilogue<'_>) 
 /// addition is exact, so tiling changes nothing numerically: outputs
 /// match `forward_batch` bit-for-bit (see
 /// `gemm_matches_scalar_mac_exactly`).
-pub(crate) fn linear_i16(
+pub(crate) fn int_gemm(
     a: &[i16],
     t: usize,
     k: usize,
@@ -473,13 +473,13 @@ pub(crate) fn linear_i16(
     sx: f32,
     out: &mut [f32],
 ) {
-    linear_i16_epi(a, t, k, b, n, sw, bias, sx, out, Epilogue::None)
+    int_gemm_epi(a, t, k, b, n, sw, bias, sx, out, Epilogue::None)
 }
 
-/// [`linear_i16`] with a fused epilogue at the scale-up site (see
+/// [`int_gemm`] with a fused epilogue at the scale-up site (see
 /// [`Epilogue`]). `Epilogue::AddScale` reads the pre-filled destination,
 /// so it only makes sense for accumulation into an existing buffer.
-pub(crate) fn linear_i16_epi(
+pub(crate) fn int_gemm_epi(
     a: &[i16],
     t: usize,
     k: usize,
@@ -495,7 +495,7 @@ pub(crate) fn linear_i16_epi(
     assert_eq!(b.len(), n * k);
     assert_eq!(out.len(), t * n);
     assert!(k >= 1 && t >= 1 && n >= 1);
-    assert!(!matches!(epi, Epilogue::Glu), "Glu needs linear_i16_rows");
+    assert!(!matches!(epi, Epilogue::Glu), "Glu needs int_gemm_rows");
     if let Some(bb) = bias {
         assert_eq!(bb.len(), n);
     }
@@ -503,10 +503,10 @@ pub(crate) fn linear_i16_epi(
     gemm_driver(a, t, k, b, n, sw, bias, sx, &bases, epi);
 }
 
-/// [`linear_i16`] writing straight into pre-sized `[T][N]` rows: callers
+/// [`int_gemm`] writing straight into pre-sized `[T][N]` rows: callers
 /// own/reuse the buffers, so there is no flat temp and no row-copy pass.
 /// `Epilogue::Glu` halves the width — `rows` must be `T x N/2` then.
-pub(crate) fn linear_i16_rows(
+pub(crate) fn int_gemm_rows(
     a: &[i16],
     t: usize,
     k: usize,
@@ -542,7 +542,7 @@ pub(crate) fn linear_i16_rows(
     gemm_driver(a, t, k, b, n, sw, bias, sx, &bases, epi);
 }
 
-/// Tiled driver behind [`linear_i16_epi`] / [`linear_i16_rows`]. `bases`
+/// Tiled driver behind [`int_gemm_epi`] / [`int_gemm_rows`]. `bases`
 /// is either one flat base (rows at stride `n`) or one base per row
 /// (`bases.len() == t`).
 fn gemm_driver(
@@ -557,7 +557,7 @@ fn gemm_driver(
     bases: &[usize],
     epi: Epilogue<'_>,
 ) {
-    let fast = has_fast_path();
+    let fast = has_avx512_int_gemm();
     let row_ptr = |ti: usize| -> *mut f32 {
         if bases.len() == 1 {
             (bases[0] as *mut f32).wrapping_add(ti * n)
@@ -793,7 +793,7 @@ mod tests {
         // This port builds with `-C target-cpu=native` (see
         // `.cargo/config.toml`) for a local AVX-512 host; the integer
         // path must actually engage there.
-        assert!(has_fast_path(), "expected AVX-512F+BW on this host");
+        assert!(has_avx512_int_gemm(), "expected AVX-512F+BW on this host");
     }
 
     /// LCG f32s in [-3, 3], deterministic (no rand dependency).
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn quantize_twin_matches_serial() {        use super::super::quant::dynamic_quantize_u8;
+    fn quantize_twin_matches_serial() {        use super::super::quant_linear::dynamic_quantize_u8;
         // Shapes incl. non-multiples of 32/64, constants, all-zero (guard
         // path), and single-element inputs.
         for (len, seed) in [(1, 7), (3, 8), (31, 9), (64, 10), (1000, 11), (4096, 12)] {
@@ -852,7 +852,7 @@ mod tests {
     /// splits, and the joint's wide single-row out-projection.
     #[test]
     fn gemm_matches_scalar_mac_exactly() {
-        use super::super::quant::Uint8Linear;
+        use super::super::quant_linear::Uint8Linear;
         let mut seed: u64 = 0x16E44;
         let mut rnd = move || {
             seed = seed
@@ -892,7 +892,7 @@ mod tests {
             };
             // Reference: the scalar integer path under test.
             let lin = Uint8Linear {
-                weight_u8: super::super::quant::transpose_u8(&wu, k, n),
+                weight_u8: super::super::quant_linear::transpose_u8(&wu, k, n),
                 scale: sw.clone(),
                 zero_point: zpw.clone(),
                 bias: bias.clone(),
@@ -906,7 +906,7 @@ mod tests {
             let (a, sx, _) = quantize_from_rows(&xs);
             let b = widen_weights(&lin.weight_u8, n, k, &lin.zero_point);
             let mut out = vec![0.0f32; t * n];
-            linear_i16(&a, t, k, &b, n, &lin.scale, lin.bias.as_deref(), sx, &mut out);
+            int_gemm(&a, t, k, &b, n, &lin.scale, lin.bias.as_deref(), sx, &mut out);
             let got: Vec<Vec<f32>> = out.chunks(n).map(|c| c.to_vec()).collect();
             assert_eq!(got, expect, "t={t} k={k} n={n}");
         }
@@ -914,12 +914,12 @@ mod tests {
 
     /// Every fused epilogue equals its unfused twin bit-for-bit: the
     /// reference is the scalar integer path (`forward_batch`) plus the
-    /// production post-pass (`block::swish_inplace` / `block::glu` /
+    /// production post-pass (`ops::swish_inplace` / `ops::glu` /
     /// add-relu), so a changed op order would show up here.
     #[test]
     fn epilogue_matches_post_pass() {
-        use super::super::block::{glu, swish_inplace};
-        use super::super::quant::Uint8Linear;
+        use super::super::ops::{glu, swish_inplace};
+        use super::super::quant_linear::Uint8Linear;
         let mut seed: u64 = 0xE711;
         let mut rnd = move || {
             seed = seed
@@ -935,7 +935,7 @@ mod tests {
             let sw: Vec<f32> = (0..n).map(|i| 0.01 + 0.001 * (i % 7) as f32).collect();
             let zpw: Vec<f32> = (0..n).map(|i| (i * 13 % 256) as f32).collect();
             let lin = Uint8Linear {
-                weight_u8: super::super::quant::transpose_u8(&wu, k, n),
+                weight_u8: super::super::quant_linear::transpose_u8(&wu, k, n),
                 scale: sw.clone(),
                 zero_point: zpw.clone(),
                 bias: None,
@@ -955,7 +955,7 @@ mod tests {
                         _ => n,
                     }]; t],
                 };
-                linear_i16_rows(&a, t, k, &b, n, &lin.scale, None, sx, &mut rows, epi);
+                int_gemm_rows(&a, t, k, &b, n, &lin.scale, None, sx, &mut rows, epi);
                 rows
             };
 
@@ -1017,9 +1017,9 @@ mod tests {
                 assert_eq!(run(Epilogue::Glu, None), want_glu, "glu t={t} k={k} n={n}");
             }
 
-            // Flat twin (`linear_i16_epi`) must agree with the rows path.
+            // Flat twin (`int_gemm_epi`) must agree with the rows path.
             let mut flat = vec![0.0f32; t * n];
-            linear_i16_epi(&a, t, k, &b, n, &lin.scale, None, sx, &mut flat, Epilogue::Swish);
+            int_gemm_epi(&a, t, k, &b, n, &lin.scale, None, sx, &mut flat, Epilogue::Swish);
             let flat_rows: Vec<Vec<f32>> = flat.chunks(n).map(|c| c.to_vec()).collect();
             assert_eq!(flat_rows, want_swish, "flat swish t={t} k={k} n={n}");
         }
@@ -1054,7 +1054,7 @@ mod tests {
     /// (half-even vs half-away) would show up.
     #[test]
     fn simd_quantize_matches_scalar() {
-        if !has_fast_path() {
+        if !has_avx512_int_gemm() {
             return;
         }
         let mut seed: u64 = 0x51D;
@@ -1086,7 +1086,7 @@ mod tests {
             assert_eq!(quantize_rows_i16(&xs), quantize_rows_i16_scalar(&xs));
         }
         // u8 dispatcher vs its scalar reference across the same cases.
-        use super::super::quant::{dynamic_quantize_u8, dynamic_quantize_u8_scalar};
+        use super::super::quant_linear::{dynamic_quantize_u8, dynamic_quantize_u8_scalar};
         for len in [1usize, 15, 16, 17, 33, 1000] {
             let xs = rnd_vec(len, seed);
             seed = seed.wrapping_add(1);
@@ -1107,7 +1107,7 @@ mod tests {
     /// flatten-then-quantize exactly, over odd shapes and the guard path.
     #[test]
     fn quantize_3d_matches_flat() {
-        use super::super::quant::dynamic_quantize_u8;
+        use super::super::quant_linear::dynamic_quantize_u8;
         let mut seed: u64 = 0x3D;
         for (c, h, w) in [(1usize, 1usize, 1usize), (1, 4, 4), (3, 5, 7), (2, 16, 3)] {
             let x: Vec<Vec<Vec<f32>>> = (0..c)
@@ -1145,7 +1145,7 @@ mod tests {
     fn dot_avx512_matches_scalar_on_tails() {
         // K values around vector widths (31/32/33, 63/64/65, 0) plus a
         // large K, extreme i16 values (saturation corners).
-        if !has_fast_path() {
+        if !has_avx512_int_gemm() {
             return;
         }
         let mut seed: u64 = 0xD07;

@@ -16,7 +16,7 @@
 //   stage (Add -1, Div 2, Add 1, Floor); the Where mask is a no-op for
 //   full-length offline utterances, so it is not reproduced here.
 //
-// Like `block.rs`, weights stay 8-bit in RAM (scalar scale/zp in the
+// Like `conformer_block.rs`, weights stay 8-bit in RAM (scalar scale/zp in the
 // converted files) and dequantize inside the fp32 forward. The conv
 // weights are tiny (~138 K params); the `pre_encode/out` projection
 // reuses `Uint8Linear`.
@@ -27,17 +27,17 @@ use anyhow::{Context, Result};
 
 use rayon::prelude::*;
 
-use super::backend::CpuBackend;
-use super::encoder::EncoderManifest;
-use super::quant::Uint8Linear;
-use super::tensor::TensorCtx;
+use super::runtime::CpuBackend;
+use super::manifest::EncoderManifest;
+use super::quant_linear::Uint8Linear;
+use super::tensor_ctx::TensorCtx;
 use super::weights::RawTensor;
 
 /// Exact staged output length: three stride-2 (k=3, p=1) stages, each
 /// `floor((t + 1) / 2)`. This is NOT `t / 8` for small `t` (e.g. 50 ->
-/// 25 -> 13 -> 7, not 6); `encoder::subsampled_frames` stays as the
+/// 25 -> 13 -> 7, not 6); `encoder::coarse_subsampled_frames` stays as the
 /// coarse `encoder_stride = 8` estimate.
-pub(crate) fn pre_encode_len(t: usize) -> usize {
+pub(crate) fn exact_subsampled_len(t: usize) -> usize {
     let mut n = t;
     for _ in 0..3 {
         n = (n + 1) / 2;
@@ -58,7 +58,7 @@ pub(crate) struct Conv2dW {
     pub(crate) stride: usize,
     pub(crate) pad: usize,
     /// Lazily-built dequantized `[out_c, in_c/group, k, k]` weight tensor
-    /// (same rationale as `quant::CachedT`: the pre-encode convs run once
+    /// (same rationale as `quant_linear::CachedT`: the pre-encode convs run once
     /// per forward, and per-call `from_data` is pure overhead).
     pub(crate) cache: std::sync::OnceLock<burn::tensor::Tensor<CpuBackend, 4>>,
 }
@@ -74,7 +74,7 @@ impl Conv2dW {
     /// Dequantized `[out_c, in_c/group, k, k]` weight tensor, built once
     /// (bit-identical to the old per-call dequant: same per-element
     /// arithmetic, only built once instead of once per forward).
-    fn cached(&self, device: &super::backend::CpuDevice) -> &burn::tensor::Tensor<CpuBackend, 4> {
+    fn cached(&self, device: &super::runtime::CpuDevice) -> &burn::tensor::Tensor<CpuBackend, 4> {
         self.cache.get_or_init(|| {
             burn::tensor::Tensor::from_data(
                 burn::tensor::TensorData::new(
@@ -87,7 +87,7 @@ impl Conv2dW {
     }
 
     /// Build the cached weight tensor now (load-time warming).
-    fn warm(&self, device: &super::backend::CpuDevice) {
+    fn prime_cache(&self, device: &super::runtime::CpuDevice) {
         let _ = self.cached(device);
     }
 }
@@ -98,7 +98,7 @@ impl Conv2dW {
 /// arithmetic; the weight scale applies after. Bias lands later via
 /// `add_bias_relu`, matching the graph's Add order.
 fn conv2d_forward(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
-    use super::quant::dynamic_quantize_u8;
+    use super::quant_linear::dynamic_quantize_u8;
     assert_eq!(x.len(), w.in_c);
     let h = x[0].len();
     let wd = x[0][0].len();
@@ -159,7 +159,7 @@ fn conv2d_par(w: &Conv2dW, x: &[Vec<Vec<f32>>], relu: bool) -> Vec<Vec<Vec<f32>>
     let ow = (wd + 2 * w.pad - w.kernel) / w.stride + 1;
     // Planar quantize: same window/q values as flatten-then-quantize, but
     // no intermediate f32 copy (this input reaches 2M elements per conv).
-    let (xq, sx, zpx) = super::igemm::quantize_u8_3d(x);
+    let (xq, sx, zpx) = super::int_gemm::quantize_u8_3d(x);
     let xq3: Vec<&[u8]> = xq.chunks(h * wd).collect();
     let zpw = w.zero_point.round() as i64;
     let icg = w.in_c / w.group;
@@ -209,14 +209,14 @@ fn conv2d_par(w: &Conv2dW, x: &[Vec<Vec<f32>>], relu: bool) -> Vec<Vec<Vec<f32>>
 
 /// Exact 1x1-conv fast path (conv3/conv6: 256 -> 256, k1 s1, dense):
 /// a 1x1 stride-1 conv IS a per-position matmul, so this runs it as one
-/// blocked integer GEMM (`igemm::linear_i16_epi`) over H*W rows instead of
+/// blocked integer GEMM (`int_gemm::int_gemm_epi`) over H*W rows instead of
 /// a direct convolution. Same per-tensor activation quantization window as
 /// `conv2d_forward` (whole input tensor), same integers, same scale-up;
 /// the graph's bias + ReLU ride the GEMM's epilogue (same arithmetic
 /// `add_bias_relu` applies afterwards) — bit-identical to both twins.
 /// Weights widen per call (65k u8, ~10 us); no cache needed.
 fn conv1x1_gemm(w: &Conv2dW, x: &[Vec<Vec<f32>>], relu: bool) -> Vec<Vec<Vec<f32>>> {
-    use super::igemm::{linear_i16_epi, quantize_rows_i16, widen_weights, Epilogue};
+    use super::int_gemm::{int_gemm_epi, quantize_rows_i16, widen_weights, Epilogue};
     assert_eq!(x.len(), w.in_c);
     let h = x[0].len();
     let wd = x[0][0].len();
@@ -243,7 +243,7 @@ fn conv1x1_gemm(w: &Conv2dW, x: &[Vec<Vec<f32>>], relu: bool) -> Vec<Vec<Vec<f32
     } else {
         Epilogue::None
     };
-    linear_i16_epi(
+    int_gemm_epi(
         &a,
         t,
         w.in_c,
@@ -300,7 +300,7 @@ fn conv_dispatch(
 fn conv2d_t(
     w: &Conv2dW,
     x: &[Vec<Vec<f32>>],
-    device: &super::backend::CpuDevice,
+    device: &super::runtime::CpuDevice,
 ) -> Vec<Vec<Vec<f32>>> {
     use burn::tensor::{module::conv2d, ops::ConvOptions, TensorData};
     assert_eq!(x.len(), w.in_c);
@@ -308,7 +308,7 @@ fn conv2d_t(
     let wd = x[0][0].len();
     assert!(x.iter().all(|c| c.len() == h && c.iter().all(|r| r.len() == wd)));
     let flat: Vec<f32> = x.iter().flat_map(|c| c.iter().flat_map(|r| r.iter().copied())).collect();
-    let (xq, sx, zpx) = super::quant::dynamic_quantize_u8(&flat);
+    let (xq, sx, zpx) = super::quant_linear::dynamic_quantize_u8(&flat);
     let xd: Vec<f32> = xq.iter().map(|&q| (q as f32 - zpx as f32) * sx).collect();
     let xt: burn::tensor::Tensor<CpuBackend, 4> = burn::tensor::Tensor::from_data(
         TensorData::new(xd, [1, w.in_c, h, wd]),
@@ -487,7 +487,7 @@ impl PreEncodeWeights {
             anyhow::bail!("pre_encode/out: weight len {} != 4096*1024", o_data.len());
         }
         let out = Uint8Linear {
-            weight_u8: super::quant::transpose_u8(o_data, 4096, 1024),
+            weight_u8: super::quant_linear::transpose_u8(o_data, 4096, 1024),
             scale: bcast(o_scale),
             zero_point: bcast(o_zp),
             bias: Some(out_bias),
@@ -509,11 +509,11 @@ impl PreEncodeWeights {
 
     /// Build every cached tensor now (load-time warming): the 5 convs
     /// plus the out-projection.
-    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
+    pub(crate) fn prime_cache(&self, device: &super::runtime::CpuDevice) {
         for w in [&self.conv0, &self.conv2, &self.conv3, &self.conv5, &self.conv6] {
-            w.warm(device);
+            w.prime_cache(device);
         }
-        self.out.warm(device);
+        self.out.prime_cache(device);
     }
 
     /// Mel `[T][128]` -> `[T'][1024]`. Empty in, empty out.
@@ -542,11 +542,11 @@ impl PreEncodeWeights {
         // x is [256][Ht][Wf]; Transpose[0,2,1,3] + flatten rows.
         let ht = x[0].len();
         let wf = x[0][0].len();
-        if ht != pre_encode_len(mel.len()) {
+        if ht != exact_subsampled_len(mel.len()) {
             anyhow::bail!(
                 "pre_encode: T={} gave Ht={ht}, expected {}",
                 mel.len(),
-                pre_encode_len(mel.len())
+                exact_subsampled_len(mel.len())
             );
         }
         let mut flat = vec![vec![0.0f32; 256 * wf]; ht];
@@ -571,7 +571,7 @@ impl PreEncodeWeights {
 }
 
 /// Exact tensor names `weights::load_selected` must fetch for `load`.
-pub(crate) fn pre_encode_want(manifest: &EncoderManifest) -> Result<HashSet<String>> {
+pub(crate) fn required_tensors(manifest: &EncoderManifest) -> Result<HashSet<String>> {
     let mut want = HashSet::new();
     for role in [
         "pre_encode/conv/conv.0",
@@ -600,16 +600,16 @@ pub(crate) fn pre_encode_want(manifest: &EncoderManifest) -> Result<HashSet<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parakeet_burn::quant::Uint8Linear;
+    use crate::parakeet_burn::quant_linear::Uint8Linear;
 
     #[test]
     fn staged_length_is_exact() {
-        assert_eq!(pre_encode_len(0), 0);
-        assert_eq!(pre_encode_len(1), 1); // (1+1)/2 x3
-        assert_eq!(pre_encode_len(50), 7); // 25 -> 13 -> 7, NOT 50/8=6
-        assert_eq!(pre_encode_len(64), 8);
-        assert_eq!(pre_encode_len(101), 13); // 51 -> 26 -> 13
-        assert_eq!(pre_encode_len(800), 100);
+        assert_eq!(exact_subsampled_len(0), 0);
+        assert_eq!(exact_subsampled_len(1), 1); // (1+1)/2 x3
+        assert_eq!(exact_subsampled_len(50), 7); // 25 -> 13 -> 7, NOT 50/8=6
+        assert_eq!(exact_subsampled_len(64), 8);
+        assert_eq!(exact_subsampled_len(101), 13); // 51 -> 26 -> 13
+        assert_eq!(exact_subsampled_len(800), 100);
     }
 
     #[test]
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn conv_tensor_matches_scalar() {
-        use super::super::backend::cpu_device;
+        use super::super::runtime::cpu_device;
         // Dense k3s2p1 + depthwise k3s2p1 over small maps with mixed
         // signs; tensor twin must match the integer chain to f32 order.
         let dense = Conv2dW {
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn forward_rejects_bad_width() {
-        use super::super::tensor::TensorCtx;
+        use super::super::tensor_ctx::TensorCtx;
         let w = tiny_weights();
         assert!(w.forward(&[vec![0.0; 127]], &TensorCtx::scalar()).is_err());
         assert!(w.forward(&[], &TensorCtx::scalar()).unwrap().is_empty());
@@ -860,12 +860,12 @@ mod tests {
     #[test]
     #[ignore]
     fn real_pre_encode_shape_finite_deterministic() {
-        use super::super::encoder::load_manifest;
+        use super::super::manifest::load_manifest;
         use super::super::weights::load_selected;
         let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
         let json = std::fs::read_to_string(dir.join("encoder-manifest.json")).unwrap();
         let manifest = load_manifest(&json).unwrap();
-        let want = pre_encode_want(&manifest).unwrap();
+        let want = required_tensors(&manifest).unwrap();
         // 6 weights + 6 scales + 6 zps + 5 conv biases + out bias.
         assert_eq!(want.len(), 6 * 3 + 6);
         let tensors =
@@ -878,11 +878,11 @@ mod tests {
             ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
         };
         let mel: Vec<Vec<f32>> = (0..64).map(|_| (0..128).map(|_| rnd()).collect()).collect();
-        let y1 = w.forward(&mel, &super::super::tensor::TensorCtx::scalar()).unwrap();
+        let y1 = w.forward(&mel, &super::super::tensor_ctx::TensorCtx::scalar()).unwrap();
         assert_eq!(y1.len(), 8, "T=64 -> T'=8");
         assert!(y1.iter().all(|r| r.len() == 1024));
         assert!(y1.iter().all(|r| r.iter().all(|v| v.is_finite())));
-        let y2 = w.forward(&mel, &super::super::tensor::TensorCtx::scalar()).unwrap();
+        let y2 = w.forward(&mel, &super::super::tensor_ctx::TensorCtx::scalar()).unwrap();
         assert_eq!(y1, y2, "forward is deterministic");
         // Output spans a sane range (projection of normalized mel).
         let max: f32 = y1.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, &b| a.max(b.abs()));
@@ -898,12 +898,12 @@ mod tests {
     #[test]
     #[ignore]
     fn ort_golden_parity() {
-        use super::super::encoder::load_manifest;
+        use super::super::manifest::load_manifest;
         use super::super::weights::load_selected;
         let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
         let json = std::fs::read_to_string(dir.join("encoder-manifest.json")).unwrap();
         let manifest = load_manifest(&json).unwrap();
-        let want = pre_encode_want(&manifest).unwrap();
+        let want = required_tensors(&manifest).unwrap();
         let tensors =
             load_selected(&dir.join("encoder-burn.safetensors"), &want).unwrap();
         let w = PreEncodeWeights::load(&tensors, &manifest).unwrap();
@@ -923,12 +923,12 @@ mod tests {
         let mel_f = f32row(mel_v);
         let ref_f = f32row(ref_v);
         let mel: Vec<Vec<f32>> = mel_f.chunks(128).map(|c| c.to_vec()).collect();
-        let tctx = super::super::tensor::TensorCtx {
-            device: super::super::backend::cpu_device(),
+        let tctx = super::super::tensor_ctx::TensorCtx {
+            device: super::super::runtime::cpu_device(),
             enabled: true,
         };
         for (tag, ctx) in [
-            ("scalar", super::super::tensor::TensorCtx::scalar()),
+            ("scalar", super::super::tensor_ctx::TensorCtx::scalar()),
             ("tensor", tctx),
         ] {
             let y = w.forward(&mel, &ctx).unwrap();

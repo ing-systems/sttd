@@ -1,6 +1,6 @@
 // Vocabulary for the Burn port: loads the same `vocab.txt` as the ORT
 // path (one SentencePiece token per line) and mirrors the TDT decoder's
-// text rebuild (`▁` -> space, digit spacing, `<...>` special skip).
+// text decode_to_text (`▁` -> space, digit spacing, `<...>` special skip).
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -51,7 +51,7 @@ impl BurnVocab {
     }
 
     /// Rebuild text from greedy token ids (mirrors `decoder_tdt.rs`).
-    pub(crate) fn rebuild(&self, tokens: &[usize]) -> String {
+    pub(crate) fn decode_to_text(&self, tokens: &[usize]) -> String {
         let mut full = String::new();
         for &id in tokens {
             let Some(tok) = self.id_to_text(id) else { continue };
@@ -86,7 +86,7 @@ mod tests {
         let v = BurnVocab {
             id_to_token: vec!["▁like".into(), "1".into(), "0".into(), "0".into()],
         };
-        assert_eq!(v.rebuild(&[0, 1, 2, 3]), "like 100");
+        assert_eq!(v.decode_to_text(&[0, 1, 2, 3]), "like 100");
         assert_eq!(v.blank_id(), 3);
     }
 
@@ -95,7 +95,7 @@ mod tests {
         let v = BurnVocab {
             id_to_token: vec!["▁a".into(), "<blank>".into()],
         };
-        assert_eq!(v.rebuild(&[0, 1]), "a");
+        assert_eq!(v.decode_to_text(&[0, 1]), "a");
     }
 
     #[test]
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn file_format_strips_trailing_ids() {
         // On-disk lines are `{token} {id}` (parakeet-rs `splitn(2,
-        // ' ')`); the id must not leak into token text or rebuild
+        // ' ')`); the id must not leak into token text or decode_to_text
         // emits phantom digits ("▁ma 483" -> " ma 483").
         let dir = std::env::temp_dir().join(format!(
             "sttd-burn-vocab-test-{}",
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(v.size(), 3);
         assert_eq!(v.id_to_text(0), Some("▁like"));
         assert_eq!(v.id_to_text(1), Some("100"));
-        assert_eq!(v.rebuild(&[0, 1, 2]), "like 100");
+        assert_eq!(v.decode_to_text(&[0, 1, 2]), "like 100");
         assert_eq!(v.blank_id(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }

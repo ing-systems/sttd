@@ -1,16 +1,16 @@
 // Burn Tensor helpers for the tensor-ops swap (step 4, Phase 1+).
 //
-// The scalar int8 forward (`quant`, `block`, `pre_encode`, `joint`)
-// stays the default path during bring-up (see `backend::parse_tensor_flag`);
+// The scalar int8 forward (`quant_linear`, `conformer_block`, `subsampler`, `joint`)
+// stays the default path during bring-up (see `runtime::parse_tensor_flag`);
 // the tensor variants built on these helpers must reproduce it within
 // f32 rounding so the ORT goldens keep passing under policy (b).
 // Everything here is generic over `B: Backend` so the concrete CPU
-// backend (`Flex` today) remains a one-line choice in `backend.rs`.
+// backend (`Flex` today) remains a one-line choice in `runtime.rs`.
 
 use burn::tensor::{backend::Backend, Tensor, TensorData};
 use burn::tensor::backend::BackendTypes;
 
-use super::backend::CpuBackend;
+use super::runtime::CpuBackend;
 
 /// `&[Vec<f32>]` rows (`[T][K]`, non-empty, rectangular) -> `Tensor<B, 2>`.
 /// Panics on empty/ragged input: callers return early on empty (as the
@@ -43,7 +43,7 @@ pub(crate) struct TensorCtx {
 impl TensorCtx {
     pub(crate) fn scalar() -> Self {
         Self {
-            device: super::backend::cpu_device(),
+            device: super::runtime::cpu_device(),
             enabled: false,
         }
     }
@@ -63,11 +63,11 @@ pub(crate) fn tensor_to_rows<B: Backend>(t: Tensor<B, 2>) -> Vec<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parakeet_burn::backend::CpuBackend;
+    use crate::parakeet_burn::runtime::CpuBackend;
 
     #[test]
     fn tensor_roundtrip_preserves_non_square() {
-        let device = crate::parakeet_burn::backend::cpu_device();
+        let device = crate::parakeet_burn::runtime::cpu_device();
         let rows = vec![
             vec![1.0f32, -2.0, 3.5],
             vec![0.0, 100.0, -0.25],
@@ -83,14 +83,14 @@ mod tests {
     #[test]
     #[should_panic]
     fn tensor_rejects_empty() {
-        let device = crate::parakeet_burn::backend::cpu_device();
+        let device = crate::parakeet_burn::runtime::cpu_device();
         let _: Tensor<CpuBackend, 2> = rows_to_tensor(&[], &device);
     }
 
     #[test]
     #[should_panic]
     fn tensor_rejects_ragged() {
-        let device = crate::parakeet_burn::backend::cpu_device();
+        let device = crate::parakeet_burn::runtime::cpu_device();
         let _: Tensor<CpuBackend, 2> = rows_to_tensor(&[vec![1.0], vec![1.0, 2.0]], &device);
     }
 }

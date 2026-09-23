@@ -11,7 +11,7 @@
 // only (1-op probe: 1.5e-6). Swapping the inner loops for native Burn
 // tensor ops later changes speed, not numerics.
 
-use super::backend::{CpuBackend, CpuDevice};
+use super::runtime::{CpuBackend, CpuDevice};
 
 /// One row-quantized int8 Linear: `y = ((w_i8 - zp) * scale) @ x + bias`.
 #[derive(Debug, Clone)]
@@ -113,15 +113,15 @@ pub(crate) fn transpose_u8(d: &[u8], rows: usize, cols: usize) -> Vec<u8> {
 /// rounds half away from zero; no probe produced an exact .5 to tell).
 /// At most 1 LSB on a negligible share of values.
 ///
-/// Dispatches to the AVX-512 twin (`igemm::quantize_u8_avx512`) on
+/// Dispatches to the AVX-512 twin (`int_gemm::quantize_u8_avx512`) on
 /// fast-path machines — bit-identical (see its docs) and several times
 /// faster: the scalar map's per-element libm `roundf` call dominates
 /// every conv/depthwise call. The scalar body below is the reference.
 pub(crate) fn dynamic_quantize_u8(xs: &[f32]) -> (Vec<u8>, f32, u8) {
     assert!(!xs.is_empty());
-    if super::igemm::has_fast_path() {
+    if super::int_gemm::has_avx512_int_gemm() {
         // SAFETY: gated on the runtime AVX-512F+BW check.
-        return unsafe { super::igemm::quantize_u8_avx512(xs) };
+        return unsafe { super::int_gemm::quantize_u8_avx512(xs) };
     }
     dynamic_quantize_u8_scalar(xs)
 }
@@ -167,9 +167,9 @@ pub(crate) struct QuantizedRows<'a> {
 pub(crate) fn apply_epilogue(
     src: &[Vec<f32>],
     out: &mut [Vec<f32>],
-    epi: super::igemm::Epilogue<'_>,
+    epi: super::int_gemm::Epilogue<'_>,
 ) {
-    use super::igemm::{sigmoid, Epilogue};
+    use super::int_gemm::{sigmoid, Epilogue};
     assert_eq!(src.len(), out.len());
     let n = src[0].len();
     match epi {
@@ -242,12 +242,12 @@ pub(crate) struct Uint8Linear {
     /// weights; the device is always the CPU Flex one (every dispatch
     /// site passes `CpuBackend` — see `batch_dispatch`).
     /// Only built on machines without the integer-GEMM fast path (see
-    /// `igemm::has_fast_path`): where the fast path runs, the f32 Flex
+    /// `int_gemm::has_avx512_int_gemm`): where the fast path runs, the f32 Flex
     /// matmul — and this cache — is never touched.
     pub(crate) cache: std::sync::OnceLock<CachedT>,
-    /// Lazily-widened i16 weight twin (`igemm::widen_weights`, same layout
+    /// Lazily-widened i16 weight twin (`int_gemm::widen_weights`, same layout
     /// as the u8 store): the integer-GEMM fast path's read-only weights.
-    /// Built at warm on fast-path machines, on first use otherwise.
+    /// Built at prime_cache on fast-path machines, on first use otherwise.
     pub(crate) w_i16: std::sync::OnceLock<Vec<i16>>,
 }
 
@@ -352,18 +352,18 @@ impl Uint8Linear {
     /// utterance never pays the ~4 s cold-build stall. Builds the i16
     /// weight twin on integer-GEMM machines, the f32 Flex twins
     /// otherwise — never both.
-    pub(crate) fn warm(&self, device: &CpuDevice) {
-        if super::igemm::has_fast_path() {
+    pub(crate) fn prime_cache(&self, device: &CpuDevice) {
+        if super::int_gemm::has_avx512_int_gemm() {
             let _ = self.widened();
         } else {
             let _ = self.cached(device);
         }
     }
 
-    /// Widened i16 weight twin, built once (see `igemm::widen_weights`).
+    /// Widened i16 weight twin, built once (see `int_gemm::widen_weights`).
     pub(crate) fn widened(&self) -> &Vec<i16> {
         self.w_i16.get_or_init(|| {
-            super::igemm::widen_weights(
+            super::int_gemm::widen_weights(
                 &self.weight_u8,
                 self.out_dim,
                 self.in_dim,
@@ -404,7 +404,7 @@ impl Uint8Linear {
 
     /// Tensor twin of `forward_batch`: identical per-tensor activation
     /// quantization, but the MAC runs as one integer GEMM over the
-    /// quantized activations and weights (`igemm::linear_i16`) instead of
+    /// quantized activations and weights (`int_gemm::int_gemm`) instead of
     /// a dequantized f32 Flex matmul. Bit-identical to `forward_batch`
     /// (integer arithmetic is exact, so blocking changes nothing); the
     /// Flex path below stays as the fallback for machines without
@@ -419,14 +419,14 @@ impl Uint8Linear {
         if xs.is_empty() {
             return Vec::new();
         }
-        if super::igemm::has_fast_path() {
+        if super::int_gemm::has_avx512_int_gemm() {
             let t = xs.len();
             // Quantize straight from the rows: no intermediate f32 `flat`
             // copy (same window, same zp, same q — see `quantize_from_rows`).
-            let (a, sx, _) = super::igemm::quantize_from_rows(xs);
+            let (a, sx, _) = super::int_gemm::quantize_from_rows(xs);
             let w = self.widened();
             let mut out = vec![0.0f32; t * self.out_dim];
-            super::igemm::linear_i16(
+            super::int_gemm::int_gemm(
                 &a,
                 t,
                 self.in_dim,
@@ -455,7 +455,7 @@ impl Uint8Linear {
             // `[1, out]` broadcasts over the `[T, out]` rows.
             y = y + b.clone();
         }
-        super::tensor::tensor_to_rows(y)
+        super::tensor_ctx::tensor_to_rows(y)
     }
 
     /// Quantize `xs` once for sharing across several linears (see
@@ -467,7 +467,7 @@ impl Uint8Linear {
     pub(crate) fn quantize_activations(xs: &[Vec<f32>]) -> QuantizedRows<'_> {
         assert!(!xs.is_empty());
         assert!(xs.iter().all(|r| r.len() == xs[0].len()));
-        let (a, sx, _) = super::igemm::quantize_from_rows(xs);
+        let (a, sx, _) = super::int_gemm::quantize_from_rows(xs);
         QuantizedRows {
             a,
             sx,
@@ -482,10 +482,10 @@ impl Uint8Linear {
     /// `None` on the Flex fallback (which re-reads `xs` per linear, so
     /// building `A` would be dead work).
     pub(crate) fn shared_activation<'a>(
-        ctx: &super::tensor::TensorCtx,
+        ctx: &super::tensor_ctx::TensorCtx,
         xs: &'a [Vec<f32>],
     ) -> Option<QuantizedRows<'a>> {
-        (ctx.enabled && super::igemm::has_fast_path()).then(|| Self::quantize_activations(xs))
+        (ctx.enabled && super::int_gemm::has_avx512_int_gemm()).then(|| Self::quantize_activations(xs))
     }
 
     /// [`Self::forward_batch_t`] with the epilogue fused into the GEMM's
@@ -496,17 +496,17 @@ impl Uint8Linear {
     pub(crate) fn forward_batch_into(
         &self,
         xs: &[Vec<f32>],
-        ctx: &super::tensor::TensorCtx,
+        ctx: &super::tensor_ctx::TensorCtx,
         out: &mut [Vec<f32>],
-        epi: super::igemm::Epilogue<'_>,
+        epi: super::int_gemm::Epilogue<'_>,
     ) {
         assert!(xs.iter().all(|r| r.len() == self.in_dim));
         if xs.is_empty() {
             return;
         }
         assert_eq!(out.len(), xs.len());
-        if ctx.enabled && super::igemm::has_fast_path() {
-            let (a, sx, _) = super::igemm::quantize_from_rows(xs);
+        if ctx.enabled && super::int_gemm::has_avx512_int_gemm() {
+            let (a, sx, _) = super::int_gemm::quantize_from_rows(xs);
             self.gemm_quantized_into(&a, xs.len(), sx, out, epi);
             return;
         }
@@ -520,13 +520,13 @@ impl Uint8Linear {
     pub(crate) fn forward_quantized_into(
         &self,
         q: &QuantizedRows<'_>,
-        ctx: &super::tensor::TensorCtx,
+        ctx: &super::tensor_ctx::TensorCtx,
         out: &mut [Vec<f32>],
-        epi: super::igemm::Epilogue<'_>,
+        epi: super::int_gemm::Epilogue<'_>,
     ) {
         assert_eq!(q.k, self.in_dim);
         assert_eq!(out.len(), q.t);
-        if ctx.enabled && super::igemm::has_fast_path() {
+        if ctx.enabled && super::int_gemm::has_avx512_int_gemm() {
             self.gemm_quantized_into(&q.a, q.t, q.sx, out, epi);
             return;
         }
@@ -540,10 +540,10 @@ impl Uint8Linear {
         t: usize,
         sx: f32,
         out: &mut [Vec<f32>],
-        epi: super::igemm::Epilogue<'_>,
+        epi: super::int_gemm::Epilogue<'_>,
     ) {
         let w = self.widened();
-        super::igemm::linear_i16_rows(
+        super::int_gemm::int_gemm_rows(
             a,
             t,
             self.in_dim,
@@ -563,7 +563,7 @@ impl Uint8Linear {
     pub(crate) fn batch_dispatch(
         &self,
         xs: &[Vec<f32>],
-        ctx: &super::tensor::TensorCtx,
+        ctx: &super::tensor_ctx::TensorCtx,
     ) -> Vec<Vec<f32>> {
         if ctx.enabled {
             self.forward_batch_t(xs, &ctx.device)
@@ -578,7 +578,7 @@ impl Uint8Linear {
     pub(crate) fn forward_dispatch(
         &self,
         x: &[f32],
-        ctx: &super::tensor::TensorCtx,
+        ctx: &super::tensor_ctx::TensorCtx,
     ) -> Vec<f32> {
         if ctx.enabled {
             self.forward_batch_t(&[x.to_vec()], &ctx.device)
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn tensor_linear_matches_integer_path() {
-        use crate::parakeet_burn::backend::cpu_device;
+        use crate::parakeet_burn::runtime::cpu_device;
         // Non-square (3 -> 2) with per-row scales, distinct zero-points
         // and bias, so a transposed weight read or a dropped bias shows
         // up. Inputs span signs and magnitudes.
@@ -774,9 +774,9 @@ mod tests {
     /// Flex fallback's post-pass arithmetic).
     #[test]
     fn into_rows_matches_then_epilogue() {
-        use crate::parakeet_burn::backend::cpu_device;
-        use crate::parakeet_burn::igemm::Epilogue;
-        use crate::parakeet_burn::tensor::TensorCtx;
+        use crate::parakeet_burn::runtime::cpu_device;
+        use crate::parakeet_burn::int_gemm::Epilogue;
+        use crate::parakeet_burn::tensor_ctx::TensorCtx;
         let lin = Uint8Linear {
             weight_u8: vec![1, 2, 250, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             scale: vec![0.02, 0.03, 0.04, 0.05],
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn tensor_linear_empty_matches_scalar() {
-        use crate::parakeet_burn::backend::cpu_device;
+        use crate::parakeet_burn::runtime::cpu_device;
         let lin = Uint8Linear {
             weight_u8: vec![1, 2],
             scale: vec![1.0],
