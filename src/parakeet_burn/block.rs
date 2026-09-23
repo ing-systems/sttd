@@ -42,6 +42,13 @@ pub(crate) struct LayerNormP {
 pub(crate) const LN_EPS: f32 = 1e-5;
 
 pub(crate) fn layernorm_row(x: &[f32], p: &LayerNormP) -> Vec<f32> {
+    // Stays scalar by decision (Phase 4): the mean/variance sums span
+    // 1024+ elements and a sequential f32 sum rounds enough to matter
+    // downstream (~1e-6 normalized error amplifies 4096-wide through
+    // the FFN to ~1.0 — bisected during bring-up). f32 tensor
+    // reductions (parallel order) regress this; f64 tensor layernorm
+    // would cost more traffic than the scalar loop saves. The op is
+    // memory-bound O(T*D) beside the matmuls, so nothing is lost.
     assert_eq!(x.len(), p.gamma.len());
     // f64 accumulators: the mean/variance sums span 1024 elements, and a
     // sequential f32 sum rounds enough to matter downstream (a ~1e-6
@@ -67,6 +74,11 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+// Swish/GLU/add/scale stay scalar by decision (Phase 4): each is an
+// independent-per-element op the scalar loop computes exactly (same
+// libm exp the graph was verified against), and together they are ~5%
+// of per-layer compute beside the matmuls/convs. Tensor twins would
+// trade Flex's SIMD exp approximation drift for no meaningful speed.
 pub(crate) fn swish_inplace(v: &mut [f32]) {
     for x in v.iter_mut() {
         *x = *x * sigmoid(*x);
