@@ -88,6 +88,7 @@ package() {
   install -Dm644 "models/$m/encoder-model.int8.onnx" "$d/encoder-model.int8.onnx"
   install -Dm644 "models/$m/decoder_joint-model.int8.onnx" "$d/decoder_joint-model.int8.onnx"
   install -Dm644 "models/$m/vocab.txt" "$d/vocab.txt"
+  install -Dm644 "models/$m/tokenizer.json" "$d/tokenizer.json"
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 CONTEXT.md "$pkgdir/usr/share/doc/$pkgname/CONTEXT.md"

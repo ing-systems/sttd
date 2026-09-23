@@ -105,7 +105,10 @@ whisper.cpp or Parakeet, chosen
 once at startup by the model spec and fixed for the process's lifetime. The
 offline two sit behind one seam so the worker loop,
 gates, metrics and prompt-context tail never branch on which is loaded; only
-their own load and inference are engine-specific.
+their own load and inference are engine-specific. Parakeet runs over direct
+`ort` sessions (Rust mel frontend, no `nemo128.onnx`) with dictionary
+phrase-boosting on its greedy decode plus per-word confidences for the
+dictionary gate.
 (Sherpa-onnx support lives on branch `sherpa-onnx`.)
 _Avoid_: model (bare, when the engine — as opposed to the weights — is meant), backend
 

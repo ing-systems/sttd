@@ -531,6 +531,7 @@ mod tests {
                     "encoder-model.int8.onnx",
                     "decoder_joint-model.int8.onnx",
                     "vocab.txt",
+                    "tokenizer.json",
                 ],
             }
         );

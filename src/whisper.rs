@@ -164,6 +164,7 @@ impl SpeechModel for WhisperModel {
         Ok(Transcript {
             text: t.text,
             confidence: Some(t.confidence),
+            word_confidences: Vec::new(),
         })
     }
 

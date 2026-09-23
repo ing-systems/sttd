@@ -395,18 +395,24 @@ pub(crate) fn valid_model_specs() -> String {
 }
 
 /// Parakeet-TDT-0.6B-v3 weights, published as loose ONNX files (no archive)
-/// rather than a single `.bin`: `parakeet-rs::ParakeetTDT::from_pretrained`
-/// loads from a directory containing an encoder, a decoder_joint and
-/// `vocab.txt`. Preprocessor config is compiled into `parakeet-rs` for this
-/// model, so `config.json`/`preprocessor_config.json` are not needed.
+/// rather than a single `.bin`: the engine loads from a directory containing
+/// an encoder, a decoder_joint, `vocab.txt` and `tokenizer.json`
+/// (phrase-boosting; without it transcription works but boosting stays off).
+/// The ONNX weights come from the istupakov export; `tokenizer.json` comes
+/// from the upstream NVIDIA checkpoint (the export has none). Mel features
+/// are computed in Rust (`ort_engine::frontend`), so no `nemo128.onnx` and
+/// no `config.json`/`preprocessor_config.json` are needed.
 pub(crate) const PARAKEET_BASE_URL: &str =
     "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/";
+/// Upstream NVIDIA checkpoint, source of `tokenizer.json` (absent from the
+/// ONNX export above).
+pub(crate) const PARAKEET_TOKENIZER_URL: &str =
+    "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/tokenizer.json";
 
 /// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
 /// int8 is the default variant (`PARAKEET_DEFAULT_SPEC`); fp32 is offered
-/// for accuracy-sensitive use. Filenames match what
-/// `parakeet_rs::model_tdt::ParakeetTDTModel::find_encoder`/
-/// `find_decoder_joint` look for, so no renaming after download.
+/// for accuracy-sensitive use. Filenames match what the engine looks for,
+/// so no renaming after download.
 pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[
     (
         "parakeet-tdt-0.6b-v3-int8",
@@ -415,6 +421,7 @@ pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[
             "encoder-model.int8.onnx",
             "decoder_joint-model.int8.onnx",
             "vocab.txt",
+            "tokenizer.json",
         ],
         "640 MiB",
     ),
@@ -426,6 +433,7 @@ pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[
             "encoder-model.onnx.data",
             "decoder_joint-model.onnx",
             "vocab.txt",
+            "tokenizer.json",
         ],
         "2.4 GiB",
     ),

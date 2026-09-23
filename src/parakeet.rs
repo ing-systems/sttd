@@ -1,92 +1,67 @@
 // ---------------------------------------------------------------------------
-// Parakeet engine: the NVIDIA Parakeet-TDT-0.6B-v3 `SpeechModel` impl.
-// ---------------------------------------------------------------------------
+// Parakeet engine: NVIDIA Parakeet-TDT-0.6B-v3 `SpeechModel` impl.
 //
-// Wraps `parakeet_rs::ParakeetTDT` (FastConformer-TDT, 0.6B params, 25
-// European languages with per-utterance auto-detection). Unlike whisper.cpp,
-// decoding is greedy and reports no per-token probability, so `transcribe`
-// always returns `confidence: None` (see `asr::Transcript`) — the transcript
-// gate's confidence-floor arm is a no-op for this engine, and its whisper-only
-// tunables (`--beam-size`, `--temperature*`, `--prompt`, `--translate`, ...)
-// are rejected or warned about in `main::validate_parakeet_model_flags`
-// before the worker ever loads this.
+// Wraps `ort_engine::ParakeetModel` (FastConformer-TDT, 0.6B params, 25
+// European languages with per-utterance auto-detection): direct `ort`
+// sessions with dictionary phrase-boosting on the greedy TDT decode (see
+// `ort_engine`). Unlike `parakeet-rs` (removed), this engine reports
+// per-word confidences, so the dictionary fuzzy correction runs gated
+// (Phase B) instead of ungated.
+//
+// Runs on CPU. `--gpu` warns and falls back to CPU: the prebuilt ORT CUDA
+// EP targets older CUDA/cuDNN than the CUDA 13.4/sm_120 toolchain
+// whisper.cpp is built against here.
+// ---------------------------------------------------------------------------
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber as _};
 
 use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
 use crate::config::PARAKEET_MIN_SAMPLES;
-
-#[cfg(feature = "parakeet-cuda")]
-use parakeet_rs::ExecutionProvider;
+use crate::ort_engine::ParakeetModel as OrtModel;
 
 pub(crate) struct ParakeetModel {
-    inner: ParakeetTDT,
+    inner: OrtModel,
     ready_line: String,
 }
 
 impl ParakeetModel {
     /// Load a Parakeet model from `dir` (already guaranteed to hold an
     /// encoder, a decoder_joint and `vocab.txt` by
-    /// `weights::ensure_available`). `--gpu` selects CUDA only when this
-    /// binary was built with the `parakeet-cuda` feature; otherwise it warns
-    /// once and runs on CPU (see `main::unsupported_parakeet_flags`, which
-    /// warns about this same case before the worker gets here).
+    /// `weights::ensure_available`). `tokenizer.json` in the same directory
+    /// enables dictionary phrase-boosting; without it transcription works
+    /// but boosting stays off (warned once). The startup dictionary is
+    /// synced here — it is fixed for the process lifetime, and
+    /// `set_boost_words` is a no-op when unchanged.
     pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
-        let intra_threads = opts.n_threads.max(1) as usize;
-
-        #[cfg(feature = "parakeet-cuda")]
         if opts.use_gpu {
-            let cuda_config = ExecutionConfig::new()
-                .with_execution_provider(ExecutionProvider::Cuda)
-                .with_intra_threads(intra_threads)
-                .with_inter_threads(1);
-            match Self::load_with_config(dir, cuda_config) {
-                Ok(inner) => {
-                    return Ok(Self {
-                        inner,
-                        ready_line: format!(
-                            "parakeet ready (model={}, threads={}, gpu=true)",
-                            opts.model_spec, opts.n_threads
-                        ),
-                    });
-                }
-                Err(e) => {
-                    log::warn!("parakeet CUDA load failed ({e:#}), falling back to CPU");
-                }
-            }
+            log::warn!("--gpu is set but Parakeet runs on CPU in this build; running on CPU");
         }
-        #[cfg(not(feature = "parakeet-cuda"))]
-        if opts.use_gpu {
+        let intra_threads = opts.n_threads.max(1) as usize;
+        let tokenizer_path = dir.join("tokenizer.json");
+        let tokenizer_opt = tokenizer_path.exists().then_some(tokenizer_path);
+        if tokenizer_opt.is_none() {
             log::warn!(
-                "--gpu is set but this build has no `parakeet-cuda` feature; Parakeet runs \
-                 on CPU (rebuild with `--features parakeet-cuda` for GPU)"
+                "tokenizer.json not found in {}; phrase boosting disabled (transcription unaffected)",
+                dir.display()
             );
         }
-
-        let cpu_config = ExecutionConfig::new()
-            .with_intra_threads(intra_threads)
-            .with_inter_threads(1);
-        let inner = Self::load_with_config(dir, cpu_config)?;
+        log::info!("loading parakeet model ({})...", dir.display());
+        let mut inner = with_loading_ticker("parakeet model", || {
+            OrtModel::new(dir, true, tokenizer_opt.as_deref(), intra_threads)
+                .map_err(|e| anyhow::anyhow!("failed to load parakeet model: {e}"))
+                .context("failed to load parakeet model")
+        })?;
+        inner.set_boost_words(&opts.dictionary);
         Ok(Self {
             inner,
             ready_line: format!(
                 "parakeet ready (model={}, threads={}, gpu=false)",
                 opts.model_spec, opts.n_threads
             ),
-        })
-    }
-
-    fn load_with_config(dir: &Path, exec: ExecutionConfig) -> Result<ParakeetTDT> {
-        log::info!("loading parakeet model ({})...", dir.display());
-        with_loading_ticker("parakeet model", || {
-            ParakeetTDT::from_pretrained(dir, Some(exec))
-                .map_err(|e| anyhow::anyhow!("failed to load parakeet model: {e}"))
-                .context("failed to load parakeet model")
         })
     }
 }
@@ -98,8 +73,8 @@ impl SpeechModel for ParakeetModel {
         _prompt: &str,
         running: &Arc<AtomicBool>,
     ) -> Result<Transcript> {
-        // `ort`/parakeet-rs has no abort callback, unlike whisper.cpp: a
-        // single utterance's inference is hundreds of ms, not minutes, so a
+        // `ort` has no abort callback, unlike whisper.cpp: a single
+        // utterance's inference is hundreds of ms, not minutes, so a
         // pre-call check (rather than aborting mid-inference) is enough to
         // avoid running needless work after shutdown was requested.
         if !running.load(Ordering::Relaxed) {
@@ -118,11 +93,16 @@ impl SpeechModel for ParakeetModel {
         };
         let result = self
             .inner
-            .transcribe_samples(pcm.to_vec(), 16_000, 1, Some(TimestampMode::Sentences))
+            .transcribe_samples(pcm.to_vec())
             .map_err(|e| anyhow::anyhow!("parakeet inference failed: {e}"))?;
         Ok(Transcript {
             text: result.text,
+            // Greedy TDT decode reports no utterance-level average
+            // probability, so the transcript gate's confidence-floor arm
+            // stays a no-op (as with `parakeet-rs` before); per-word
+            // confidences below still gate the dictionary correction.
             confidence: None,
+            word_confidences: result.word_confidences,
         })
     }
 
