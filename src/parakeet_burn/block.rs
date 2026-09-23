@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 
 use super::backend::CpuBackend;
 use super::encoder::EncoderManifest;
+use super::igemm::{sigmoid, Epilogue};
 use super::quant::Uint8Linear;
 use super::tensor::TensorCtx;
 use super::weights::RawTensor;
@@ -72,11 +73,6 @@ pub(crate) fn layernorm_batch(x: &[Vec<f32>], p: &LayerNormP) -> Vec<Vec<f32>> {
     // order within a row): rayon only spreads rows over threads, so this
     // is bit-exact vs the serial loop.
     x.par_iter().map(|r| layernorm_row(r, p)).collect()
-}
-
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
 }
 
 // Swish/GLU/add/scale stay scalar *per element* by decision (Phase 4):
@@ -254,7 +250,10 @@ impl DwConv {
     /// the integer MACs here are ~300k per layer, so Flex dispatch and
     /// its copies dominate — and Flex additionally drifts by f32
     /// summation order, which this removes.
-    pub(crate) fn forward_par(&self, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    /// `swish` fuses the conv's Swish activation into the same output
+    /// write (`v * sigmoid(v)` — the exact expression `swish_inplace`
+    /// applies afterwards), saving a full pass over the `[T][C]` output.
+    pub(crate) fn forward_par(&self, x: &[Vec<f32>], swish: bool) -> Vec<Vec<f32>> {
         use super::quant::dynamic_quantize_u8;
         let t = x.len();
         let c = self.channels;
@@ -282,7 +281,11 @@ impl DwConv {
                         let q = padded[(t_out + k) * c + ch] as i64 - zpx as i64;
                         acc += (w[base + k] as i64 - zpw) * q;
                     }
-                    row[ch] = acc as f32 * scale_sx + bias[ch];
+                    let mut v = acc as f32 * scale_sx + bias[ch];
+                    if swish {
+                        v = v * sigmoid(v);
+                    }
+                    row[ch] = v;
                 }
                 row
             })
@@ -294,7 +297,7 @@ impl DwConv {
     /// the Flex grouped-conv twin, is kept for its parity test only.)
     pub(crate) fn dispatch(&self, x: &[Vec<f32>], ctx: &super::tensor::TensorCtx) -> Vec<Vec<f32>> {
         if ctx.enabled {
-            self.forward_par(x)
+            self.forward_par(x, false)
         } else {
             self.forward(x)
         }
@@ -605,60 +608,89 @@ pub(crate) fn rel_scores(
     }
     out
 }
-/// Tensor core of `rel_attention`: same math (see module docs), one
-/// Flex matmul per head per term instead of scalar triple loops.
-/// B[i,j] = (q_i + v) . P[(j-i) + (T-1)] becomes a dense product plus
-/// a gather: M = (Q+v) P^T is `[T, 2T-1]`, and row i reads the
-/// contiguous slice `M[i, T-1-i .. 2T-1-i]` — i.e. `M.gather(1, kk)`
-/// with `kk[i,j] = (j-i)+(T-1)`, the same index the scalar path
-/// computes. `rel_scores` stays scalar (staged parity probe); only
-/// this core and the final out-projection dispatch.
-pub(crate) fn rel_attention_t(
-    x: &[Vec<f32>],
-    w: &BlockWeights,
-    pos_window: &[Vec<f32>],
-    ctx: &TensorCtx,
-) -> Vec<Vec<f32>> {
-    use burn::tensor::{activation, Int, Tensor, TensorData};
-    let t = x.len();
-    assert!(t >= 1, "rel_attention_t: empty input");
-    let (h, dh) = (w.n_heads, w.d_head);
-    let dev = &ctx.device;
-    let q = super::tensor::rows_to_tensor::<CpuBackend>(&linear_batch(&w.wq, x, ctx), dev);
-    let k = super::tensor::rows_to_tensor::<CpuBackend>(&linear_batch(&w.wk, x, ctx), dev);
-    let v = super::tensor::rows_to_tensor::<CpuBackend>(&linear_batch(&w.wv, x, ctx), dev);
-    let p = super::tensor::rows_to_tensor::<CpuBackend>(&linear_batch(&w.wpos, pos_window, ctx), dev);
-    // kk[i,j] = (j-i)+(T-1), the scalar path's window index.
-    let kk: Vec<i32> = (0..t)
-        .flat_map(|i| (0..t).map(move |j| j as i32 - i as i32 + t as i32 - 1))
-        .collect();
-    let kk_t: Tensor<CpuBackend, 2, Int> =
-        Tensor::from_data(TensorData::new(kk, [t, t]), dev);
-    let scale = 1.0 / (dh as f32).sqrt();
-    let mut heads = Vec::with_capacity(h);
-    for hh in 0..h {
-        let c = hh * dh;
-        let qh = q.clone().narrow(1, c, dh);
-        let kh = k.clone().narrow(1, c, dh);
-        let vh = v.clone().narrow(1, c, dh);
-        let ph = p.clone().narrow(1, c, dh);
-        let u: Tensor<CpuBackend, 1> =
-            Tensor::from_data(TensorData::new(w.pos_bias_u[hh].clone(), [dh]), dev);
-        let vb: Tensor<CpuBackend, 1> =
-            Tensor::from_data(TensorData::new(w.pos_bias_v[hh].clone(), [dh]), dev);
-        let ac = (qh.clone() + u.unsqueeze::<2>()).matmul(kh.transpose());
-        let m = (qh + vb.unsqueeze::<2>()).matmul(ph.transpose());
-        let bd: Tensor<CpuBackend, 2> = m.gather(1, kk_t.clone());
-        let a = activation::softmax((ac + bd) * scale, 1);
-        heads.push(a.matmul(vh));
-    }
-    let merged = Tensor::cat(heads, 1);
-    // Out-projection rides the linear dispatch (tensor under `ctx`).
-    w.wout.batch_dispatch(&super::tensor::tensor_to_rows(merged), ctx)
+/// Fused core of relative attention: one rayon task per query row
+/// computing AC + shifted BD, softmax and value mixing in the *scalar*
+/// path's exact accumulation order — each dot is a sequential f32 sum,
+/// the softmax follows `softmax_rows` step for step, AV accumulates over
+/// `j` in order — so the result is bit-identical to the scalar core
+/// (pinned by `fused_attention_matches_scalar`). What it removes is the
+/// Flex path's ~100 tiny op dispatches per layer (and the scalar path's
+/// per-(row, head) `Vec`s); T rows × H heads in one parallel pass.
+fn attention_core_into(
+    q: &[Vec<f32>],
+    k: &[Vec<f32>],
+    v: &[Vec<f32>],
+    p: &[Vec<f32>],
+    n_heads: usize,
+    d_head: usize,
+    pos_bias_u: &[Vec<f32>],
+    pos_bias_v: &[Vec<f32>],
+    out: &mut [Vec<f32>],
+) {
+    let t = q.len();
+    assert_eq!(k.len(), t);
+    assert_eq!(v.len(), t);
+    assert_eq!(p.len(), 2 * t - 1);
+    assert_eq!(out.len(), t);
+    let scale = 1.0 / (d_head as f32).sqrt();
+    out.par_iter_mut().enumerate().for_each(|(i, orow)| {
+        // Reused across heads: no per-(row, head) allocations.
+        let mut scores = vec![0.0f32; t];
+        let mut qu = vec![0.0f32; d_head];
+        let mut qv = vec![0.0f32; d_head];
+        for hh in 0..n_heads {
+            let qs = &q[i][hh * d_head..(hh + 1) * d_head];
+            for d in 0..d_head {
+                qu[d] = qs[d] + pos_bias_u[hh][d];
+            }
+            for d in 0..d_head {
+                qv[d] = qs[d] + pos_bias_v[hh][d];
+            }
+            for j in 0..t {
+                let kj = &k[j][hh * d_head..(hh + 1) * d_head];
+                let mut ac = 0.0f32;
+                for d in 0..d_head {
+                    ac += qu[d] * kj[d];
+                }
+                // Same window index as `rel_scores` (see its docs).
+                let kk = (j as isize - i as isize + t as isize - 1) as usize;
+                let pj = &p[kk][hh * d_head..(hh + 1) * d_head];
+                let mut bd = 0.0f32;
+                for d in 0..d_head {
+                    bd += qv[d] * pj[d];
+                }
+                scores[j] = (ac + bd) * scale;
+            }
+            // `softmax_rows`' exact sequence.
+            let m = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let mut s = 0.0f32;
+            for x in scores.iter_mut() {
+                *x = (*x - m).exp();
+                s += *x;
+            }
+            let inv = 1.0 / s;
+            for x in scores.iter_mut() {
+                *x *= inv;
+            }
+            let ov = &mut orow[hh * d_head..(hh + 1) * d_head];
+            for o in ov.iter_mut() {
+                *o = 0.0;
+            }
+            for j in 0..t {
+                let a = scores[j];
+                let vj = &v[j][hh * d_head..(hh + 1) * d_head];
+                for d in 0..d_head {
+                    ov[d] += a * vj[d];
+                }
+            }
+        }
+    });
 }
 /// Relative multi-head attention (Transformer-XL shift):
 /// B[i,j] = (q_i + v) . P[(j-i) + (T-1)], scores / sqrt(dh).
 /// Scores come from `rel_scores`; this adds softmax + value mixing.
+/// Scalar reference / `STTD_BURN_TENSOR=0` path; the tensor path goes
+/// through [`rel_attention_into`].
 pub(crate) fn rel_attention(
     x: &[Vec<f32>],
     w: &BlockWeights,
@@ -666,15 +698,25 @@ pub(crate) fn rel_attention(
     ctx: &TensorCtx,
 ) -> Vec<Vec<f32>> {
     if ctx.enabled {
-        return rel_attention_t(x, w, pos_window, ctx);
+        let t = x.len();
+        let mut out = vec![vec![0.0f32; w.n_heads * w.d_head]; t];
+        rel_attention_into(x, w, pos_window, ctx, &mut out, None);
+        return out;
     }
+    rel_attention_scalar(x, w, pos_window, ctx)
+}
+
+/// Exact scalar core of [`rel_attention`] (softmax + value mixing over
+/// `rel_scores`), used as the reference the fused core is pinned to.
+fn rel_attention_scalar(
+    x: &[Vec<f32>],
+    w: &BlockWeights,
+    pos_window: &[Vec<f32>],
+    ctx: &TensorCtx,
+) -> Vec<Vec<f32>> {
     let t = x.len();
     let (h, dh) = (w.n_heads, w.d_head);
-    let v = split_heads(
-        &linear_batch(&w.wv, x, ctx),
-        h,
-        dh,
-    );
+    let v = split_heads(&linear_batch(&w.wv, x, ctx), h, dh);
     let scores = rel_scores(x, w, pos_window, ctx);
     // scores is [T][H][T]; softmax over keys per (frame, head).
     let mut heads_out = Vec::with_capacity(h);
@@ -703,10 +745,98 @@ pub(crate) fn rel_attention(
     linear_batch(&w.wout, &merged, ctx)
 }
 
+/// [`rel_attention`] writing straight into `out`: `None` overwrites,
+/// `Some(scale)` accumulates `out += scale * attn`. The tensor path runs
+/// the shared-A Q/K/V projections (one activation quantization for all
+/// three — exact, they see the same input), the fused
+/// [`attention_core_into`], and the out-projection with the residual add
+/// fused into its GEMM epilogue.
+pub(crate) fn rel_attention_into(
+    x: &[Vec<f32>],
+    w: &BlockWeights,
+    pos_window: &[Vec<f32>],
+    ctx: &TensorCtx,
+    out: &mut [Vec<f32>],
+    add: Option<f32>,
+) {
+    let t = x.len();
+    let (h, dh) = (w.n_heads, w.d_head);
+    let d = h * dh;
+    assert_eq!(out.len(), t);
+    if !ctx.enabled {
+        let a = rel_attention_scalar(x, w, pos_window, ctx);
+        match add {
+            None => {
+                for (o, s) in out.iter_mut().zip(&a) {
+                    o.copy_from_slice(s);
+                }
+            }
+            Some(sc) => {
+                out.par_iter_mut().zip(a.par_iter()).for_each(|(o, s)| {
+                    for (x, &y) in o.iter_mut().zip(s.iter()) {
+                        *x += sc * y;
+                    }
+                });
+            }
+        }
+        return;
+    }
+    let qkv = Uint8Linear::shared_activation(ctx, x);
+    let mut q = vec![vec![0.0f32; d]; t];
+    let mut k = vec![vec![0.0f32; d]; t];
+    let mut v = vec![vec![0.0f32; d]; t];
+    let mut proj = |lin: &Uint8Linear, dst: &mut [Vec<f32>]| match &qkv {
+        Some(a) => lin.forward_quantized_into(a, ctx, dst, Epilogue::None),
+        None => lin.forward_batch_into(x, ctx, dst, Epilogue::None),
+    };
+    proj(&w.wq, &mut q);
+    proj(&w.wk, &mut k);
+    proj(&w.wv, &mut v);
+    let mut p = vec![vec![0.0f32; d]; pos_window.len()];
+    w.wpos.forward_batch_into(pos_window, ctx, &mut p, Epilogue::None);
+    let mut merged = vec![vec![0.0f32; d]; t];
+    attention_core_into(
+        &q,
+        &k,
+        &v,
+        &p,
+        h,
+        dh,
+        &w.pos_bias_u,
+        &w.pos_bias_v,
+        &mut merged,
+    );
+    let epi = match add {
+        Some(sc) => Epilogue::AddScale(sc),
+        None => Epilogue::None,
+    };
+    w.wout.forward_batch_into(&merged, ctx, out, epi);
+}
+
 pub(crate) fn ffn(x: &[Vec<f32>], l1: &Uint8Linear, l2: &Uint8Linear, ctx: &TensorCtx) -> Vec<Vec<f32>> {
     let mut h = linear_batch(l1, x, ctx);
     h.par_iter_mut().for_each(|row| swish_inplace(row));
     linear_batch(l2, &h, ctx)
+}
+
+/// Tensor-path [`ffn`] accumulating the branch straight into `out`:
+/// `out += scale * l2(swish(l1(x)))`. The Swish runs in l1's GEMM
+/// epilogue and the residual add in l2's (`AddScale(scale)`), so there is
+/// no activation pass, no scale pass, no add pass and no branch buffer.
+/// Bit-identical to `ffn` + `scale_inplace(0.5)` + `add_inplace`.
+pub(crate) fn ffn_into(
+    x: &[Vec<f32>],
+    l1: &Uint8Linear,
+    l2: &Uint8Linear,
+    ctx: &TensorCtx,
+    out: &mut [Vec<f32>],
+    scale: f32,
+) {
+    let t = x.len();
+    assert_eq!(out.len(), t);
+    let mut hidden = vec![vec![0.0f32; l1.out_dim]; t];
+    l1.forward_batch_into(x, ctx, &mut hidden, Epilogue::Swish);
+    l2.forward_batch_into(&hidden, ctx, out, Epilogue::AddScale(scale));
 }
 
 pub(crate) fn conv_block(x: &[Vec<f32>], w: &BlockWeights, ctx: &TensorCtx) -> Vec<Vec<f32>> {
@@ -724,6 +854,37 @@ pub(crate) fn conv_block(x: &[Vec<f32>], w: &BlockWeights, ctx: &TensorCtx) -> V
     linear_batch(&w.pw2, &dwed, ctx)
 }
 
+/// Tensor-path [`conv_block`] accumulating into `out`: pw1's GEMM writes
+/// the GLU result directly (the 2048-wide pre-activation never exists as
+/// a buffer), the depthwise conv's Swish is fused into its output write,
+/// and pw2 accumulates into `out` (`AddScale`). Bit-identical to
+/// `conv_block` + `add_inplace`.
+pub(crate) fn conv_block_into(
+    x: &[Vec<f32>],
+    w: &BlockWeights,
+    ctx: &TensorCtx,
+    out: &mut [Vec<f32>],
+    scale: f32,
+) {
+    let t = x.len();
+    assert_eq!(out.len(), t);
+    let mut gated = vec![vec![0.0f32; w.dw.channels]; t];
+    w.pw1.forward_batch_into(x, ctx, &mut gated, Epilogue::Glu);
+    let mut dwed = if ctx.enabled {
+        w.dw.forward_par(&gated, true)
+    } else {
+        let mut y = w.dw.forward(&gated);
+        y.par_iter_mut().for_each(|r| swish_inplace(r));
+        y
+    };
+    // SAME padding (k=9, pads 4/4) preserves length; trim defensively.
+    dwed.truncate(t);
+    while dwed.len() < t {
+        dwed.push(vec![0.0; w.dw.channels]);
+    }
+    w.pw2.forward_batch_into(&dwed, ctx, out, Epilogue::AddScale(scale));
+}
+
 /// One full block: half-step FFN sandwich + final norm.
 pub(crate) fn block_forward(
     x: &[Vec<f32>],
@@ -732,6 +893,26 @@ pub(crate) fn block_forward(
     ctx: &TensorCtx,
 ) -> Vec<Vec<f32>> {
     let mut h = x.to_vec();
+    if ctx.enabled {
+        // Fused tensor path: each branch accumulates straight into `h`
+        // through its GEMM epilogues (no branch buffers, no separate
+        // scale/add passes).
+        ffn_into(
+            &layernorm_batch(&h, &w.norm_ff1),
+            &w.ffn1_l1,
+            &w.ffn1_l2,
+            ctx,
+            &mut h,
+            0.5,
+        );
+        let na = layernorm_batch(&h, &w.norm_att);
+        rel_attention_into(&na, w, pos_window, ctx, &mut h, Some(1.0));
+        let nc = layernorm_batch(&h, &w.norm_conv);
+        conv_block_into(&nc, w, ctx, &mut h, 1.0);
+        let n2 = layernorm_batch(&h, &w.norm_ff2);
+        ffn_into(&n2, &w.ffn2_l1, &w.ffn2_l2, ctx, &mut h, 0.5);
+        return layernorm_batch(&h, &w.norm_out);
+    }
     let mut f = ffn(&layernorm_batch(&h, &w.norm_ff1), &w.ffn1_l1, &w.ffn1_l2, ctx);
     scale_inplace(&mut f, 0.5);
     add_inplace(&mut h, &f);
@@ -827,7 +1008,13 @@ mod tests {
             let x: Vec<Vec<f32>> = (0..t)
                 .map(|_| (0..channels).map(|_| rnd()).collect())
                 .collect();
-            assert_eq!(dw.forward_par(&x), dw.forward(&x), "c={channels} k={kernel} t={t}");
+            let s = dw.forward(&x);
+            assert_eq!(dw.forward_par(&x, false), s, "c={channels} k={kernel} t={t}");
+            // Swish-fused twin: same values, activation applied in the
+            // output write (exact vs swish_inplace over `forward`).
+            let mut want = s.clone();
+            want.iter_mut().for_each(|r| swish_inplace(r));
+            assert_eq!(dw.forward_par(&x, true), want, "c={channels} k={kernel} t={t}");
         }
     }
 
@@ -961,7 +1148,10 @@ mod tests {
         assert!((y[1][0] - 0.5).abs() < 1e-5, "y={y:?}");
         // Tensor core must agree with the scalar path (and therefore
         // pick the same shift direction): any gather/indexing bug shows
-        // up here before real weights are involved.
+        // up here before real weights are involved. On the integer
+        // fast path the whole comparison is bit-exact (shared-A Q/K/V
+        // quantize identically, the fused core replicates the scalar
+        // accumulation order).
         let yt = rel_attention(
             &x,
             &w,
@@ -972,8 +1162,13 @@ mod tests {
             },
         );
         assert_eq!(yt.len(), 2);
+        let exact = crate::parakeet_burn::igemm::has_fast_path();
         for (a, b) in y.iter().zip(yt.iter()) {
-            assert!((a[0] - b[0]).abs() < 1e-5, "scalar={y:?} tensor={yt:?}");
+            if exact {
+                assert_eq!(a, b, "scalar={y:?} tensor={yt:?}");
+            } else {
+                assert!((a[0] - b[0]).abs() < 1e-5, "scalar={y:?} tensor={yt:?}");
+            }
         }
         // Full block preserves shape and stays finite.
         let table: Vec<Vec<f32>> = (0..9999).map(|i| vec![i as f32]).collect();
@@ -981,6 +1176,70 @@ mod tests {
         let z = block_forward(&vec![vec![1.0], vec![0.0]], &w, &win, &TensorCtx::scalar());
         assert_eq!(z.len(), 2);
         assert!(z.iter().all(|r| r.len() == 1 && r.iter().all(|v| v.is_finite())));
+    }
+
+    /// The fused attention core replicates the scalar core bit-for-bit:
+    /// identical `qu/qv`, sequential f32 dots, `softmax_rows`' sequence
+    /// and in-order AV accumulation, over multiple T and heads.
+    #[test]
+    fn fused_attention_core_matches_scalar_core() {
+        let mut seed: u64 = 0xA77;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 4.0
+        };
+        for (t, h, dh) in [(1usize, 1usize, 4usize), (2, 2, 4), (5, 2, 4), (8, 2, 8)] {
+            let d = h * dh;
+            let q: Vec<Vec<f32>> = (0..t).map(|_| (0..d).map(|_| rnd()).collect()).collect();
+            let k: Vec<Vec<f32>> = (0..t).map(|_| (0..d).map(|_| rnd()).collect()).collect();
+            let v: Vec<Vec<f32>> = (0..t).map(|_| (0..d).map(|_| rnd()).collect()).collect();
+            let p: Vec<Vec<f32>> = (0..2 * t - 1)
+                .map(|_| (0..d).map(|_| rnd()).collect())
+                .collect();
+            let pu: Vec<Vec<f32>> = (0..h).map(|_| (0..dh).map(|_| rnd()).collect()).collect();
+            let pv: Vec<Vec<f32>> = (0..h).map(|_| (0..dh).map(|_| rnd()).collect()).collect();
+            // Scalar reference: the exact code `rel_scores` + `softmax_rows`
+            // + AV run (same per-head slice copies, same orders).
+            let scale = 1.0 / (dh as f32).sqrt();
+            let mut want = vec![vec![0.0f32; d]; t];
+            for i in 0..t {
+                for hh in 0..h {
+                    let qs = &q[i][hh * dh..(hh + 1) * dh];
+                    let qu: Vec<f32> =
+                        qs.iter().zip(pu[hh].iter()).map(|(a, b)| a + b).collect();
+                    let qv: Vec<f32> =
+                        qs.iter().zip(pv[hh].iter()).map(|(a, b)| a + b).collect();
+                    let mut row = vec![0.0f32; t];
+                    for j in 0..t {
+                        let ac: f32 = qu
+                            .iter()
+                            .zip(k[j][hh * dh..(hh + 1) * dh].iter())
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        let kk = (j as isize - i as isize + t as isize - 1) as usize;
+                        let bd: f32 = qv
+                            .iter()
+                            .zip(p[kk][hh * dh..(hh + 1) * dh].iter())
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        row[j] = (ac + bd) * scale;
+                    }
+                    let mut rows = vec![row];
+                    softmax_rows(&mut rows);
+                    for j in 0..t {
+                        let a = rows[0][j];
+                        for dd in 0..dh {
+                            want[i][hh * dh + dd] += a * v[j][hh * dh + dd];
+                        }
+                    }
+                }
+            }
+            let mut got = vec![vec![0.0f32; d]; t];
+            attention_core_into(&q, &k, &v, &p, h, dh, &pu, &pv, &mut got);
+            assert_eq!(got, want, "t={t} h={h} dh={dh}");
+        }
     }
 
     fn load_layer0(dir: &std::path::Path) -> (BlockWeights, Vec<Vec<f32>>) {

@@ -112,7 +112,24 @@ pub(crate) fn transpose_u8(d: &[u8], rows: usize, cols: usize) -> Vec<u8> {
 /// One deliberate unknown: the exact .5 rounding mode (Rust `round`
 /// rounds half away from zero; no probe produced an exact .5 to tell).
 /// At most 1 LSB on a negligible share of values.
+///
+/// Dispatches to the AVX-512 twin (`igemm::quantize_u8_avx512`) on
+/// fast-path machines — bit-identical (see its docs) and several times
+/// faster: the scalar map's per-element libm `roundf` call dominates
+/// every conv/depthwise call. The scalar body below is the reference.
 pub(crate) fn dynamic_quantize_u8(xs: &[f32]) -> (Vec<u8>, f32, u8) {
+    assert!(!xs.is_empty());
+    if super::igemm::has_fast_path() {
+        // SAFETY: gated on the runtime AVX-512F+BW check.
+        return unsafe { super::igemm::quantize_u8_avx512(xs) };
+    }
+    dynamic_quantize_u8_scalar(xs)
+}
+
+/// Scalar reference for [`dynamic_quantize_u8`] (fallback on machines
+/// without AVX-512): the probe-pinned arithmetic exactly as documented
+/// above, bit-identical to the SIMD twin.
+pub(crate) fn dynamic_quantize_u8_scalar(xs: &[f32]) -> (Vec<u8>, f32, u8) {
     assert!(!xs.is_empty());
     let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
     for &v in xs {
@@ -131,6 +148,74 @@ pub(crate) fn dynamic_quantize_u8(xs: &[f32]) -> (Vec<u8>, f32, u8) {
         .map(|&v| ((v / s).round() as i32 + zp as i32).clamp(0, 255) as u8)
         .collect();
     (q, s, zp)
+}
+
+/// Quantized `[T,K]` activation rows plus their scale: the shared-A form
+/// (attention quantizes its input once and runs Q/K/V against the same
+/// integers). `src` keeps the original rows for the Flex fallback.
+pub(crate) struct QuantizedRows<'a> {
+    pub(crate) a: Vec<i16>,
+    pub(crate) sx: f32,
+    pub(crate) t: usize,
+    pub(crate) k: usize,
+    pub(crate) src: &'a [Vec<f32>],
+}
+
+/// Unfused epilogue (Flex fallback and test reference): applies exactly
+/// the per-element arithmetic the GEMM-fused variants apply in `igemm`
+/// (same expressions, same order), so switching paths changes nothing.
+pub(crate) fn apply_epilogue(
+    src: &[Vec<f32>],
+    out: &mut [Vec<f32>],
+    epi: super::igemm::Epilogue<'_>,
+) {
+    use super::igemm::{sigmoid, Epilogue};
+    assert_eq!(src.len(), out.len());
+    let n = src[0].len();
+    match epi {
+        Epilogue::None => {
+            for (o, s) in out.iter_mut().zip(src) {
+                o.copy_from_slice(s);
+            }
+        }
+        Epilogue::Swish => {
+            for (o, s) in out.iter_mut().zip(src) {
+                for (dst, &y) in o.iter_mut().zip(s.iter()) {
+                    *dst = y * sigmoid(y);
+                }
+            }
+        }
+        Epilogue::Relu => {
+            for (o, s) in out.iter_mut().zip(src) {
+                for (dst, &y) in o.iter_mut().zip(s.iter()) {
+                    *dst = if y < 0.0 { 0.0 } else { y };
+                }
+            }
+        }
+        Epilogue::AddScale(sc) => {
+            for (o, s) in out.iter_mut().zip(src) {
+                for (dst, &y) in o.iter_mut().zip(s.iter()) {
+                    *dst += sc * y;
+                }
+            }
+        }
+        Epilogue::BiasRelu(b) => {
+            for (o, s) in out.iter_mut().zip(src) {
+                for (dst, (&y, &bb)) in o.iter_mut().zip(s.iter().zip(b.iter())) {
+                    let v = y + bb;
+                    *dst = if v < 0.0 { 0.0 } else { v };
+                }
+            }
+        }
+        Epilogue::Glu => {
+            for (o, s) in out.iter_mut().zip(src) {
+                let (v, g) = s.split_at(n / 2);
+                for (dst, (&vv, &gg)) in o.iter_mut().zip(v.iter().zip(g.iter())) {
+                    *dst = vv * sigmoid(gg);
+                }
+            }
+        }
+    }
 }
 
 /// One asymmetrically-quantized uint8 Linear (encoder MatMuls/Convs,
@@ -373,6 +458,105 @@ impl Uint8Linear {
         super::tensor::tensor_to_rows(y)
     }
 
+    /// Quantize `xs` once for sharing across several linears (see
+    /// [`QuantizedRows`]): the same window / scale / i16 values
+    /// `forward_batch_t` would build internally, built once. Exact by
+    /// construction: the graph's per-MatMul `DynamicQuantizeLinear` over
+    /// the *same* input tensor quantizes identically, so Q/K/V can share
+    /// one activation quantization.
+    pub(crate) fn quantize_activations(xs: &[Vec<f32>]) -> QuantizedRows<'_> {
+        assert!(!xs.is_empty());
+        assert!(xs.iter().all(|r| r.len() == xs[0].len()));
+        let (a, sx, _) = super::igemm::quantize_from_rows(xs);
+        QuantizedRows {
+            a,
+            sx,
+            t: xs.len(),
+            k: xs[0].len(),
+            src: xs,
+        }
+    }
+
+    /// Shared activation quantization only where it pays off: `Some` when
+    /// `ctx` selects the integer path (which consumes the i16 rows),
+    /// `None` on the Flex fallback (which re-reads `xs` per linear, so
+    /// building `A` would be dead work).
+    pub(crate) fn shared_activation<'a>(
+        ctx: &super::tensor::TensorCtx,
+        xs: &'a [Vec<f32>],
+    ) -> Option<QuantizedRows<'a>> {
+        (ctx.enabled && super::igemm::has_fast_path()).then(|| Self::quantize_activations(xs))
+    }
+
+    /// [`Self::forward_batch_t`] with the epilogue fused into the GEMM's
+    /// scale-up, writing straight into pre-sized `out` rows: no per-call
+    /// output rows, no separate swish/GLU/add pass, no row-copy loop.
+    /// Bit-identical to `forward_batch_t` followed by the matching
+    /// [`apply_epilogue`] (pinned by `into_rows_matches_then_epilogue`).
+    pub(crate) fn forward_batch_into(
+        &self,
+        xs: &[Vec<f32>],
+        ctx: &super::tensor::TensorCtx,
+        out: &mut [Vec<f32>],
+        epi: super::igemm::Epilogue<'_>,
+    ) {
+        assert!(xs.iter().all(|r| r.len() == self.in_dim));
+        if xs.is_empty() {
+            return;
+        }
+        assert_eq!(out.len(), xs.len());
+        if ctx.enabled && super::igemm::has_fast_path() {
+            let (a, sx, _) = super::igemm::quantize_from_rows(xs);
+            self.gemm_quantized_into(&a, xs.len(), sx, out, epi);
+            return;
+        }
+        let rows = self.forward_batch_t(xs, &ctx.device);
+        apply_epilogue(&rows, out, epi);
+    }
+
+    /// GEMM against a shared [`QuantizedRows`] (integer path) or its
+    /// source rows (Flex fallback), with the epilogue contract of
+    /// [`Self::forward_batch_into`].
+    pub(crate) fn forward_quantized_into(
+        &self,
+        q: &QuantizedRows<'_>,
+        ctx: &super::tensor::TensorCtx,
+        out: &mut [Vec<f32>],
+        epi: super::igemm::Epilogue<'_>,
+    ) {
+        assert_eq!(q.k, self.in_dim);
+        assert_eq!(out.len(), q.t);
+        if ctx.enabled && super::igemm::has_fast_path() {
+            self.gemm_quantized_into(&q.a, q.t, q.sx, out, epi);
+            return;
+        }
+        let rows = self.forward_batch_t(q.src, &ctx.device);
+        apply_epilogue(&rows, out, epi);
+    }
+
+    fn gemm_quantized_into(
+        &self,
+        a: &[i16],
+        t: usize,
+        sx: f32,
+        out: &mut [Vec<f32>],
+        epi: super::igemm::Epilogue<'_>,
+    ) {
+        let w = self.widened();
+        super::igemm::linear_i16_rows(
+            a,
+            t,
+            self.in_dim,
+            w,
+            self.out_dim,
+            &self.scale,
+            self.bias.as_deref(),
+            sx,
+            out,
+            epi,
+        );
+    }
+
     /// Dispatch: scalar `forward_batch` (exact integer path, default)
     /// or its tensor twin, per `ctx`. All tensor-path call sites funnel
     /// through here, so `STTD_BURN_TENSOR` flips the whole encoder at once.
@@ -582,6 +766,73 @@ mod tests {
         // Activation requantization noise is replicated exactly, so the
         // residual is f32 summation order only.
         assert!(max_rel < 1e-4, "max_rel={max_rel} ref_max={ref_max}");
+    }
+
+    /// The rows-direct fused API equals `forward_batch_t` + the unfused
+    /// `apply_epilogue` for every epilogue, and the shared-A path equals
+    /// the per-linear one (integer path: bit-exact; this also pins the
+    /// Flex fallback's post-pass arithmetic).
+    #[test]
+    fn into_rows_matches_then_epilogue() {
+        use crate::parakeet_burn::backend::cpu_device;
+        use crate::parakeet_burn::igemm::Epilogue;
+        use crate::parakeet_burn::tensor::TensorCtx;
+        let lin = Uint8Linear {
+            weight_u8: vec![1, 2, 250, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            scale: vec![0.02, 0.03, 0.04, 0.05],
+            zero_point: vec![121.0, 5.0, 30.0, 200.0],
+            bias: Some(vec![0.5, -0.25, 1.0, -2.0]),
+            in_dim: 3,
+            out_dim: 4,
+            cache: std::sync::OnceLock::new(),
+            w_i16: std::sync::OnceLock::new(),
+        };
+        let xs = vec![
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 0.25, -1.5],
+            vec![10.0, 0.0, -7.0],
+            vec![0.0, 0.0, 0.0],
+        ];
+        let dev = cpu_device();
+        let ctx = TensorCtx {
+            device: dev,
+            enabled: true,
+        };
+        let reference = lin.forward_batch_t(&xs, &dev);
+        for epi in [
+            Epilogue::None,
+            Epilogue::Swish,
+            Epilogue::Relu,
+            Epilogue::BiasRelu(&[0.5, -0.5, 0.0, 2.0]),
+        ] {
+            let mut out = vec![vec![0.0f32; 4]; 4];
+            lin.forward_batch_into(&xs, &ctx, &mut out, epi);
+            let mut want = vec![vec![0.0f32; 4]; 4];
+            apply_epilogue(&reference, &mut want, epi);
+            assert_eq!(out, want, "epi={epi:?}");
+        }
+        // Accumulate into an existing stream.
+        let base = vec![vec![1.0f32; 4]; 4];
+        let mut out = base.clone();
+        lin.forward_batch_into(&xs, &ctx, &mut out, Epilogue::AddScale(0.5));
+        let mut want = base.clone();
+        apply_epilogue(&reference, &mut want, Epilogue::AddScale(0.5));
+        assert_eq!(out, want, "addscale");
+        // GLU halves the width (out_dim 4 -> 2).
+        let mut out = vec![vec![0.0f32; 2]; 4];
+        lin.forward_batch_into(&xs, &ctx, &mut out, Epilogue::Glu);
+        let mut want = vec![vec![0.0f32; 2]; 4];
+        apply_epilogue(&reference, &mut want, Epilogue::Glu);
+        assert_eq!(out, want, "glu");
+        // Shared-A path (attention's Q/K/V form).
+        let q = Uint8Linear::quantize_activations(&xs);
+        assert_eq!(q.t, 4);
+        assert_eq!(q.k, 3);
+        let mut out = vec![vec![0.0f32; 4]; 4];
+        lin.forward_quantized_into(&q, &ctx, &mut out, Epilogue::Swish);
+        let mut want = vec![vec![0.0f32; 4]; 4];
+        apply_epilogue(&reference, &mut want, Epilogue::Swish);
+        assert_eq!(out, want, "shared-A swish");
     }
 
     #[test]

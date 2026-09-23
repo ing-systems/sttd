@@ -674,6 +674,18 @@ mod tests {
         use super::super::weights::load_selected;
         let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
 
+        // Match the production pool before timing: the binary resolves
+        // `--threads 0` to physical cores and pins workers by default, so
+        // these numbers are comparable to `sttd --parakeet-engine burn`.
+        super::super::backend::cap_thread_pool(num_cpus::get_physical());
+        eprintln!(
+            "profile: rayon threads = {} (pin={})",
+            rayon::current_num_threads(),
+            super::super::backend::parse_pin_flag(
+                std::env::var("STTD_BURN_PIN").ok().as_deref()
+            )
+        );
+
         let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
         let json = std::fs::read_to_string(dir.join("encoder-manifest.json")).unwrap();
         let manifest = load_manifest(&json).unwrap();
@@ -1014,6 +1026,15 @@ mod tests {
                 best = best.min(ms(t));
             }
             eprintln!("profile joint decode T=32: {best:.2} ms/call (min of 5)");
+            // Per-step cost (one `step_for`: 2 LSTM layers + enc/pred/out
+            // projections) — the decode driver runs one per frame/token.
+            let frame = frame32[0].clone();
+            let reps = 100;
+            let t = Instant::now();
+            for _ in 0..reps {
+                let _ = joint.step_for(&frame, 0, &tctx);
+            }
+            eprintln!("profile joint step_for: {:.3} ms/step", ms(t) / reps as f64);
         }
 
         // Aligned-vs-split 64B vector loads in the integer micro-kernel:

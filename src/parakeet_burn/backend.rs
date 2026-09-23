@@ -56,23 +56,86 @@ pub(crate) fn use_tensor_path() -> bool {
 /// `tokenizers` on the ORT path could, and it never loads alongside
 /// Burn), the existing size is kept and logged, never overridden.
 ///
-/// Nothing in the Burn path uses this pool yet beyond flex's own
-/// multithreaded ops (on by default): the int8 forward loops are still
-/// scalar. So today this pins the size for the tensor-ops swap; it
-/// changes no numerics and no current speed.
+/// Worker `i` is additionally pinned to the first CPU of physical core
+/// `i % n_cores` (Linux sysfs topology; no SMT siblings share a worker),
+/// so AVX-512-heavy workers stop migrating. On by default since Phase 10
+/// (measured ~85 ms vs ~95 ms per 2.5 s utterance on the Ryzen 9 9950X);
+/// `STTD_BURN_PIN=0` disables it. If `--threads` exceeds the physical
+/// core count, pinning is skipped (two pinned workers must not share a
+/// CPU) and logged.
 pub(crate) fn cap_thread_pool(n_threads: usize) {
     use std::sync::Once;
     static CAP: Once = Once::new();
     let want = n_threads.max(1);
+    let pin = parse_pin_flag(std::env::var("STTD_BURN_PIN").ok().as_deref());
     CAP.call_once(|| {
-        match rayon::ThreadPoolBuilder::new()
-            .num_threads(want)
-            .build_global()
-        {
+        let mut cpus = if pin { physical_cpus() } else { Vec::new() };
+        if !cpus.is_empty() && want > cpus.len() {
+            // More workers than cores would stack two pinned threads on
+            // one CPU; don't pin in that case.
+            log::info!(
+                "burn parakeet: STTD_BURN_PIN ignored ({want} threads > {} physical cores)",
+                cpus.len()
+            );
+            cpus.clear();
+        }
+        if !cpus.is_empty() {
+            log::info!("burn parakeet: pinning rayon workers to physical cores {cpus:?}");
+        }
+        let builder = rayon::ThreadPoolBuilder::new().num_threads(want);
+        let builder = if cpus.is_empty() {
+            builder
+        } else {
+            builder.start_handler(move |i| pin_current_thread(cpus[i % cpus.len()]))
+        };
+        match builder.build_global() {
             Ok(()) => log::info!("burn parakeet: rayon pool capped at {want} threads (--threads)"),
             Err(e) => log::info!("burn parakeet: rayon pool already sized, keeping it ({e})"),
         }
     });
+}
+
+/// `STTD_BURN_PIN` parsing (pure, testable): default on, `0`/`false`
+/// opts out (same shape as `parse_tensor_flag`).
+pub(crate) fn parse_pin_flag(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("false"))
+}
+
+/// First CPU of every physical core, from the Linux sysfs topology
+/// (`cpuN/topology/thread_siblings_list`); falls back to `0..physical`
+/// when the topology is unreadable. Sorted ascending, duplicates removed.
+pub(crate) fn physical_cpus() -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for cpu in 0..num_cpus::get() {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        let Ok(list) = std::fs::read_to_string(&path) else {
+            break;
+        };
+        let first = list
+            .trim()
+            .split([',', '-'])
+            .next()
+            .and_then(|s| s.parse::<usize>().ok());
+        if let Some(f) = first {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+    }
+    if out.is_empty() {
+        out = (0..num_cpus::get_physical()).collect();
+    }
+    out.sort_unstable();
+    out
+}
+
+fn pin_current_thread(_cpu: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(_cpu, &mut set);
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +162,27 @@ mod tests {
     }
 
     #[test]
+    fn pin_flag_parsing() {
+        // Default on; only explicit 0/false opts out.
+        assert!(super::parse_pin_flag(None));
+        assert!(super::parse_pin_flag(Some("1")));
+        assert!(super::parse_pin_flag(Some("true")));
+        assert!(!super::parse_pin_flag(Some("0")));
+        assert!(!super::parse_pin_flag(Some("false")));
+    }
+
+    #[test]
+    fn physical_cpus_are_unique_and_nonempty() {
+        let cpus = super::physical_cpus();
+        assert!(!cpus.is_empty(), "physical_cpus must fall back to cpu ids");
+        let mut sorted = cpus.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(cpus, sorted, "physical_cpus must be unique and sorted");
+        assert!(cpus.iter().all(|&c| c < num_cpus::get()));
+    }
+
+    #[test]
     fn cpu_is_default_without_cuda_build() {
         // Without the cuda feature every request lands on CPU.
         let d = select_device(false);
@@ -107,16 +191,20 @@ mod tests {
 
     #[test]
     fn rayon_cap_is_idempotent_and_effective() {
+        // The pool is process-wide and one-shot. Several tests in this
+        // binary use rayon (frontend, block/igemm kernels), so the first
+        // `build_global` may already have happened by the time this runs;
+        // what must hold either way is that repeated calls never panic and
+        // never change an existing size. (The winning-first case —
+        // `--threads` actually sizing the pool — is what the binary
+        // relies on, and it calls `cap_thread_pool` before any parallel
+        // work; it is not observable from a shared test process.)
+        let before = rayon::current_num_threads();
         super::cap_thread_pool(4);
         // Reloads re-call this: the Once gate makes every later call a
         // no-op that must never panic, even with a different request.
         super::cap_thread_pool(2);
-        // First call wins the process-wide pool. Nothing else in this
-        // test binary initializes it first (the only other rayon user,
-        // `tokenizers`, never loads here), so the size must be ours.
-        // If some future test beats us to it, build_global reports
-        // AlreadyInitialized and this assert needs revisiting.
-        assert_eq!(rayon::current_num_threads(), 4);
+        assert_eq!(rayon::current_num_threads(), before);
     }
 
     #[test]

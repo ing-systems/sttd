@@ -72,12 +72,22 @@ pub(crate) struct EmbedTable {
 
 impl EmbedTable {
     pub(crate) fn lookup(&self, token: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.lookup_into(token, &mut out);
+        out
+    }
+
+    /// [`Self::lookup`] into a reused buffer (per-step, so the row Vec is
+    /// not reallocated every decode step); same per-element arithmetic.
+    pub(crate) fn lookup_into(&self, token: usize, out: &mut Vec<f32>) {
         assert!(token < self.rows, "token {token} >= {}", self.rows);
         let base = token * self.cols;
-        self.data[base..base + self.cols]
-            .iter()
-            .map(|&q| (q as f32 - self.zero_point) * self.scale)
-            .collect()
+        out.clear();
+        out.extend(
+            self.data[base..base + self.cols]
+                .iter()
+                .map(|&q| (q as f32 - self.zero_point) * self.scale),
+        );
     }
 }
 
@@ -177,17 +187,22 @@ impl LstmLayer {
             LstmT { wr, b }
         })
     }
+}
 
-    /// One step: `(h_new, c_new)` from `(x, h_prev, c_prev)`.
-    /// Gate MACs dispatch on `ctx`: the tensor path runs them as one Flex
-    /// matmul over the concatenated `[x, h]` input against the stacked
-    /// gate matrix (one dispatch + one input tensor per step instead of
-    /// two; scalar nonlinearities unchanged). Gate nonlinearities and the
-    /// state update stay scalar on both paths (same libm calls, same
-    /// order — exact). The tensor gates differ from scalar by f32
-    /// summation order only (~1e-7 relative, and the sigmoid/tanh gates
-    /// are contractive, so it cannot amplify); the embed lookup stays
-    /// scalar on both (one row gather).
+/// Reusable per-step LSTM buffers (see [`LstmLayer::step_into`]): the
+/// greedy loop runs tens to hundreds of steps per utterance, and the
+/// `xh`/gates/candidate allocations were pure churn.
+#[derive(Default)]
+pub(crate) struct LstmStep {
+    xh: Vec<f32>,
+    gates: Vec<f32>,
+    pub(crate) h: Vec<f32>,
+    pub(crate) c: Vec<f32>,
+}
+
+impl LstmLayer {
+    /// One step: `(h_new, c_new)` from `(x, h_prev, c_prev)`, allocating
+    /// fresh outputs (tests/goldens; the greedy loop uses `step_into`).
     pub(crate) fn step(
         &self,
         x: &[f32],
@@ -195,31 +210,57 @@ impl LstmLayer {
         c: &[f32],
         ctx: &TensorCtx,
     ) -> (Vec<f32>, Vec<f32>) {
+        let mut buf = LstmStep::default();
+        self.step_into(x, h, c, ctx, &mut buf);
+        (buf.h, buf.c)
+    }
+
+    /// [`Self::step`] writing into caller-owned buffers (`buf.xh`/gates/
+    /// h/c are resized as needed and reused across steps).
+    /// Gate MACs dispatch on `ctx`: the tensor path runs them as one Flex
+    /// matmul over the concatenated `[x, h]` input against the stacked
+    /// gate matrix (one dispatch + one input tensor per step instead of
+    /// two; scalar nonlinearities unchanged). Gate nonlinearities and the
+    /// state update stay scalar on both paths (same libm calls, same
+    /// order — exact), now parallel over the hidden dimension (per-element
+    /// independent, so bit-identical to the serial loop). The tensor gates
+    /// differ from scalar by f32 summation order only (~1e-7 relative, and
+    /// the sigmoid/tanh gates are contractive, so it cannot amplify); the
+    /// embed lookup stays scalar on both (one row gather).
+    pub(crate) fn step_into(
+        &self,
+        x: &[f32],
+        h: &[f32],
+        c: &[f32],
+        ctx: &TensorCtx,
+        buf: &mut LstmStep,
+    ) {
         assert_eq!(x.len(), self.in_dim);
         assert_eq!(h.len(), self.hid);
         assert_eq!(c.len(), self.hid);
         let g4 = 4 * self.hid;
-        let mut gates = vec![0.0f32; g4];
+        buf.xh.clear();
+        buf.xh.reserve(self.in_dim + self.hid);
+        buf.xh.extend_from_slice(x);
+        buf.xh.extend_from_slice(h);
         if ctx.enabled {
             use burn::tensor::{Tensor, TensorData};
             let tc = self.t_cached(&ctx.device);
-            let mut xh = Vec::with_capacity(self.in_dim + self.hid);
-            xh.extend_from_slice(x);
-            xh.extend_from_slice(h);
             let xt: Tensor<CpuBackend, 2> = Tensor::from_data(
-                TensorData::new(xh, [1, self.in_dim + self.hid]),
+                TensorData::new(buf.xh.clone(), [1, self.in_dim + self.hid]),
                 &ctx.device,
             );
             let g = xt.matmul(tc.wr.clone()) + tc.b.clone();
-            gates = g.into_data().to_vec::<f32>().expect("lstm gates: to_vec");
+            buf.gates = g.into_data().to_vec::<f32>().expect("lstm gates: to_vec");
         } else {
             let wf = self.wf();
             let rf = self.rf();
+            buf.gates.resize(g4, 0.0);
             // Gate columns are independent: parallelize over chunks,
             // keeping the per-gate accumulation order identical
             // (bit-exact vs serial).
             use rayon::prelude::*;
-            gates
+            buf.gates
                 .par_chunks_mut(256)
                 .enumerate()
                 .for_each(|(chunk, gchunk)| {
@@ -240,22 +281,27 @@ impl LstmLayer {
                     }
                 });
         }
-        // ONNX gate order: i, o, f, c.
-        let (gi, rest) = gates.split_at(self.hid);
+        // ONNX gate order: i, o, f, c. Each hidden element is independent:
+        // rayon only spreads the loop, so this is bit-exact vs serial.
+        let (gi, rest) = buf.gates.split_at(self.hid);
         let (go, rest) = rest.split_at(self.hid);
         let (gf, gc) = rest.split_at(self.hid);
-        let mut h_new = vec![0.0f32; self.hid];
-        let mut c_new = vec![0.0f32; self.hid];
-        for k in 0..self.hid {
-            let i = sigmoid(gi[k]);
-            let o = sigmoid(go[k]);
-            let f = sigmoid(gf[k]);
-            let g = gc[k].tanh();
-            let cc = f * c[k] + i * g;
-            c_new[k] = cc;
-            h_new[k] = o * cc.tanh();
-        }
-        (h_new, c_new)
+        buf.h.resize(self.hid, 0.0);
+        buf.c.resize(self.hid, 0.0);
+        use rayon::prelude::*;
+        buf.h
+            .par_iter_mut()
+            .zip(buf.c.par_iter_mut())
+            .enumerate()
+            .for_each(|(k, (h_new, c_new))| {
+                let i = sigmoid(gi[k]);
+                let o = sigmoid(go[k]);
+                let f = sigmoid(gf[k]);
+                let g = gc[k].tanh();
+                let cc = f * c[k] + i * g;
+                *c_new = cc;
+                *h_new = o * cc.tanh();
+            });
     }
 }
 
@@ -277,6 +323,16 @@ pub(crate) struct BurnJoint {
     blank_id: usize,
     h: [Vec<f32>; 2],
     c: [Vec<f32>; 2],
+    /// Per-step reusable buffers (embed row + both LSTM layers): the
+    /// greedy loop runs tens to hundreds of steps per utterance.
+    scratch: JointScratch,
+}
+
+#[derive(Default)]
+struct JointScratch {
+    embed: Vec<f32>,
+    l0: LstmStep,
+    l1: LstmStep,
 }
 
 fn take_f32(tensors: &HashMap<String, RawTensor>, name: &str) -> Result<(Vec<usize>, Vec<f32>)> {
@@ -460,6 +516,7 @@ impl BurnJoint {
             blank_id,
             h: [vec![0.0; 640], vec![0.0; 640]],
             c: [vec![0.0; 640], vec![0.0; 640]],
+            scratch: JointScratch::default(),
         })
     }
 
@@ -504,11 +561,14 @@ impl BurnJoint {
         ctx: &TensorCtx,
     ) -> (JointStep, StepStates) {
         assert_eq!(enc_frame.len(), 1024);
-        let e = self.embed.lookup(token);
-        let (h0n, c0n) = self.l0.step(&e, &self.h[0], &self.c[0], ctx);
-        let (h1n, c1n) = self.l1.step(&h0n, &self.h[1], &self.c[1], ctx);
+        // Per-step buffers are reused (no fresh embed/xh/gates/candidate
+        // allocations); only the returned logits/states are owned.
+        let JointScratch { embed, l0, l1 } = &mut self.scratch;
+        self.embed.lookup_into(token, embed);
+        self.l0.step_into(embed, &self.h[0], &self.c[0], ctx, l0);
+        self.l1.step_into(&l0.h, &self.h[1], &self.c[1], ctx, l1);
         let pe = self.enc.forward_dispatch(enc_frame, ctx);
-        let pp = self.pred.forward_dispatch(&h1n, ctx);
+        let pp = self.pred.forward_dispatch(&l1.h, ctx);
         let mut hsum: Vec<f32> = pe.iter().zip(pp.iter()).map(|(a, b)| a + b).collect();
         for v in hsum.iter_mut() {
             if *v < 0.0 {
@@ -518,14 +578,20 @@ impl BurnJoint {
         let logits = self.out.forward_dispatch(&hsum, ctx);
         let tok = TdtGreedy::argmax(&logits[..self.vocab_size]);
         if tok != self.blank_id {
-            self.h = [h0n.clone(), h1n.clone()];
-            self.c = [c0n.clone(), c1n.clone()];
+            self.h = [l0.h.clone(), l1.h.clone()];
+            self.c = [l0.c.clone(), l1.c.clone()];
         }
         let step = JointStep {
             token_logits: logits[..self.vocab_size].to_vec(),
             duration_logits: logits[self.vocab_size..].to_vec(),
         };
-        (step, StepStates { h: [h0n, h1n], c: [c0n, c1n] })
+        (
+            step,
+            StepStates {
+                h: [l0.h.clone(), l1.h.clone()],
+                c: [l0.c.clone(), l1.c.clone()],
+            },
+        )
     }
 
     /// Greedy-decode `enc` frames (`[T'][1024]` rows from `BurnEncoder`).
