@@ -1,8 +1,8 @@
-// Burn backend selection: NdArray (CPU) always with `parakeet-burn`,
+// Burn backend selection: Flex (CPU) always with `parakeet-burn`,
 // CubeCL CUDA with `parakeet-burn-cuda` + `--gpu`.
 
 #[cfg(feature = "parakeet-burn")]
-pub(crate) type CpuBackend = burn_ndarray::NdArray;
+pub(crate) type CpuBackend = burn_flex::Flex;
 
 #[cfg(feature = "parakeet-burn-cuda")]
 pub(crate) type CudaBackend = burn_cuda::Cuda;
@@ -33,11 +33,10 @@ pub(crate) fn select_device(request_gpu: bool) -> BurnDevice {
 /// `tokenizers` on the ORT path could, and it never loads alongside
 /// Burn), the existing size is kept and logged, never overridden.
 ///
-/// Nothing in the Burn path uses this pool yet: `burn-ndarray` is
-/// built without its `multi-threads` feature (its `iter_par!` degrades
-/// to sequential) and the int8 forward loops are scalar. So today this
-/// only pins the size for the future tensor-ops swap; it changes no
-/// numerics and no current speed.
+/// Nothing in the Burn path uses this pool yet beyond flex's own
+/// multithreaded ops (on by default): the int8 forward loops are still
+/// scalar. So today this pins the size for the tensor-ops swap; it
+/// changes no numerics and no current speed.
 pub(crate) fn cap_thread_pool(n_threads: usize) {
     use std::sync::Once;
     static CAP: Once = Once::new();
@@ -79,12 +78,12 @@ mod tests {
     }
 
     #[test]
-    fn burn_ndarray_matmul_runs() {
+    fn burn_flex_matmul_runs() {
         use burn::tensor::Tensor;
-        use burn_ndarray::{NdArray, NdArrayDevice};
-        let device = NdArrayDevice::Cpu;
-        let a: Tensor<NdArray, 2> = Tensor::from_data([[1.0f32, 2.0], [3.0, 4.0]], &device);
-        let b: Tensor<NdArray, 2> = Tensor::from_data([[1.0f32, 0.0], [0.0, 1.0]], &device);
+        use burn_flex::{Flex, FlexDevice};
+        let device = FlexDevice;
+        let a: Tensor<Flex, 2> = Tensor::from_data([[1.0f32, 2.0], [3.0, 4.0]], &device);
+        let b: Tensor<Flex, 2> = Tensor::from_data([[1.0f32, 0.0], [0.0, 1.0]], &device);
         let c = a.matmul(b);
         let data: Vec<f32> = c.into_data().to_vec().expect("to_vec");
         assert_eq!(data, vec![1.0, 2.0, 3.0, 4.0]);
