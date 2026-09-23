@@ -80,9 +80,12 @@ mod model {
     impl ParakeetBurnModel {
         pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
             let intra_threads = opts.n_threads.max(1) as usize;
-            // Burn NdArray runs its kernels on the global rayon pool;
-            // the pool is sized once per process, so this only logs the
-            // request today (threading the cap through is step 4 remains).
+            // Honor `--threads` (resolved: 0 = physical cores, min 1):
+            // size rayon's process-wide pool once. See
+            // `backend::cap_thread_pool` for why this is a verified
+            // no-op today (nothing in the Burn path uses the pool yet)
+            // that pins the size for the tensor-ops swap.
+            super::backend::cap_thread_pool(intra_threads);
             let device = super::backend::select_device(opts.use_gpu);
             #[cfg(not(feature = "parakeet-burn-cuda"))]
             if opts.use_gpu {

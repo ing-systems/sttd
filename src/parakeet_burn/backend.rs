@@ -25,6 +25,34 @@ pub(crate) fn select_device(request_gpu: bool) -> BurnDevice {
     BurnDevice::Cpu
 }
 
+/// Size rayon's process-wide thread pool from `--threads` (already
+/// resolved: `0` means physical cores, minimum 1 — see
+/// `asr::resolve_n_threads`). The pool is global and one-shot: the
+/// first `build_global` wins and later calls (reloads after pause)
+/// are no-ops via `CAP`. If something else sized it first (today only
+/// `tokenizers` on the ORT path could, and it never loads alongside
+/// Burn), the existing size is kept and logged, never overridden.
+///
+/// Nothing in the Burn path uses this pool yet: `burn-ndarray` is
+/// built without its `multi-threads` feature (its `iter_par!` degrades
+/// to sequential) and the int8 forward loops are scalar. So today this
+/// only pins the size for the future tensor-ops swap; it changes no
+/// numerics and no current speed.
+pub(crate) fn cap_thread_pool(n_threads: usize) {
+    use std::sync::Once;
+    static CAP: Once = Once::new();
+    let want = n_threads.max(1);
+    CAP.call_once(|| {
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(want)
+            .build_global()
+        {
+            Ok(()) => log::info!("burn parakeet: rayon pool capped at {want} threads (--threads)"),
+            Err(e) => log::info!("burn parakeet: rayon pool already sized, keeping it ({e})"),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -34,6 +62,20 @@ mod tests {
         // Without the cuda feature every request lands on CPU.
         let d = select_device(false);
         assert_eq!(d, BurnDevice::Cpu);
+    }
+
+    #[test]
+    fn rayon_cap_is_idempotent_and_effective() {
+        super::cap_thread_pool(4);
+        // Reloads re-call this: the Once gate makes every later call a
+        // no-op that must never panic, even with a different request.
+        super::cap_thread_pool(2);
+        // First call wins the process-wide pool. Nothing else in this
+        // test binary initializes it first (the only other rayon user,
+        // `tokenizers`, never loads here), so the size must be ours.
+        // If some future test beats us to it, build_global reports
+        // AlreadyInitialized and this assert needs revisiting.
+        assert_eq!(rayon::current_num_threads(), 4);
     }
 
     #[test]

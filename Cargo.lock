@@ -5481,6 +5481,7 @@ dependencies = [
  "ndarray 0.15.6",
  "num_cpus",
  "parakeet-rs",
+ "rayon",
  "realfft",
  "resampler",
  "rtrb",

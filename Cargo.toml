@@ -49,6 +49,7 @@ burn = { version = "0.21", default-features = false, features = ["std"], optiona
 burn-ndarray = { version = "0.21", default-features = false, features = ["std"], optional = true }
 burn-cuda = { version = "0.21", default-features = false, features = ["std"], optional = true }
 realfft = { version = "3", optional = true }
+rayon = { version = "1", optional = true }
 safetensors = { version = "0.4", optional = true }
 serde_json = { version = "1", optional = true }
 
@@ -75,7 +76,7 @@ parakeet-cuda = ["parakeet-rs/cuda"]
 # `parakeet-burn-cuda` only compiles where CUDA <= 12.x is installed.
 # The CPU Burn path is unaffected; GPU bring-up resumes with a cudarc
 # release that supports CUDA 13.x.
-parakeet-burn = ["dep:burn", "dep:burn-ndarray", "dep:realfft", "dep:safetensors", "dep:serde_json"]
+parakeet-burn = ["dep:burn", "dep:burn-ndarray", "dep:realfft", "dep:rayon", "dep:safetensors", "dep:serde_json"]
 parakeet-burn-cuda = ["parakeet-burn", "dep:burn-cuda"]
 # Sherpa-onnx engine family (see src/sherpa.rs): offline Nemo-transducer
 # (Parakeet-TDT-v3), Canary-1B-v2 (Sarphix int8 export of nvidia/canary-1b-v2,
