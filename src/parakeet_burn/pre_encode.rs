@@ -55,6 +55,10 @@ pub(crate) struct Conv2dW {
     pub(crate) kernel: usize,
     pub(crate) stride: usize,
     pub(crate) pad: usize,
+    /// Lazily-built dequantized `[out_c, in_c/group, k, k]` weight tensor
+    /// (same rationale as `quant::CachedT`: the pre-encode convs run once
+    /// per forward, and per-call `from_data` is pure overhead).
+    pub(crate) cache: std::sync::OnceLock<burn::tensor::Tensor<CpuBackend, 4>>,
 }
 
 impl Conv2dW {
@@ -63,6 +67,26 @@ impl Conv2dW {
             .iter()
             .map(|&q| (q as f32 - self.zero_point) * self.scale)
             .collect()
+    }
+
+    /// Dequantized `[out_c, in_c/group, k, k]` weight tensor, built once
+    /// (bit-identical to the old per-call dequant: same per-element
+    /// arithmetic, only built once instead of once per forward).
+    fn cached(&self, device: &super::backend::CpuDevice) -> &burn::tensor::Tensor<CpuBackend, 4> {
+        self.cache.get_or_init(|| {
+            burn::tensor::Tensor::from_data(
+                burn::tensor::TensorData::new(
+                    self.dequant(),
+                    [self.out_c, self.in_c / self.group, self.kernel, self.kernel],
+                ),
+                device,
+            )
+        })
+    }
+
+    /// Build the cached weight tensor now (load-time warming).
+    fn warm(&self, device: &super::backend::CpuDevice) {
+        let _ = self.cached(device);
     }
 }
 
@@ -118,16 +142,16 @@ fn conv2d_forward(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
 }
 
 /// Tensor twin of `conv2d_forward`: identical per-tensor activation
-/// quantization, dequantized to f32, one Flex conv2d against
+/// quantization, dequantized to f32, one Flex conv2d against the cached
 /// dequantized weights. No bias here: the caller runs the shared
 /// `add_bias_relu` tail exactly as the scalar path (matches the
 /// graph's Add order and keeps one bias site). Residual is f32
 /// summation order only. Pads are symmetric throughout the graph, so
 /// plain `ConvOptions` suffices (no `PaddedConvOptions`).
-fn conv2d_t<B: burn::tensor::backend::Backend>(
+fn conv2d_t(
     w: &Conv2dW,
     x: &[Vec<Vec<f32>>],
-    device: &<B as burn::tensor::backend::BackendTypes>::Device,
+    device: &super::backend::CpuDevice,
 ) -> Vec<Vec<Vec<f32>>> {
     use burn::tensor::{module::conv2d, ops::ConvOptions, TensorData};
     assert_eq!(x.len(), w.in_c);
@@ -137,22 +161,15 @@ fn conv2d_t<B: burn::tensor::backend::Backend>(
     let flat: Vec<f32> = x.iter().flat_map(|c| c.iter().flat_map(|r| r.iter().copied())).collect();
     let (xq, sx, zpx) = super::quant::dynamic_quantize_u8(&flat);
     let xd: Vec<f32> = xq.iter().map(|&q| (q as f32 - zpx as f32) * sx).collect();
-    let xt: burn::tensor::Tensor<B, 4> = burn::tensor::Tensor::from_data(
+    let xt: burn::tensor::Tensor<CpuBackend, 4> = burn::tensor::Tensor::from_data(
         TensorData::new(xd, [1, w.in_c, h, wd]),
         device,
     );
-    let wflat: Vec<f32> = w
-        .weight_u8
-        .iter()
-        .map(|&q| (q as f32 - w.zero_point) * w.scale)
-        .collect();
-    let wt: burn::tensor::Tensor<B, 4> = burn::tensor::Tensor::from_data(
-        TensorData::new(wflat, [w.out_c, w.in_c / w.group, w.kernel, w.kernel]),
-        device,
-    );
+    // Dequantized weights, built once (see `Conv2dW::cached`).
+    let wt = w.cached(device);
     let y = conv2d(
         xt,
-        wt,
+        wt.clone(),
         None,
         ConvOptions::new([w.stride, w.stride], [w.pad, w.pad], [1, 1], w.group),
     );
@@ -254,6 +271,7 @@ fn take_conv(
         kernel,
         stride,
         pad,
+        cache: std::sync::OnceLock::new(),
     })
 }
 
@@ -326,6 +344,8 @@ impl PreEncodeWeights {
             bias: Some(out_bias),
             in_dim: 4096,
             out_dim: 1024,
+            cache: std::sync::OnceLock::new(),
+            w_i16: std::sync::OnceLock::new(),
         };
 
         Ok(Self {
@@ -336,6 +356,15 @@ impl PreEncodeWeights {
             conv6,
             out,
         })
+    }
+
+    /// Build every cached tensor now (load-time warming): the 5 convs
+    /// plus the out-projection.
+    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
+        for w in [&self.conv0, &self.conv2, &self.conv3, &self.conv5, &self.conv6] {
+            w.warm(device);
+        }
+        self.out.warm(device);
     }
 
     /// Mel `[T][128]` -> `[T'][1024]`. Empty in, empty out.
@@ -358,7 +387,7 @@ impl PreEncodeWeights {
             // Convs follow `ctx` (tensor twin replicates the
             // `ConvInteger` chain exactly); bias+Relu tail is shared.
             let mut y = if ctx.enabled {
-                conv2d_t::<CpuBackend>(w, &x, &ctx.device)
+                conv2d_t(w, &x, &ctx.device)
             } else {
                 conv2d_forward(w, &x)
             };
@@ -454,6 +483,7 @@ mod tests {
             kernel: 3,
             stride: 2,
             pad: 1,
+            cache: std::sync::OnceLock::new(),
         };
         let x = vec![vec![vec![2.0; 4]; 4]];
         let y = conv2d_forward(&w, &x);
@@ -485,6 +515,7 @@ mod tests {
             kernel: 1,
             stride: 1,
             pad: 0,
+            cache: std::sync::OnceLock::new(),
         };
         let x = vec![vec![vec![-2.0]], vec![vec![4.0]]];
         let y = conv2d_forward(&w, &x);
@@ -494,7 +525,7 @@ mod tests {
 
     #[test]
     fn conv_tensor_matches_scalar() {
-        use super::super::backend::{cpu_device, CpuBackend};
+        use super::super::backend::cpu_device;
         // Dense k3s2p1 + depthwise k3s2p1 over small maps with mixed
         // signs; tensor twin must match the integer chain to f32 order.
         let dense = Conv2dW {
@@ -508,6 +539,7 @@ mod tests {
             kernel: 3,
             stride: 2,
             pad: 1,
+            cache: std::sync::OnceLock::new(),
         };
         let x = vec![vec![
             vec![1.0, -2.0, 3.0, -0.5],
@@ -517,7 +549,7 @@ mod tests {
         ]];
         let dev = cpu_device();
         let s = conv2d_forward(&dense, &x);
-        let t = conv2d_t::<CpuBackend>(&dense, &x, &dev);
+        let t = conv2d_t(&dense, &x, &dev);
         assert_eq!((s.len(), t.len()), (2, 2));
         let (mut mx, mut rm) = (0.0f32, 0.0f32);
         for (a, b) in s.iter().zip(t.iter()) {
@@ -556,6 +588,7 @@ mod tests {
             kernel: 1,
             stride: 1,
             pad: 0,
+            cache: std::sync::OnceLock::new(),
         };
         PreEncodeWeights {
             conv0: id(vec![0.0]),
@@ -570,6 +603,8 @@ mod tests {
                 bias: Some(vec![10.0]),
                 in_dim: 2,
                 out_dim: 1,
+                cache: std::sync::OnceLock::new(),
+                w_i16: std::sync::OnceLock::new(),
             },
         }
     }

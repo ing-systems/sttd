@@ -11,6 +11,8 @@
 // only (1-op probe: 1.5e-6). Swapping the inner loops for native Burn
 // tensor ops later changes speed, not numerics.
 
+use super::backend::{CpuBackend, CpuDevice};
+
 /// One row-quantized int8 Linear: `y = ((w_i8 - zp) * scale) @ x + bias`.
 #[derive(Debug, Clone)]
 pub(crate) struct Int8Linear {
@@ -149,6 +151,35 @@ pub(crate) struct Uint8Linear {
     pub(crate) bias: Option<Vec<f32>>,
     pub(crate) in_dim: usize,
     pub(crate) out_dim: usize,
+    /// Lazily-built dequantized tensor twins (see [`CachedT`]): `None`
+    /// until the first tensor-path call, then reused forever. Laziness
+    /// keeps `load` signatures device-free and covers hand-built test
+    /// weights; the device is always the CPU Flex one (every dispatch
+    /// site passes `CpuBackend` — see `batch_dispatch`).
+    /// Only built on machines without the integer-GEMM fast path (see
+    /// `igemm::has_fast_path`): where the fast path runs, the f32 Flex
+    /// matmul — and this cache — is never touched.
+    pub(crate) cache: std::sync::OnceLock<CachedT>,
+    /// Lazily-widened i16 weight twin (`igemm::widen_weights`, same layout
+    /// as the u8 store): the integer-GEMM fast path's read-only weights.
+    /// Built at warm on fast-path machines, on first use otherwise.
+    pub(crate) w_i16: std::sync::OnceLock<Vec<i16>>,
+}
+
+/// Dequantized tensor twins of a [`Uint8Linear`]'s weights, built once and
+/// reused by every tensor-path call.
+///
+/// `forward_batch_t` used to dequantize + transpose + `from_data` the full
+/// weight store on every call — for the encoder's FFN linears (4 M params
+/// each) that re-ran ~600 M dequant ops per utterance. The contents are
+/// bit-identical to `dequant_weights` transposed (same per-element
+/// `(q - z) * s`, pure reorder), so only the repeated work disappears.
+#[derive(Clone, Debug)]
+pub(crate) struct CachedT {
+    /// `[in_dim, out_dim]` (matmul-ready, transposed from the `[out][in]` store).
+    w: burn::tensor::Tensor<CpuBackend, 2>,
+    /// `[1, out_dim]` bias row, when the linear carries one.
+    b: Option<burn::tensor::Tensor<CpuBackend, 2>>,
 }
 
 impl Uint8Linear {
@@ -231,39 +262,112 @@ impl Uint8Linear {
         w
     }
 
+    /// Build the cached tensors now (load-time warming): identical to
+    /// what the first tensor-path call would build, so the first
+    /// utterance never pays the ~4 s cold-build stall. Builds the i16
+    /// weight twin on integer-GEMM machines, the f32 Flex twins
+    /// otherwise — never both.
+    pub(crate) fn warm(&self, device: &CpuDevice) {
+        if super::igemm::has_fast_path() {
+            let _ = self.widened();
+        } else {
+            let _ = self.cached(device);
+        }
+    }
+
+    /// Widened i16 weight twin, built once (see `igemm::widen_weights`).
+    pub(crate) fn widened(&self) -> &Vec<i16> {
+        self.w_i16.get_or_init(|| {
+            super::igemm::widen_weights(
+                &self.weight_u8,
+                self.out_dim,
+                self.in_dim,
+                &self.zero_point,
+            )
+        })
+    }
+
+    /// Dequantized weight tensor in matmul layout (`[in_dim, out_dim]`)
+    /// plus bias row, built once per linear. Bit-identical to
+    /// `dequant_weights` transposed: same per-element `(q - z) * s`
+    /// arithmetic, only the layout differs (pure reorder).
+    fn cached(&self, device: &CpuDevice) -> &CachedT {
+        self.cache.get_or_init(|| {
+            let mut wt = vec![0.0f32; self.in_dim * self.out_dim];
+            for o in 0..self.out_dim {
+                let s = self.scale[o.min(self.scale.len() - 1)];
+                let z = self.zero_point[o.min(self.zero_point.len() - 1)];
+                let base = o * self.in_dim;
+                for i in 0..self.in_dim {
+                    wt[i * self.out_dim + o] =
+                        (self.weight_u8[base + i] as f32 - z) * s;
+                }
+            }
+            let w = burn::tensor::Tensor::from_data(
+                burn::tensor::TensorData::new(wt, [self.in_dim, self.out_dim]),
+                device,
+            );
+            let b = self.bias.as_ref().map(|bias| {
+                burn::tensor::Tensor::from_data(
+                    burn::tensor::TensorData::new(bias.clone(), [1, self.out_dim]),
+                    device,
+                )
+            });
+            CachedT { w, b }
+        })
+    }
+
     /// Tensor twin of `forward_batch`: identical per-tensor activation
-    /// quantization, but the quantized activations are dequantized back
-    /// to f32 and the MAC runs as one Flex matmul against dequantized
-    /// weights. Activation-requantization noise is therefore replicated
-    /// exactly; the residual vs the integer path is f32 summation order
-    /// only (measured 9e-8 relative on synthetic inputs).
-    pub(crate) fn forward_batch_t<B: burn::tensor::backend::Backend>(
+    /// quantization, but the MAC runs as one integer GEMM over the
+    /// quantized activations and weights (`igemm::linear_i16`) instead of
+    /// a dequantized f32 Flex matmul. Bit-identical to `forward_batch`
+    /// (integer arithmetic is exact, so blocking changes nothing); the
+    /// Flex path below stays as the fallback for machines without
+    /// AVX-512 (its residual vs the integer path is f32 summation order
+    /// only, measured 9e-8 relative on synthetic inputs).
+    pub(crate) fn forward_batch_t(
         &self,
         xs: &[Vec<f32>],
-        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+        device: &CpuDevice,
     ) -> Vec<Vec<f32>> {
-        use burn::tensor::Tensor;
         assert!(xs.iter().all(|r| r.len() == self.in_dim));
         if xs.is_empty() {
             return Vec::new();
         }
+        if super::igemm::has_fast_path() {
+            let t = xs.len();
+            let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
+            let (a, sx, _) = super::igemm::quantize_rows_i16(&flat);
+            let w = self.widened();
+            let mut out = vec![0.0f32; t * self.out_dim];
+            super::igemm::linear_i16(
+                &a,
+                t,
+                self.in_dim,
+                w,
+                self.out_dim,
+                &self.scale,
+                self.bias.as_deref(),
+                sx,
+                &mut out,
+            );
+            return out.chunks(self.out_dim).map(|c| c.to_vec()).collect();
+        }
         let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
         let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
         let xd: Vec<f32> = xq.iter().map(|&q| (q as f32 - zpx as f32) * sx).collect();
-        let x_rows: Vec<Vec<f32>> = xd.chunks(self.in_dim).map(|c| c.to_vec()).collect();
-        let x = super::tensor::rows_to_tensor::<B>(&x_rows, device);
-        let w_rows: Vec<Vec<f32>> = self
-            .dequant_weights()
-            .chunks(self.in_dim)
-            .map(|c| c.to_vec())
-            .collect();
-        // Store is `[out][in]`; matmul wants `[K, N] = [in, out]`.
-        let w: Tensor<B, 2> = super::tensor::rows_to_tensor::<B>(&w_rows, device).transpose();
-        let mut y = x.matmul(w);
-        if let Some(b) = &self.bias {
+        // Flat straight into the tensor: no `Vec<Vec>` roundtrip (the old
+        // code re-chunked into rows and re-flattened inside
+        // `rows_to_tensor` — one full copy saved per call).
+        let x = burn::tensor::Tensor::from_data(
+            burn::tensor::TensorData::new(xd, [xs.len(), self.in_dim]),
+            device,
+        );
+        let c = self.cached(device);
+        let mut y = x.matmul(c.w.clone());
+        if let Some(b) = &c.b {
             // `[1, out]` broadcasts over the `[T, out]` rows.
-            let bt = super::tensor::rows_to_tensor::<B>(&[b.clone()], device);
-            y = y + bt;
+            y = y + b.clone();
         }
         super::tensor::tensor_to_rows(y)
     }
@@ -277,7 +381,7 @@ impl Uint8Linear {
         ctx: &super::tensor::TensorCtx,
     ) -> Vec<Vec<f32>> {
         if ctx.enabled {
-            self.forward_batch_t::<super::backend::CpuBackend>(xs, &ctx.device)
+            self.forward_batch_t(xs, &ctx.device)
         } else {
             self.forward_batch(xs)
         }
@@ -292,7 +396,7 @@ impl Uint8Linear {
         ctx: &super::tensor::TensorCtx,
     ) -> Vec<f32> {
         if ctx.enabled {
-            self.forward_batch_t::<super::backend::CpuBackend>(&[x.to_vec()], &ctx.device)
+            self.forward_batch_t(&[x.to_vec()], &ctx.device)
                 .pop()
                 .expect("forward_dispatch: one row in, one row out")
         } else {
@@ -342,6 +446,8 @@ mod tests {
             bias: None,
             in_dim: 2,
             out_dim: 2,
+            cache: std::sync::OnceLock::new(),
+        w_i16: std::sync::OnceLock::new(),
         };
         let batched = lin.forward_batch(&[vec![1.0, -2.0], vec![3.0, 0.5]]);
         assert_eq!(batched.len(), 2);
@@ -403,6 +509,8 @@ mod tests {
             bias: None,
             in_dim: 2,
             out_dim: 2,
+            cache: std::sync::OnceLock::new(),
+        w_i16: std::sync::OnceLock::new(),
         };
         let y = lin.forward(&[1.0, 1.0]);
         assert!((y[0] + 4.78).abs() < 1e-4, "y={y:?}");
@@ -426,6 +534,8 @@ mod tests {
             bias: None,
             in_dim: 3,
             out_dim: 2,
+            cache: std::sync::OnceLock::new(),
+        w_i16: std::sync::OnceLock::new(),
         };
         // y[0] = 1*x0 + 3*x1 + 5*x2 (column 0 of the (K,N) store).
         // Approximate: the integer path scales by 1/255, which is not
@@ -436,7 +546,7 @@ mod tests {
 
     #[test]
     fn tensor_linear_matches_integer_path() {
-        use crate::parakeet_burn::backend::{cpu_device, CpuBackend};
+        use crate::parakeet_burn::backend::cpu_device;
         // Non-square (3 -> 2) with per-row scales, distinct zero-points
         // and bias, so a transposed weight read or a dropped bias shows
         // up. Inputs span signs and magnitudes.
@@ -447,6 +557,8 @@ mod tests {
             bias: Some(vec![0.5, -0.25]),
             in_dim: 3,
             out_dim: 2,
+            cache: std::sync::OnceLock::new(),
+        w_i16: std::sync::OnceLock::new(),
         };
         let xs = vec![
             vec![1.0, -2.0, 3.0],
@@ -454,7 +566,7 @@ mod tests {
             vec![10.0, 0.0, -7.0],
         ];
         let s = lin.forward_batch(&xs);
-        let t = lin.forward_batch_t::<CpuBackend>(&xs, &cpu_device());
+        let t = lin.forward_batch_t(&xs, &cpu_device());
         assert_eq!(s.len(), 3);
         assert_eq!(t.len(), 3);
         assert!(t.iter().all(|r| r.len() == 2));
@@ -473,7 +585,7 @@ mod tests {
 
     #[test]
     fn tensor_linear_empty_matches_scalar() {
-        use crate::parakeet_burn::backend::{cpu_device, CpuBackend};
+        use crate::parakeet_burn::backend::cpu_device;
         let lin = Uint8Linear {
             weight_u8: vec![1, 2],
             scale: vec![1.0],
@@ -481,8 +593,10 @@ mod tests {
             bias: None,
             in_dim: 2,
             out_dim: 1,
+            cache: std::sync::OnceLock::new(),
+        w_i16: std::sync::OnceLock::new(),
         };
         let empty: Vec<Vec<f32>> = Vec::new();
-        assert_eq!(lin.forward_batch_t::<CpuBackend>(&empty, &cpu_device()), empty);
+        assert_eq!(lin.forward_batch_t(&empty, &cpu_device()), empty);
     }
 }

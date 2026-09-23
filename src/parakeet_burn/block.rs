@@ -32,6 +32,8 @@ use super::quant::Uint8Linear;
 use super::tensor::TensorCtx;
 use super::weights::RawTensor;
 
+use rayon::prelude::*;
+
 /// LayerNorm params (gamma/beta, eps fixed 1e-5 per graph).
 #[derive(Debug, Clone)]
 pub(crate) struct LayerNormP {
@@ -66,7 +68,10 @@ pub(crate) fn layernorm_row(x: &[f32], p: &LayerNormP) -> Vec<f32> {
 }
 
 pub(crate) fn layernorm_batch(x: &[Vec<f32>], p: &LayerNormP) -> Vec<Vec<f32>> {
-    x.iter().map(|r| layernorm_row(r, p)).collect()
+    // Rows are independent (same per-row f64 math as `layernorm_row`, same
+    // order within a row): rayon only spreads rows over threads, so this
+    // is bit-exact vs the serial loop.
+    x.par_iter().map(|r| layernorm_row(r, p)).collect()
 }
 
 #[inline]
@@ -74,11 +79,12 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-// Swish/GLU/add/scale stay scalar by decision (Phase 4): each is an
-// independent-per-element op the scalar loop computes exactly (same
-// libm exp the graph was verified against), and together they are ~5%
-// of per-layer compute beside the matmuls/convs. Tensor twins would
-// trade Flex's SIMD exp approximation drift for no meaningful speed.
+// Swish/GLU/add/scale stay scalar *per element* by decision (Phase 4):
+// each element is computed exactly (same libm exp the graph was verified
+// against — no SIMD-exp tensor twins, which would drift); independent
+// rows additionally run in parallel via rayon (same intra-row order, so
+// bit-exact vs the serial loops). Serial exp was the bottleneck for
+// short utterances (a 4096-wide swish row costs ~3x its own matmul).
 pub(crate) fn swish_inplace(v: &mut [f32]) {
     for x in v.iter_mut() {
         *x = *x * sigmoid(*x);
@@ -86,7 +92,7 @@ pub(crate) fn swish_inplace(v: &mut [f32]) {
 }
 
 pub(crate) fn softmax_rows(scores: &mut [Vec<f32>]) {
-    for row in scores.iter_mut() {
+    scores.par_iter_mut().for_each(|row| {
         let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         let mut s = 0.0f32;
         for x in row.iter_mut() {
@@ -97,7 +103,7 @@ pub(crate) fn softmax_rows(scores: &mut [Vec<f32>]) {
         for x in row.iter_mut() {
             *x *= inv;
         }
-    }
+    });
 }
 
 /// Depthwise conv (groups == channels): `w[c][k]`, symmetric padding.
@@ -111,6 +117,13 @@ pub(crate) struct DwConv {
     pub(crate) kernel: usize,
     pub(crate) pad_left: usize,
     pub(crate) pad_right: usize,
+    /// Lazily-built dequantized weight + bias tensors (same rationale as
+    /// `quant::CachedT`: the `[C,1,K]` store is tiny but `from_data` per
+    /// call still costs an allocation + copy per block per forward).
+    pub(crate) cache: std::sync::OnceLock<(
+        burn::tensor::Tensor<CpuBackend, 3>,
+        burn::tensor::Tensor<CpuBackend, 1>,
+    )>,
 }
 
 impl DwConv {
@@ -148,17 +161,52 @@ impl DwConv {
         out
     }
 
+    /// Build the cached weight + bias tensors now (load-time warming).
+    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
+        let _ = self.cached(device);
+    }
+
+    /// Dequantized `[C,1,K]` weight + `[C]` bias tensors, built once.
+    /// Bit-identical to the old per-call dequant (same per-element
+    /// `(q - zp) * scale`, pure reorder into the conv layout).
+    fn cached(
+        &self,
+        device: &super::backend::CpuDevice,
+    ) -> &(
+        burn::tensor::Tensor<CpuBackend, 3>,
+        burn::tensor::Tensor<CpuBackend, 1>,
+    ) {
+        self.cache.get_or_init(|| {
+            use burn::tensor::{Tensor, TensorData};
+            let zpw = self.zero_point;
+            let wflat: Vec<f32> = self
+                .weight_u8
+                .iter()
+                .map(|&q| (q as f32 - zpw) * self.scale)
+                .collect();
+            let wt: Tensor<CpuBackend, 3> = Tensor::from_data(
+                TensorData::new(wflat, [self.channels, 1, self.kernel]),
+                device,
+            );
+            let bt: Tensor<CpuBackend, 1> = Tensor::from_data(
+                TensorData::new(self.bias.clone(), [self.channels]),
+                device,
+            );
+            (wt, bt)
+        })
+    }
+
     /// Tensor twin of `forward`: identical per-tensor activation
     /// quantization, dequantized to f32, one Flex depthwise conv1d
-    /// (`groups == channels`) against dequantized weights with bias.
-    /// Zero-padding is real 0 on both sides (quantized `zpx` subtracts
-    /// to 0, Flex pads `Constant(0.0)`), and pads are symmetric
+    /// (`groups == channels`) against the cached dequantized weights with
+    /// bias. Zero-padding is real 0 on both sides (quantized `zpx`
+    /// subtracts to 0, Flex pads `Constant(0.0)`), and pads are symmetric
     /// (`kernel / 2` each side), so plain `ConvOptions` suffices.
     /// Residual is f32 summation order only.
-    pub(crate) fn forward_t<B: burn::tensor::backend::Backend>(
+    pub(crate) fn forward_t(
         &self,
         x: &[Vec<f32>],
-        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+        device: &super::backend::CpuDevice,
     ) -> Vec<Vec<f32>> {
         use burn::tensor::{module::conv1d, ops::ConvOptions, Tensor, TensorData};
         use super::quant::dynamic_quantize_u8;
@@ -169,28 +217,20 @@ impl DwConv {
         assert_eq!((self.pad_left, self.pad_right), (self.kernel / 2, self.kernel / 2));
         let flat: Vec<f32> = x.iter().flat_map(|r| r.iter().copied()).collect();
         let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
-        // [T][C] rows -> [1, C, T].
-        let xd: Vec<f32> = xq.iter().map(|&q| (q as f32 - zpx as f32) * sx).collect();
+        // [T][C] rows -> [1, C, T], dequantizing straight into the planar
+        // layout (no intermediate dequant Vec).
         let mut ncl = vec![0.0f32; c * t];
-        for (i, row) in xd.chunks(c).enumerate() {
-            for (ch, v) in row.iter().enumerate() {
-                ncl[ch * t + i] = *v;
+        for (i, row) in xq.chunks(c).enumerate() {
+            for (ch, &q) in row.iter().enumerate() {
+                ncl[ch * t + i] = (q as f32 - zpx as f32) * sx;
             }
         }
-        let xt: Tensor<B, 3> = Tensor::from_data(TensorData::new(ncl, [1, c, t]), device);
-        // Store is `[c][k]` -> conv weight `[C, 1, K]`, dequantized.
-        let zpw = self.zero_point;
-        let wflat: Vec<f32> = self
-            .weight_u8
-            .iter()
-            .map(|&q| (q as f32 - zpw) * self.scale)
-            .collect();
-        let wt: Tensor<B, 3> = Tensor::from_data(TensorData::new(wflat, [c, 1, self.kernel]), device);
-        let bt: Tensor<B, 1> = Tensor::from_data(TensorData::new(self.bias.clone(), [c]), device);
+        let xt: Tensor<CpuBackend, 3> = Tensor::from_data(TensorData::new(ncl, [1, c, t]), device);
+        let (wt, bt) = self.cached(device);
         let y = conv1d(
             xt,
-            wt,
-            Some(bt),
+            wt.clone(),
+            Some(bt.clone()),
             ConvOptions::new([1], [self.pad_left], [1], c),
         );
         // [1, C, T] -> [T][C] rows.
@@ -208,7 +248,7 @@ impl DwConv {
     /// tensor twin, per `ctx`.
     pub(crate) fn dispatch(&self, x: &[Vec<f32>], ctx: &super::tensor::TensorCtx) -> Vec<Vec<f32>> {
         if ctx.enabled {
-            self.forward_t::<super::backend::CpuBackend>(x, &ctx.device)
+            self.forward_t(x, &ctx.device)
         } else {
             self.forward(x)
         }
@@ -311,6 +351,8 @@ fn take_linear(
         bias: None, // verified: quantized linears carry no bias
         in_dim,
         out_dim,
+        cache: std::sync::OnceLock::new(),
+        w_i16: std::sync::OnceLock::new(),
     })
 }
 
@@ -399,8 +441,30 @@ impl BlockWeights {
                 kernel,
                 pad_left: kernel / 2,
                 pad_right: kernel / 2,
+                cache: std::sync::OnceLock::new(),
             },
         })
+    }
+}
+
+impl BlockWeights {
+    /// Build every cached tensor in this layer now (load-time warming —
+    /// see `Uint8Linear::warm`): the 11 quantized linears plus the
+    /// depthwise conv. Each warms independently (no shared state), so the
+    /// encoder warms all layers in parallel via rayon's pool.
+    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
+        self.ffn1_l1.warm(device);
+        self.ffn1_l2.warm(device);
+        self.ffn2_l1.warm(device);
+        self.ffn2_l2.warm(device);
+        self.wq.warm(device);
+        self.wk.warm(device);
+        self.wv.warm(device);
+        self.wpos.warm(device);
+        self.wout.warm(device);
+        self.pw1.warm(device);
+        self.pw2.warm(device);
+        self.dw.warm(device);
     }
 }
 
@@ -421,19 +485,19 @@ fn linear_batch(lin: &Uint8Linear, x: &[Vec<f32>], ctx: &TensorCtx) -> Vec<Vec<f
 }
 
 fn add_inplace(a: &mut [Vec<f32>], b: &[Vec<f32>]) {
-    for (ra, rb) in a.iter_mut().zip(b.iter()) {
-        for (x, y) in ra.iter_mut().zip(rb.iter()) {
+    a.par_iter_mut().enumerate().for_each(|(i, ra)| {
+        for (x, y) in ra.iter_mut().zip(b[i].iter()) {
             *x += *y;
         }
-    }
+    });
 }
 
 fn scale_inplace(a: &mut [Vec<f32>], s: f32) {
-    for r in a.iter_mut() {
+    a.par_iter_mut().for_each(|r| {
         for x in r.iter_mut() {
             *x *= s;
         }
-    }
+    });
 }
 
 fn split_heads(x: &[Vec<f32>], n_heads: usize, d_head: usize) -> Vec<Vec<Vec<f32>>> {
@@ -595,23 +659,22 @@ pub(crate) fn rel_attention(
 
 pub(crate) fn ffn(x: &[Vec<f32>], l1: &Uint8Linear, l2: &Uint8Linear, ctx: &TensorCtx) -> Vec<Vec<f32>> {
     let mut h = linear_batch(l1, x, ctx);
-    for row in h.iter_mut() {
-        swish_inplace(row);
-    }
+    h.par_iter_mut().for_each(|row| swish_inplace(row));
     linear_batch(l2, &h, ctx)
 }
 
 pub(crate) fn conv_block(x: &[Vec<f32>], w: &BlockWeights, ctx: &TensorCtx) -> Vec<Vec<f32>> {
-    let gated: Vec<Vec<f32>> = linear_batch(&w.pw1, x, ctx).iter().map(|r| glu(r)).collect();
+    let gated: Vec<Vec<f32>> = linear_batch(&w.pw1, x, ctx)
+        .into_par_iter()
+        .map(|r| glu(&r))
+        .collect();
     let mut dwed = w.dw.dispatch(&gated, ctx);
     // SAME padding (k=9, pads 4/4) preserves length; trim defensively.
     dwed.truncate(x.len());
     while dwed.len() < x.len() {
         dwed.push(vec![0.0; dwed[0].len()]);
     }
-    for row in dwed.iter_mut() {
-        swish_inplace(row);
-    }
+    dwed.par_iter_mut().for_each(|row| swish_inplace(row));
     linear_batch(&w.pw2, &dwed, ctx)
 }
 
@@ -680,6 +743,7 @@ mod tests {
             kernel: 3,
             pad_left: 1,
             pad_right: 1,
+            cache: std::sync::OnceLock::new(),
         };
         let x = vec![vec![2.0], vec![2.0], vec![2.0], vec![2.0]];
         let y = dw.forward(&x);
@@ -691,7 +755,7 @@ mod tests {
 
     #[test]
     fn dw_tensor_matches_scalar() {
-        use super::super::backend::{cpu_device, CpuBackend};
+        use super::super::backend::cpu_device;
         // 2 channels, k=3, non-trivial taps/scales/biases, mixed signs.
         let dw = DwConv {
             weight_u8: vec![3, 250, 7, 200, 10, 44],
@@ -702,6 +766,7 @@ mod tests {
             kernel: 3,
             pad_left: 1,
             pad_right: 1,
+            cache: std::sync::OnceLock::new(),
         };
         let x = vec![
             vec![1.0, -2.0],
@@ -712,7 +777,7 @@ mod tests {
         ];
         let dev = cpu_device();
         let s = dw.forward(&x);
-        let t = dw.forward_t::<CpuBackend>(&x, &dev);
+        let t = dw.forward_t(&x, &dev);
         assert_eq!((s.len(), t.len()), (5, 5));
         let (mut mx, mut rm) = (0.0f32, 0.0f32);
         for (a, b) in s.iter().zip(t.iter()) {
@@ -753,6 +818,8 @@ mod tests {
             bias: None,
             in_dim: 1,
             out_dim: 1,
+            cache: std::sync::OnceLock::new(),
+            w_i16: std::sync::OnceLock::new(),
         };
         let one = LayerNormP { gamma: vec![1.0], beta: vec![0.0] };
         let w = BlockWeights {
@@ -781,6 +848,8 @@ mod tests {
                 bias: None,
                 in_dim: 1,
                 out_dim: 2,
+                cache: std::sync::OnceLock::new(),
+                w_i16: std::sync::OnceLock::new(),
             },
             pw2: Uint8Linear {
                 weight_u8: vec![1],
@@ -789,6 +858,8 @@ mod tests {
                 bias: None,
                 in_dim: 1,
                 out_dim: 1,
+                cache: std::sync::OnceLock::new(),
+                w_i16: std::sync::OnceLock::new(),
             },
             dw: DwConv {
                 weight_u8: vec![0, 1, 0],
@@ -799,6 +870,7 @@ mod tests {
                 kernel: 3,
                 pad_left: 1,
                 pad_right: 1,
+                cache: std::sync::OnceLock::new(),
             },
         };
         let x = vec![vec![1.0], vec![0.0]];

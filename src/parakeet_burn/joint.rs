@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
+use super::backend::{CpuBackend, CpuDevice};
 use super::decode::{JointStep, TdtGreedy};
 use super::quant::Uint8Linear;
 use super::tensor::TensorCtx;
@@ -91,6 +92,26 @@ pub(crate) struct LstmLayer {
     pub(crate) b: Vec<f32>, // [8*hid] = [Wb(4H), Rb(4H)]
     pub(crate) in_dim: usize,
     pub(crate) hid: usize,
+    /// Lazily-dequantized f32 twins of `w`/`r` (same layout). `step`
+    /// dequantized on the fly per MAC (`(q - zp) * scale` per inner
+    /// iteration — ~3 M redundant dequants per layer per decode step);
+    /// the cached values are bit-identical (same per-element arithmetic),
+    /// so only the repeated work disappears.
+    w_f32: std::sync::OnceLock<Vec<f32>>,
+    r_f32: std::sync::OnceLock<Vec<f32>>,
+    /// Tensor twins for the tensorized gate MACs: dequantized `w`/`r` as
+    /// Flex matrices plus the folded bias, built once (see `step`).
+    t_cache: std::sync::OnceLock<LstmT>,
+}
+
+/// Dequantized Flex twins of an LSTM layer's gate matrices: `w`/`r` as
+/// `[in,4H]`/`[H,4H]` f32 plus the folded bias `[1,4H]`
+/// (`Wb+Rb`, the same sum `step` adds per gate).
+#[derive(Clone, Debug)]
+struct LstmT {
+    w: burn::tensor::Tensor<CpuBackend, 2>,
+    r: burn::tensor::Tensor<CpuBackend, 2>,
+    b: burn::tensor::Tensor<CpuBackend, 2>,
 }
 
 #[inline]
@@ -99,29 +120,123 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 impl LstmLayer {
+    /// Dequantized `[in_dim][4*hid]` twin of `w`, built once
+    /// (bit-identical to the old inline per-MAC dequant: same per-element
+    /// `(q - zp) * scale`, so the accumulation order in `step` decides
+    /// the result exactly as before).
+    fn wf(&self) -> &Vec<f32> {
+        self.w_f32.get_or_init(|| {
+            self.w
+                .iter()
+                .map(|&q| (q as f32 - self.w_zp) * self.w_scale)
+                .collect()
+        })
+    }
+
+    /// Dequantized `[hid][4*hid]` twin of `r`, built once (same terms).
+    fn rf(&self) -> &Vec<f32> {
+        self.r_f32.get_or_init(|| {
+            self.r
+                .iter()
+                .map(|&q| (q as f32 - self.r_zp) * self.r_scale)
+                .collect()
+        })
+    }
+
+    /// Build the dequantized twins + Flex gate tensors now (load-time
+    /// warming). The gate MACs always run on Flex when the tensor path
+    /// is enabled (their f32 inputs are never quantized, so `igemm`
+    /// does not apply — but at 61 µs per matmul Flex is already fast
+    /// enough here that no integer path is needed).
+    pub(crate) fn warm(&self, device: &CpuDevice) {
+        let _ = (self.wf(), self.rf());
+        let _ = self.t_cached(device);
+    }
+
+    /// Flex gate-matrix twins, built once from the dequantized twins
+    /// (same values, matmul-ready layout — the stores are already
+    /// `[in,4H]`/`[H,4H]`, so no transpose).
+    fn t_cached(&self, device: &CpuDevice) -> &LstmT {
+        self.t_cache.get_or_init(|| {
+            use burn::tensor::{Tensor, TensorData};
+            let g4 = 4 * self.hid;
+            let w: Tensor<CpuBackend, 2> = Tensor::from_data(
+                TensorData::new(self.wf().clone(), [self.in_dim, g4]),
+                device,
+            );
+            let r: Tensor<CpuBackend, 2> = Tensor::from_data(
+                TensorData::new(self.rf().clone(), [self.hid, g4]),
+                device,
+            );
+            let bf: Vec<f32> = (0..g4).map(|j| self.b[j] + self.b[g4 + j]).collect();
+            let b: Tensor<CpuBackend, 2> =
+                Tensor::from_data(TensorData::new(bf, [1, g4]), device);
+            LstmT { w, r, b }
+        })
+    }
+
     /// One step: `(h_new, c_new)` from `(x, h_prev, c_prev)`.
-    /// Stays scalar by decision (Phase 6): steps are state-sequential
-    /// so only the tiny intra-step matmuls ([1,640]x[640,2560]) would
-    /// parallelize — Flex call overhead dominates at that shape, and
-    /// the joint projections around it are already tensorized. The
-    /// embed lookup stays scalar for the same reason (one row gather).
-    pub(crate) fn step(&self, x: &[f32], h: &[f32], c: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    /// Gate MACs dispatch on `ctx`: the tensor path runs them as two Flex
+    /// matmuls against the cached gate matrices (measured ~60 µs each —
+    /// the Phase-6 "Flex overhead dominates" note predates the
+    /// measurement; scalar MACs cost ~2.5 ms here instead). Gate
+    /// nonlinearities and the state update stay scalar on both paths
+    /// (same libm calls, same order — exact). The tensor gates differ
+    /// from scalar by f32 summation order only (~1e-7 relative, and the
+    /// sigmoid/tanh gates are contractive, so it cannot amplify); the
+    /// embed lookup stays scalar on both (one row gather).
+    pub(crate) fn step(
+        &self,
+        x: &[f32],
+        h: &[f32],
+        c: &[f32],
+        ctx: &TensorCtx,
+    ) -> (Vec<f32>, Vec<f32>) {
         assert_eq!(x.len(), self.in_dim);
         assert_eq!(h.len(), self.hid);
         assert_eq!(c.len(), self.hid);
         let g4 = 4 * self.hid;
         let mut gates = vec![0.0f32; g4];
-        for j in 0..g4 {
-            // Bias pair first (matches the graph's Add order trivially —
-            // addition commutes; kept explicit for readability).
-            let mut acc = self.b[j] + self.b[g4 + j];
-            for (i, xi) in x.iter().enumerate() {
-                acc += (self.w[i * g4 + j] as f32 - self.w_zp) * self.w_scale * xi;
-            }
-            for (i, hi) in h.iter().enumerate() {
-                acc += (self.r[i * g4 + j] as f32 - self.r_zp) * self.r_scale * hi;
-            }
-            gates[j] = acc;
+        if ctx.enabled {
+            use burn::tensor::{Tensor, TensorData};
+            let tc = self.t_cached(&ctx.device);
+            let xt: Tensor<CpuBackend, 2> = Tensor::from_data(
+                TensorData::new(x.to_vec(), [1, self.in_dim]),
+                &ctx.device,
+            );
+            let ht: Tensor<CpuBackend, 2> = Tensor::from_data(
+                TensorData::new(h.to_vec(), [1, self.hid]),
+                &ctx.device,
+            );
+            let g = xt.matmul(tc.w.clone()) + ht.matmul(tc.r.clone()) + tc.b.clone();
+            gates = g.into_data().to_vec::<f32>().expect("lstm gates: to_vec");
+        } else {
+            let wf = self.wf();
+            let rf = self.rf();
+            // Gate columns are independent: parallelize over chunks,
+            // keeping the per-gate accumulation order identical
+            // (bit-exact vs serial).
+            use rayon::prelude::*;
+            gates
+                .par_chunks_mut(256)
+                .enumerate()
+                .for_each(|(chunk, gchunk)| {
+                    let j0 = chunk * 256;
+                    for (k, g) in gchunk.iter_mut().enumerate() {
+                        let j = j0 + k;
+                        // Bias pair first (matches the graph's Add order
+                        // trivially — addition commutes; kept explicit for
+                        // readability).
+                        let mut acc = self.b[j] + self.b[g4 + j];
+                        for (i, xi) in x.iter().enumerate() {
+                            acc += wf[i * g4 + j] * xi;
+                        }
+                        for (i, hi) in h.iter().enumerate() {
+                            acc += rf[i * g4 + j] * hi;
+                        }
+                        *g = acc;
+                    }
+                });
         }
         // ONNX gate order: i, o, f, c.
         let (gi, rest) = gates.split_at(self.hid);
@@ -213,6 +328,8 @@ fn take_matmul(
         bias: Some(bias),
         in_dim,
         out_dim,
+        cache: std::sync::OnceLock::new(),
+        w_i16: std::sync::OnceLock::new(),
     })
 }
 
@@ -264,6 +381,9 @@ fn take_lstm(
         b,
         in_dim,
         hid,
+        w_f32: std::sync::OnceLock::new(),
+        r_f32: std::sync::OnceLock::new(),
+        t_cache: std::sync::OnceLock::new(),
     })
 }
 
@@ -347,6 +467,16 @@ impl BurnJoint {
         }
     }
 
+    /// Build every cached tensor / dequantized twin now (load-time
+    /// warming): the 3 joint projections plus both LSTM layers.
+    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
+        self.enc.warm(device);
+        self.pred.warm(device);
+        self.out.warm(device);
+        self.l0.warm(device);
+        self.l1.warm(device);
+    }
+
     /// Overwrite the running states (tests seed ORT states to isolate
     /// one step; the greedy driver only ever uses `reset` + commits).
     #[cfg(test)]
@@ -373,8 +503,8 @@ impl BurnJoint {
     ) -> (JointStep, StepStates) {
         assert_eq!(enc_frame.len(), 1024);
         let e = self.embed.lookup(token);
-        let (h0n, c0n) = self.l0.step(&e, &self.h[0], &self.c[0]);
-        let (h1n, c1n) = self.l1.step(&h0n, &self.h[1], &self.c[1]);
+        let (h0n, c0n) = self.l0.step(&e, &self.h[0], &self.c[0], ctx);
+        let (h1n, c1n) = self.l1.step(&h0n, &self.h[1], &self.c[1], ctx);
         let pe = self.enc.forward_dispatch(enc_frame, ctx);
         let pp = self.pred.forward_dispatch(&h1n, ctx);
         let mut hsum: Vec<f32> = pe.iter().zip(pp.iter()).map(|(a, b)| a + b).collect();
@@ -477,6 +607,9 @@ mod tests {
             b: vec![0.0; 8 * hid],
             in_dim,
             hid,
+            w_f32: std::sync::OnceLock::new(),
+            r_f32: std::sync::OnceLock::new(),
+            t_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -485,7 +618,7 @@ mod tests {
         // Zero weights/bias/state: all gates see 0 -> i=o=f=0.5,
         // g~ = 0 -> c = 0, h = 0.
         let l = zero_lstm(2, 2);
-        let (h, c) = l.step(&[0.0, 0.0], &[0.0, 0.0], &[0.0, 0.0]);
+        let (h, c) = l.step(&[0.0, 0.0], &[0.0, 0.0], &[0.0, 0.0], &TensorCtx::scalar());
         assert_eq!((h, c), (vec![0.0, 0.0], vec![0.0, 0.0]));
     }
 
@@ -497,13 +630,13 @@ mod tests {
         // c = 1*c_prev + 0.5*0 = c_prev; h = 0.5*tanh(c).
         let mut l = zero_lstm(1, 1);
         l.b = vec![0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let (h, c) = l.step(&[0.0], &[0.0], &[2.0]);
+        let (h, c) = l.step(&[0.0], &[0.0], &[2.0], &TensorCtx::scalar());
         assert!((c[0] - 2.0).abs() < 1e-3, "c={c:?}");
         assert!((h[0] - 0.5 * 2.0f32.tanh()).abs() < 1e-3, "h={h:?}");
         // Case input-open, forget-shut: c = 0*prev + 1*tanh(10)... g
         // must be large: set g bias 10 instead.
         l.b = vec![10.0, 0.0, -10.0, 10.0, 0.0, 0.0, 0.0, 0.0];
-        let (h2, c2) = l.step(&[0.0], &[0.0], &[2.0]);
+        let (h2, c2) = l.step(&[0.0], &[0.0], &[2.0], &TensorCtx::scalar());
         // i~=1, f~=0, g~=tanh(10)~=1 -> c ~= 1.
         assert!((c2[0] - 1.0).abs() < 1e-2, "c2={c2:?}");
         // o = 0.5 -> h = 0.5*tanh(c).

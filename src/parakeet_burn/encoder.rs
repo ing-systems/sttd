@@ -133,6 +133,17 @@ impl BurnEncoder {
         self.blocks.len()
     }
 
+    /// Build every cached tensor in the stack now (load-time warming):
+    /// pre-encode first, then all 24 layers in parallel over rayon's
+    /// pool (each layer warms independently — see `BlockWeights::warm`).
+    /// Without this the first utterance pays the full dequant + `from_data`
+    /// build (~4 s); warmed, every forward reuses the tensors.
+    pub(crate) fn warm(&self, device: &super::backend::CpuDevice) {
+        use rayon::prelude::*;
+        self.pre.warm(device);
+        self.blocks.par_iter().for_each(|b| b.warm(device));
+    }
+
     /// Mel `[T][128]` -> encoder states `[T'][1024]`. Empty in, empty out.
     pub(crate) fn forward(&self, mel: &[Vec<f32>], ctx: &TensorCtx) -> Result<Vec<Vec<f32>>> {
         let mut h = self.pre.forward(mel, ctx)?;

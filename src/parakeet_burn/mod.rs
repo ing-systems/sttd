@@ -40,6 +40,9 @@ mod encoder;
 mod frontend;
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
+mod igemm;
+#[cfg(feature = "parakeet-burn")]
+#[allow(dead_code)]
 mod joint;
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
@@ -135,6 +138,13 @@ mod model {
                     &super::joint::joint_want(),
                 )?;
                 let joint = super::joint::BurnJoint::load(&joint_tensors, vocab.size())?;
+                // Warm the tensor-path caches now (dequant + `from_data`
+                // once per weight, in parallel): without this the first
+                // utterance pays the full build (~4 s stall). Inside the
+                // loading ticker so mic/file startup shows progress.
+                let cpu = super::backend::cpu_device();
+                encoder.warm(&cpu);
+                joint.warm(&cpu);
                 Ok::<_, anyhow::Error>((encoder, joint))
             })?;
 
