@@ -9,11 +9,10 @@
 // near-miss dictionary key cannot resurrect boilerplate.
 //
 // Phase A (this spike): exact normalized restore + strict fuzzy, ungated.
-// `parakeet-rs 0.3` exposes no per-token probabilities (only
-// `text + TimedToken{start,end}`), so Murmure's confidence gate
-// (`POSTCORR_CONF_THRESHOLD`) has nothing to read. The signature already
-// takes `confidences: Option<...>` so Phase B is a fill-in once token probs
-// exist; callers pass `None` today.
+// `parakeet-rs 0.3` is gone: `ort_engine` reports per-word confidences, so
+// the production path (`asr::transcribe_and_emit`) passes a gated map and
+// Phase B is live — confident words are never fuzzy-corrected. Callers
+// without confidences (whisper, tests) pass `None` for the ungated form.
 //
 // Strictness caps (same values as Murmure):
 // - words < 5 chars never fuzzy-corrected;
@@ -116,6 +115,26 @@ where
         );
     }
     kept
+}
+
+/// A word appearing several times keeps its max confidence: protecting a
+/// confident occurrence beats correcting a mumbled duplicate. Engine words
+/// are split on non-alphanumeric characters so the keys match the lookup
+/// segmentation of the restore pass.
+pub(crate) fn confidence_map(word_confidences: &[(String, f32)]) -> HashMap<String, f32> {
+    let mut map: HashMap<String, f32> = HashMap::new();
+    for (word, conf) in word_confidences {
+        for fragment in word.split(|c: char| !c.is_alphanumeric()) {
+            let key = normalize_word(fragment);
+            if key.is_empty() {
+                continue;
+            }
+            map.entry(key)
+                .and_modify(|c| *c = c.max(*conf))
+                .or_insert(*conf);
+        }
+    }
+    map
 }
 
 /// Production path: correct `text` against `dictionary`.

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{
     parakeet_entry_for_spec, valid_model_specs, DEFAULT_MODELS_DIR,
-    PARAKEET_BASE_URL,
+    PARAKEET_BASE_URL, PARAKEET_TOKENIZER_URL,
 };
 #[cfg(feature = "whisper")]
 use crate::config::{MODEL_BASE_URL, model_file_for_spec};
@@ -12,9 +12,8 @@ use crate::config::{MODEL_BASE_URL, model_file_for_spec};
 /// Which ASR engine a resolved `--model` value maps to, and where its
 /// weights live on disk. Whisper's engine takes a single `ggml-*.bin` file
 /// (only with the `whisper` Cargo feature); Parakeet's takes a directory
-/// (encoder + decoder_joint + `vocab.txt`) —
-/// `parakeet-rs::ParakeetTDT::from_pretrained` only accepts a directory, so
-/// there is no single-file equivalent to fall back to.
+/// (encoder + decoder_joint + `vocab.txt` + `tokenizer.json`) — the engine
+/// only accepts a directory, so there is no single-file equivalent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModelRef {
     /// `ggml-*.bin` for whisper.cpp (only with the `whisper` Cargo feature).
@@ -212,8 +211,13 @@ pub(crate) fn download_url(file_name: &str) -> Option<String> {
 }
 
 /// Download URL for one Parakeet asset filename (e.g.
-/// `encoder-model.int8.onnx`).
+/// `encoder-model.int8.onnx`). `tokenizer.json` lives in the upstream
+/// NVIDIA checkpoint, everything else in the ONNX export (see
+/// `PARAKEET_BASE_URL` / `PARAKEET_TOKENIZER_URL`).
 pub(crate) fn parakeet_asset_url(file_name: &str) -> String {
+    if file_name == "tokenizer.json" {
+        return PARAKEET_TOKENIZER_URL.to_string();
+    }
     format!("{PARAKEET_BASE_URL}{file_name}")
 }
 
@@ -415,7 +419,7 @@ mod tests {
             panic!("must resolve to Parakeet");
         };
         assert_eq!(dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"));
-        assert_eq!(assets.len(), 3);
+        assert_eq!(assets.len(), 4);
     }
 
     #[test]
@@ -434,6 +438,13 @@ mod tests {
         for file in ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "vocab.txt"] {
             assert_eq!(parakeet_asset_url(file), format!("{PARAKEET_BASE_URL}{file}"));
         }
+    }
+
+    #[test]
+    fn parakeet_tokenizer_url_points_upstream() {
+        use crate::config::PARAKEET_TOKENIZER_URL;
+        assert_eq!(parakeet_asset_url("tokenizer.json"), PARAKEET_TOKENIZER_URL);
+        assert!(PARAKEET_TOKENIZER_URL.contains("nvidia/parakeet-tdt-0.6b-v3"));
     }
 
     #[cfg(feature = "whisper")]

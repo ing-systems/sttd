@@ -3,8 +3,9 @@
 // ---------------------------------------------------------------------------
 //
 // Two speech models exist (`whisper`: whisper.cpp via whisper-rs; `parakeet`:
-// NVIDIA Parakeet-TDT-0.6B-v3 via parakeet-rs), selected once at startup by
-// `--model` (see `weights::ModelRef`) and fixed for the process's lifetime.
+// NVIDIA Parakeet-TDT-0.6B-v3 via direct `ort` sessions, see `ort_engine`),
+// selected once at startup by `--model` (see `weights::ModelRef`) and fixed
+// for the process's lifetime.
 // This module owns everything that doesn't change between them: the worker
 // thread and its load/unload/pause/shed loop, the transcript gate call,
 // `--metrics` JSONL, audio conditioning, and the prompt-context tail. Each
@@ -56,11 +57,15 @@ pub(crate) struct TokenConfidence {
 }
 
 /// Result of one inference: the joined text plus its confidence, when the
-/// engine reports one. `None` for engines with no per-token probability
-/// (Parakeet) — see this module's doc comment.
+/// engine reports one. `None` for engines with no utterance-level
+/// per-token probability (Parakeet decodes greedily) — see this module's
+/// doc comment. `word_confidences` carries per-word model confidences when
+/// the engine reports them (Parakeet, for the dictionary gate); empty
+/// otherwise (whisper).
 pub(crate) struct Transcript {
     pub(crate) text: String,
     pub(crate) confidence: Option<TokenConfidence>,
+    pub(crate) word_confidences: Vec<(String, f32)>,
 }
 
 /// One loaded, ready-to-run speech model. Implementors own everything
@@ -1076,11 +1081,15 @@ fn transcribe_and_emit(
             );
             let mut emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit { .. });
             // Post-gate dictionary polish only: drops stay drops, so a
-            // near-miss key cannot resurrect boilerplate. `None` confidences
-            // = Phase A ungated (see `dictionary`).
+            // near-miss key cannot resurrect boilerplate. Engines that
+            // report per-word confidences (Parakeet) gate the fuzzy step
+            // on them (Phase B); without (whisper) correction is exact
+            // plus ungated fuzzy (see `dictionary`).
             let mut final_text = if emitted && !dictionary.is_empty() {
+                let confidences = crate::dictionary::confidence_map(&t.word_confidences);
+                let gated = (!t.word_confidences.is_empty()).then_some(&confidences);
                 let corrected =
-                    crate::dictionary::correct_transcription(deduped_trimmed, dictionary, None);
+                    crate::dictionary::correct_transcription(deduped_trimmed, dictionary, gated);
                 if corrected != deduped_trimmed {
                     log::debug!("{tag}: dictionary {deduped_trimmed:?} -> {corrected:?}");
                 }

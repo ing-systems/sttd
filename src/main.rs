@@ -103,6 +103,7 @@ mod asr;
 use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
 #[cfg(feature = "whisper")]
 mod whisper;
+mod ort_engine;
 mod parakeet;
 
 // ---------------------------------------------------------------------------
@@ -933,7 +934,7 @@ fn resolve_model_input(cli: &Cli) -> Result<ModelRef> {
 /// indistinguishable from not setting it, and that's fine: it changes
 /// nothing either way). Returns the flag names to warn about. With the
 /// `whisper` feature off, only the shared flags that Parakeet still ignores
-/// (`--min-conf*`, `--gpu` without `parakeet-cuda`) are reported; whisper
+/// (`--min-conf*`, `--gpu`) are reported; whisper
 /// decoder flags don't exist to set.
 fn unsupported_parakeet_flags(cli: &Cli) -> Vec<&'static str> {
     use crate::config::{DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG};
@@ -973,7 +974,8 @@ fn unsupported_parakeet_flags(cli: &Cli) -> Vec<&'static str> {
     if (cli.min_conf_strong - DEFAULT_MIN_CONFIDENCE_STRONG).abs() > f32::EPSILON {
         flags.push("--min-conf-strong");
     }
-    if cli.gpu && !cfg!(feature = "parakeet-cuda") {
+    if cli.gpu {
+        // Parakeet runs on CPU in this build (see parakeet.rs).
         flags.push("--gpu");
     }
     flags
@@ -1318,15 +1320,13 @@ mod tests {
     #[test]
     fn unsupported_parakeet_flags_are_empty_for_plain_cli_without_gpu() {
         // `--gpu` defaults to false (DEFAULT_USE_GPU), so a plain CLI is
-        // clean without `parakeet-cuda`; only an explicit `--gpu` warns —
-        // see the next test.
+        // clean; only an explicit `--gpu` warns — see the next test.
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert!(unsupported_parakeet_flags(&cli).is_empty());
     }
 
-    #[cfg(not(feature = "parakeet-cuda"))]
     #[test]
-    fn unsupported_parakeet_flags_flags_explicit_gpu_without_cuda_feature() {
+    fn unsupported_parakeet_flags_flags_explicit_gpu() {
         let cli = Cli::try_parse_from(["sttd", "--gpu"]).expect("defaults must parse");
         assert_eq!(unsupported_parakeet_flags(&cli), vec!["--gpu"]);
     }
