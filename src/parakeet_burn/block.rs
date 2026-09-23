@@ -244,11 +244,57 @@ impl DwConv {
         out
     }
 
-    /// Dispatch: scalar `forward` (exact integer path, default) or its
-    /// tensor twin, per `ctx`.
+    /// Exact parallel twin of `forward`: the same `dynamic_quantize_u8`
+    /// call (identical q/s/zpx by construction — same function, same
+    /// input), the same padded layout, and the same per-element tap-sum
+    /// in the same serial order — rayon only spreads independent output
+    /// rows over threads, so outputs match `forward` bit-for-bit (pinned
+    /// by `dw_par_matches_scalar`). Replaces `forward_t` (Flex grouped
+    /// conv1d + dequant/re-planar copies per call) on the tensor path:
+    /// the integer MACs here are ~300k per layer, so Flex dispatch and
+    /// its copies dominate — and Flex additionally drifts by f32
+    /// summation order, which this removes.
+    pub(crate) fn forward_par(&self, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        use super::quant::dynamic_quantize_u8;
+        let t = x.len();
+        let c = self.channels;
+        assert!(x.iter().all(|r| r.len() == c));
+        let flat: Vec<f32> = x.iter().flat_map(|r| r.iter().copied()).collect();
+        let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
+        let zpw = self.zero_point.round() as i64;
+        let mut padded = vec![zpx; c * (self.pad_left + t + self.pad_right)];
+        for (i, _row) in x.iter().enumerate() {
+            let base = (self.pad_left + i) * c;
+            let qbase = i * c;
+            padded[base..base + c].copy_from_slice(&xq[qbase..qbase + c]);
+        }
+        let out_len = self.pad_left + t + self.pad_right - self.kernel + 1;
+        let scale_sx = self.scale * sx;
+        let (w, kernel, bias) = (&self.weight_u8, self.kernel, &self.bias);
+        (0..out_len)
+            .into_par_iter()
+            .map(|t_out| {
+                let mut row = vec![0.0f32; c];
+                for ch in 0..c {
+                    let mut acc = 0i64;
+                    let base = ch * kernel;
+                    for k in 0..kernel {
+                        let q = padded[(t_out + k) * c + ch] as i64 - zpx as i64;
+                        acc += (w[base + k] as i64 - zpw) * q;
+                    }
+                    row[ch] = acc as f32 * scale_sx + bias[ch];
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// Dispatch: exact parallel integer `forward_par` on the tensor path,
+    /// exact serial integer `forward` on the scalar path. (`forward_t`,
+    /// the Flex grouped-conv twin, is kept for its parity test only.)
     pub(crate) fn dispatch(&self, x: &[Vec<f32>], ctx: &super::tensor::TensorCtx) -> Vec<Vec<f32>> {
         if ctx.enabled {
-            self.forward_t(x, &ctx.device)
+            self.forward_par(x)
         } else {
             self.forward(x)
         }
@@ -750,6 +796,38 @@ mod tests {
         assert_eq!(y.len(), 4);
         for (a, b) in y.iter().zip(x.iter()) {
             assert!((a[0] - b[0]).abs() < 1e-5, "y={y:?}");
+        }
+    }
+
+    #[test]
+    fn dw_par_matches_scalar_exactly() {
+        // Parallel integer twin must equal the serial integer path
+        // bit-for-bit (independent outputs, identical per-element order),
+        // over odd lengths, kernel sizes and mixed-sign weights/biases.
+        let mk = |channels: usize, kernel: usize| DwConv {
+            weight_u8: (0..channels * kernel).map(|i| (i * 37 % 256) as u8).collect(),
+            scale: 0.02,
+            zero_point: 121.0,
+            bias: (0..channels).map(|i| i as f32 * 0.125 - 1.0).collect(),
+            channels,
+            kernel,
+            pad_left: kernel / 2,
+            pad_right: kernel / 2,
+            cache: std::sync::OnceLock::new(),
+        };
+        let mut seed: u64 = 0xD1E;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 6.0
+        };
+        for (channels, kernel, t) in [(1, 3, 4), (2, 3, 5), (8, 9, 32), (16, 5, 17)] {
+            let dw = mk(channels, kernel);
+            let x: Vec<Vec<f32>> = (0..t)
+                .map(|_| (0..channels).map(|_| rnd()).collect())
+                .collect();
+            assert_eq!(dw.forward_par(&x), dw.forward(&x), "c={channels} k={kernel} t={t}");
         }
     }
 

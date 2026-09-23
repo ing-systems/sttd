@@ -658,4 +658,412 @@ mod tests {
             }
         }
     }
+
+    /// Timing breakdown on real weights (release only — debug times are
+    /// meaningless). No asserts on speed: prints a per-stage table so
+    /// optimization targets are measured, not guessed. Ignored: needs
+    /// converted weights on disk.
+    /// `cargo test --release --features parakeet-burn -- --ignored profile --nocapture`.
+    #[test]
+    #[ignore]
+    fn profile_breakdown() {
+        use std::time::Instant;
+        use super::super::block::{
+            block_forward, conv_block, ffn, layernorm_batch, pos_window, rel_attention,
+        };
+        use super::super::weights::load_selected;
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+
+        let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
+        let json = std::fs::read_to_string(dir.join("encoder-manifest.json")).unwrap();
+        let manifest = load_manifest(&json).unwrap();
+        let t0 = Instant::now();
+        let tensors =
+            load_selected(&dir.join("encoder-burn.safetensors"), &encoder_want(&manifest).unwrap())
+                .unwrap();
+        let enc = BurnEncoder::load(&tensors, &manifest).unwrap();
+        eprintln!("profile: encoder load+warm = {:.0} ms", ms(t0));
+        // Steady-state only: the binary warms at load (see `mod.rs`), so
+        // the first forward must not pay cache builds in these numbers.
+        let cpu = super::super::backend::cpu_device();
+        enc.warm(&cpu);
+
+        let bytes =
+            std::fs::read("src/parakeet_burn/testdata/encoder_full_golden.safetensors").unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mel_v = st.tensor("mel_T128").unwrap();
+        let mel: Vec<Vec<f32>> = mel_v
+            .data()
+            .chunks(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect::<Vec<f32>>()
+            .chunks(128)
+            .map(|c| c.to_vec())
+            .collect();
+
+        let sctx = TensorCtx::scalar();
+        let tctx = TensorCtx {
+            device: super::super::backend::cpu_device(),
+            enabled: true,
+        };
+        for (tag, ctx) in [("scalar", sctx), ("tensor", tctx)] {
+            let pre = enc.pre.forward(&mel, &ctx).unwrap();
+            let mut pre_ms = f64::INFINITY;
+            for _ in 0..5 {
+                let t = Instant::now();
+                let _ = enc.pre.forward(&mel, &ctx).unwrap();
+                pre_ms = pre_ms.min(ms(t));
+            }
+            let win = pos_window(&enc.pos_table, pre.len());
+            let b = &enc.blocks[0];
+            // Stage breakdown on layer 0 (replicates `block_forward` staging).
+            let mut stage = |f: &dyn Fn()| {
+                let mut best = f64::INFINITY;
+                for _ in 0..5 {
+                    let t = Instant::now();
+                    f();
+                    best = best.min(ms(t));
+                }
+                best
+            };
+            let ffn1_ms = stage(&|| {
+                let n1 = layernorm_batch(&pre, &b.norm_ff1);
+                let _ = ffn(&n1, &b.ffn1_l1, &b.ffn1_l2, &ctx);
+            });
+            let norm_att_ms = stage(&|| {
+                let _ = layernorm_batch(&pre, &b.norm_att);
+            });
+            let attn_ms = stage(&|| {
+                // NOTE: attention input here is norm(pre), not norm(pre+f1)
+                // as in the real chain — timing only, values discarded.
+                let na = layernorm_batch(&pre, &b.norm_att);
+                let _ = rel_attention(&na, b, &win, &ctx);
+            });
+            let conv_ms = stage(&|| {
+                let nc = layernorm_batch(&pre, &b.norm_conv);
+                let _ = conv_block(&nc, b, &ctx);
+            });
+            let ffn2_ms = stage(&|| {
+                let n2 = layernorm_batch(&pre, &b.norm_ff2);
+                let _ = ffn(&n2, &b.ffn2_l1, &b.ffn2_l2, &ctx);
+            });
+            let t = Instant::now();
+            let reps = 5;
+            let mut blocks_ms = f64::INFINITY;
+            for _ in 0..reps {
+                let t1 = Instant::now();
+                let mut h = pre.clone();
+                for b in &enc.blocks {
+                    h = block_forward(&h, b, &win, &ctx);
+                }
+                blocks_ms = blocks_ms.min(ms(t1));
+            }
+            let _ = ms(t);
+            eprintln!(
+                "profile {tag}: T=64 mel -> T'={} | pre={pre_ms:.1}ms blocks24={blocks_ms:.1}ms/layer={:.2}ms | layer0: ffn1={ffn1_ms:.2}ms norm_att={norm_att_ms:.2}ms attn={attn_ms:.2}ms conv={conv_ms:.2}ms ffn2={ffn2_ms:.2}ms",
+                pre.len(),
+                blocks_ms / 24.0,
+            );
+        }
+
+        // Linear microbench on real FFN weights (T=8, the golden shape).
+        let b = &enc.blocks[0];
+        let mut seed: u64 = 0xB00;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+        };
+        let x1024: Vec<Vec<f32>> = (0..8).map(|_| (0..1024).map(|_| rnd()).collect()).collect();
+        let x4096: Vec<Vec<f32>> = (0..8).map(|_| (0..4096).map(|_| rnd()).collect()).collect();
+        let x1024_32: Vec<Vec<f32>> =
+            (0..32).map(|_| (0..1024).map(|_| rnd()).collect()).collect();
+        let x4096_32: Vec<Vec<f32>> =
+            (0..32).map(|_| (0..4096).map(|_| rnd()).collect()).collect();
+        let dev = super::super::backend::cpu_device();
+        for (name, lin, xs) in [
+            ("ffn1_l1 1024->4096", &b.ffn1_l1, &x1024),
+            ("ffn1_l2 4096->1024", &b.ffn1_l2, &x4096),
+            ("wout 1024->1024", &b.wout, &x1024),
+        ] {
+            let t = Instant::now();
+            let reps = 20;
+            for _ in 0..reps {
+                let _ = lin.forward_batch_t(xs, &dev);
+            }
+            eprintln!(
+                "profile linear {name}: {:.3} ms/call (T=8, {reps} reps)",
+                ms(t) / reps as f64
+            );
+        }
+        for (name, lin, xs) in [
+            ("ffn1_l1 1024->4096 T32", &b.ffn1_l1, &x1024_32),
+            ("ffn1_l2 4096->1024 T32", &b.ffn1_l2, &x4096_32),
+            ("wout 1024->1024 T32", &b.wout, &x1024_32),
+        ] {
+            let t = Instant::now();
+            let reps = 20;
+            for _ in 0..reps {
+                let _ = lin.forward_batch_t(xs, &dev);
+            }
+            eprintln!(
+                "profile linear {name}: {:.3} ms/call (20 reps)",
+                ms(t) / reps as f64
+            );
+        }
+        // Quantize-only cost at T32 (flat copy + min/max + map).
+        {
+            let flat: Vec<f32> =
+                x1024_32.iter().flat_map(|r| r.iter().copied()).collect();
+            let t = Instant::now();
+            let reps = 50;
+            for _ in 0..reps {
+                let _ = super::super::igemm::quantize_rows_i16(&flat);
+            }
+            eprintln!(
+                "profile quantize 32x1024: {:.3} ms/call (50 reps)",
+                ms(t) / reps as f64
+            );
+            let flat4: Vec<f32> =
+                x4096_32.iter().flat_map(|r| r.iter().copied()).collect();
+            let t = Instant::now();
+            for _ in 0..reps {
+                let _ = super::super::igemm::quantize_rows_i16(&flat4);
+            }
+            eprintln!(
+                "profile quantize 32x4096: {:.3} ms/call (50 reps)",
+                ms(t) / reps as f64
+            );
+        }
+
+        // Elementwise microbench: swish over FFN-width rows (T=8 x 4096)
+        // isolates the libm exp cost inside ffn1/ffn2 timings above.
+        {
+            use super::super::block::swish_inplace;
+            let mut rows = x4096.clone();
+            let t = Instant::now();
+            let reps = 20;
+            for _ in 0..reps {
+                for r in rows.iter_mut() {
+                    swish_inplace(r);
+                }
+            }
+            eprintln!(
+                "profile swish 8x4096 serial: {:.3} ms/call ({reps} reps)",
+                ms(t) / reps as f64
+            );
+            let t = Instant::now();
+            for _ in 0..reps {
+                use rayon::prelude::*;
+                rows.par_iter_mut().for_each(|r| swish_inplace(r));
+            }
+            eprintln!(
+                "profile swish 8x4096 rayon-rows: {:.3} ms/call ({reps} reps)",
+                ms(t) / reps as f64
+            );
+        }
+
+        // Attention Flex-vs-scalar on the same T=8 input.
+        {
+            let b = &enc.blocks[0];
+            let pre = enc.pre.forward(&mel, &sctx).unwrap();
+            let win = pos_window(&enc.pos_table, pre.len());
+            let natt = layernorm_batch(&pre, &b.norm_att);
+            let t = Instant::now();
+            for _ in 0..10 {
+                let _ = rel_attention(&natt, b, &win, &sctx);
+            }
+            let s_ms = ms(t) / 10.0;
+            let t = Instant::now();
+            for _ in 0..10 {
+                let _ = rel_attention(&natt, b, &win, &tctx);
+            }
+            let t_ms = ms(t) / 10.0;
+            eprintln!("profile attn T=8/layer: scalar={s_ms:.2}ms tensor={t_ms:.2}ms");
+        }
+
+        // Realistic-utterance shapes: random mel T=256 -> T'=32 (what a
+        // 2.5 s utterance looks like after the frontend). Values are
+        // random — timing has no data-dependent branches — but shapes,
+        // quantization windows and attention O(T^2) match production.
+        {
+            let mut seed: u64 = 0x32;
+            let mut rnd = move || {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+            };
+            let mel256: Vec<Vec<f32>> =
+                (0..256).map(|_| (0..128).map(|_| rnd()).collect()).collect();
+            for (tag, ctx) in [("scalar", sctx), ("tensor", tctx)] {
+                if tag == "scalar" {
+                    continue; // scalar path timing already covered; skip 1 s+ burn
+                }
+                let mut pre_ms = f64::INFINITY;
+                for _ in 0..5 {
+                    let t = Instant::now();
+                    let _ = enc.pre.forward(&mel256, &ctx).unwrap();
+                    pre_ms = pre_ms.min(ms(t));
+                }
+                let pre = enc.pre.forward(&mel256, &ctx).unwrap();
+                assert_eq!(pre.len(), 32);
+                let win = pos_window(&enc.pos_table, pre.len());
+                let b = &enc.blocks[0];
+                let mut stage = |f: &dyn Fn()| {
+                    let mut best = f64::INFINITY;
+                    for _ in 0..5 {
+                        let t = Instant::now();
+                        f();
+                        best = best.min(ms(t));
+                    }
+                    best
+                };
+                let attn_ms = stage(&|| {
+                    let na = layernorm_batch(&pre, &b.norm_att);
+                    let _ = rel_attention(&na, b, &win, &ctx);
+                });
+                let conv_ms = stage(&|| {
+                    let nc = layernorm_batch(&pre, &b.norm_conv);
+                    let _ = conv_block(&nc, b, &ctx);
+                });
+                let ffn_ms = stage(&|| {
+                    let n1 = layernorm_batch(&pre, &b.norm_ff1);
+                    let _ = ffn(&n1, &b.ffn1_l1, &b.ffn1_l2, &ctx);
+                });
+                let mut h = pre.clone();
+                let mut full_ms = f64::INFINITY;
+                for _ in 0..5 {
+                    let t1 = Instant::now();
+                    h = pre.clone();
+                    for b in &enc.blocks {
+                        h = block_forward(&h, b, &win, &ctx);
+                    }
+                    full_ms = full_ms.min(ms(t1));
+                }
+                eprintln!(
+                    "profile {tag} T=256 mel -> T'=32 | pre={pre_ms:.1}ms blocks24={full_ms:.1}ms/layer={:.2}ms | layer0: attn={attn_ms:.2}ms conv={conv_ms:.2}ms ffn={ffn_ms:.2}ms",
+                    full_ms / 24.0,
+                );
+            }
+        }
+
+        // Frontend on 2.5 s synthetic audio.
+        {
+            let fe = super::super::frontend::MelFrontend::tdt_v3();
+            let mut seed: u64 = 0xFE;
+            let pcm: Vec<f32> = (0..40_000)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 0.6
+                })
+                .collect();
+            let mut best = f64::INFINITY;
+            let reps = 5;
+            let mut n_frames = 0;
+            for _ in 0..reps {
+                let t = Instant::now();
+                n_frames = fe.extract(&pcm).unwrap().len();
+                best = best.min(ms(t));
+            }
+            eprintln!(
+                "profile frontend 2.5s -> {n_frames} frames: {best:.1} ms/call (min of {reps})",
+            );
+        }
+
+        // Joint decode on the real T=8 encoder output (e2e tripwire: tokens).
+        {
+            use super::super::joint::{BurnJoint, joint_want};
+            let want = joint_want();
+            let jt = load_selected(&dir.join("decoder_joint-burn.safetensors"), &want).unwrap();
+            let mut joint = BurnJoint::load(&jt, 8193).unwrap();
+            let enc_out = enc.forward(&mel, &tctx).unwrap();
+            let t = Instant::now();
+            let reps = 5;
+            let mut toks = Vec::new();
+            for _ in 0..reps {
+                let (tk, _, _) = joint.decode(&enc_out, &tctx);
+                toks = tk;
+            }
+            eprintln!(
+                "profile joint decode T={}: {:.2} ms/call ({reps} reps) tokens={toks:?}",
+                enc_out.len(),
+                ms(t) / reps as f64
+            );
+            // Realistic T=32 decode on random encoder-shaped frames.
+            let mut seed: u64 = 0xE70;
+            let frame32: Vec<Vec<f32>> = (0..32)
+                .map(|_| {
+                    (0..1024)
+                        .map(|_| {
+                            seed = seed
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let t = Instant::now();
+                let _ = joint.decode(&frame32, &tctx);
+                best = best.min(ms(t));
+            }
+            eprintln!("profile joint decode T=32: {best:.2} ms/call (min of 5)");
+        }
+
+        // Aligned-vs-split 64B vector loads in the integer micro-kernel:
+        // Vec<i16> is only 2B-aligned, so every `_mm512_loadu` splits.
+        // If aligned buffers win clearly, the hot path allocates them.
+        {
+            use super::super::igemm::linear_i16;
+            use super::super::igemm::widen_weights;
+            let (t, k, n) = (32usize, 1024usize, 1024usize);
+            let wu: Vec<u8> = (0..n * k).map(|i| (i * 37 % 256) as u8).collect();
+            let bw = widen_weights(&wu, n, k, &[100.0]);
+            let mut seed: u64 = 0xA6;
+            let a: Vec<i16> = (0..t * k)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed % 511) as i16 - 255
+                })
+                .collect();
+            // 64B-aligned twin of `a` (same values).
+            let mut abuf = vec![0i16; a.len() + 32];
+            let off = abuf.as_ptr() as usize % 64;
+            let shift = if off == 0 { 0 } else { (64 - off) / 2 };
+            abuf[shift..shift + a.len()].copy_from_slice(&a);
+            let aa = &abuf[shift..shift + a.len()];
+            assert_eq!(aa.as_ptr() as usize % 64, 0);
+            // Forced-split twin: 2B offset (rows stay equally shifted —
+            // every real K is a multiple of 32, so the stride keeps all
+            // rows 2-mod-64 together).
+            let mut sbuf = vec![0i16; a.len() + 32];
+            let base = sbuf.as_ptr() as usize % 64;
+            let soff = (((2 + 64 - base) % 64) / 2).max(1);
+            sbuf[soff..soff + a.len()].copy_from_slice(&a);
+            let sp = &sbuf[soff..soff + a.len()];
+            assert_ne!(sp.as_ptr() as usize % 64, 0);
+            assert_eq!(sp, &a[..]);
+            let sw = vec![0.02f32; n];
+            let mut best_split = f64::INFINITY;
+            let mut best_al = f64::INFINITY;
+            for _ in 0..10 {
+                let mut out = vec![0.0f32; t * n];
+                let t0 = Instant::now();
+                linear_i16(sp, t, k, &bw, n, &sw, None, 0.05, &mut out);
+                best_split = best_split.min(ms(t0));
+                let t0 = Instant::now();
+                linear_i16(aa, t, k, &bw, n, &sw, None, 0.05, &mut out);
+                best_al = best_al.min(ms(t0));
+            }
+            eprintln!("profile gemm T32/K1024/N1024: split={best_split:.3}ms aligned={best_al:.3}ms");
+        }
+    }
 }

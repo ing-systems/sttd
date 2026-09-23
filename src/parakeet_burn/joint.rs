@@ -104,13 +104,17 @@ pub(crate) struct LstmLayer {
     t_cache: std::sync::OnceLock<LstmT>,
 }
 
-/// Dequantized Flex twins of an LSTM layer's gate matrices: `w`/`r` as
-/// `[in,4H]`/`[H,4H]` f32 plus the folded bias `[1,4H]`
-/// (`Wb+Rb`, the same sum `step` adds per gate).
+/// Dequantized Flex twin of an LSTM layer's gate matrices: `w`/`r`
+/// stacked as one `[in+hid,4H]` f32 matrix plus the folded bias `[1,4H]`
+/// (`Wb+Rb`, the same sum `step` adds per gate). One matmul per step
+/// instead of two (`x@W + h@R` needs two dispatches plus an add); the
+/// single 1280-wide dot differs from the split pair by f32 summation
+/// order only (~1e-7 relative — the same class as the existing
+/// tensor-vs-scalar residual, and the sigmoid/tanh gates are
+/// contractive, so it cannot amplify).
 #[derive(Clone, Debug)]
 struct LstmT {
-    w: burn::tensor::Tensor<CpuBackend, 2>,
-    r: burn::tensor::Tensor<CpuBackend, 2>,
+    wr: burn::tensor::Tensor<CpuBackend, 2>,
     b: burn::tensor::Tensor<CpuBackend, 2>,
 }
 
@@ -153,38 +157,37 @@ impl LstmLayer {
         let _ = self.t_cached(device);
     }
 
-    /// Flex gate-matrix twins, built once from the dequantized twins
-    /// (same values, matmul-ready layout — the stores are already
-    /// `[in,4H]`/`[H,4H]`, so no transpose).
+    /// Flex gate-matrix twin, built once from the dequantized twins
+    /// (same values stacked — `[W; R]` row-blocks, so no transpose: the
+    /// stores are already `[in,4H]`/`[H,4H]` row-major).
     fn t_cached(&self, device: &CpuDevice) -> &LstmT {
         self.t_cache.get_or_init(|| {
             use burn::tensor::{Tensor, TensorData};
             let g4 = 4 * self.hid;
-            let w: Tensor<CpuBackend, 2> = Tensor::from_data(
-                TensorData::new(self.wf().clone(), [self.in_dim, g4]),
-                device,
-            );
-            let r: Tensor<CpuBackend, 2> = Tensor::from_data(
-                TensorData::new(self.rf().clone(), [self.hid, g4]),
+            let mut wrf = Vec::with_capacity((self.in_dim + self.hid) * g4);
+            wrf.extend_from_slice(self.wf());
+            wrf.extend_from_slice(self.rf());
+            let wr: Tensor<CpuBackend, 2> = Tensor::from_data(
+                TensorData::new(wrf, [self.in_dim + self.hid, g4]),
                 device,
             );
             let bf: Vec<f32> = (0..g4).map(|j| self.b[j] + self.b[g4 + j]).collect();
             let b: Tensor<CpuBackend, 2> =
                 Tensor::from_data(TensorData::new(bf, [1, g4]), device);
-            LstmT { w, r, b }
+            LstmT { wr, b }
         })
     }
 
     /// One step: `(h_new, c_new)` from `(x, h_prev, c_prev)`.
-    /// Gate MACs dispatch on `ctx`: the tensor path runs them as two Flex
-    /// matmuls against the cached gate matrices (measured ~60 µs each —
-    /// the Phase-6 "Flex overhead dominates" note predates the
-    /// measurement; scalar MACs cost ~2.5 ms here instead). Gate
-    /// nonlinearities and the state update stay scalar on both paths
-    /// (same libm calls, same order — exact). The tensor gates differ
-    /// from scalar by f32 summation order only (~1e-7 relative, and the
-    /// sigmoid/tanh gates are contractive, so it cannot amplify); the
-    /// embed lookup stays scalar on both (one row gather).
+    /// Gate MACs dispatch on `ctx`: the tensor path runs them as one Flex
+    /// matmul over the concatenated `[x, h]` input against the stacked
+    /// gate matrix (one dispatch + one input tensor per step instead of
+    /// two; scalar nonlinearities unchanged). Gate nonlinearities and the
+    /// state update stay scalar on both paths (same libm calls, same
+    /// order — exact). The tensor gates differ from scalar by f32
+    /// summation order only (~1e-7 relative, and the sigmoid/tanh gates
+    /// are contractive, so it cannot amplify); the embed lookup stays
+    /// scalar on both (one row gather).
     pub(crate) fn step(
         &self,
         x: &[f32],
@@ -200,15 +203,14 @@ impl LstmLayer {
         if ctx.enabled {
             use burn::tensor::{Tensor, TensorData};
             let tc = self.t_cached(&ctx.device);
+            let mut xh = Vec::with_capacity(self.in_dim + self.hid);
+            xh.extend_from_slice(x);
+            xh.extend_from_slice(h);
             let xt: Tensor<CpuBackend, 2> = Tensor::from_data(
-                TensorData::new(x.to_vec(), [1, self.in_dim]),
+                TensorData::new(xh, [1, self.in_dim + self.hid]),
                 &ctx.device,
             );
-            let ht: Tensor<CpuBackend, 2> = Tensor::from_data(
-                TensorData::new(h.to_vec(), [1, self.hid]),
-                &ctx.device,
-            );
-            let g = xt.matmul(tc.w.clone()) + ht.matmul(tc.r.clone()) + tc.b.clone();
+            let g = xt.matmul(tc.wr.clone()) + tc.b.clone();
             gates = g.into_data().to_vec::<f32>().expect("lstm gates: to_vec");
         } else {
             let wf = self.wf();

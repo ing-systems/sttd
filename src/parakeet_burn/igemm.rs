@@ -88,11 +88,74 @@ pub(crate) fn quantize_rows_i16(xs: &[f32]) -> (Vec<i16>, f32, i64) {
     (a, s, zp as i64)
 }
 
+/// Below this many elements quantization runs serially: two rayon
+/// dispatches (min/max reduce + map) cost ~0.06 ms while the math over
+/// these shapes is ~0.02 ms. Serial min/max over finite inputs is exact
+/// (min/max associate), and the per-element map is order-independent, so
+/// this is bit-identical to the parallel version — it IS the reference
+/// `dynamic_quantize_u8` arithmetic. Every shape in this model (largest:
+/// 32x4096 = 131k) lands below the threshold; the parallel twin stays
+/// for inputs bigger than any current caller.
+const QUANT_PAR_MIN: usize = 1 << 20;
+
+/// Row-slice twin of `quantize_rows_i16`: same window (whole `[T,K]`
+/// tensor, as ORT quantizes it), same zp, same q values — but computed
+/// straight from `&[Vec<f32>]` rows with no intermediate f32 `flat` copy
+/// (that copy re-read + re-wrote T*K floats per linear, ~0.5 MB per FFN
+/// call). Bit-identical to flatten-then-quantize (pinned by
+/// `quantize_rows_matches_flat`).
+pub(crate) fn quantize_from_rows(xs: &[Vec<f32>]) -> (Vec<i16>, f32, i64) {
+    assert!(!xs.is_empty());
+    let total: usize = xs.iter().map(|r| r.len()).sum();
+    assert!(total > 0);
+    debug_assert!(xs.iter().all(|r| r.len() == xs[0].len()));
+    if total >= QUANT_PAR_MIN {
+        // Huge inputs (none in this model): flatten once and reuse the
+        // tested parallel twin; the copy is amortized at this size.
+        let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
+        return quantize_rows_i16(&flat);
+    }
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for r in xs {
+        for &v in r {
+            mn = mn.min(v);
+            mx = mx.max(v);
+        }
+    }
+    let (lo, hi) = (mn.min(0.0), mx.max(0.0));
+    let range = hi - lo;
+    if !(range > 0.0) {
+        return (vec![0; total], 1.0, 0);
+    }
+    let s = range / 255.0;
+    let zp = ((-lo / s).round() as i32).clamp(0, 255);
+    let mut a = vec![0i16; total];
+    let mut o = 0;
+    for r in xs {
+        for &x in r {
+            a[o] = ((x / s).round() as i32 + zp).clamp(0, 255) as i16 - zp as i16;
+            o += 1;
+        }
+    }
+    (a, s, zp as i64)
+}
+
 /// `C[T,N] = A[T,K] @ B[N,K]^T`, integer MACs in i32, one f32 scale-up +
 /// bias per element with the same formula as `Uint8Linear::mac_all`:
 /// `out = acc as f32 * (sx * sw[o]) + bias[o]` (`sw` honors the same
 /// scalar-or-per-row broadcast, `bias` is `None` or full-length).
 /// `out` must hold exactly `T*N` f32s.
+///
+/// Tasks tile the output in 2D (row-chunks x column-blocks) and write
+/// disjoint rectangles straight into `out` — no thread-local temps, no
+/// stitch copy. Column blocks are sized so a `NC x K` i16 B-tile sits in
+/// L2 (~256 KB budget): each task faults its B-tile once and reuses it
+/// across all its rows, where the old row-parallel scheme re-read the
+/// whole B (up to 8 MB for the FFN linears) once *per row*. Integer
+/// addition is exact, so tiling changes nothing numerically: outputs
+/// match `forward_batch` bit-for-bit (see
+/// `gemm_matches_scalar_mac_exactly`).
 pub(crate) fn linear_i16(
     a: &[i16],
     t: usize,
@@ -112,59 +175,85 @@ pub(crate) fn linear_i16(
         assert_eq!(bb.len(), n);
     }
     let fast = has_fast_path();
-    if t >= 16 {
-        // Row-major C: rows are contiguous, so parallelize over rows;
-        // each row runs the blocked micro-kernel over all N columns.
-        out.par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(ti, row)| {
-                let arow = &a[ti * k..(ti + 1) * k];
-                if fast {
-                    // SAFETY: AVX-512 gated on `fast`; slice lengths
-                    // asserted on entry.
-                    unsafe { row_kernel(arow, b, k, n, 0, n, sw, bias, sx, row) };
-                } else {
-                    row_scalar(arow, b, k, n, 0, n, sw, bias, sx, row);
-                }
-            });
-    } else {
-        // Few rows (joint single-step calls): rows are too few to balance
-        // threads, so parallelize over column tiles into thread-local
-        // buffers, then stitch (C is small here: T<16 rows).
-        let tb = (n.div_ceil(64).div_ceil(OB) * OB).max(OB);
-        let ranges: Vec<(usize, usize)> = (0..n)
-            .step_by(tb)
-            .map(|o0| (o0, (o0 + tb).min(n)))
-            .collect();
-        let tiles: Vec<Vec<f32>> = ranges
-            .into_par_iter()
-            .map(|(o0, o1)| {
-                let mut tile = vec![0.0f32; t * (o1 - o0)];
-                for ti in 0..t {
-                    let arow = &a[ti * k..(ti + 1) * k];
-                    let seg = &mut tile[ti * (o1 - o0)..(ti + 1) * (o1 - o0)];
-                    if fast {
-                        // SAFETY: as above.
-                        unsafe { row_kernel(arow, b, k, n, o0, o1, sw, bias, sx, seg) };
-                    } else {
-                        row_scalar(arow, b, k, n, o0, o1, sw, bias, sx, seg);
-                    }
-                }
-                tile
-            })
-            .collect();
-        // Serial stitch: tiles cover disjoint column ranges (rayon
-        // `collect` preserves range order).
-        let mut o0 = 0;
-        for tile in &tiles {
-            let w = tile.len() / t;
-            for ti in 0..t {
-                out[ti * n + o0..ti * n + o0 + w]
-                    .copy_from_slice(&tile[ti * w..(ti + 1) * w]);
+    // Serial below this many outputs: a rayon spawn costs more than the
+    // math (joint single-row small projections land here).
+    if t * n < PAR_MIN_OUTPUTS {
+        for ti in 0..t {
+            let arow = &a[ti * k..(ti + 1) * k];
+            let row = &mut out[ti * n..(ti + 1) * n];
+            if fast {
+                // SAFETY: AVX-512 gated on `fast`; slice lengths asserted
+                // on entry.
+                unsafe { row_kernel(arow, b, k, n, 0, n, sw, bias, sx, row) };
+            } else {
+                row_scalar(arow, b, k, n, 0, n, sw, bias, sx, row);
             }
-            o0 += w;
+        }
+        return;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    // Column block from the L2 budget (multiple of OB so the micro-kernel
+    // never sees a ragged block edge, only a ragged tail block).
+    let mut nc = col_block(k);
+    let mut nb = n.div_ceil(nc);
+    // Row chunks: enough tiles to feed the pool (~1-2x threads).
+    let mut row_chunks = threads.div_ceil(nb).min(t).max(1);
+    // Cap total tiles at ~4x threads by widening columns (tiny T=1 calls
+    // would otherwise spawn hundreds of ~5 us tasks).
+    while row_chunks * nb > 4 * threads && nc < n {
+        nc = (nc * 2).min(n);
+        nb = n.div_ceil(nc);
+        row_chunks = threads.div_ceil(nb).min(t).max(1);
+    }
+    let tr = t.div_ceil(row_chunks);
+    let mut tiles = Vec::with_capacity(row_chunks * nb);
+    for r in 0..row_chunks {
+        let ti0 = r * tr;
+        let ti1 = ((r + 1) * tr).min(t);
+        if ti0 >= ti1 {
+            break;
+        }
+        for c in 0..nb {
+            let o0 = c * nc;
+            let o1 = ((c + 1) * nc).min(n);
+            tiles.push((ti0, ti1, o0, o1));
         }
     }
+    // Disjoint writes through a raw pointer: each (row, col) belongs to
+    // exactly one tile (rows partitioned, then columns partitioned), and
+    // `out` never reallocates, so this is sound. A safe per-tile
+    // `&mut` borrow is unrepresentable (strided rectangles), hence the
+    // pointer. `usize` (not `*mut`) crosses the `Sync` boundary.
+    let out_ptr = out.as_mut_ptr() as usize;
+    tiles.into_par_iter().for_each(|(ti0, ti1, o0, o1)| {
+        for ti in ti0..ti1 {
+            let arow = &a[ti * k..(ti + 1) * k];
+            // SAFETY: disjoint by construction (see above); bounds hold
+            // since ti < t and o1 <= n.
+            let seg = unsafe {
+                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(ti * n + o0), o1 - o0)
+            };
+            if fast {
+                // SAFETY: AVX-512 gated on `fast`; slice lengths as above.
+                unsafe { row_kernel(arow, b, k, n, o0, o1, sw, bias, sx, seg) };
+            } else {
+                row_scalar(arow, b, k, n, o0, o1, sw, bias, sx, seg);
+            }
+        }
+    });
+}
+
+/// Below this many output elements the kernel runs serially: spawning
+/// rayon tasks costs more than the integer math (joint single-row small
+/// projections live here; exact either way).
+const PAR_MIN_OUTPUTS: usize = 8192;
+
+/// Column-block width from a ~256 KB L2 budget for the `NC x K` i16
+/// B-tile, clamped and rounded down to a multiple of `OB` (the
+/// micro-kernel's block width).
+fn col_block(k: usize) -> usize {
+    let nc = (262_144 / k.max(1)).clamp(64, 512);
+    (nc / OB * OB).max(OB)
 }
 
 /// Scalar row-segment fallback (and exactness reference for the
@@ -326,8 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn quantize_twin_matches_serial() {
-        use super::super::quant::dynamic_quantize_u8;
+    fn quantize_twin_matches_serial() {        use super::super::quant::dynamic_quantize_u8;
         // Shapes incl. non-multiples of 32/64, constants, all-zero (guard
         // path), and single-element inputs.
         for (len, seed) in [(1, 7), (3, 8), (31, 9), (64, 10), (1000, 11), (4096, 12)] {
@@ -366,6 +454,8 @@ mod tests {
 
     /// Full driver vs the scalar integer path, exact equality, over odd
     /// shapes (tails!), per-row scales/zps, bias/None, and extreme values.
+    /// Shapes span the serial path (tiny), row-chunk splits, column-block
+    /// splits, and the joint's wide single-row out-projection.
     #[test]
     fn gemm_matches_scalar_mac_exactly() {
         use super::super::quant::Uint8Linear;
@@ -376,9 +466,20 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 6.0
         };
-        // (t, k, n) incl. non-multiples of 32 (tail), t < 16 (serial
-        // branch) and t >= 16 (parallel branch).
-        for (t, k, n) in [(1, 70, 3), (3, 128, 65), (16, 100, 40), (20, 1024, 33), (5, 640, 8198)] {
+        // (t, k, n) incl. non-multiples of 32 (tail), tiny serial shapes,
+        // row-chunked and column-blocked parallel shapes.
+        for (t, k, n) in [
+            (1, 70, 3),
+            (3, 128, 65),
+            (16, 100, 40),
+            (20, 1024, 33),
+            (5, 640, 8198),
+            (32, 1024, 4096),
+            (32, 4096, 1024),
+            (32, 1024, 1024),
+            (1, 640, 8198),
+            (1, 1024, 640),
+        ] {
             let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..k).map(|_| rnd()).collect()).collect();
             let wu: Vec<u8> = (0..n * k).map(|_| (rnd() * 41.0 + 128.0) as u8).collect();
             // Per-row scales/zps (including a scalar-broadcast case).
@@ -407,14 +508,36 @@ mod tests {
                 w_i16: std::sync::OnceLock::new(),
             };
             let expect = lin.forward_batch(&xs);
-            // Driver under test: quantize twin + integer GEMM.
-            let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
-            let (a, sx, _) = quantize_rows_i16(&flat);
+            // Driver under test: row-direct quantize + integer GEMM.
+            let (a, sx, _) = quantize_from_rows(&xs);
             let b = widen_weights(&lin.weight_u8, n, k, &lin.zero_point);
             let mut out = vec![0.0f32; t * n];
             linear_i16(&a, t, k, &b, n, &lin.scale, lin.bias.as_deref(), sx, &mut out);
             let got: Vec<Vec<f32>> = out.chunks(n).map(|c| c.to_vec()).collect();
             assert_eq!(got, expect, "t={t} k={k} n={n}");
+        }
+    }
+
+    #[test]
+    fn quantize_rows_matches_flat() {
+        // Row-direct quantize must equal flatten-then-quantize exactly,
+        // over ragged-tail shapes, constants and the guard path.
+        let mut seed: u64 = 0x9075;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 6.0
+        };
+        for (t, k) in [(1, 1), (3, 70), (8, 1024), (32, 1024), (32, 4096), (5, 640)] {
+            let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..k).map(|_| rnd()).collect()).collect();
+            let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
+            assert_eq!(quantize_from_rows(&xs), quantize_rows_i16(&flat), "t={t} k={k}");
+        }
+        // Guard path: all-zero and constant inputs.
+        for xs in [vec![vec![0.0; 16]], vec![vec![2.5; 100]], vec![vec![-1.0; 7]]] {
+            let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
+            assert_eq!(quantize_from_rows(&xs), quantize_rows_i16(&flat));
         }
     }
 

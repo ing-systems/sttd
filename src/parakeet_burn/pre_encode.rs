@@ -25,6 +25,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
+use rayon::prelude::*;
+
 use super::backend::CpuBackend;
 use super::encoder::EncoderManifest;
 use super::quant::Uint8Linear;
@@ -139,6 +141,126 @@ fn conv2d_forward(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
         }
     }
     y
+}
+
+/// Exact parallel twin of `conv2d_forward`: the same
+/// `dynamic_quantize_u8` call (identical q/s/zpx), the same padded
+/// layout, and the same per-output accumulation order
+/// (`ic -> ky -> kx`, serial) — rayon only spreads independent output
+/// channels over threads, so outputs match `forward` bit-for-bit.
+/// Replaces `conv2d_t` (Flex conv2d + dequant/re-layout copies per call)
+/// on the tensor path for k>1 or strided/grouped convs.
+fn conv2d_par(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
+    use super::quant::dynamic_quantize_u8;
+    assert_eq!(x.len(), w.in_c);
+    let h = x[0].len();
+    let wd = x[0][0].len();
+    assert!(x.iter().all(|c| c.len() == h && c.iter().all(|r| r.len() == wd)));
+    let oh = (h + 2 * w.pad - w.kernel) / w.stride + 1;
+    let ow = (wd + 2 * w.pad - w.kernel) / w.stride + 1;
+    let flat: Vec<f32> = x.iter().flat_map(|c| c.iter().flat_map(|r| r.iter().copied())).collect();
+    let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
+    let xq3: Vec<&[u8]> = xq.chunks(h * wd).collect();
+    let zpw = w.zero_point.round() as i64;
+    let icg = w.in_c / w.group;
+    let k2 = w.kernel * w.kernel;
+    let sxs = sx * w.scale;
+    let (wu, kk, st, pd) = (&w.weight_u8, w.kernel, w.stride, w.pad);
+    (0..w.out_c)
+        .into_par_iter()
+        .map(|oc| {
+            let g = oc / (w.out_c / w.group);
+            let mut omap = vec![vec![0.0f32; ow]; oh];
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut acc = 0i64;
+                    for ic in 0..icg {
+                        let c = g * icg + ic;
+                        let base = (oc * icg + ic) * k2;
+                        for ky in 0..kk {
+                            let iy = oy * st + ky;
+                            if iy < pd || iy >= h + pd {
+                                continue;
+                            }
+                            for kx in 0..kk {
+                                let ix = ox * st + kx;
+                                if ix < pd || ix >= wd + pd {
+                                    continue;
+                                }
+                                acc += (xq3[c][(iy - pd) * wd + (ix - pd)] as i64 - zpx as i64)
+                                    * (wu[base + ky * kk + kx] as i64 - zpw);
+                            }
+                        }
+                    }
+                    omap[oy][ox] = acc as f32 * sxs;
+                }
+            }
+            omap
+        })
+        .collect()
+}
+
+/// Exact 1x1-conv fast path (conv3/conv6: 256 -> 256, k1 s1, dense):
+/// a 1x1 stride-1 conv IS a per-position matmul, so this runs it as one
+/// blocked integer GEMM (`igemm::linear_i16`) over H*W rows instead of a
+/// direct convolution. Same per-tensor activation quantization window as
+/// `conv2d_forward` (whole input tensor), same integers, same scale-up,
+/// no bias here (the caller runs `add_bias_relu`, as on every path) —
+/// bit-identical to both twins. Weights widen per call (65k u8, ~10 us);
+/// no cache needed.
+fn conv1x1_gemm(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
+    use super::igemm::{linear_i16, quantize_rows_i16, widen_weights};
+    assert_eq!(x.len(), w.in_c);
+    let h = x[0].len();
+    let wd = x[0][0].len();
+    assert!(x.iter().all(|c| c.len() == h && c.iter().all(|r| r.len() == wd)));
+    debug_assert!(w.kernel == 1 && w.stride == 1 && w.pad == 0 && w.group == 1);
+    // Rows are positions (h*wd of them), columns are channels: gather
+    // straight into row-major (no separate flat copy — the window spans
+    // the same values either way).
+    let t = h * wd;
+    let mut rows = vec![0.0f32; t * w.in_c];
+    for (c, cmap) in x.iter().enumerate() {
+        for (i, row) in cmap.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
+                rows[(i * wd + j) * w.in_c + c] = v;
+            }
+        }
+    }
+    let (a, sx, _) = quantize_rows_i16(&rows);
+    // k=1 store is already `[out][in]` row-major (see `take_conv`).
+    let bw = widen_weights(&w.weight_u8, w.out_c, w.in_c, &[w.zero_point]);
+    let mut out = vec![0.0f32; t * w.out_c];
+    linear_i16(&a, t, w.in_c, &bw, w.out_c, &[w.scale], None, sx, &mut out);
+    // Rows back to `[out_c][h][wd]` maps.
+    let mut y = vec![vec![vec![0.0f32; wd]; h]; w.out_c];
+    for (i, orow) in out.chunks(w.out_c).enumerate() {
+        let (r, c_) = (i / wd, i % wd);
+        for (oc, &v) in orow.iter().enumerate() {
+            y[oc][r][c_] = v;
+        }
+    }
+    y
+}
+
+/// Dispatch: exact parallel integer kernels on the tensor path
+/// (`conv1x1_gemm` for dense 1x1, `conv2d_par` otherwise), exact serial
+/// integer `conv2d_forward` on the scalar path. (`conv2d_t`, the Flex
+/// twin, is kept for its parity test only.)
+fn conv_dispatch(
+    w: &Conv2dW,
+    x: &[Vec<Vec<f32>>],
+    ctx: &TensorCtx,
+) -> Vec<Vec<Vec<f32>>> {
+    if ctx.enabled {
+        if w.kernel == 1 && w.stride == 1 && w.pad == 0 && w.group == 1 {
+            conv1x1_gemm(w, x)
+        } else {
+            conv2d_par(w, x)
+        }
+    } else {
+        conv2d_forward(w, x)
+    }
 }
 
 /// Tensor twin of `conv2d_forward`: identical per-tensor activation
@@ -384,13 +506,10 @@ impl PreEncodeWeights {
             (&self.conv5, false),
             (&self.conv6, true),
         ] {
-            // Convs follow `ctx` (tensor twin replicates the
-            // `ConvInteger` chain exactly); bias+Relu tail is shared.
-            let mut y = if ctx.enabled {
-                conv2d_t(w, &x, &ctx.device)
-            } else {
-                conv2d_forward(w, &x)
-            };
+            // Convs follow `ctx`: exact parallel integer kernels on the
+            // tensor path, exact serial integer on the scalar path.
+            // Bias+Relu tail is shared (matches the graph's Add order).
+            let mut y = conv_dispatch(w, &x, ctx);
             add_bias_relu(&mut y, &w.bias, relu);
             x = y;
         }
@@ -642,6 +761,64 @@ mod tests {
         let w = tiny_weights();
         assert!(w.forward(&[vec![0.0; 127]], &TensorCtx::scalar()).is_err());
         assert!(w.forward(&[], &TensorCtx::scalar()).unwrap().is_empty());
+    }
+
+    fn conv_par_case(
+        out_c: usize,
+        in_c: usize,
+        group: usize,
+        kernel: usize,
+        stride: usize,
+        pad: usize,
+        h: usize,
+        wd: usize,
+    ) {
+        // Non-trivial taps/scales/biases, mixed signs; outputs must match
+        // the serial integer path bit-for-bit.
+        let icg = in_c / group;
+        let w = Conv2dW {
+            weight_u8: (0..out_c * icg * kernel * kernel)
+                .map(|i| (i * 37 % 256) as u8)
+                .collect(),
+            scale: 0.02,
+            zero_point: 121.0,
+            bias: (0..out_c).map(|i| i as f32 * 0.125 - 1.0).collect(),
+            out_c,
+            in_c,
+            group,
+            kernel,
+            stride,
+            pad,
+            cache: std::sync::OnceLock::new(),
+        };
+        let mut seed: u64 = 0xC0E | ((out_c * 7919 + h * 104729) as u64);
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 6.0
+        };
+        let x: Vec<Vec<Vec<f32>>> = (0..in_c)
+            .map(|_| (0..h).map(|_| (0..wd).map(|_| rnd()).collect()).collect())
+            .collect();
+        let s = conv2d_forward(&w, &x);
+        let p = conv2d_par(&w, &x);
+        assert_eq!(p, s, "out_c={out_c} group={group} k={kernel} s={stride}");
+        if kernel == 1 && stride == 1 && pad == 0 && group == 1 {
+            let g = conv1x1_gemm(&w, &x);
+            assert_eq!(g, s, "1x1 out_c={out_c}");
+        }
+    }
+
+    #[test]
+    fn conv_par_matches_scalar_exactly() {
+        // Dense k3s2p1, depthwise k3s2p1, pointwise 1x1, and odd shapes —
+        // the same geometries the encoder actually runs.
+        conv_par_case(2, 1, 1, 3, 2, 1, 4, 4);
+        conv_par_case(4, 4, 4, 3, 2, 1, 8, 6);
+        conv_par_case(4, 4, 1, 1, 1, 0, 7, 5);
+        conv_par_case(8, 8, 1, 1, 1, 0, 9, 9);
+        conv_par_case(6, 3, 1, 3, 1, 1, 5, 7);
     }
 
     /// Loads real pre-encode weights. Ignored: needs converted weights on

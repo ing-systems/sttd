@@ -5,6 +5,7 @@
 // and CUDA paths share bit-identical features.
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 
 /// TDT-v3 preprocessor constants (see `parakeet_rs::ParakeetTDT::from_pretrained`).
 pub(crate) const TDT_FEATURE_SIZE: usize = 128;
@@ -16,6 +17,8 @@ pub(crate) const TDT_LOG_GUARD: f32 = 5.9604645e-8; // 2^-24
 
 pub(crate) struct MelFrontend {
     mel_basis: Vec<Vec<f32>>, // [n_mels][n_fft/2+1]
+    window: Vec<f32>,        // cached Hann (rebuilt per call before)
+    fft: std::sync::Arc<dyn realfft::RealToComplex<f32>>, // cached plan
     n_mels: usize,
     n_fft: usize,
     hop: usize,
@@ -35,8 +38,11 @@ impl MelFrontend {
     }
 
     pub(crate) fn new(n_mels: usize, n_fft: usize, hop: usize, win: usize, preemphasis: f32) -> Self {
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
         Self {
             mel_basis: slaney_mel_basis(n_fft, n_mels, 16_000),
+            window: hann_window(win),
+            fft: planner.plan_fft_forward(n_fft),
             n_mels,
             n_fft,
             hop,
@@ -54,32 +60,33 @@ impl MelFrontend {
 
     /// Log-mel *before* per-feature normalization (for parity tests that
     /// compare spectral energy across bins — normalization destroys that).
-    #[allow(clippy::needless_range_loop)] // transposes mel(frames) in lockstep
+    /// Frames are independent (same per-bin f64 accumulation in the same
+    /// inner-k order as the old serial loops), so rayon over frames is
+    /// bit-exact — and the `[frames][mels]` layout lands directly, with no
+    /// `[mels][frames]` transpose roundtrip.
     fn unnormalized_log_mel(&self, pcm_16k: &[f32]) -> Result<Vec<Vec<f32>>> {
         if pcm_16k.is_empty() {
             return Ok(Vec::new());
         }
         let emphasized = apply_preemphasis(pcm_16k, self.preemphasis);
-        let power = stft_power(&emphasized, self.n_fft, self.hop, self.win)
+        let power = self
+            .stft_power(&emphasized)
             .context("burn frontend: stft failed")?;
         let n_frames = power.first().map(|_| power[0].len()).unwrap_or(0);
-        let mut mel = vec![vec![0.0f32; n_frames]; self.n_mels];
-        for (i, row) in self.mel_basis.iter().enumerate() {
-            for f in 0..n_frames {
-                let mut acc = 0.0f64;
-                for (k, w) in row.iter().enumerate() {
-                    acc += *w as f64 * power[k][f] as f64;
+        Ok((0..n_frames)
+            .into_par_iter()
+            .map(|f| {
+                let mut row = vec![0.0f32; self.n_mels];
+                for (m, basis) in self.mel_basis.iter().enumerate() {
+                    let mut acc = 0.0f64;
+                    for (k, w) in basis.iter().enumerate() {
+                        acc += *w as f64 * power[k][f] as f64;
+                    }
+                    row[m] = (acc as f32 + TDT_LOG_GUARD).ln();
                 }
-                mel[i][f] = ((acc as f32) + TDT_LOG_GUARD).ln();
-            }
-        }
-        let mut feats = vec![vec![0.0f32; self.n_mels]; n_frames];
-        for f in 0..n_frames {
-            for m in 0..self.n_mels {
-                feats[f][m] = mel[m][f];
-            }
-        }
-        Ok(feats)
+                row
+            })
+            .collect())
     }
 }
 
@@ -98,40 +105,48 @@ fn hann_window(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Power spectrogram via `realfft`: `[freq_bins][frames]`, reflect-padded
-/// like `parakeet-rs` (`pad = n_fft/2` zeros each side).
-#[allow(clippy::needless_range_loop)] // indexes input/padded/window/spectrum in lockstep
-fn stft_power(x: &[f32], n_fft: usize, hop: usize, win: usize) -> Result<Vec<Vec<f32>>> {
-    let mut planner = realfft::RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(n_fft);
-    let window = hann_window(win);
-    let pad = n_fft / 2;
-    let mut padded = vec![0.0f32; pad];
-    padded.extend_from_slice(x);
-    padded.resize(padded.len() + pad, 0.0);
-    if padded.len() < n_fft {
-        return Ok(vec![vec![0.0; 1]; n_fft / 2 + 1]);
-    }
-    let n_frames = (padded.len() - n_fft) / hop + 1;
-    let bins = n_fft / 2 + 1;
-    let mut out = vec![vec![0.0f32; n_frames]; bins];
-    let mut input = vec![0.0f32; n_fft];
-    let mut spectrum = fft.make_output_vec();
-    let mut scratch = fft.make_scratch_vec();
-    for f in 0..n_frames {
-        let start = f * hop;
-        input.fill(0.0);
-        let avail = (padded.len() - start).min(win);
-        for i in 0..avail {
-            input[i] = padded[start + i] * window[i];
+/// Power spectrogram via the cached `realfft` plan: `[freq_bins][frames]`,
+/// reflect-padded like `parakeet-rs` (`pad = n_fft/2` zeros each side).
+/// Frames are fully independent (same window, same per-frame FFT), so
+/// rayon over frames is bit-exact; results collect in order.
+impl MelFrontend {
+    /// Power spectrogram via the cached `realfft` plan (see above).
+    fn stft_power(&self, x: &[f32]) -> Result<Vec<Vec<f32>>> {
+        let pad = self.n_fft / 2;
+        let mut padded = vec![0.0f32; pad];
+        padded.extend_from_slice(x);
+        padded.resize(padded.len() + pad, 0.0);
+        if padded.len() < self.n_fft {
+            return Ok(vec![vec![0.0; 1]; self.n_fft / 2 + 1]);
         }
-        fft.process_with_scratch(&mut input, &mut spectrum, &mut scratch)
-            .map_err(|e| anyhow::anyhow!("fft failed: {e}"))?;
-        for k in 0..bins {
-            out[k][f] = spectrum[k].norm_sqr();
+        let n_frames = (padded.len() - self.n_fft) / self.hop + 1;
+        let bins = self.n_fft / 2 + 1;
+        let per_frame: Result<Vec<Vec<f32>>> = (0..n_frames)
+            .into_par_iter()
+            .map(|f| {
+                let start = f * self.hop;
+                let mut input = vec![0.0f32; self.n_fft];
+                let avail = (padded.len() - start).min(self.win);
+                for i in 0..avail {
+                    input[i] = padded[start + i] * self.window[i];
+                }
+                let mut spectrum = self.fft.make_output_vec();
+                let mut scratch = self.fft.make_scratch_vec();
+                self.fft
+                    .process_with_scratch(&mut input, &mut spectrum, &mut scratch)
+                    .map_err(|e| anyhow::anyhow!("fft failed: {e}"))?;
+                Ok(spectrum.iter().map(|c| c.norm_sqr()).collect())
+            })
+            .collect();
+        // Transpose [frames][bins] -> [bins][frames] (pure reorder).
+        let mut out = vec![vec![0.0f32; n_frames]; bins];
+        for (f, spec) in per_frame?.iter().enumerate() {
+            for (k, &v) in spec.iter().enumerate() {
+                out[k][f] = v;
+            }
         }
+        Ok(out)
     }
-    Ok(out)
 }
 
 const F_SP: f64 = 200.0 / 3.0;
@@ -238,6 +253,26 @@ mod tests {
         let n = feats.len() as f32;
         let mean0: f32 = feats.iter().map(|r| r[0]).sum::<f32>() / n;
         assert!(mean0.abs() < 0.05, "mean0={mean0}");
+    }
+
+    #[test]
+    fn parallel_frontend_is_deterministic() {
+        // Frames run on rayon's pool: same input must give bit-identical
+        // features every time (collect preserves order, per-element math
+        // is unchanged from the serial loops).
+        let fe = MelFrontend::tdt_v3();
+        let mut seed: u32 = 0xF207;
+        let pcm: Vec<f32> = (0..16_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed as f32 / u32::MAX as f32 - 0.5) * 0.6
+            })
+            .collect();
+        let a = fe.extract(&pcm).expect("extract");
+        let b = fe.extract(&pcm).expect("extract");
+        assert_eq!(a, b);
     }
 
     #[test]

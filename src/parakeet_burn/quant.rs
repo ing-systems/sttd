@@ -336,8 +336,9 @@ impl Uint8Linear {
         }
         if super::igemm::has_fast_path() {
             let t = xs.len();
-            let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
-            let (a, sx, _) = super::igemm::quantize_rows_i16(&flat);
+            // Quantize straight from the rows: no intermediate f32 `flat`
+            // copy (same window, same zp, same q — see `quantize_from_rows`).
+            let (a, sx, _) = super::igemm::quantize_from_rows(xs);
             let w = self.widened();
             let mut out = vec![0.0f32; t * self.out_dim];
             super::igemm::linear_i16(
