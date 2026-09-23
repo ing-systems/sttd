@@ -3,10 +3,8 @@
 // ---------------------------------------------------------------------------
 //
 // Two speech models exist (`whisper`: whisper.cpp via whisper-rs; `parakeet`:
-// NVIDIA Parakeet-TDT-0.6B-v3 via parakeet-rs), plus sherpa-onnx's offline
-// Nemo-transducer + Canary (`sherpa`, only with the `sherpa` Cargo feature),
-// selected once at startup by `--model` (see `weights::ModelRef`) and fixed
-// for the process's lifetime.
+// NVIDIA Parakeet-TDT-0.6B-v3 via parakeet-rs), selected once at startup by
+// `--model` (see `weights::ModelRef`) and fixed for the process's lifetime.
 // This module owns everything that doesn't change between them: the worker
 // thread and its load/unload/pause/shed loop, the transcript gate call,
 // `--metrics` JSONL, audio conditioning, and the prompt-context tail. Each
@@ -112,10 +110,6 @@ pub(crate) fn load_model(model: &ModelRef, opts: &AsrOptions) -> Result<Box<dyn 
         #[cfg(feature = "whisper")]
         ModelRef::Whisper(path) => Ok(Box::new(crate::whisper::WhisperModel::load(path, opts)?)),
         ModelRef::Parakeet { dir, .. } => Ok(Box::new(crate::parakeet::ParakeetModel::load(dir, opts)?)),
-        #[cfg(feature = "sherpa")]
-        ModelRef::Sherpa { dir, kind, .. } => Ok(Box::new(crate::sherpa::SherpaOfflineModel::load(
-            dir, *kind, opts,
-        )?)),
     }
 }
 
@@ -188,11 +182,6 @@ pub(crate) struct AsrOptions {
     pub(crate) logprob_thold: f32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
-    /// Canary src == tgt / sherpa-whisper language (ISO code, `--sherpa-lang`);
-    /// the transducer auto-detects per utterance and ignores it. Sherpa-only
-    /// (see the `sherpa` Cargo feature).
-    #[cfg(feature = "sherpa")]
-    pub(crate) sherpa_lang: String,
     /// Append per-utterance JSON metrics here when `Some` (see `--metrics`).
     /// Opened by the worker at startup; open errors only warn, never fail
     /// transcription.
@@ -1653,8 +1642,6 @@ mod tests {
             logprob_thold: crate::config::DEFAULT_LOGPROB_THOLD,
             n_threads: DEFAULT_THREADS,
             use_gpu: false,
-            #[cfg(feature = "sherpa")]
-            sherpa_lang: crate::config::DEFAULT_SHERPA_LANG.to_string(),
             metrics_path: None,
             shed_stale: false,
         };

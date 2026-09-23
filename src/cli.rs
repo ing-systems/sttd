@@ -9,11 +9,6 @@ use crate::config::{
     DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS,
     DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
-#[cfg(feature = "sherpa")]
-use crate::config::{
-    parse_vad_secs, DEFAULT_SHERPA_LANG, DEFAULT_SHERPA_MIN_SILENCE,
-    DEFAULT_SHERPA_MIN_SPEECH, DEFAULT_SHERPA_VAD_THRESHOLD,
-};
 #[cfg(feature = "whisper")]
 use crate::config::{
     parse_beam_size, parse_context_chars, parse_entropy_thold, parse_logprob_thold,
@@ -23,8 +18,6 @@ use crate::config::{
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
-#[cfg(feature = "sherpa")]
-use crate::sherpa::SherpaMode;
 #[cfg(feature = "whisper")]
 use crate::whisper::Language;
 
@@ -63,9 +56,8 @@ pub(crate) struct Cli {
     pub(crate) channel: ChannelSel,
 
     /// Model spec (e.g. `parakeet`, `parakeet-tdt-0.6b-v3-int8`, or with the
-    /// `whisper` Cargo feature also `small`, `large-v3-turbo-q8_0`, or with
-    /// the `sherpa` Cargo feature `sherpa-parakeet` / `sherpa-whisper`)
-    /// or path to model weights (a Parakeet/sherpa model directory, or with
+    /// `whisper` Cargo feature also `small`, `large-v3-turbo-q8_0`)
+    /// or path to model weights (a Parakeet model directory, or with
     /// `whisper` a ggml `.bin` file; auto-downloaded if missing). `STTD_MODEL`
     /// wins over the legacy `WHISPER_MODEL_PATH` fallback; CLI wins over both.
     #[arg(
@@ -183,31 +175,6 @@ pub(crate) struct Cli {
     )]
     pub(crate) gpu: bool,
 
-    /// Sherpa decode mode: `offline` reuses the utterance pipeline
-    /// (pre-roll + hangover cuts), `streaming` feeds sherpa's Silero VAD
-    /// which owns the cuts. Only meaningful with a sherpa `--model`.
-    /// Sherpa-only (requires the `sherpa` Cargo feature).
-    #[cfg(feature = "sherpa")]
-    #[arg(
-        long,
-        env = "STTD_SHERPA_MODE",
-        value_enum,
-        ignore_case = true,
-        default_value_t = SherpaMode::Offline,
-        help_heading = "Model"
-    )]
-    pub(crate) sherpa_mode: SherpaMode,
-
-    /// Canary source/target language and sherpa-whisper language (ISO code,
-    /// `pl` = Polish): Canary transcription keeps src == tgt, sherpa-whisper
-    /// forces that language. Parakeet-TDT auto-detects per utterance and ignores
-    /// this. Note: Canary langs outside en/de/es/fr (e.g. `pl`) need a native
-    /// lib newer than sherpa-onnx 1.13.8 (see `SherpaKind`). Sherpa-only
-    /// (requires the `sherpa` Cargo feature).
-    #[cfg(feature = "sherpa")]
-    #[arg(long, env = "STTD_SHERPA_LANG", default_value = DEFAULT_SHERPA_LANG, help_heading = "Model")]
-    pub(crate) sherpa_lang: String,
-
     /// Minimum earshot score for a 16 ms window to count as speech.
     #[arg(long, env = "STTD_VAD_THRESHOLD", default_value_t = DEFAULT_VAD_THRESHOLD, value_parser = parse_fraction, help_heading = "Acoustic gates")]
     pub(crate) vad_threshold: f32,
@@ -234,25 +201,6 @@ pub(crate) struct Cli {
     /// Frame-level Agc target RMS (VAD-gated shared gain, speech-only), 0 disables.
     #[arg(long, env = "STTD_TARGET_RMS", default_value_t = DEFAULT_TARGET_RMS, value_parser = parse_linear_rms, help_heading = "Acoustic gates")]
     pub(crate) target_rms: f32,
-
-    /// Sherpa streaming VAD threshold: Silero speech score that opens a cut.
-    /// Streaming mode only. Sherpa-only (requires the `sherpa` Cargo feature).
-    #[cfg(feature = "sherpa")]
-    #[arg(long, env = "STTD_SHERPA_VAD_THRESHOLD", default_value_t = DEFAULT_SHERPA_VAD_THRESHOLD, value_parser = parse_fraction, help_heading = "Acoustic gates")]
-    pub(crate) sherpa_vad_threshold: f32,
-
-    /// Sherpa streaming trailing silence (seconds) that closes a cut. Lower =
-    /// faster finals, more splits. Streaming mode only.
-    /// Sherpa-only (requires the `sherpa` Cargo feature).
-    #[cfg(feature = "sherpa")]
-    #[arg(long, env = "STTD_SHERPA_MIN_SILENCE", default_value_t = DEFAULT_SHERPA_MIN_SILENCE, value_parser = parse_vad_secs, value_name = "SECS", help_heading = "Acoustic gates")]
-    pub(crate) sherpa_min_silence: f32,
-
-    /// Sherpa streaming minimum speech (seconds) that opens a cut. Streaming
-    /// mode only. Sherpa-only (requires the `sherpa` Cargo feature).
-    #[cfg(feature = "sherpa")]
-    #[arg(long, env = "STTD_SHERPA_MIN_SPEECH", default_value_t = DEFAULT_SHERPA_MIN_SPEECH, value_parser = parse_vad_secs, value_name = "SECS", help_heading = "Acoustic gates")]
-    pub(crate) sherpa_min_speech: f32,
 
     /// Min avg token confidence, weak acoustic evidence.
     #[arg(long, env = "STTD_MIN_CONF", default_value_t = DEFAULT_MIN_CONFIDENCE, value_parser = parse_fraction, help_heading = "Transcript gates")]
@@ -308,21 +256,6 @@ pub(crate) struct Cli {
         help_heading = "Emission"
     )]
     pub(crate) stdout: bool,
-
-    /// Log interim streaming partials as they decode (stderr, never clipboard
-    /// or paste). Finals still go through the normal emission path. Streaming
-    /// mode only. Sherpa-only (requires the `sherpa` Cargo feature).
-    #[cfg(feature = "sherpa")]
-    #[arg(
-        long,
-        env = "STTD_SHERPA_PARTIALS",
-        default_value_t = false,
-        value_parser = parse_bool,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        help_heading = "Emission"
-    )]
-    pub(crate) sherpa_partials: bool,
 
     /// Write each utterance as WAV+TXT into this directory (TXT written
     /// for dropped utterances too, prefixed with the drop reason).
@@ -590,15 +523,6 @@ mod tests {
         assert!(!cli.auto_unload);
         assert_eq!(cli.auto_unload, DEFAULT_AUTO_UNLOAD);
         assert_eq!(cli.auto_unload_after, DEFAULT_AUTO_UNLOAD_AFTER_SECS);
-        #[cfg(feature = "sherpa")]
-        {
-            assert_eq!(cli.sherpa_mode, crate::sherpa::SherpaMode::Offline);
-            assert_eq!(cli.sherpa_lang, DEFAULT_SHERPA_LANG);
-            assert!(!cli.sherpa_partials);
-            assert!((cli.sherpa_vad_threshold - DEFAULT_SHERPA_VAD_THRESHOLD).abs() < 1e-6);
-            assert!((cli.sherpa_min_silence - DEFAULT_SHERPA_MIN_SILENCE).abs() < 1e-6);
-            assert!((cli.sherpa_min_speech - DEFAULT_SHERPA_MIN_SPEECH).abs() < 1e-6);
-        }
     }
 
     #[cfg(feature = "whisper")]

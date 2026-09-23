@@ -57,8 +57,6 @@
 //! the legacy `WHISPER_MODEL_PATH` when `STTD_MODEL` is unset.
 
 use std::path::Path;
-#[cfg(feature = "sherpa")]
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -75,8 +73,6 @@ mod cli;
 use cli::Cli;
 mod config;
 use config::{parakeet_entry_for_spec, DEFAULT_MODELS_DIR, PARAKEET_CATALOG};
-#[cfg(feature = "sherpa")]
-use config::{sherpa_entry_for_spec, SHERPA_CATALOG};
 #[cfg(feature = "whisper")]
 use config::{model_file_for_spec, DEFAULT_PROMPT, DEFAULT_TRANSLATE_PROMPT, MODEL_CATALOG};
 mod capture;
@@ -106,8 +102,6 @@ use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
 #[cfg(feature = "whisper")]
 mod whisper;
 mod parakeet;
-#[cfg(feature = "sherpa")]
-mod sherpa;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -184,28 +178,10 @@ fn print_available_models(cli: &Cli) {
     println!("parakeet models:");
     print!("{}", format_parakeet_models(parakeet_selected, &parakeet_installed));
 
-    #[cfg(feature = "sherpa")]
-    let sherpa_selected = selected_sherpa_spec_for_input(&input);
-    #[cfg(feature = "sherpa")]
-    {
-        let sherpa_installed: Vec<bool> = SHERPA_CATALOG
-            .iter()
-            .map(|(_, dir, files, _, _)| {
-                let base = Path::new(DEFAULT_MODELS_DIR).join(dir);
-                files.iter().all(|f| base.join(f).exists())
-            })
-            .collect();
-        println!();
-        println!("sherpa models:");
-        print!("{}", format_sherpa_models(sherpa_selected, &sherpa_installed));
-    }
-
     #[cfg(feature = "whisper")]
     let any_selected = whisper_selected.is_some() || parakeet_selected.is_some();
     #[cfg(not(feature = "whisper"))]
     let any_selected = parakeet_selected.is_some();
-    #[cfg(feature = "sherpa")]
-    let any_selected = any_selected || sherpa_selected.is_some();
     if !any_selected {
         let trimmed = input.trim();
         if !trimmed.is_empty() {
@@ -225,64 +201,6 @@ fn selected_parakeet_spec_for_input(input: &str) -> Option<&'static str> {
         return None;
     }
     parakeet_entry_for_spec(trimmed).map(|(spec, ..)| *spec)
-}
-
-/// Map a `--model` input value to the sherpa catalog spec it selects, if any
-/// (exact spec match, including the `sherpa-parakeet`/`sherpa-canary`
-/// aliases — see `sherpa_entry_for_spec`). Sherpa-only (see the `sherpa`
-/// Cargo feature).
-#[cfg(feature = "sherpa")]
-fn selected_sherpa_spec_for_input(input: &str) -> Option<&'static str> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    sherpa_entry_for_spec(trimmed).map(|(spec, ..)| *spec)
-}
-
-/// Render the sherpa section of `--list-models`: same `*`/`I` marker scheme
-/// as `format_parakeet_models`, over `SHERPA_CATALOG`. Sherpa-only (see the
-/// `sherpa` Cargo feature).
-#[cfg(feature = "sherpa")]
-fn format_sherpa_models(selected: Option<&str>, installed: &[bool]) -> String {
-    let spec_w = SHERPA_CATALOG
-        .iter()
-        .map(|(s, ..)| s.len())
-        .max()
-        .unwrap_or(0)
-        .max("SPEC".len());
-    let dir_w = SHERPA_CATALOG
-        .iter()
-        .map(|(_, d, ..)| d.len())
-        .max()
-        .unwrap_or(0)
-        .max("DIR".len());
-    let size_w = SHERPA_CATALOG
-        .iter()
-        .map(|(_, _, _, s, _)| s.len())
-        .max()
-        .unwrap_or(0)
-        .max("SIZE".len());
-    let mut out = String::new();
-    out.push_str(&format!(
-        "   {0:<1$}  {2:<3$}  {4:>5$}\n",
-        "SPEC", spec_w, "DIR", dir_w, "SIZE", size_w
-    ));
-    for (i, (spec, dir, _files, size, _kind)) in SHERPA_CATALOG.iter().enumerate() {
-        let is_selected = selected == Some(*spec);
-        let is_installed = installed.get(i).copied().unwrap_or(false);
-        let marker = match (is_selected, is_installed) {
-            (true, true) => "*I",
-            (true, false) => "* ",
-            (false, true) => "I ",
-            (false, false) => "  ",
-        };
-        out.push_str(&format!(
-            "{marker} {0:<1$}  {2:<3$}  {4:>5$}\n",
-            spec, spec_w, dir, dir_w, size, size_w
-        ));
-    }
-    out
 }
 
 /// Render the Parakeet section of `--list-models`: same `*`/`I` marker
@@ -466,57 +384,6 @@ fn push_utterance_blocking(whisper_tx: &mut Producer<Utterance>, utterance: Utte
     }
 }
 
-/// Push 16 kHz samples into the sherpa streaming worker's ring. Never
-/// blocks the processing loop: a full ring drops the newest with a warn
-/// (decode runs far below realtime, so this only fires when the worker is
-/// paused/unloaded — and the paused main loop drops raw before it gets
-/// here). A dead worker is also just a warn. Sherpa-only (see the `sherpa`
-/// Cargo feature).
-#[cfg(feature = "sherpa")]
-fn push_samples(tx: &mut Option<Producer<f32>>, samples: &[f32]) {
-    let Some(tx) = tx else { return };
-    if tx.is_abandoned() {
-        log::warn!("sherpa worker gone, dropping samples");
-        return;
-    }
-    let mut dropped = 0usize;
-    for &s in samples {
-        if tx.push(s).is_err() {
-            dropped += 1;
-        }
-    }
-    if dropped > 0 {
-        log::warn!("sherpa sample queue full, dropping {dropped} newest sample(s)");
-    }
-}
-
-/// Blocking variant for file mode (lossless offline decoding): waits for
-/// room instead of dropping. Sherpa-only (see the `sherpa` Cargo feature).
-#[cfg(feature = "sherpa")]
-fn push_samples_blocking(tx: &mut Option<Producer<f32>>, samples: &[f32]) {
-    let Some(tx) = tx else { return };
-    if tx.is_abandoned() {
-        log::warn!("sherpa worker gone, dropping samples");
-        return;
-    }
-    for &s in samples {
-        let mut pending = s;
-        loop {
-            match tx.push(pending) {
-                Ok(()) => break,
-                Err(rtrb::PushError::Full(back)) => {
-                    if tx.is_abandoned() {
-                        log::warn!("sherpa worker gone, dropping samples");
-                        return;
-                    }
-                    pending = back;
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-        }
-    }
-}
-
 /// Occupied slots on the producer side (`Producer::slots` reports free).
 fn producer_occupied<T>(tx: &Producer<T>, cap: usize) -> usize {
     cap.saturating_sub(tx.slots())
@@ -541,20 +408,6 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let model = resolve_model_input(cli)?;
     log::info!("model: {model}");
     validate_parakeet_model_flags(cli, &model)?;
-    #[cfg(feature = "sherpa")]
-    validate_sherpa_model_flags(cli, &model)?;
-    #[cfg(feature = "sherpa")]
-    warn_unused_sherpa_flags(cli, &model);
-    // Streaming mode needs the Silero VAD up front (fail fast, same as the
-    // ASR weights above) — the worker would otherwise die on first load.
-    #[cfg(feature = "sherpa")]
-    let sherpa_vad_model: Option<PathBuf> = if is_sherpa_streaming(cli, &model) {
-        Some(crate::weights::ensure_sherpa_vad_available()?)
-    } else {
-        None
-    };
-    #[cfg(feature = "sherpa")]
-    let streaming = is_sherpa_streaming(cli, &model);
 
     // Raw mono samples (hw rate, f32 in [-1, 1]) from the cpal callback via a
     // realtime-safe `rtrb` sample ring (no allocation in the callback;
@@ -609,43 +462,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
     // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
     // Capture is already running above and the drain loop below sheds (counted)
-    // while it loads. Sherpa streaming mode spawns the VAD-driven sample
-    // worker instead of the utterance worker (never both).
-    #[cfg(feature = "sherpa")]
-    let mut sample_tx_opt: Option<Producer<f32>> = None;
-    #[cfg(feature = "sherpa")]
-    let (whisper_handle, whisper_ready) = if streaming {
-        let (tx, sample_rx) = RingBuffer::<f32>::new(crate::sherpa::SHERPA_SAMPLE_QUEUE_CAP);
-        let (handle, ready) = crate::sherpa::spawn_sherpa_streaming_worker(
-            sample_rx,
-            model,
-            sherpa_vad_model.unwrap(),
-            sherpa_stream_options(cli),
-            make_emitter(cli)?,
-            Arc::clone(&paused),
-            Arc::clone(&running),
-            cli.auto_unload,
-            cli.auto_unload_after,
-            cli.sound,
-            cli.autopause,
-        );
-        sample_tx_opt = Some(tx);
-        (handle, ready)
-    } else {
-        spawn_asr_worker(
-            whisper_rx,
-            model,
-            asr_options(cli, true),
-            make_emitter(cli)?,
-            Arc::clone(&paused),
-            Arc::clone(&running),
-            cli.auto_unload,
-            cli.auto_unload_after,
-            cli.sound,
-            cli.autopause,
-        )
-    };
-    #[cfg(not(feature = "sherpa"))]
+    // while it loads.
     let (whisper_handle, whisper_ready) = spawn_asr_worker(
         whisper_rx,
         model,
@@ -753,20 +570,8 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         }
 
         // Raw hw-rate samples -> FrameProcessor (denoise/VAD + whisper
-        // branches, all resampling included). Streaming mode bypasses the
-        // utterance buffer (sherpa VAD owns the cuts) and queues raw 16 kHz
-        // samples instead.
+        // branches, all resampling included).
         while accumulator.len() >= input_frames {
-            #[cfg(feature = "sherpa")]
-            if streaming {
-                let samples = fp.process_frame_samples(&accumulator[..input_frames]);
-                push_samples(&mut sample_tx_opt, &samples);
-            } else {
-                if let Some(utterance) = fp.process_frame(&accumulator[..input_frames]) {
-                    push_utterance(&mut whisper_tx, utterance);
-                }
-            }
-            #[cfg(not(feature = "sherpa"))]
             if let Some(utterance) = fp.process_frame(&accumulator[..input_frames]) {
                 push_utterance(&mut whisper_tx, utterance);
             }
@@ -806,16 +611,6 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     drop(stream);
     drain_raw_into(&mut raw_rx, &mut accumulator);
     while accumulator.len() >= input_frames {
-        #[cfg(feature = "sherpa")]
-        if streaming {
-            let samples = fp.process_frame_samples(&accumulator[..input_frames]);
-            push_samples(&mut sample_tx_opt, &samples);
-        } else {
-            if let Some(utterance) = fp.process_frame(&accumulator[..input_frames]) {
-                push_utterance(&mut whisper_tx, utterance);
-            }
-        }
-        #[cfg(not(feature = "sherpa"))]
         if let Some(utterance) = fp.process_frame(&accumulator[..input_frames]) {
             push_utterance(&mut whisper_tx, utterance);
         }
@@ -826,26 +621,13 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // exits — otherwise the last utterance can be silently dropped, and an
     // in-flight CUDA op can race process teardown the same way an early `?`
     // above used to.
-    #[cfg(feature = "sherpa")]
-    if streaming {
-        let tail = fp.flush_samples_streaming();
-        push_samples(&mut sample_tx_opt, &tail);
-    } else {
-        if let Some(utterance) = fp.flush_trailing_speech() {
-            push_utterance(&mut whisper_tx, utterance);
-        }
-    }
-    #[cfg(not(feature = "sherpa"))]
     if let Some(utterance) = fp.flush_trailing_speech() {
         push_utterance(&mut whisper_tx, utterance);
     }
     drop(fp);
     // Drop the last utterance producer so the whisper worker sees
     // `is_abandoned` and exits; without this the `join` below hangs forever
-    // on Ctrl-C / SIGTERM. Streaming mode drops the sample producer instead
-    // (same abandonment contract, other queue).
-    #[cfg(feature = "sherpa")]
-    drop(sample_tx_opt);
+    // on Ctrl-C / SIGTERM.
     drop(whisper_tx);
     drop(raw_rx);
     whisper_handle
@@ -1021,20 +803,6 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     let model = resolve_model_input(cli)?;
     log::info!("model: {model}");
     validate_parakeet_model_flags(cli, &model)?;
-    #[cfg(feature = "sherpa")]
-    validate_sherpa_model_flags(cli, &model)?;
-    #[cfg(feature = "sherpa")]
-    warn_unused_sherpa_flags(cli, &model);
-    // Streaming mode needs the Silero VAD up front (fail fast, same as the
-    // ASR weights above) — the worker would otherwise die on first load.
-    #[cfg(feature = "sherpa")]
-    let sherpa_vad_model: Option<PathBuf> = if is_sherpa_streaming(cli, &model) {
-        Some(crate::weights::ensure_sherpa_vad_available()?)
-    } else {
-        None
-    };
-    #[cfg(feature = "sherpa")]
-    let streaming = is_sherpa_streaming(cli, &model);
 
     let (mut whisper_tx, whisper_rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
     let mut fp = FrameProcessor::new(
@@ -1049,47 +817,6 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     )?;
     let input_frames = fp.required_input_frames();
 
-    #[cfg(feature = "sherpa")]
-    let mut sample_tx_opt: Option<Producer<f32>> = None;
-    #[cfg(feature = "sherpa")]
-    let (whisper_handle, whisper_ready) = if streaming {
-        let (tx, sample_rx) = RingBuffer::<f32>::new(crate::sherpa::SHERPA_SAMPLE_QUEUE_CAP);
-        let (handle, ready) = crate::sherpa::spawn_sherpa_streaming_worker(
-            sample_rx,
-            model,
-            sherpa_vad_model.unwrap(),
-            sherpa_stream_options(cli),
-            make_emitter(cli)?,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(true)),
-            false,
-            cli.auto_unload_after,
-            false,
-            false,
-        );
-        sample_tx_opt = Some(tx);
-        (handle, ready)
-    } else {
-        spawn_asr_worker(
-            whisper_rx,
-            model,
-            asr_options(cli, false),
-            make_emitter(cli)?,
-            // File mode has no pause signalling; a permanently-clear flag plus
-            // disabled auto-unload can never trigger an unload mid-file. Sounds
-            // stay off offline: no pause/resume transitions exist to cue.
-            // Autopause is forced off for the same reason: file input must never
-            // flip the (unread) pause flag into an unload mid-file.
-            Arc::new(AtomicBool::new(false)),
-            // File input runs to completion; inference is never aborted.
-            Arc::new(AtomicBool::new(true)),
-            false,
-            cli.auto_unload_after,
-            false,
-            false,
-        )
-    };
-    #[cfg(not(feature = "sherpa"))]
     let (whisper_handle, whisper_ready) = spawn_asr_worker(
         whisper_rx,
         model,
@@ -1123,16 +850,6 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
 
     let mut offset = 0usize;
     while offset + input_frames <= wav.samples.len() {
-        #[cfg(feature = "sherpa")]
-        if streaming {
-            let samples = fp.process_frame_samples(&wav.samples[offset..offset + input_frames]);
-            push_samples_blocking(&mut sample_tx_opt, &samples);
-        } else {
-            if let Some(utterance) = fp.process_frame(&wav.samples[offset..offset + input_frames]) {
-                push_utterance_blocking(&mut whisper_tx, utterance);
-            }
-        }
-        #[cfg(not(feature = "sherpa"))]
         if let Some(utterance) = fp.process_frame(&wav.samples[offset..offset + input_frames]) {
             push_utterance_blocking(&mut whisper_tx, utterance);
         }
@@ -1140,25 +857,11 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     }
     // A trailing partial chunk (< input_frames samples, at most ~30 ms) is
     // dropped; fine for offline comparison runs.
-    #[cfg(feature = "sherpa")]
-    if streaming {
-        let tail = fp.flush_samples_streaming();
-        push_samples_blocking(&mut sample_tx_opt, &tail);
-    } else {
-        if let Some(utterance) = fp.flush_trailing_speech() {
-            push_utterance_blocking(&mut whisper_tx, utterance);
-        }
-    }
-    #[cfg(not(feature = "sherpa"))]
     if let Some(utterance) = fp.flush_trailing_speech() {
         push_utterance_blocking(&mut whisper_tx, utterance);
     }
 
     drop(fp);
-    // Streaming mode drops the sample producer instead (same abandonment
-    // contract — without this the worker join below hangs forever).
-    #[cfg(feature = "sherpa")]
-    drop(sample_tx_opt);
     drop(whisper_tx);
     whisper_handle
         .join()
@@ -1226,140 +929,6 @@ fn unsupported_parakeet_flags(cli: &Cli) -> Vec<&'static str> {
         flags.push("--gpu");
     }
     flags
-}
-
-/// When `model` is a sherpa model: rejects `--translate` (no translate mode
-/// — silently ignoring it would produce source-language text instead of the
-/// requested English) and warns about whisper-only flags sherpa doesn't
-/// honor. A no-op for other engines. Sherpa-only (see the `sherpa` Cargo
-/// feature).
-#[cfg(feature = "sherpa")]
-fn validate_sherpa_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
-    if !matches!(model, ModelRef::Sherpa { .. }) {
-        return Ok(());
-    }
-    #[cfg(feature = "whisper")]
-    if cli.translate {
-        anyhow::bail!(
-            "--translate/STTD_TRANSLATE is not supported with a sherpa model: it decodes \
-             greedily with no translate mode, so silently ignoring the flag would produce \
-             the source-language text instead of the requested English. Use a whisper \
-             --model, or drop --translate."
-        );
-    }
-    let unsupported = unsupported_sherpa_flags(cli);
-    if !unsupported.is_empty() {
-        log::warn!(
-            "sherpa ignores flag(s): {} (no effect with this --model)",
-            unsupported.join(", ")
-        );
-    }
-    #[cfg(feature = "whisper")]
-    if cli.language != crate::whisper::Language::Polish {
-        log::warn!(
-            "--language/STTD_LANGUAGE is not honored by sherpa models (Parakeet-TDT \
-             auto-detects per utterance; Canary and sherpa-whisper use --sherpa-lang)"
-        );
-    }
-    log::info!(
-        "sherpa auto-detects the spoken language per utterance (Parakeet-TDT) \
-         or uses --sherpa-lang (Canary and sherpa-whisper, currently {})",
-        cli.sherpa_lang,
-    );
-    Ok(())
-}
-
-/// Whisper-only flags sherpa doesn't honor, checked against their compiled
-/// defaults (same `ArgMatches` limitation as `unsupported_parakeet_flags`:
-/// a flag set to its own default is indistinguishable from unset, and
-/// that's fine). Plus `--min-conf*`: sherpa reports no per-token
-/// probability, so the confidence floor never fires. Sherpa-only (see the
-/// `sherpa` Cargo feature).
-#[cfg(feature = "sherpa")]
-fn unsupported_sherpa_flags(cli: &Cli) -> Vec<&'static str> {
-    use crate::config::{DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG};
-    let mut flags = Vec::new();
-    #[cfg(feature = "whisper")]
-    {
-        use crate::config::{
-            DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_LOGPROB_THOLD,
-            DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TEMPERATURE,
-            DEFAULT_TEMPERATURE_INC,
-        };
-        if cli.prompt != DEFAULT_PROMPT {
-            flags.push("--prompt");
-        }
-        if cli.prompt_context_chars != DEFAULT_PROMPT_CONTEXT_CHARS {
-            flags.push("--prompt-context-chars");
-        }
-        if cli.beam_size != DEFAULT_BEAM_SIZE {
-            flags.push("--beam-size");
-        }
-        if (cli.temperature - DEFAULT_TEMPERATURE).abs() > f32::EPSILON {
-            flags.push("--temperature");
-        }
-        if (cli.temperature_inc - DEFAULT_TEMPERATURE_INC).abs() > f32::EPSILON {
-            flags.push("--temperature-inc");
-        }
-        if (cli.entropy_thold - DEFAULT_ENTROPY_THOLD).abs() > f32::EPSILON {
-            flags.push("--entropy-thold");
-        }
-        if (cli.logprob_thold - DEFAULT_LOGPROB_THOLD).abs() > f32::EPSILON {
-            flags.push("--logprob-thold");
-        }
-    }
-    if (cli.min_conf - DEFAULT_MIN_CONFIDENCE).abs() > f32::EPSILON {
-        flags.push("--min-conf");
-    }
-    if (cli.min_conf_strong - DEFAULT_MIN_CONFIDENCE_STRONG).abs() > f32::EPSILON {
-        flags.push("--min-conf-strong");
-    }
-    // The static prebuilt ships no CUDA EP (see `SherpaOfflineModel::load`),
-    // so `--gpu` never takes effect — same standing warn as Parakeet without
-    // `parakeet-cuda`.
-    if cli.gpu {
-        flags.push("--gpu");
-    }
-    flags
-}
-
-/// Warn when sherpa-only flags are set but the loaded model isn't sherpa
-/// (they silently do nothing there). Sherpa-only (see the `sherpa` Cargo
-/// feature).
-#[cfg(feature = "sherpa")]
-fn warn_unused_sherpa_flags(cli: &Cli, model: &ModelRef) {
-    if matches!(model, ModelRef::Sherpa { .. }) {
-        return;
-    }
-    use crate::config::{
-        DEFAULT_SHERPA_LANG, DEFAULT_SHERPA_MIN_SILENCE, DEFAULT_SHERPA_MIN_SPEECH,
-        DEFAULT_SHERPA_VAD_THRESHOLD,
-    };
-    let mut flags = Vec::new();
-    if cli.sherpa_mode != crate::sherpa::SherpaMode::Offline {
-        flags.push("--sherpa-mode");
-    }
-    if cli.sherpa_lang != DEFAULT_SHERPA_LANG {
-        flags.push("--sherpa-lang");
-    }
-    if cli.sherpa_partials {
-        flags.push("--sherpa-partials");
-    }
-    if (cli.sherpa_vad_threshold - DEFAULT_SHERPA_VAD_THRESHOLD).abs() > f32::EPSILON {
-        flags.push("--sherpa-vad-threshold");
-    }
-    if (cli.sherpa_min_silence - DEFAULT_SHERPA_MIN_SILENCE).abs() > f32::EPSILON {
-        flags.push("--sherpa-min-silence");
-    }
-    if (cli.sherpa_min_speech - DEFAULT_SHERPA_MIN_SPEECH).abs() > f32::EPSILON {
-        flags.push("--sherpa-min-speech");
-    }
-    if !flags.is_empty() {
-        log::warn!(
-            "sherpa-only flag(s) set without a sherpa --model: {} (no effect)",
-            flags.join(", ")
-        );
-    }
 }
 
 /// When `model` is a Parakeet model: rejects `--translate` (whisper builds
@@ -1446,8 +1015,6 @@ fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
         logprob_thold: cli.logprob_thold,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
-        #[cfg(feature = "sherpa")]
-        sherpa_lang: cli.sherpa_lang.clone(),
         metrics_path: cli.metrics.clone(),
         shed_stale,
     }
@@ -1460,29 +1027,6 @@ fn make_emitter(cli: &Cli) -> Result<SystemEmitter> {
     SystemEmitter::new(cli.dump_dir.clone(), cli.copy, cli.paste, cli.stdout)
 }
 
-/// Tunables the sherpa streaming worker needs, resolved once from `Cli`.
-/// Sherpa-only (see the `sherpa` Cargo feature).
-#[cfg(feature = "sherpa")]
-fn sherpa_stream_options(cli: &Cli) -> crate::sherpa::SherpaStreamOptions {
-    crate::sherpa::SherpaStreamOptions {
-        model_spec: cli.model_input(),
-        lang: cli.sherpa_lang.clone(),
-        gate: gate_config(cli),
-        n_threads: resolve_n_threads(cli.threads, auto_threads()),
-        metrics_path: cli.metrics.clone(),
-        vad_threshold: cli.sherpa_vad_threshold,
-        vad_min_silence: cli.sherpa_min_silence,
-        vad_min_speech: cli.sherpa_min_speech,
-        partials: cli.sherpa_partials,
-    }
-}
-
-/// Whether `model` runs in sherpa streaming mode: a sherpa model plus
-/// `--sherpa-mode streaming`. Sherpa-only (see the `sherpa` Cargo feature).
-#[cfg(feature = "sherpa")]
-fn is_sherpa_streaming(cli: &Cli, model: &ModelRef) -> bool {
-    matches!(model, ModelRef::Sherpa { .. }) && cli.sherpa_mode == crate::sherpa::SherpaMode::Streaming
-}
 
 /// Thresholds for deciding-not-to-emit, resolved once from `Cli` and shared
 /// by the acoustic path (`FrameProcessor`) and the transcript path
@@ -1649,103 +1193,6 @@ mod tests {
             .find(|l| l.contains("parakeet-tdt-0.6b-v3-int8"))
             .expect("int8 row must exist");
         assert!(int8_row.starts_with("* "), "row={int8_row:?}");
-    }
-
-    #[cfg(feature = "sherpa")]
-    #[test]
-    fn sherpa_selection_matches_spec_and_alias() {
-        assert_eq!(
-            selected_sherpa_spec_for_input("sherpa-parakeet-tdt-0.6b-v3-int8"),
-            Some("sherpa-parakeet-tdt-0.6b-v3-int8")
-        );
-        assert_eq!(
-            selected_sherpa_spec_for_input("sherpa-parakeet"),
-            Some("sherpa-parakeet-tdt-0.6b-v3-int8")
-        );
-        assert_eq!(
-            selected_sherpa_spec_for_input("sherpa-whisper-large-v3-turbo-int8"),
-            Some("sherpa-whisper-large-v3-turbo-int8")
-        );
-        assert_eq!(
-            selected_sherpa_spec_for_input("sherpa-whisper"),
-            Some("sherpa-whisper-large-v3-turbo-int8")
-        );
-        assert_eq!(selected_sherpa_spec_for_input("small"), None);
-        assert_eq!(selected_sherpa_spec_for_input("parakeet"), None);
-        assert_eq!(selected_sherpa_spec_for_input(""), None);
-    }
-
-    #[cfg(feature = "sherpa")]
-    #[test]
-    fn sherpa_models_table_aligns_columns_and_marks_rows() {
-        let installed = vec![false; SHERPA_CATALOG.len()];
-        let table = format_sherpa_models(Some("sherpa-parakeet-tdt-0.6b-v3-int8"), &installed);
-        let lines: Vec<&str> = table.lines().collect();
-        assert_eq!(lines.len(), SHERPA_CATALOG.len() + 1);
-        assert!(lines[0].contains("SPEC"));
-        assert!(lines[0].contains("DIR"));
-        assert!(lines[0].contains("SIZE"));
-        let parakeet_row = lines
-            .iter()
-            .find(|l| l.contains("sherpa-parakeet-tdt-0.6b-v3-int8"))
-            .expect("sherpa-parakeet row must exist");
-        assert!(parakeet_row.starts_with("* "), "row={parakeet_row:?}");
-        let whisper_row = lines
-            .iter()
-            .find(|l| l.contains("sherpa-whisper-large-v3-turbo-int8"))
-            .expect("sherpa-whisper row must exist");
-        assert!(whisper_row.starts_with("  "), "row={whisper_row:?}");
-    }
-
-    #[cfg(all(feature = "sherpa", feature = "whisper"))]
-    #[test]
-    fn unsupported_sherpa_flags_lists_whisper_only_tunables() {
-        let cli = Cli::try_parse_from([
-            "sttd",
-            "--beam-size",
-            "8",
-            "--min-conf",
-            "0.4",
-            "--gpu",
-        ])
-        .expect("flags must parse");
-        // --beam-size/--min-conf are ignored by sherpa, and so is --gpu
-        // (CPU-only static build).
-        let flags = unsupported_sherpa_flags(&cli);
-        assert!(flags.contains(&"--beam-size"), "flags={flags:?}");
-        assert!(flags.contains(&"--min-conf"), "flags={flags:?}");
-        assert!(flags.contains(&"--gpu"), "flags={flags:?}");
-        assert_eq!(flags.len(), 3, "flags={flags:?}");
-    }
-
-    #[cfg(all(feature = "sherpa", not(feature = "whisper")))]
-    #[test]
-    fn unsupported_sherpa_flags_lists_shared_tunables_without_whisper() {
-        let cli =
-            Cli::try_parse_from(["sttd", "--min-conf", "0.4", "--gpu", "off"])
-                .expect("flags must parse");
-        let flags = unsupported_sherpa_flags(&cli);
-        assert!(flags.contains(&"--min-conf"), "flags={flags:?}");
-        assert!(!flags.contains(&"--gpu"), "flags={flags:?}");
-        assert_eq!(flags.len(), 1, "flags={flags:?}");
-        // ...an explicit --gpu still warns like Parakeet without CUDA.
-        let cli = Cli::try_parse_from(["sttd", "--gpu"]).expect("defaults must parse");
-        assert!(unsupported_sherpa_flags(&cli).contains(&"--gpu"));
-        // ...while the default (off) stays quiet.
-        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
-        assert!(!unsupported_sherpa_flags(&cli).contains(&"--gpu"));
-    }
-
-    #[cfg(feature = "sherpa")]
-    #[test]
-    fn sherpa_mode_parses_offline_and_streaming() {
-        use crate::sherpa::SherpaMode;
-        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
-        assert_eq!(cli.sherpa_mode, SherpaMode::Offline);
-        let cli =
-            Cli::try_parse_from(["sttd", "--sherpa-mode", "streaming"]).expect("must parse");
-        assert_eq!(cli.sherpa_mode, SherpaMode::Streaming);
-        assert!(Cli::try_parse_from(["sttd", "--sherpa-mode", "live"]).is_err());
     }
 
     #[test]
