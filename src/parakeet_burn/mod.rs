@@ -49,6 +49,9 @@ mod pre_encode;
 mod quant;
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
+mod tensor;
+#[cfg(feature = "parakeet-burn")]
+#[allow(dead_code)]
 mod vocab;
 #[cfg(feature = "parakeet-burn")]
 #[allow(dead_code)]
