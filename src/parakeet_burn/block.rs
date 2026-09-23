@@ -111,7 +111,7 @@ impl DwConv {
         let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
         let zpw = self.zero_point.round() as i64;
         let mut padded = vec![zpx; c * (self.pad_left + t + self.pad_right)];
-        for (i, row) in x.iter().enumerate() {
+        for (i, _row) in x.iter().enumerate() {
             let base = (self.pad_left + i) * c;
             let qbase = i * c;
             padded[base..base + c].copy_from_slice(&xq[qbase..qbase + c]);
@@ -428,7 +428,7 @@ pub(crate) fn rel_attention(
         h,
         dh,
     );
-    let mut scores = rel_scores(x, w, pos_window);
+    let scores = rel_scores(x, w, pos_window);
     // scores is [T][H][T]; softmax over keys per (frame, head).
     let mut heads_out = Vec::with_capacity(h);
     for hh in 0..h {

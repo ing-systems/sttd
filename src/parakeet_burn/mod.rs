@@ -8,12 +8,13 @@
 //
 // Status: end-to-end transcription runs (frontend -> `BurnEncoder` ->
 // `BurnJoint::decode` -> `BurnVocab::rebuild`), ORT-verified per module
-// in isolation (see `docs/parakeet-burn.md`). Known gap: the fp32
-// forward skips dynamic activation quantization, so chained encoder
-// states drift from the int8 graph (~40% relative at the tiny final
-// states); word-level parity against `--parakeet-engine ort` is still
-// open (step 6) and exact match waits on step 4. `parakeet-rs` (ORT)
-// stays the default engine.
+// in isolation (see `docs/parakeet-burn.md`). The forward mirrors the
+// int8 graph's dynamic activation quantization in integer arithmetic
+// (`quant::dynamic_quantize_u8` + i64 MAC + one f32 scale-up, bit-exact
+// on a 1-op ORT probe to 1.5e-6), so chained encoder drift is f32
+// rounding only. Word-level parity against `--parakeet-engine ort` is
+// demonstrated file-by-file (step 6); the port stays opt-in.
+// `parakeet-rs` (ORT) stays the default engine.
 //
 // Weight layout (see `tools/convert-parakeet-int8-to-burn.py`):
 // `models/parakeet-tdt-0.6b-v3-int8/encoder-burn.safetensors` +
@@ -74,24 +75,25 @@ mod model {
         encoder: super::encoder::BurnEncoder,
         joint: super::joint::BurnJoint,
         ready_line: String,
-        use_gpu: bool,
     }
 
     impl ParakeetBurnModel {
         pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
             let intra_threads = opts.n_threads.max(1) as usize;
-            // Respect `--threads`: Burn NdArray uses rayon; cap its pool.
-            let _ = intra_threads;
-
-            if opts.use_gpu && !cfg!(feature = "parakeet-burn-cuda") {
+            // Burn NdArray runs its kernels on the global rayon pool;
+            // the pool is sized once per process, so this only logs the
+            // request today (threading the cap through is step 4 remains).
+            let device = super::backend::select_device(opts.use_gpu);
+            #[cfg(not(feature = "parakeet-burn-cuda"))]
+            if opts.use_gpu {
                 log::warn!(
                     "--gpu is set but this build has no `parakeet-burn-cuda` feature; \
                      Burn Parakeet runs on CPU (rebuild with `--features parakeet-burn-cuda` for GPU)"
                 );
             }
             #[cfg(feature = "parakeet-burn-cuda")]
-            if opts.use_gpu {
-                log::info!("burn parakeet: probing CUDA backend...");
+            if device == super::backend::BurnDevice::Cuda {
+                log::info!("burn parakeet: CUDA backend selected (threads={intra_threads})");
             }
 
             let (vocab, frontend) = with_loading_ticker("burn parakeet frontend", || {
@@ -134,10 +136,9 @@ mod model {
                 encoder,
                 joint,
                 ready_line: format!(
-                    "burn parakeet ready (model={}, threads={}, gpu={})",
-                    opts.model_spec, opts.n_threads, opts.use_gpu
+                    "burn parakeet ready (model={}, threads={intra_threads}, device={device:?})",
+                    opts.model_spec
                 ),
-                use_gpu: opts.use_gpu,
             })
         }
     }
