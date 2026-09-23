@@ -122,8 +122,7 @@ pub(crate) fn requant_u8_to_s8(
 /// Widen one `[out][in]` u8 weight store to i16 with the row zero-point
 /// subtracted: `B[o,k] = w - zp[o].round()`, the same integers the scalar
 /// `mac_row` multiplies (range [-255, 255], exact).
-pub(crate) fn widen_weights(w: &[u8], out_dim: usize, in_dim: usize, zp: &[f32]) -> Vec<i16> {
-    assert_eq!(w.len(), out_dim * in_dim);
+pub(crate) fn widen_weights(w: &[u8], out_dim: usize, in_dim: usize, zp: &[f32]) -> Vec<i16> {    assert_eq!(w.len(), out_dim * in_dim);
     let mut b = vec![0i16; w.len()];
     // Rows are independent: exact in any order, so parallelize.
     b.par_chunks_mut(in_dim)
@@ -132,6 +131,23 @@ pub(crate) fn widen_weights(w: &[u8], out_dim: usize, in_dim: usize, zp: &[f32])
             let z = zp[o.min(zp.len() - 1)].round() as i16;
             for (k, v) in row.iter_mut().enumerate() {
                 *v = w[o * in_dim + k] as i16 - z;
+            }
+        });
+    b
+}
+
+/// Widen one `[out][in]` s8 weight store to i16 with the scalar
+/// zero-point subtracted: `B[o,k] = w - zpw` (LSTM `W`/`R`, whose zp is
+/// integral). Range [-255, 255], exact.
+pub(crate) fn widen_weights_s8(w: &[i8], out_dim: usize, in_dim: usize, zpw: i32) -> Vec<i16> {
+    assert_eq!(w.len(), out_dim * in_dim);
+    let mut b = vec![0i16; w.len()];
+    // Rows are independent: exact in any order, so parallelize.
+    b.par_chunks_mut(in_dim)
+        .enumerate()
+        .for_each(|(o, row)| {
+            for (k, v) in row.iter_mut().enumerate() {
+                *v = w[o * in_dim + k] as i16 - zpw as i16;
             }
         });
     b
@@ -1260,6 +1276,302 @@ pub(crate) fn vnni_gemm_rows(
     vnni_driver(q, t, k, w_s8, rowsum, n, s_prime, bias, sx, zpx, &bases, epi);
 }
 
+// ---------------------------------------------------------------------------
+// Exact u8*s8 kernels with a weight zero-point (LSTM gates).
+//
+// The encoder's VNNI path requantizes weights to symmetric s8 (Phase 11,
+// approximate) so `vnni_gemm_*` can assume `zpw == 0`. LSTM weights arrive
+// natively s8 with a nonzero zero-point (2, 2, -15, 124 on the TDT-v3
+// export) that must NOT be requantized: the gates feed a recurrent state
+// loop, where requant noise would compound across emits. Instead the dot
+// keeps both zero-points exactly:
+//
+//   acc[o] = Σ(q-zpx)(w-zpw) = raw - zpx*rowsum[o] - zpw*(sumq-K*zpx)
+//
+// every term an exact integer (|acc| <= 83M for K <= 1280, far from i32
+// overflow), so these kernels are bit-identical to the i16 `vpmaddwd`
+// path and to a scalar integer reference — no exactness-policy change.
+// `sumq` (per-row Σq) is a post-pass over the L1-hot u8 row at the call
+// site; `rowsum` (per-output Σw) is precomputed once at load.
+// ---------------------------------------------------------------------------
+
+/// Per-output Σw over raw s8 rows (the VNNI correction term's
+/// `rowsum[o]`), built once at load. Rows are independent, so parallel.
+pub(crate) fn row_sums_s8(w: &[i8], out_dim: usize, in_dim: usize) -> Vec<i32> {
+    assert_eq!(w.len(), out_dim * in_dim);
+    let mut sums = vec![0i32; out_dim];
+    sums
+        .par_chunks_mut(64)
+        .enumerate()
+        .for_each(|(chunk, s)| {
+            let o0 = chunk * 64;
+            for (i, s) in s.iter_mut().enumerate() {
+                let mut acc = 0i32;
+                for &v in &w[(o0 + i) * in_dim..(o0 + i + 1) * in_dim] {
+                    acc += v as i32;
+                }
+                *s = acc;
+            }
+        });
+    sums
+}
+
+/// Per-row Σq over a raw u8 activation row (the VNNI correction term's
+/// `sumq`). Scalar post-pass at the call site; K <= 1280 here.
+#[inline]
+pub(crate) fn sum_u8(q: &[u8]) -> i32 {
+    q.iter().map(|&v| v as i32).sum()
+}
+
+/// Scalar zp-aware row-segment (reference): columns `[o0, o1)` of one
+/// output row with `epi` at the scale-up site. Exact.
+fn vnni_zp_row_scalar(
+    q_row: &[u8],
+    sumq: i32,
+    w_s8: &[i8],
+    rowsum: &[i32],
+    k: usize,
+    _n: usize,
+    o0: usize,
+    o1: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    zpw: i32,
+    out: &mut [f32],
+    epi: Epilogue<'_>,
+) {
+    debug_assert_eq!(out.len(), o1 - o0);
+    let qcorr = sumq - k as i32 * zpx;
+    for (oi, o) in (o0..o1).enumerate() {
+        let raw = dot_u8s8_scalar(q_row, &w_s8[o * k..(o + 1) * k], k);
+        let acc = raw - zpx * rowsum[o.min(rowsum.len() - 1)] - zpw * qcorr;
+        let sp = s_prime[o.min(s_prime.len() - 1)];
+        let mut y = acc as f32 * (sx * sp);
+        if let Some(bb) = bias {
+            y += bb[o];
+        }
+        out[oi] = apply_epi(y, o, oi, out, epi);
+    }
+}
+
+/// Blocked zp-aware VNNI micro-kernel: `OB` columns at a time, A streamed
+/// once per block. Requires `avx512vnni`; exact vs [`vnni_zp_row_scalar`]
+/// (same integers, blocking changes nothing).
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn vnni_zp_row_kernel(
+    q_row: &[u8],
+    sumq: i32,
+    w_s8: &[i8],
+    rowsum: &[i32],
+    k: usize,
+    _n: usize,
+    o0: usize,
+    o1: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    zpw: i32,
+    out: &mut [f32],
+    epi: Epilogue<'_>,
+) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(out.len(), o1 - o0);
+    let qp = q_row.as_ptr();
+    let wp = w_s8.as_ptr();
+    let rsp = rowsum.as_ptr();
+    let rslen = rowsum.len();
+    let spp = s_prime.as_ptr();
+    let splen = s_prime.len();
+    let bbp = bias.map(|bb| bb.as_ptr());
+    let outp = out.as_mut_ptr();
+    let qcorr = sumq - k as i32 * zpx;
+    let k_main = k - (k % 64);
+    let mut o = o0;
+    while o + OB <= o1 {
+        let mut accs = [_mm512_setzero_si512(); OB];
+        let mut kk = 0;
+        while kk < k_main {
+            let vq = _mm512_loadu_si512(qp.add(kk) as *const _);
+            let mut j = 0;
+            while j < OB {
+                let vw = _mm512_loadu_si512(wp.add((o + j) * k + kk) as *const _);
+                accs[j] = _mm512_dpbusd_epi32(accs[j], vq, vw);
+                j += 1;
+            }
+            kk += 64;
+        }
+        let mut j = 0;
+        while j < OB {
+            let mut raw = _mm512_reduce_add_epi32(accs[j]);
+            let mut kk2 = k_main;
+            while kk2 < k {
+                raw += *qp.add(kk2) as i32 * *wp.add((o + j) * k + kk2) as i32;
+                kk2 += 1;
+            }
+            let rs = *rsp.add((o + j).min(rslen - 1));
+            let acc = raw - zpx * rs - zpw * qcorr;
+            let sp = *spp.add((o + j).min(splen - 1));
+            let mut y = acc as f32 * (sx * sp);
+            if let Some(p) = bbp {
+                y += *p.add(o + j);
+            }
+            let slot = o - o0 + j;
+            *outp.add(slot) = apply_epi(y, o + j, slot, out, epi);
+            j += 1;
+        }
+        o += OB;
+    }
+    while o < o1 {
+        let raw = dot_u8s8_avx512(qp, wp.add(o * k), k);
+        let rs = *rsp.add(o.min(rslen - 1));
+        let acc = raw - zpx * rs - zpw * qcorr;
+        let sp = *spp.add(o.min(splen - 1));
+        let mut y = acc as f32 * (sx * sp);
+        if let Some(p) = bbp {
+            y += *p.add(o);
+        }
+        let slot = o - o0;
+        *outp.add(slot) = apply_epi(y, o, slot, out, epi);
+        o += 1;
+    }
+}
+
+/// Tiled zp-aware VNNI driver: same 2D tiling (row-chunks x L2 column
+/// blocks) as [`vnni_driver`], threading the per-row `sumq` alongside.
+fn vnni_zp_driver(
+    q: &[u8],
+    sumq: &[i32],
+    t: usize,
+    k: usize,
+    w_s8: &[i8],
+    rowsum: &[i32],
+    n: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    zpw: i32,
+    bases: &[usize],
+    epi: Epilogue<'_>,
+) {
+    let fast = has_avx512_vnni();
+    let row_ptr = |ti: usize| -> *mut f32 {
+        if bases.len() == 1 {
+            (bases[0] as *mut f32).wrapping_add(ti * n)
+        } else {
+            bases[ti] as *mut f32
+        }
+    };
+    if t * n < PAR_MIN_OUTPUTS {
+        for ti in 0..t {
+            let qrow = &q[ti * k..(ti + 1) * k];
+            // SAFETY: one row's full column range; disjoint per iteration.
+            let row = unsafe { std::slice::from_raw_parts_mut(row_ptr(ti), n) };
+            if fast {
+                // SAFETY: VNNI gated on `fast`; slice lengths asserted on entry.
+                unsafe {
+                    vnni_zp_row_kernel(
+                        qrow, sumq[ti], w_s8, rowsum, k, n, 0, n, s_prime, bias, sx,
+                        zpx, zpw, row, epi,
+                    )
+                };
+            } else {
+                vnni_zp_row_scalar(
+                    qrow, sumq[ti], w_s8, rowsum, k, n, 0, n, s_prime, bias, sx,
+                    zpx, zpw, row, epi,
+                );
+            }
+        }
+        return;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    // s8 B-tile: ~512 KB budget equivalent (same lines as the i16 path's
+    // 256 KB, since params are half-width).
+    let mut nc = ((524_288 / k.max(1)).clamp(64, 1024) / OB * OB).max(OB);
+    let mut nb = n.div_ceil(nc);
+    let mut row_chunks = threads.div_ceil(nb).min(t).max(1);
+    while row_chunks * nb > 4 * threads && nc < n {
+        nc = (nc * 2).min(n);
+        nb = n.div_ceil(nc);
+        row_chunks = threads.div_ceil(nb).min(t).max(1);
+    }
+    let tr = t.div_ceil(row_chunks);
+    let mut tiles = Vec::with_capacity(row_chunks * nb);
+    for r in 0..row_chunks {
+        let ti0 = r * tr;
+        let ti1 = ((r + 1) * tr).min(t);
+        if ti0 >= ti1 {
+            break;
+        }
+        for c in 0..nb {
+            let o0 = c * nc;
+            let o1 = ((c + 1) * nc).min(n);
+            tiles.push((ti0, ti1, o0, o1));
+        }
+    }
+    tiles.into_par_iter().for_each(|(ti0, ti1, o0, o1)| {
+        for ti in ti0..ti1 {
+            let qrow = &q[ti * k..(ti + 1) * k];
+            let sq = sumq[ti];
+            // SAFETY: disjoint by construction; bounds hold since ti < t, o1 <= n.
+            let seg = unsafe { std::slice::from_raw_parts_mut(row_ptr(ti).add(o0), o1 - o0) };
+            if fast {
+                // SAFETY: VNNI gated on `fast`; slice lengths as above.
+                unsafe {
+                    vnni_zp_row_kernel(
+                        qrow, sq, w_s8, rowsum, k, n, o0, o1, s_prime, bias, sx,
+                        zpx, zpw, seg, epi,
+                    )
+                };
+            } else {
+                vnni_zp_row_scalar(
+                    qrow, sq, w_s8, rowsum, k, n, o0, o1, s_prime, bias, sx,
+                    zpx, zpw, seg, epi,
+                );
+            }
+        }
+    });
+}
+
+/// Zp-aware VNNI `C[T,N] = f(A_u8[T,K], B_s8[N,K])` with fused epilogue:
+/// `y[o] = (raw - zpx*rowsum[o] - zpw*(sumq-K*zpx)) * sx*sp[o] + bias[o]`.
+/// Exact (all-integer correction); `Epilogue::Glu` needs a rows variant
+/// that does not exist — LSTM call sites only use `None`/`AddScale`.
+pub(crate) fn vnni_gemm_zp_epi(
+    q: &[u8],
+    sumq: &[i32],
+    t: usize,
+    k: usize,
+    w_s8: &[i8],
+    rowsum: &[i32],
+    n: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    zpw: i32,
+    out: &mut [f32],
+    epi: Epilogue<'_>,
+) {
+    assert_eq!(q.len(), t * k);
+    assert_eq!(sumq.len(), t);
+    assert_eq!(w_s8.len(), n * k);
+    assert_eq!(rowsum.len(), n);
+    assert_eq!(out.len(), t * n);
+    assert!(k >= 1 && t >= 1 && n >= 1);
+    assert!(!matches!(epi, Epilogue::Glu), "Glu needs rows API");
+    if let Some(bb) = bias {
+        assert_eq!(bb.len(), n);
+    }
+    let bases = [out.as_mut_ptr() as usize];
+    vnni_zp_driver(
+        q, sumq, t, k, w_s8, rowsum, n, s_prime, bias, sx, zpx, zpw, &bases, epi,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1853,6 +2165,74 @@ mod tests {
                     epi,
                 );
                 assert_eq!(got, want, "epi={epi:?}");
+            }
+        }
+    }
+
+    /// The zp-aware VNNI kernel is bit-exact vs a scalar integer reference
+    /// with nonzero weight zero-points (the LSTM case: zp 2, -15, 124):
+    /// the `-zpw*(sumq-K*zpx)` correction is exact integer arithmetic, so
+    /// blocking/SIMD change nothing. Shapes span the serial driver (the
+    /// LSTM single-row gate calls), odd tails, and a parallel tile split.
+    #[test]
+    fn vnni_zp_matches_integer_mac_exactly() {
+        let mut seed: u64 = 0x2b7d;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 6.0
+        };
+        for (t, k, n, zpw) in [
+            (1usize, 640usize, 2560usize, 2i32),
+            (1, 640, 2560, -15),
+            (1, 640, 2560, 124),
+            (3, 65, 130, -7),
+            (20, 1024, 33, 100),
+        ] {
+            let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..k).map(|_| rnd()).collect()).collect();
+            // s8 weights spanning negatives (like the LSTM stores).
+            let w: Vec<i8> = (0..n * k)
+                .map(|_| (rnd() * 40.0) as i8)
+                .collect();
+            let sp: Vec<f32> = vec![0.37];
+            let bias: Vec<f32> = (0..n).map(|_| rnd()).collect();
+            let (q, sx, zpx) = quantize_u8_from_rows(&xs);
+            let sumq: Vec<i32> = q
+                .chunks(k)
+                .map(|r| r.iter().map(|&v| v as i32).sum())
+                .collect();
+            assert_eq!(sumq, q.chunks(k).map(|r| sum_u8(r)).collect::<Vec<_>>());
+            let rowsum = row_sums_s8(&w, n, k);
+            for epi in [Epilogue::None, Epilogue::AddScale(1.0)] {
+                // Reference: scalar integer MAC with both zero-points.
+                let mut expect = match epi {
+                    Epilogue::AddScale(_) => vec![1.5f32; t * n],
+                    _ => vec![0.0f32; t * n],
+                };
+                for ti in 0..t {
+                    for o in 0..n {
+                        let mut acc = 0i64;
+                        for kk in 0..k {
+                            acc += (q[ti * k + kk] as i64 - zpx as i64)
+                                * (w[o * k + kk] as i64 - zpw as i64);
+                        }
+                        let mut y = acc as f32 * (sx * sp[0]) + bias[o];
+                        if matches!(epi, Epilogue::AddScale(_)) {
+                            y = expect[ti * n + o] + 1.0 * y;
+                        }
+                        expect[ti * n + o] = y;
+                    }
+                }
+                let mut got = match epi {
+                    Epilogue::AddScale(_) => vec![1.5f32; t * n],
+                    _ => vec![0.0f32; t * n],
+                };
+                vnni_gemm_zp_epi(
+                    &q, &sumq, t, k, &w, &rowsum, n, &sp, Some(&bias), sx,
+                    zpx as i32, zpw, &mut got, epi,
+                );
+                assert_eq!(got, expect, "t={t} k={k} n={n} zpw={zpw} epi={epi:?}");
             }
         }
     }

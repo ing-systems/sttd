@@ -177,3 +177,96 @@ Gap closed from ~1.6x to ~1.1x ORT. Isolated per-layer VNNI drift is
 three paths; pl_test matches ORT on VNNI (i16 flips one word-piece on
 the robotic boundary — both in the known ambiguous class); pl3_test 1/3
 exact on both burn paths as before.
+
+## Phase 12: joint memoization (2026-09-23, same day)
+
+Point 1 of the plan (`joint decode ~17 ms`, LSTM Flex dominates). Two
+redundancies, both keyed by inputs so reuse is bit-exact (clones of
+already-computed values — no golden re-baselining, tripwire tokens
+unchanged):
+
+- **Pred side** (`src/parakeet_burn/joint.rs`, `step_core`): LSTM
+  candidates + pred projection memoized per `(token, states-version,
+  ctx-mode)`. Consecutive blank frames share inputs (same last token,
+  uncommitted states); a non-blank commit bumps `version`, so the next
+  step always recomputes. Mode is in the key (scalar/i16/VNNI compute
+  different values).
+- **Encoder projection** (`step_for_frame`, used by `decode` only):
+  memoized per `(frame-index, mode)` — TDT re-evaluates the same frame
+  on multi-emit (`dur == 0`), where only the token side changes.
+  `reset`/`set_states` invalidate both.
+
+`profile_breakdown` (same host/config, min-of-5; encoder unchanged):
+
+| Joint | Before | After |
+|---|---|---|
+| decode T=32 (random frames, mostly blank) | 17.05 ms | 5.94 ms (−65%) |
+| decode T=8 (real encoder output, `tokens=[]` both) | 5.99 ms | 4.65 ms (−22%) |
+| `step_for` same-input ×100 (hit path) | 0.465 ms/step | 0.051 ms/step |
+
+E2E on a dense 5 s espeak-PL single utterance (`T'≈63`): burn
+108–110 → 102–106 ms vs ORT 85–97 ms (host noise ±5 ms). The profile
+win is blank-heavy; dense speech emits often (each emit bumps the
+version → mandatory recompute), so the speech gain is smaller. Burn
+transcript differs from ORT by one robotic-boundary word-piece (known
+ambiguous class); `en_test`/silence stay word-exact.
+
+Tests: 5 new weight-free cache tests (blank-hit determinism,
+commit-bump-miss, ctx-mode isolation, blank-run 3/4 pred hits,
+multi-emit 9/10 enc hits) + unchanged ignored parity
+(`ort_joint_parity`, `tensor_joint_step_matches_scalar`,
+`ort_vnni_encoder_parity`); unit suite 283 passed.
+
+What's left of joint: the emit path still pays 2× Flex LSTM (f32,
+weight-streaming bound ~13 MB/layer/step) + 3 projections per step.
+The durable fix is integer LSTM gates (`DynamicQuantizeLSTM`, VNNI)
+instead of Flex — a new quantization policy needing ORT probing, not a
+cache tweak. Per-step floor after that is the out-projection
+(640×8198, input changes every frame) + argmax.
+
+## Phase 13: integer LSTM gates (2026-09-23, same day)
+
+The durable emit-path fix above, done exactly — no new quantization
+policy. Probing the joint graph with a hand-rolled protobuf walk
+(`decoder_joint-model.int8.onnx`, 55 nodes) shows each
+`DynamicQuantizeLSTM` takes F32 X (dequantized embed row) + I8 W/R +
+F32 B, so activation quantization lives inside the op; the port now
+mirrors it: x and h dynamically quantized per-tensor (same
+window/zp/q as the encoder's `DynamicQuantizeLinear`), gates as exact
+integer MACs `Σ(qx-zpx)(w-zpw)` / `Σ(qh-zph)(r-zpr)` with one f32
+scale-up + load-folded bias each (`src/parakeet_burn/joint.rs`,
+`step_into`). LSTM weights arrive natively s8 with nonzero zp
+(2, 2, -15, 124), so VNNI runs a new zp-aware kernel
+(`int_gemm::vnni_gemm_zp_epi`: `raw - zpx*rowsum - zpw*(sumq-K*zpx)`,
+all-integer, exact) instead of Phase-11 requantization — recurrent
+state would compound requant noise across emits. Scalar, i16
+(`vpmaddwd` over widened rows) and VNNI therefore compute the same
+integers: all three paths are bit-identical, and the ORT golden now
+reads max_abs=0.00000 (was ≤0.15 with f32 dequant gates).
+
+One real bug died to the golden: the LSTM store is `[in][4H]` while
+every GEMM entry reads `[N][K]` row-major — the first cut computed
+`x @ Wᵀ`. Zero-input steps (l0 on blank) masked it exactly, which is
+why the iofc/zero unit tests stayed green while the golden went to
+13.2. The twins transpose once at load (`transpose_s8`,
+`transpose_widen_s8`), like the MatMuls' `transpose_u8`. The Flex gate
+matrices, f32 twins and `LstmStep.xh` are gone; `prime_cache` warms the
+integer twins instead.
+
+| Joint (`profile_breakdown`, min-of-5) | Phase 12 | Phase 13 |
+|---|---|---|
+| decode T=32 (random frames) | 5.94 ms | 3.88 ms |
+| decode T=8 (real encoder output, `tokens=[]` both) | 4.65 ms | 2.66 ms |
+| `step_for` same-input ×100 (pred-cache hit path, unchanged) | 0.051 ms | 0.049 ms |
+
+E2E dense 5 s espeak-PL: burn 102–106 → 96–99 ms vs ORT 84–97 ms;
+en_test word-exact vs ORT, pl_test one robotic-boundary word-piece off
+(known ambiguous class). The remaining e2e gap is the encoder (~90 ms
+at T'=63) — point 2.
+
+Tests: `vnni_zp_matches_integer_mac_exactly` (kernel bit-exact vs
+scalar ref incl. nonzero zpw, serial + tiled shapes), ORT goldens
+unchanged (`ort_joint_parity` now 0.00000, `ort_vnni_encoder_parity`
+untouched), `tensor_joint_step_matches_scalar` reborn as
+`joint_paths_agree_exactly` (scalar-vs-i16 assert_eq; VNNI leg loose at
+5% for the Phase-11 approximate projections); unit suite 284 passed.
