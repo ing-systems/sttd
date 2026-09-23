@@ -90,4 +90,4 @@ sherpa = ["dep:sherpa-onnx"]
 
 [profile.release]
 strip = true
-lto = true
+# lto = true
