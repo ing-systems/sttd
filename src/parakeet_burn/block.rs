@@ -26,6 +26,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 
+use super::backend::CpuBackend;
 use super::encoder::EncoderManifest;
 use super::quant::Uint8Linear;
 use super::tensor::TensorCtx;
@@ -416,6 +417,57 @@ pub(crate) fn rel_scores(
     }
     out
 }
+/// Tensor core of `rel_attention`: same math (see module docs), one
+/// Flex matmul per head per term instead of scalar triple loops.
+/// B[i,j] = (q_i + v) . P[(j-i) + (T-1)] becomes a dense product plus
+/// a gather: M = (Q+v) P^T is `[T, 2T-1]`, and row i reads the
+/// contiguous slice `M[i, T-1-i .. 2T-1-i]` — i.e. `M.gather(1, kk)`
+/// with `kk[i,j] = (j-i)+(T-1)`, the same index the scalar path
+/// computes. `rel_scores` stays scalar (staged parity probe); only
+/// this core and the final out-projection dispatch.
+pub(crate) fn rel_attention_t(
+    x: &[Vec<f32>],
+    w: &BlockWeights,
+    pos_window: &[Vec<f32>],
+    ctx: &TensorCtx,
+) -> Vec<Vec<f32>> {
+    use burn::tensor::{activation, Int, Tensor, TensorData};
+    let t = x.len();
+    assert!(t >= 1, "rel_attention_t: empty input");
+    let (h, dh) = (w.n_heads, w.d_head);
+    let dev = &ctx.device;
+    let q = super::tensor::rows_to_tensor::<CpuBackend>(&linear_batch(&w.wq, x, ctx), dev);
+    let k = super::tensor::rows_to_tensor::<CpuBackend>(&linear_batch(&w.wk, x, ctx), dev);
+    let v = super::tensor::rows_to_tensor::<CpuBackend>(&linear_batch(&w.wv, x, ctx), dev);
+    let p = super::tensor::rows_to_tensor::<CpuBackend>(&linear_batch(&w.wpos, pos_window, ctx), dev);
+    // kk[i,j] = (j-i)+(T-1), the scalar path's window index.
+    let kk: Vec<i32> = (0..t)
+        .flat_map(|i| (0..t).map(move |j| j as i32 - i as i32 + t as i32 - 1))
+        .collect();
+    let kk_t: Tensor<CpuBackend, 2, Int> =
+        Tensor::from_data(TensorData::new(kk, [t, t]), dev);
+    let scale = 1.0 / (dh as f32).sqrt();
+    let mut heads = Vec::with_capacity(h);
+    for hh in 0..h {
+        let c = hh * dh;
+        let qh = q.clone().narrow(1, c, dh);
+        let kh = k.clone().narrow(1, c, dh);
+        let vh = v.clone().narrow(1, c, dh);
+        let ph = p.clone().narrow(1, c, dh);
+        let u: Tensor<CpuBackend, 1> =
+            Tensor::from_data(TensorData::new(w.pos_bias_u[hh].clone(), [dh]), dev);
+        let vb: Tensor<CpuBackend, 1> =
+            Tensor::from_data(TensorData::new(w.pos_bias_v[hh].clone(), [dh]), dev);
+        let ac = (qh.clone() + u.unsqueeze::<2>()).matmul(kh.transpose());
+        let m = (qh + vb.unsqueeze::<2>()).matmul(ph.transpose());
+        let bd: Tensor<CpuBackend, 2> = m.gather(1, kk_t.clone());
+        let a = activation::softmax((ac + bd) * scale, 1);
+        heads.push(a.matmul(vh));
+    }
+    let merged = Tensor::cat(heads, 1);
+    // Out-projection rides the linear dispatch (tensor under `ctx`).
+    w.wout.batch_dispatch(&super::tensor::tensor_to_rows(merged), ctx)
+}
 /// Relative multi-head attention (Transformer-XL shift):
 /// B[i,j] = (q_i + v) . P[(j-i) + (T-1)], scores / sqrt(dh).
 /// Scores come from `rel_scores`; this adds softmax + value mixing.
@@ -425,6 +477,9 @@ pub(crate) fn rel_attention(
     pos_window: &[Vec<f32>],
     ctx: &TensorCtx,
 ) -> Vec<Vec<f32>> {
+    if ctx.enabled {
+        return rel_attention_t(x, w, pos_window, ctx);
+    }
     let t = x.len();
     let (h, dh) = (w.n_heads, w.d_head);
     let v = split_heads(
@@ -640,6 +695,22 @@ mod tests {
         assert!(y[0][0] < 0.1, "y={y:?}");
         // Row 1: all-zero scores -> uniform mean of v = 0.5.
         assert!((y[1][0] - 0.5).abs() < 1e-5, "y={y:?}");
+        // Tensor core must agree with the scalar path (and therefore
+        // pick the same shift direction): any gather/indexing bug shows
+        // up here before real weights are involved.
+        let yt = rel_attention(
+            &x,
+            &w,
+            &pw,
+            &TensorCtx {
+                device: super::super::backend::cpu_device(),
+                enabled: true,
+            },
+        );
+        assert_eq!(yt.len(), 2);
+        for (a, b) in y.iter().zip(yt.iter()) {
+            assert!((a[0] - b[0]).abs() < 1e-5, "scalar={y:?} tensor={yt:?}");
+        }
         // Full block preserves shape and stays finite.
         let table: Vec<Vec<f32>> = (0..9999).map(|i| vec![i as f32]).collect();
         let win = pos_window(&table, 2);
@@ -935,7 +1006,7 @@ mod tests {
             max_abs < 0.001 * ref_max.max(1.0),
             "max_abs={max_abs} ref_max={ref_max}"
         );
-        assert!(max_vs < 1e-3 * ref_max.max(1.0), "vs_scalar={max_vs}");
+        assert!(max_vs < 1e-4 * ref_max.max(1.0), "vs_scalar={max_vs}");
     }
 
     }
