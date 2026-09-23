@@ -1,2 +1,7 @@
 /target
 /models/
+# makepkg scratch (packaging/PKGBUILD): srcdir, pkgdir, built package, logs
+/packaging/src/
+/packaging/pkg/
+/packaging/*.pkg.tar.*
+/packaging/*.log

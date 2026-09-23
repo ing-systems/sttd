@@ -1,0 +1,29 @@
+[Unit]
+Description=sttd real-time speech-to-text
+Documentation=file:///usr/share/doc/sttd/CONTEXT.md
+# Mic + clipboard + paste live in the user's Wayland session: PipeWire for
+# capture, WAYLAND_DISPLAY for wl-copy/ydotool, so this is a user unit, not
+# a system one.
+After=pipewire.socket wireplumber.service
+
+[Service]
+Type=simple
+# Foreground on purpose: no --start. Under systemd the unit IS the
+# supervisor -- --start would fork, have the parent exit 0 and leave the unit
+# dead (and the cgroup cleaned up). systemd tracks this process directly, so
+# `systemctl --user stop` sends SIGTERM to the normal graceful-flush path and
+# the journal gets env_logger's stderr instead of /tmp/sttd.log.
+ExecStart=/usr/bin/sttd --autopause --copy 1 --paste 1
+# No STTD_START_PAUSED: the compiled default (paused) applies, so the unit
+# comes up idle and transcribes nothing until armed.
+#   systemctl --user kill -s SIGUSR2 sttd   # arm one sentence (--autopause is single-shot)
+#   systemctl --user kill -s SIGHUP  sttd   # toggle pause/run
+#   systemctl --user kill -s SIGUSR1 sttd   # pause
+# --copy/--paste need wl-clipboard/ydotoold and WAYLAND_DISPLAY in the user
+# manager (`systemctl --user import-environment WAYLAND_DISPLAY`); without
+# them emit.rs disables both with a warning.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

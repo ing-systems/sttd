@@ -112,9 +112,11 @@ _Avoid_: model (bare, when the engine — as opposed to the weights — is meant
 **Model spec**:
 A `--model` value that names a catalog entry rather than a filesystem path —
 `large-v3-turbo-q8_0` for a whisper weight, `parakeet` or
-`parakeet-tdt-0.6b-v3-int8` for a Parakeet one. Resolved to a location and,
-for a catalog spec, downloaded if missing; a bare path (`.bin` file or an
-existing directory) passes through untouched instead.
+`parakeet-tdt-0.6b-v3-int8` for a Parakeet one. Resolved into the models
+directory baked into the binary at build time (`STTD_MODELS_DIR`, default
+`models`; the Arch package uses `/usr/share/sttd/models`) and, for a catalog
+spec, downloaded if missing; a bare path (`.bin` file or an existing
+directory) passes through untouched instead.
 _Avoid_: model name, model id
 
 ### Signal paths

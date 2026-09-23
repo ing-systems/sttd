@@ -171,7 +171,7 @@ fn ensure_parakeet_available(dir: &Path, assets: &'static [&'static str]) -> Res
         }
         return Ok(());
     }
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| install_hint(dir))?;
     for file in assets {
         let dest = dir.join(file);
         if dest.exists() {
@@ -179,9 +179,24 @@ fn ensure_parakeet_available(dir: &Path, assets: &'static [&'static str]) -> Res
         }
         let url = parakeet_asset_url(file);
         log::info!("model not found at {}, downloading {url}...", dest.display());
-        download(&url, &dest)?;
+        download(&url, &dest)
+            .with_context(|| format!("{file}: {}", install_hint(dir)))?;
     }
     Ok(())
+}
+
+/// What to say when a catalog model has to be fetched into a directory that
+/// isn't writable — the usual case being `DEFAULT_MODELS_DIR` baked to the
+/// root-owned `/usr/share/sttd/models` of a packaged install, where only the
+/// bundled default model is present. Keeps the raw `EACCES` from
+/// `create_dir_all`/`File::create` from being the whole story.
+fn install_hint(dir: &Path) -> String {
+    format!(
+        "cannot prepare model directory {} (packaged model dirs are root-owned: \
+         install the sttd package, run once with sudo, or point --model at a \
+         writable directory)",
+        dir.display()
+    )
 }
 
 /// Download URL for a `ggml-*.bin` model filename (full or quantized,
@@ -485,6 +500,20 @@ mod tests {
         for bad in ["tiny-q5_0", "medium-q5_1"] {
             let err = resolve_model(bad).expect_err("must reject");
             assert!(err.to_string().contains("large-v3-turbo-q8_0"), "msg={err}");
+        }
+    }
+
+    #[test]
+    fn install_hint_names_the_directory_and_the_way_out() {
+        // The raw EACCES from a root-owned /usr/share/sttd/models must not be
+        // the whole story: name the directory, then the three ways forward.
+        let hint = install_hint(Path::new("/usr/share/sttd/models/parakeet-tdt-0.6b-v3-fp32"));
+        assert!(
+            hint.contains("/usr/share/sttd/models/parakeet-tdt-0.6b-v3-fp32"),
+            "hint={hint}"
+        );
+        for way_out in ["sttd package", "sudo", "--model"] {
+            assert!(hint.contains(way_out), "missing {way_out:?} in hint={hint}");
         }
     }
 

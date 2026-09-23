@@ -26,8 +26,10 @@ pub(crate) fn default_log_file() -> PathBuf {
 
 /// Fork into the background. Parent prints pid/log and exits 0; child
 /// (stdout+stderr appended to `log`) returns `Ok` to keep running.
-/// Relative paths (`models/...`, `--dump-dir`) keep working because the
-/// daemon keeps the current working directory instead of `chdir("/")`.
+/// Relative paths (an explicit `--model models/...`, `--dump-dir`) keep
+/// working because the daemon keeps the current working directory instead of
+/// `chdir("/")`. Catalog specs don't need that: they resolve into
+/// `DEFAULT_MODELS_DIR`, baked absolute at build time.
 pub(crate) fn daemonize_start(pid_file: &Path, log: &Path) -> Result<()> {
     if let Some(parent) = log.parent() {
         if !parent.as_os_str().is_empty() {

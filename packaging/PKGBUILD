@@ -1,0 +1,95 @@
+# Maintainer: Karol Harasim <karol.harasim@gmail.com>
+#
+# Local-only package: source=() is empty on purpose -- makepkg builds this
+# checkout as-is (uncommitted work included) and reads the model weights from
+# ../models instead of downloading them. Run it from this directory:
+#
+#     cd packaging && makepkg
+#
+# Keeping the PKGBUILD here (not at the repo root) is load-bearing: makepkg
+# sets srcdir="$startdir/src" *after* sourcing this file and `makepkg -c`/`-C`
+# do `rm -rf "$srcdir"` -- at the repo root that would delete src/, the Rust
+# sources. Here $startdir/src is scratch space, so every flag is safe.
+pkgname=sttd
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Real-time Polish speech-to-text for a live microphone"
+arch=('x86_64')
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'alsa-lib')
+makedepends=('cargo')
+optdepends=(
+  'wl-clipboard: --copy (Wayland clipboard emission)'
+  'ydotool: --paste auto-paste (requires ydotoold running)'
+)
+# !lto is load-bearing. makepkg's `lto` option appends -flto=auto to
+# CFLAGS/CXXFLAGS/LDFLAGS (/usr/share/makepkg/buildenv/lto.sh), and the
+# `cc`-driven build scripts (ring, openssl-sys) honour CFLAGS: they then emit
+# GCC-LTO bytecode objects that rust-lld cannot read, so the link dies on
+# undefined ring_core_* symbols. Nothing is lost -- Rust's own LTO is
+# switched on separately below via CARGO_PROFILE_RELEASE_LTO.
+# !debug: keep makepkg from splitting debug info out of an already-stripped
+# binary.
+options=(!debug !lto)
+source=()
+sha256sums=()
+
+# --- Top level: makepkg sources this file in the same shell that runs
+# --- build()/check()/package(), so these exports reach all three.
+
+# LTO for packaged builds only. Cargo's env config overrides Cargo.toml, so
+# the repo's [profile.release].lto stays commented out and a dev
+# `cargo build` remains LTO-free. Must NOT be scoped inside build(): profile
+# settings are part of every unit's fingerprint, so check() running without
+# them would rebuild the whole dependency tree non-LTO and the next makepkg
+# would rebuild it LTO again -- permanent double-build on every run.
+export CARGO_PROFILE_RELEASE_LTO=true
+# Fat LTO over one pre-LTO codegen unit (default 16 would blunt cross-crate
+# inlining). Use CARGO_PROFILE_RELEASE_LTO=thin for faster links.
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+
+# Keep the LTO artifact cache in target/pkg/ (gitignored via /target) so the
+# packaged and dev flag sets stop invalidating each other's fingerprints.
+export CARGO_TARGET_DIR="$(cd "$startdir/.." && pwd)/target/pkg"
+
+# makepkg always exports RUSTFLAGS (here /etc/makepkg.conf.d/rust.conf), and
+# an env RUSTFLAGS *replaces* .cargo/config.toml's build.rustflags instead of
+# merging with it -- so pin native here rather than silently depending on the
+# host's makepkg.conf to provide it.
+export RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+
+build() {
+  cd "$startdir/.."
+  # cd to the repo root so cargo discovers .cargo/config.toml (config is
+  # searched from the *cwd* upward, not from the manifest): target-cpu=native
+  # and the WHISPER/CUDA knobs apply. No RUSTFLAGS override -- native is
+  # wanted here.
+  # STTD_MODELS_DIR is scoped to this call only: it bakes the system model
+  # dir into the binary, and check() deliberately runs without it so the
+  # tests can assert the "models" default. Only build.rs declares
+  # rerun-if-env-changed, so flipping it recompiles just this crate.
+  STTD_MODELS_DIR=/usr/share/sttd/models cargo build --release --locked
+}
+
+check() {
+  cd "$startdir/.."
+  cargo test --release --frozen
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 "$CARGO_TARGET_DIR/release/sttd" "$pkgdir/usr/bin/sttd"
+
+  # The bundled default model: catalog specs resolve to a single directory
+  # baked in at build time (STTD_MODELS_DIR above -> src/config.rs), so this
+  # is what makes `sttd --model parakeet` work offline from any directory.
+  local m=parakeet-tdt-0.6b-v3-int8
+  local d="$pkgdir/usr/share/sttd/models/$m"
+  install -Dm644 "models/$m/encoder-model.int8.onnx" "$d/encoder-model.int8.onnx"
+  install -Dm644 "models/$m/decoder_joint-model.int8.onnx" "$d/decoder_joint-model.int8.onnx"
+  install -Dm644 "models/$m/vocab.txt" "$d/vocab.txt"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 CONTEXT.md "$pkgdir/usr/share/doc/$pkgname/CONTEXT.md"
+  install -Dm644 packaging/sttd.service "$pkgdir/usr/lib/systemd/user/sttd.service"
+}

@@ -294,7 +294,18 @@ pub(crate) const MODEL_BASE_URL: &str =
 #[allow(dead_code)]
 pub(crate) const MODEL_BASE_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-pub(crate) const DEFAULT_MODELS_DIR: &str = "models";
+/// Directory every catalog spec resolves into — one fixed value per binary,
+/// chosen at **compile time** from `STTD_MODELS_DIR` (see `build.rs`), default
+/// `models` (CWD-relative, the dev checkout). The Arch package builds with
+/// `STTD_MODELS_DIR=/usr/share/sttd/models` (see `packaging/PKGBUILD`), which
+/// is also where it installs the bundled model.
+///
+/// Never probed and no fallback list: resolution is a pure join, so it can't
+/// flip depending on the working directory. Setting the variable when *running*
+/// `sttd` does nothing — an explicit `--model <path>` is the escape hatch, and
+/// a missing asset is downloaded into this directory (root-owned in a packaged
+/// install, see `weights::ensure_available`).
+pub(crate) const DEFAULT_MODELS_DIR: &str = env!("STTD_MODELS_DIR");
 pub(crate) const DEFAULT_MODEL_SPEC: &str = "parakeet";
 
 /// All `--model` symbolic specs (Polish-relevant, no `.en` variants),
