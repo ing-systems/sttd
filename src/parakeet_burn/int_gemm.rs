@@ -37,6 +37,88 @@ pub(crate) fn has_avx512_int_gemm() -> bool {
         && std::arch::is_x86_feature_detected!("avx512bw")
 }
 
+/// VNNI path needs `vpdpbusd` (u8*s8 -> i32, 64 MACs/instr) on top of
+/// F+BW. The requantized kernels (`vnni_gemm_*`) run only when this
+/// holds; otherwise the bit-exact `vpmaddwd` path runs. This host
+/// (Ryzen 9 9950X) reports it.
+pub(crate) fn has_avx512_vnni() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+}
+
+/// Requantize one `[out][in]` u8 weight store to symmetric s8 for the
+/// VNNI kernels (Phase 11, option (b)).
+///
+/// Each output row `o` holds dequant values `d[k] = (w[k]-zpw[o])*sw[o]`;
+/// the VNNI twin stores `w'[k] = round(d[k]/s'[o])` in `[-128, 127]` with
+/// `s'[o] = max|d|/127` (or `1.0` for an all-zero row), plus
+/// `rowsum[o] = sum(w')` for the activation-zp correction.
+///
+/// The forward then runs `y = sx*s'[o]*(sum(q*w') - zpx*rowsum[o]) + b`
+/// with `q` the raw u8 activations — one `vpdpbusd` dot plus a scalar
+/// correction per output, vs the i16 path's double-width traffic.
+///
+/// This is APPROXIMATE by construction (up to 0.5 LSB/weight of requant
+/// noise, `|d - w'*s'| <= 0.5*s'[o]`): the bit-exact contract ends here.
+/// Isolated per-layer residuals move from <=2e-4 to the ~1-3% class;
+/// file-mode word parity (`pl_test`/`en_test`) is the gate that matters.
+#[derive(Debug, Clone)]
+pub(crate) struct VnniWeights {
+    pub(crate) w_s8: Vec<i8>,
+    pub(crate) s_prime: Vec<f32>,
+    pub(crate) rowsum: Vec<i32>,
+}
+
+pub(crate) fn requant_u8_to_s8(
+    w: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    scale: &[f32],
+    zp: &[f32],
+) -> VnniWeights {
+    assert_eq!(w.len(), out_dim * in_dim);
+    let mut w_s8 = vec![0i8; w.len()];
+    let mut s_prime = vec![0.0f32; out_dim];
+    let mut rowsum = vec![0i32; out_dim];
+    // Serial over rows: runs once at load (`prime_cache`), not per
+    // utterance — and each layer warms in parallel via rayon's pool, so
+    // per-linear serialism costs nothing steady-state.
+    for o in 0..out_dim {
+        let s = scale[o.min(scale.len() - 1)];
+        let z = zp[o.min(zp.len() - 1)];
+        let base = o * in_dim;
+        // Max |d| over the row to set the symmetric scale.
+        let mut amax = 0.0f32;
+        for k in 0..in_dim {
+            let d = (w[base + k] as f32 - z) * s;
+            amax = amax.max(d.abs());
+        }
+        if !(amax > 0.0) {
+            s_prime[o] = 1.0;
+            rowsum[o] = 0;
+            continue;
+        }
+        let sp = amax / 127.0;
+        s_prime[o] = sp;
+        let inv = 1.0 / sp;
+        let mut sum = 0i32;
+        let dst = &mut w_s8[o * in_dim..(o + 1) * in_dim];
+        for (k, v) in dst.iter_mut().enumerate() {
+            let d = (w[base + k] as f32 - z) * s;
+            let q = (d * inv).round().clamp(-128.0, 127.0) as i8;
+            *v = q;
+            sum += q as i32;
+        }
+        rowsum[o] = sum;
+    }
+    VnniWeights {
+        w_s8,
+        s_prime,
+        rowsum,
+    }
+}
+
 /// Widen one `[out][in]` u8 weight store to i16 with the row zero-point
 /// subtracted: `B[o,k] = w - zp[o].round()`, the same integers the scalar
 /// `mac_row` multiplies (range [-255, 255], exact).
@@ -279,6 +361,79 @@ unsafe fn quantize_from_rows_avx512(xs: &[Vec<f32>]) -> (Vec<i16>, f32, i64) {
         o += r.len();
     }
     (a, s, zp as i64)
+}
+
+/// Rows-direct u8 twin of [`quantize_from_rows`] for the VNNI kernels:
+/// same per-tensor window over the whole `[T,K]` input (as ORT quantizes
+/// it), same zp/q values — but emitted as raw u8 `q` (no zp subtraction;
+/// the VNNI correction `zpx*rowsum` handles it at the scale-up site).
+/// No intermediate f32 flat copy. Bit-identical window to
+/// flatten-then-`dynamic_quantize_u8` (same min/max scan, same map).
+pub(crate) fn quantize_u8_from_rows(xs: &[Vec<f32>]) -> (Vec<u8>, f32, u8) {
+    assert!(!xs.is_empty());
+    let total: usize = xs.iter().map(|r| r.len()).sum();
+    assert!(total > 0);
+    if has_avx512_int_gemm() {
+        // SAFETY: gated on the runtime AVX-512F+BW check.
+        return unsafe { quantize_u8_from_rows_avx512(xs) };
+    }
+    quantize_u8_from_rows_scalar(xs)
+}
+
+fn quantize_u8_from_rows_scalar(xs: &[Vec<f32>]) -> (Vec<u8>, f32, u8) {
+    let total: usize = xs.iter().map(|r| r.len()).sum();
+    let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+    for r in xs {
+        for &v in r {
+            mn = mn.min(v);
+            mx = mx.max(v);
+        }
+    }
+    let (lo, hi) = (mn.min(0.0), mx.max(0.0));
+    let range = hi - lo;
+    if !(range > 0.0) {
+        return (vec![0; total], 1.0, 0);
+    }
+    let s = range / 255.0;
+    let zp = ((-lo / s).round() as i32).clamp(0, 255);
+    let mut q = vec![0u8; total];
+    let mut o = 0;
+    for r in xs {
+        for &x in r {
+            q[o] = ((x / s).round() as i32 + zp).clamp(0, 255) as u8;
+            o += 1;
+        }
+    }
+    (q, s, zp as u8)
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn quantize_u8_from_rows_avx512(xs: &[Vec<f32>]) -> (Vec<u8>, f32, u8) {
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for r in xs {
+        if r.is_empty() {
+            continue;
+        }
+        let (a, b) = min_max_avx512(r);
+        mn = mn.min(a);
+        mx = mx.max(b);
+    }
+    let total: usize = xs.iter().map(|r| r.len()).sum();
+    let (lo, hi) = (mn.min(0.0), mx.max(0.0));
+    let range = hi - lo;
+    if !(range > 0.0) {
+        return (vec![0; total], 1.0, 0);
+    }
+    let s = range / 255.0;
+    let zp = ((-lo / s).round() as i32).clamp(0, 255);
+    let mut q = vec![0u8; total];
+    let mut o = 0;
+    for r in xs {
+        map_u8_avx512(r.as_ptr(), q.as_mut_ptr().add(o), r.len(), s, zp);
+        o += r.len();
+    }
+    (q, s, zp as u8)
 }
 
 /// SIMD map `q = clamp(round(x / s) + zp, 0, 255)` into u8, scalar tail.
@@ -784,6 +939,327 @@ unsafe fn dot_avx512(a: *const i16, b: *const i16, k: usize) -> i32 {
     sum
 }
 
+// ---------------------------------------------------------------------------
+// VNNI kernels (Phase 11, option (b)): `vpdpbusd` u8*s8 -> i32.
+//
+// Math: `y[o] = (dot(q, w'[o]) - zpx*rowsum[o]) * sx*s'[o] + bias[o]`,
+// where `q` is the raw u8 activation row, `w'` the requantized s8 row
+// (see `requant_u8_to_s8`), `zpx` the activation zero-point, `sx`/`s'`
+// the activation/weight scales. The `-zpx*rowsum` correction folds the
+// activation zp subtraction out of the dot: `sum((q-zpx)*w') =
+// sum(q*w') - zpx*sum(w')`.
+//
+// Traffic: half the weight bytes of the i16 path (1 B vs 2 B/param) and
+// twice the MACs/instr (64 vs 32). Accuracy: approximate (requant noise,
+// see `requant_u8_to_s8`); residuals are ~1-3% rel, not bit-exact.
+// ---------------------------------------------------------------------------
+
+/// Scalar u8*s8 dot (reference for the VNNI micro-kernel + fallback on
+/// machines without `avx512vnni`): `sum(q[i] as i32 * w[i] as i32)`.
+fn dot_u8s8_scalar(q: &[u8], w: &[i8], k: usize) -> i32 {
+    let mut s = 0i32;
+    for i in 0..k {
+        s += q[i] as i32 * w[i] as i32;
+    }
+    s
+}
+
+/// AVX-512 VNNI twin of [`dot_u8s8_scalar`]: 64 MACs per `vpdpbusd`.
+/// Exact vs scalar (integer arithmetic; width/tails change nothing).
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dot_u8s8_avx512(q: *const u8, w: *const i8, k: usize) -> i32 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm512_setzero_si512();
+    let mut i = 0;
+    while i + 64 <= k {
+        let vq = _mm512_loadu_si512(q.add(i) as *const _);
+        let vw = _mm512_loadu_si512(w.add(i) as *const _);
+        acc = _mm512_dpbusd_epi32(acc, vq, vw);
+        i += 64;
+    }
+    let mut sum = _mm512_reduce_add_epi32(acc);
+    while i < k {
+        sum += *q.add(i) as i32 * *w.add(i) as i32;
+        i += 1;
+    }
+    sum
+}
+
+/// Scalar VNNI row-segment (reference): columns `[o0, o1)` of one output
+/// row with `epi` at the scale-up site.
+fn vnni_row_scalar(
+    q_row: &[u8],
+    w_s8: &[i8],
+    rowsum: &[i32],
+    k: usize,
+    _n: usize,
+    o0: usize,
+    o1: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    out: &mut [f32],
+    epi: Epilogue<'_>,
+) {
+    debug_assert_eq!(out.len(), o1 - o0);
+    for (oi, o) in (o0..o1).enumerate() {
+        let raw = dot_u8s8_scalar(q_row, &w_s8[o * k..(o + 1) * k], k);
+        let acc = raw - zpx * rowsum[o.min(rowsum.len() - 1)];
+        let sp = s_prime[o.min(s_prime.len() - 1)];
+        let mut y = acc as f32 * (sx * sp);
+        if let Some(bb) = bias {
+            y += bb[o];
+        }
+        out[oi] = apply_epi(y, o, oi, out, epi);
+    }
+}
+
+/// Blocked VNNI micro-kernel: `OB` columns at a time, A streamed once per
+/// block. Requires `avx512vnni`; exact vs [`vnni_row_scalar`].
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn vnni_row_kernel(
+    q_row: &[u8],
+    w_s8: &[i8],
+    rowsum: &[i32],
+    k: usize,
+    _n: usize,
+    o0: usize,
+    o1: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    out: &mut [f32],
+    epi: Epilogue<'_>,
+) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(out.len(), o1 - o0);
+    let qp = q_row.as_ptr();
+    let wp = w_s8.as_ptr();
+    let rsp = rowsum.as_ptr();
+    let rslen = rowsum.len();
+    let spp = s_prime.as_ptr();
+    let splen = s_prime.len();
+    let bbp = bias.map(|bb| bb.as_ptr());
+    let outp = out.as_mut_ptr();
+    let k_main = k - (k % 64);
+    let mut o = o0;
+    while o + OB <= o1 {
+        let mut accs = [_mm512_setzero_si512(); OB];
+        let mut kk = 0;
+        while kk < k_main {
+            let vq = _mm512_loadu_si512(qp.add(kk) as *const _);
+            let mut j = 0;
+            while j < OB {
+                let vw = _mm512_loadu_si512(wp.add((o + j) * k + kk) as *const _);
+                accs[j] = _mm512_dpbusd_epi32(accs[j], vq, vw);
+                j += 1;
+            }
+            kk += 64;
+        }
+        let mut j = 0;
+        while j < OB {
+            let mut raw = _mm512_reduce_add_epi32(accs[j]);
+            let mut kk2 = k_main;
+            while kk2 < k {
+                raw += *qp.add(kk2) as i32 * *wp.add((o + j) * k + kk2) as i32;
+                kk2 += 1;
+            }
+            let rs = *rsp.add((o + j).min(rslen - 1));
+            let acc = raw - zpx * rs;
+            let sp = *spp.add((o + j).min(splen - 1));
+            let mut y = acc as f32 * (sx * sp);
+            if let Some(p) = bbp {
+                y += *p.add(o + j);
+            }
+            let slot = o - o0 + j;
+            *outp.add(slot) = apply_epi(y, o + j, slot, out, epi);
+            j += 1;
+        }
+        o += OB;
+    }
+    while o < o1 {
+        let raw = dot_u8s8_avx512(qp, wp.add(o * k), k);
+        let rs = *rsp.add(o.min(rslen - 1));
+        let acc = raw - zpx * rs;
+        let sp = *spp.add(o.min(splen - 1));
+        let mut y = acc as f32 * (sx * sp);
+        if let Some(p) = bbp {
+            y += *p.add(o);
+        }
+        let slot = o - o0;
+        *outp.add(slot) = apply_epi(y, o, slot, out, epi);
+        o += 1;
+    }
+}
+
+/// Tiled VNNI driver behind [`vnni_gemm_epi`] / [`vnni_gemm_rows`]: same
+/// 2D tiling (row-chunks x L2 column blocks) as [`gemm_driver`], but the
+/// B-tile budget halves (1 B/param s8 vs 2 B/param i16), so blocks are
+/// ~2x wider for the same L2 footprint.
+fn vnni_driver(
+    q: &[u8],
+    t: usize,
+    k: usize,
+    w_s8: &[i8],
+    rowsum: &[i32],
+    n: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    bases: &[usize],
+    epi: Epilogue<'_>,
+) {
+    let fast = has_avx512_vnni();
+    let row_ptr = |ti: usize| -> *mut f32 {
+        if bases.len() == 1 {
+            (bases[0] as *mut f32).wrapping_add(ti * n)
+        } else {
+            bases[ti] as *mut f32
+        }
+    };
+    if t * n < PAR_MIN_OUTPUTS {
+        for ti in 0..t {
+            let qrow = &q[ti * k..(ti + 1) * k];
+            // SAFETY: one row's full column range; disjoint per iteration.
+            let row = unsafe { std::slice::from_raw_parts_mut(row_ptr(ti), n) };
+            if fast {
+                // SAFETY: VNNI gated on `fast`; slice lengths asserted on entry.
+                unsafe {
+                    vnni_row_kernel(qrow, w_s8, rowsum, k, n, 0, n, s_prime, bias, sx, zpx, row, epi)
+                };
+            } else {
+                vnni_row_scalar(qrow, w_s8, rowsum, k, n, 0, n, s_prime, bias, sx, zpx, row, epi);
+            }
+        }
+        return;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    // s8 B-tile: ~512 KB budget equivalent (same lines as the i16 path's
+    // 256 KB, since params are half-width).
+    let mut nc = ((524_288 / k.max(1)).clamp(64, 1024) / OB * OB).max(OB);
+    let mut nb = n.div_ceil(nc);
+    let mut row_chunks = threads.div_ceil(nb).min(t).max(1);
+    while row_chunks * nb > 4 * threads && nc < n {
+        nc = (nc * 2).min(n);
+        nb = n.div_ceil(nc);
+        row_chunks = threads.div_ceil(nb).min(t).max(1);
+    }
+    let tr = t.div_ceil(row_chunks);
+    let mut tiles = Vec::with_capacity(row_chunks * nb);
+    for r in 0..row_chunks {
+        let ti0 = r * tr;
+        let ti1 = ((r + 1) * tr).min(t);
+        if ti0 >= ti1 {
+            break;
+        }
+        for c in 0..nb {
+            let o0 = c * nc;
+            let o1 = ((c + 1) * nc).min(n);
+            tiles.push((ti0, ti1, o0, o1));
+        }
+    }
+    tiles.into_par_iter().for_each(|(ti0, ti1, o0, o1)| {
+        for ti in ti0..ti1 {
+            let qrow = &q[ti * k..(ti + 1) * k];
+            // SAFETY: disjoint by construction; bounds hold since ti < t, o1 <= n.
+            let seg = unsafe { std::slice::from_raw_parts_mut(row_ptr(ti).add(o0), o1 - o0) };
+            if fast {
+                // SAFETY: VNNI gated on `fast`; slice lengths as above.
+                unsafe {
+                    vnni_row_kernel(qrow, w_s8, rowsum, k, n, o0, o1, s_prime, bias, sx, zpx, seg, epi)
+                };
+            } else {
+                vnni_row_scalar(qrow, w_s8, rowsum, k, n, o0, o1, s_prime, bias, sx, zpx, seg, epi);
+            }
+        }
+    });
+}
+
+/// VNNI `C[T,N] = f(A_u8[T,K], B_s8[N,K])` with fused epilogue.
+/// `Epilogue::Glu` needs [`vnni_gemm_rows`].
+pub(crate) fn vnni_gemm_epi(
+    q: &[u8],
+    t: usize,
+    k: usize,
+    w_s8: &[i8],
+    rowsum: &[i32],
+    n: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    out: &mut [f32],
+    epi: Epilogue<'_>,
+) {
+    assert_eq!(q.len(), t * k);
+    assert_eq!(w_s8.len(), n * k);
+    assert_eq!(rowsum.len(), n);
+    assert_eq!(out.len(), t * n);
+    assert!(k >= 1 && t >= 1 && n >= 1);
+    assert!(!matches!(epi, Epilogue::Glu), "Glu needs vnni_gemm_rows");
+    if let Some(bb) = bias {
+        assert_eq!(bb.len(), n);
+    }
+    let bases = [out.as_mut_ptr() as usize];
+    vnni_driver(q, t, k, w_s8, rowsum, n, s_prime, bias, sx, zpx, &bases, epi);
+}
+
+/// VNNI twin of [`int_gemm_rows`]: writes straight into caller-owned
+/// `[T][N]` rows. `Epilogue::Glu` halves the width.
+pub(crate) fn vnni_gemm_rows(
+    q: &[u8],
+    t: usize,
+    k: usize,
+    w_s8: &[i8],
+    rowsum: &[i32],
+    n: usize,
+    s_prime: &[f32],
+    bias: Option<&[f32]>,
+    sx: f32,
+    zpx: i32,
+    rows: &mut [Vec<f32>],
+    epi: Epilogue<'_>,
+) {
+    assert_eq!(rows.len(), t);
+    let n_out = match epi {
+        Epilogue::Glu => n / 2,
+        _ => n,
+    };
+    assert!(n % 2 == 0 || !matches!(epi, Epilogue::Glu));
+    assert!(rows.iter().all(|r| r.len() == n_out));
+    if matches!(epi, Epilogue::Glu) {
+        let mut tmp = vec![0.0f32; t * n];
+        let bases = [tmp.as_mut_ptr() as usize];
+        vnni_driver(
+            q,
+            t,
+            k,
+            w_s8,
+            rowsum,
+            n,
+            s_prime,
+            bias,
+            sx,
+            zpx,
+            &bases,
+            Epilogue::None,
+        );
+        rows.par_iter_mut().enumerate().for_each(|(i, out)| {
+            let row = &tmp[i * n..(i + 1) * n];
+            let (v, g) = row.split_at(n / 2);
+            for (o, dst) in out.iter_mut().enumerate() {
+                *dst = v[o] * sigmoid(g[o]);
+            }
+        });
+        return;
+    }
+    let bases: Vec<usize> = rows.iter_mut().map(|r| r.as_mut_ptr() as usize).collect();
+    vnni_driver(q, t, k, w_s8, rowsum, n, s_prime, bias, sx, zpx, &bases, epi);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,6 +1376,7 @@ mod tests {
                 out_dim: n,
                 cache: std::sync::OnceLock::new(),
                 w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
             };
             let expect = lin.forward_batch(&xs);
             // Driver under test: row-direct quantize + integer GEMM.
@@ -943,6 +1420,7 @@ mod tests {
                 out_dim: n,
                 cache: std::sync::OnceLock::new(),
                 w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
             };
             let reference = lin.forward_batch(&xs);
             let (a, sx, _) = quantize_from_rows(&xs);
@@ -1176,5 +1654,206 @@ mod tests {
         let expect = 4096i32 * 255 * -255;
         assert_eq!(dot_scalar(&a, &b, 4096), expect);
         assert_eq!(unsafe { dot_avx512(a.as_ptr(), b.as_ptr(), 4096) }, expect);
+    }
+
+    #[test]
+    fn vnni_active_on_host() {
+        // Phase 11 needs `vpdpbusd` for the requantized path; this host
+        // (Ryzen 9 9950X, `-C target-cpu=native`) must report it.
+        assert!(has_avx512_vnni(), "expected AVX512-VNNI on this host");
+    }
+
+    #[test]
+    fn dot_u8s8_vnni_matches_scalar() {
+        // u8*s8 dots incl. 64-wide tails (VNNI width) and extremes.
+        let mut seed: u64 = 0x5AA1;
+        for k in [1, 63, 64, 65, 127, 128, 129, 1000] {
+            let q: Vec<u8> = (0..k)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed % 256) as u8
+                })
+                .collect();
+            let w: Vec<i8> = (0..k)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed % 256) as i8
+                })
+                .collect();
+            let s = dot_u8s8_scalar(&q, &w, k);
+            if has_avx512_vnni() {
+                let v = unsafe { dot_u8s8_avx512(q.as_ptr(), w.as_ptr(), k) };
+                assert_eq!(v, s, "k={k}");
+            }
+        }
+        // Extremes: 255*127 and 255*-128 at K=4096 (no overflow: 4096 *
+        // 32640 < 2^31).
+        let q = vec![255u8; 4096];
+        let w = vec![127i8; 4096];
+        assert_eq!(dot_u8s8_scalar(&q, &w, 4096), 4096 * 255 * 127);
+        if has_avx512_vnni() {
+            assert_eq!(
+                unsafe { dot_u8s8_avx512(q.as_ptr(), w.as_ptr(), 4096) },
+                4096 * 255 * 127
+            );
+        }
+    }
+
+    #[test]
+    fn requant_preserves_rowsum_and_scale() {
+        // Zero row -> s'=1, rowsum 0, all-zero s8.
+        let r = requant_u8_to_s8(&[121, 121], 1, 2, &[0.5], &[121.0]);
+        assert_eq!(r.s_prime, vec![1.0]);
+        assert_eq!(r.rowsum, vec![0]);
+        assert_eq!(r.w_s8, vec![0, 0]);
+        // Non-zero row: s' = max|d|/127, w' = round(d/s'), rowsum = sum.
+        // w=[131,116], zp=121, s=0.5 -> d=[5.0,-2.5], amax=5, s'=5/127.
+        let r = requant_u8_to_s8(&[131, 116], 1, 2, &[0.5], &[121.0]);
+        assert!((r.s_prime[0] - 5.0 / 127.0).abs() < 1e-6, "sp={:?}", r.s_prime);
+        assert_eq!(r.w_s8, vec![127, -64]);
+        assert_eq!(r.rowsum, vec![63]);
+        // Dequant error <= 0.5 LSB/weight.
+        for (i, &q) in r.w_s8.iter().enumerate() {
+            let d = ([131u8, 116][i] as f32 - 121.0) * 0.5;
+            assert!((q as f32 * r.s_prime[0] - d).abs() <= 0.5 * r.s_prime[0] + 1e-6);
+        }
+    }
+
+    #[test]
+    fn quantize_u8_from_rows_matches_flat() {
+        use super::super::quant_linear::dynamic_quantize_u8;
+        let mut seed: u64 = 0x9A8;
+        for (t, k) in [(1, 1), (3, 70), (8, 1024), (32, 1024), (5, 640)] {
+            let xs: Vec<Vec<f32>> = (0..t)
+                .map(|_| {
+                    (0..k)
+                        .map(|_| {
+                            seed = seed
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 6.0
+                        })
+                        .collect()
+                })
+                .collect();
+            let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
+            assert_eq!(quantize_u8_from_rows(&xs), dynamic_quantize_u8(&flat), "t={t} k={k}");
+        }
+    }
+
+    #[test]
+    fn vnni_gemm_tracks_i16_within_requant_tol() {
+        use super::super::quant_linear::Uint8Linear;
+        // Realistic FFN-ish shape: requant noise must stay in the ~1-3%
+        // class, not spike (a broken rowsum/correction would).
+        let mut seed: u64 = 0xBE11;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 6.0
+        };
+        for (t, k, n) in [(8, 1024, 256), (32, 1024, 1024)] {
+            let xs: Vec<Vec<f32>> = (0..t).map(|_| (0..k).map(|_| rnd()).collect()).collect();
+            let wu: Vec<u8> = (0..n * k).map(|_| (rnd() * 41.0 + 128.0) as u8).collect();
+            let sw: Vec<f32> = (0..n).map(|i| 0.01 + 0.001 * (i % 7) as f32).collect();
+            let zpw: Vec<f32> = (0..n).map(|i| (i * 13 % 256) as f32).collect();
+            let lin = Uint8Linear {
+                weight_u8: super::super::quant_linear::transpose_u8(&wu, k, n),
+                scale: sw,
+                zero_point: zpw,
+                bias: None,
+                in_dim: k,
+                out_dim: n,
+                cache: std::sync::OnceLock::new(),
+                w_i16: std::sync::OnceLock::new(),
+                w_vnni: std::sync::OnceLock::new(),
+            };
+            let expect = lin.forward_batch(&xs);
+            let got = lin.forward_batch_t_vnni(&xs);
+            assert_eq!(got.len(), expect.len());
+            let (mut max_abs, mut ref_max) = (0.0f32, 0.0f32);
+            for (a, b) in got.iter().zip(expect.iter()) {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    max_abs = max_abs.max((x - y).abs());
+                    ref_max = ref_max.max(y.abs());
+                }
+            }
+            let rel = max_abs / ref_max.max(1e-6);
+            eprintln!("vnni t={t} k={k} n={n}: max_abs={max_abs:.4} ref_max={ref_max:.3} rel={rel:.4}");
+            assert!(rel < 0.05, "vnni drift t={t} k={k} n={n}: rel={rel} ref_max={ref_max}");
+        }
+    }
+
+    #[test]
+    fn vnni_epilogues_match_unfused() {
+        use super::super::quant_linear::Uint8Linear;
+        // Fused VNNI epilogues must equal unfused `apply_epilogue` over the
+        // VNNI base (not over the i16 base — requant noise is out of scope
+        // here; this pins op order only).
+        let lin = Uint8Linear {
+            weight_u8: vec![130, 120, 140, 100, 110, 90],
+            scale: vec![0.02, 0.03],
+            zero_point: vec![121.0, 5.0],
+            bias: Some(vec![0.5, -0.25]),
+            in_dim: 3,
+            out_dim: 2,
+            cache: std::sync::OnceLock::new(),
+            w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
+        };
+        let xs = vec![vec![1.0, -2.0, 3.0], vec![0.5, 0.25, -1.5]];
+        let base = lin.forward_batch_t_vnni(&xs);
+        for epi in [Epilogue::Swish, Epilogue::Relu, Epilogue::AddScale(0.5)] {
+            let mut out = vec![vec![0.0f32; 2]; 2];
+            if matches!(epi, Epilogue::AddScale(_)) {
+                out = vec![vec![1.0f32; 2]; 2];
+                let mut want = out.clone();
+                super::super::quant_linear::apply_epilogue(&base, &mut want, epi);
+                let mut got = out.clone();
+                let (q, sx, zpx) = quantize_u8_from_rows(&xs);
+                let vw = lin.widened_vnni();
+                vnni_gemm_rows(
+                    &q,
+                    2,
+                    3,
+                    &vw.w_s8,
+                    &vw.rowsum,
+                    2,
+                    &vw.s_prime,
+                    lin.bias.as_deref(),
+                    sx,
+                    zpx as i32,
+                    &mut got,
+                    epi,
+                );
+                assert_eq!(got, want, "epi={epi:?}");
+            } else {
+                let mut want = vec![vec![0.0f32; 2]; 2];
+                super::super::quant_linear::apply_epilogue(&base, &mut want, epi);
+                let mut got = vec![vec![0.0f32; 2]; 2];
+                let (q, sx, zpx) = quantize_u8_from_rows(&xs);
+                let vw = lin.widened_vnni();
+                vnni_gemm_rows(
+                    &q,
+                    2,
+                    3,
+                    &vw.w_s8,
+                    &vw.rowsum,
+                    2,
+                    &vw.s_prime,
+                    lin.bias.as_deref(),
+                    sx,
+                    zpx as i32,
+                    &mut got,
+                    epi,
+                );
+                assert_eq!(got, want, "epi={epi:?}");
+            }
+        }
     }
 }

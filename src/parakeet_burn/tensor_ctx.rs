@@ -34,10 +34,18 @@ pub(crate) fn rows_to_tensor<B: Backend>(rows: &[Vec<f32>], device: &<B as Backe
 /// scalar fallback (decision 2: kept for debugging parity regressions)
 /// is always one flag away. `FlexDevice` is `Copy`, so this rides along
 /// by value through every forward signature from Phase 2b on.
+///
+/// `vnni` selects the Phase-11 VNNI requantized path (`vpdpbusd` u8*s8,
+/// approximate — see `int_gemm::requant_u8_to_s8`) vs the bit-exact
+/// `vpmaddwd` i16 path. Kept explicit (not env-global) so tests can run
+/// both paths in one process: production sets it from
+/// `runtime::vnni_enabled()`, tests set `false` for golden pinning and
+/// `true` for the loose-tolerance VNNI goldens.
 #[derive(Clone, Copy)]
 pub(crate) struct TensorCtx {
     pub(crate) device: <CpuBackend as BackendTypes>::Device,
     pub(crate) enabled: bool,
+    pub(crate) vnni: bool,
 }
 
 impl TensorCtx {
@@ -45,7 +53,25 @@ impl TensorCtx {
         Self {
             device: super::runtime::cpu_device(),
             enabled: false,
+            vnni: false,
         }
+    }
+
+    /// Tensor path with explicit VNNI choice (production: `vnni` from
+    /// `runtime::vnni_enabled()`; tests: `false` = bit-exact pinning).
+    pub(crate) fn with_vnni(device: <CpuBackend as BackendTypes>::Device, vnni: bool) -> Self {
+        Self {
+            device,
+            enabled: true,
+            vnni,
+        }
+    }
+
+    /// Whether this dispatch should run the VNNI kernels: tensor path on,
+    /// VNNI requested, and the CPU actually has `avx512vnni`.
+    #[inline]
+    pub(crate) fn use_vnni(&self) -> bool {
+        self.enabled && self.vnni && super::int_gemm::has_avx512_vnni()
     }
 }
 

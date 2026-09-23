@@ -329,6 +329,7 @@ fn take_linear(
         out_dim,
         cache: std::sync::OnceLock::new(),
         w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
     })
 }
 
@@ -456,8 +457,9 @@ pub(crate) fn relative_position_window(table: &[Vec<f32>], t: usize) -> Vec<Vec<
 fn linear_batch(lin: &Uint8Linear, x: &[Vec<f32>], ctx: &TensorCtx) -> Vec<Vec<f32>> {
     // Batched: the activation quantization spans the whole `[T,K]` input
     // tensor, as ORT's `DynamicQuantizeLinear` does (see `quant` docs).
-    // Tensor path replicates that span exactly (see `forward_batch_t`).
-    lin.batch_dispatch(x, ctx)
+    // Tensor path replicates that span exactly (see `forward_batch_t`);
+    // VNNI path requantizes (see `forward_batch_t_vnni`).
+    lin.batch_dispatch_auto(x, ctx)
 }
 
 fn add_inplace(a: &mut [Vec<f32>], b: &[Vec<f32>]) {
@@ -709,18 +711,38 @@ pub(crate) fn relative_attention_into(
         return;
     }
     let qkv = Uint8Linear::shared_activation(ctx, x);
+    let qkv_vnni = if ctx.use_vnni() {
+        Uint8Linear::shared_activation_vnni(x)
+    } else {
+        None
+    };
     let mut q = vec![vec![0.0f32; d]; t];
     let mut k = vec![vec![0.0f32; d]; t];
     let mut v = vec![vec![0.0f32; d]; t];
-    let mut proj = |lin: &Uint8Linear, dst: &mut [Vec<f32>]| match &qkv {
-        Some(a) => lin.forward_quantized_into(a, ctx, dst, Epilogue::None),
-        None => lin.forward_batch_into(x, ctx, dst, Epilogue::None),
+    let proj = |lin: &Uint8Linear, dst: &mut [Vec<f32>]| {
+        if ctx.use_vnni() {
+            if let Some(ref vv) = qkv_vnni {
+                lin.forward_vnni_quantized_into(vv, dst, Epilogue::None);
+            } else {
+                lin.forward_batch_into_vnni(x, dst, Epilogue::None);
+            }
+            return;
+        }
+        match &qkv {
+            Some(a) => lin.forward_quantized_into(a, ctx, dst, Epilogue::None),
+            None => lin.forward_batch_into(x, ctx, dst, Epilogue::None),
+        }
     };
     proj(&w.wq, &mut q);
     proj(&w.wk, &mut k);
     proj(&w.wv, &mut v);
     let mut p = vec![vec![0.0f32; d]; relative_position_window.len()];
-    w.wpos.forward_batch_into(relative_position_window, ctx, &mut p, Epilogue::None);
+    w.wpos.forward_batch_into_auto(
+        relative_position_window,
+        ctx,
+        &mut p,
+        Epilogue::None,
+    );
     let mut merged = vec![vec![0.0f32; d]; t];
     attention_core_into(
         &q,
@@ -737,7 +759,7 @@ pub(crate) fn relative_attention_into(
         Some(sc) => Epilogue::AddScale(sc),
         None => Epilogue::None,
     };
-    w.wout.forward_batch_into(&merged, ctx, out, epi);
+    w.wout.forward_batch_into_auto(&merged, ctx, out, epi);
 }
 
 pub(crate) fn ffn(x: &[Vec<f32>], l1: &Uint8Linear, l2: &Uint8Linear, ctx: &TensorCtx) -> Vec<Vec<f32>> {
@@ -762,8 +784,8 @@ pub(crate) fn ffn_into(
     let t = x.len();
     assert_eq!(out.len(), t);
     let mut hidden = vec![vec![0.0f32; l1.out_dim]; t];
-    l1.forward_batch_into(x, ctx, &mut hidden, Epilogue::Swish);
-    l2.forward_batch_into(&hidden, ctx, out, Epilogue::AddScale(scale));
+    l1.forward_batch_into_auto(x, ctx, &mut hidden, Epilogue::Swish);
+    l2.forward_batch_into_auto(&hidden, ctx, out, Epilogue::AddScale(scale));
 }
 
 pub(crate) fn conv_block(x: &[Vec<f32>], w: &BlockWeights, ctx: &TensorCtx) -> Vec<Vec<f32>> {
@@ -796,7 +818,7 @@ pub(crate) fn conv_block_into(
     let t = x.len();
     assert_eq!(out.len(), t);
     let mut gated = vec![vec![0.0f32; w.dw.channels]; t];
-    w.pw1.forward_batch_into(x, ctx, &mut gated, Epilogue::Glu);
+    w.pw1.forward_batch_into_auto(x, ctx, &mut gated, Epilogue::Glu);
     let mut dwed = if ctx.enabled {
         w.dw.forward_par(&gated, true)
     } else {
@@ -809,7 +831,7 @@ pub(crate) fn conv_block_into(
     while dwed.len() < t {
         dwed.push(vec![0.0; w.dw.channels]);
     }
-    w.pw2.forward_batch_into(&dwed, ctx, out, Epilogue::AddScale(scale));
+    w.pw2.forward_batch_into_auto(&dwed, ctx, out, Epilogue::AddScale(scale));
 }
 
 /// One full block: half-step FFN sandwich + final norm.
@@ -1013,6 +1035,7 @@ mod tests {
             out_dim: 1,
             cache: std::sync::OnceLock::new(),
             w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
         };
         let one = LayerNormP { gamma: vec![1.0], beta: vec![0.0] };
         let w = BlockWeights {
@@ -1043,6 +1066,7 @@ mod tests {
                 out_dim: 2,
                 cache: std::sync::OnceLock::new(),
                 w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
             },
             pw2: Uint8Linear {
                 weight_u8: vec![1],
@@ -1053,6 +1077,7 @@ mod tests {
                 out_dim: 1,
                 cache: std::sync::OnceLock::new(),
                 w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
             },
             dw: DwConv {
                 weight_u8: vec![0, 1, 0],
@@ -1087,6 +1112,7 @@ mod tests {
             &TensorCtx {
                 device: super::super::runtime::cpu_device(),
                 enabled: true,
+                vnni: false,
             },
         );
         assert_eq!(yt.len(), 2);
@@ -1436,6 +1462,7 @@ mod tests {
         let tctx = TensorCtx {
             device: super::super::runtime::cpu_device(),
             enabled: true,
+            vnni: false,
         };
         let y = conformer_forward(&x, &bw, &win, &tctx);
         let ys = conformer_forward(&x, &bw, &win, &TensorCtx::scalar());

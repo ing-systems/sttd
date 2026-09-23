@@ -215,7 +215,17 @@ fn conv2d_par(w: &Conv2dW, x: &[Vec<Vec<f32>>], relu: bool) -> Vec<Vec<Vec<f32>>
 /// the graph's bias + ReLU ride the GEMM's epilogue (same arithmetic
 /// `add_bias_relu` applies afterwards) — bit-identical to both twins.
 /// Weights widen per call (65k u8, ~10 us); no cache needed.
-fn conv1x1_gemm(w: &Conv2dW, x: &[Vec<Vec<f32>>], relu: bool) -> Vec<Vec<Vec<f32>>> {
+///
+/// VNNI (`ctx.use_vnni()`): same gather, u8 activations through
+/// `vnni_gemm_epi` with per-call requantized s8 weights (65k params —
+/// requant ~10 us, amortized over the single call per forward).
+/// Approximate (requant noise); `STTD_BURN_VNNI=0` keeps the i16 path.
+fn conv1x1_gemm(
+    w: &Conv2dW,
+    x: &[Vec<Vec<f32>>],
+    relu: bool,
+    ctx: &TensorCtx,
+) -> Vec<Vec<Vec<f32>>> {
     use super::int_gemm::{int_gemm_epi, quantize_rows_i16, widen_weights, Epilogue};
     assert_eq!(x.len(), w.in_c);
     let h = x[0].len();
@@ -234,27 +244,48 @@ fn conv1x1_gemm(w: &Conv2dW, x: &[Vec<Vec<f32>>], relu: bool) -> Vec<Vec<Vec<f32
             }
         }
     }
-    let (a, sx, _) = quantize_rows_i16(&rows);
-    // k=1 store is already `[out][in]` row-major (see `take_conv`).
-    let bw = widen_weights(&w.weight_u8, w.out_c, w.in_c, &[w.zero_point]);
-    let mut out = vec![0.0f32; t * w.out_c];
     let epi = if relu {
         Epilogue::Relu
     } else {
         Epilogue::None
     };
-    int_gemm_epi(
-        &a,
-        t,
-        w.in_c,
-        &bw,
-        w.out_c,
-        &[w.scale],
-        Some(&w.bias),
-        sx,
-        &mut out,
-        epi,
-    );
+    let mut out = vec![0.0f32; t * w.out_c];
+    if ctx.use_vnni() {
+        use super::int_gemm::{requant_u8_to_s8, vnni_gemm_epi};
+        use super::quant_linear::dynamic_quantize_u8;
+        let (q, sx, zpx) = dynamic_quantize_u8(&rows);
+        let vw = requant_u8_to_s8(&w.weight_u8, w.out_c, w.in_c, &[w.scale], &[w.zero_point]);
+        vnni_gemm_epi(
+            &q,
+            t,
+            w.in_c,
+            &vw.w_s8,
+            &vw.rowsum,
+            w.out_c,
+            &vw.s_prime,
+            Some(&w.bias),
+            sx,
+            zpx as i32,
+            &mut out,
+            epi,
+        );
+    } else {
+        let (a, sx, _) = quantize_rows_i16(&rows);
+        // k=1 store is already `[out][in]` row-major (see `take_conv`).
+        let bw = widen_weights(&w.weight_u8, w.out_c, w.in_c, &[w.zero_point]);
+        int_gemm_epi(
+            &a,
+            t,
+            w.in_c,
+            &bw,
+            w.out_c,
+            &[w.scale],
+            Some(&w.bias),
+            sx,
+            &mut out,
+            epi,
+        );
+    }
     // Rows back to `[out_c][h][wd]` maps.
     let mut y = vec![vec![vec![0.0f32; wd]; h]; w.out_c];
     for (i, orow) in out.chunks(w.out_c).enumerate() {
@@ -279,8 +310,12 @@ fn conv_dispatch(
 ) -> Vec<Vec<Vec<f32>>> {
     if ctx.enabled {
         if w.kernel == 1 && w.stride == 1 && w.pad == 0 && w.group == 1 {
-            conv1x1_gemm(w, x, relu)
+            conv1x1_gemm(w, x, relu, ctx)
         } else {
+            // Direct strided/grouped convs stay on the exact integer path
+            // (u8 activations + i64 MACs — already 1 B/param, so VNNI would
+            // not halve traffic there); only the GEMM-backed 1x1s and all
+            // `Uint8Linear`s requantize under option (b).
             conv2d_par(w, x, relu)
         }
     } else {
@@ -495,6 +530,7 @@ impl PreEncodeWeights {
             out_dim: 1024,
             cache: std::sync::OnceLock::new(),
             w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
         };
 
         Ok(Self {
@@ -564,9 +600,10 @@ impl PreEncodeWeights {
         }
         // Batched: the out-projection's activation quantization spans
         // the whole `[T',4096]` input like ORT's (see `quant` docs).
-        // Only the out-projection follows `ctx`; the five convs stay
-        // scalar until Phase 5.
-        Ok(self.out.batch_dispatch(&flat, ctx))
+        // `batch_dispatch_auto` selects scalar / i16 / VNNI per `ctx`;
+        // the five convs run their own dispatch (`conv1x1_gemm` follows
+        // VNNI via GEMM, direct convs stay exact integer).
+        Ok(self.out.batch_dispatch_auto(&flat, ctx))
     }
 }
 
@@ -750,6 +787,7 @@ mod tests {
                 out_dim: 1,
                 cache: std::sync::OnceLock::new(),
                 w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
             },
         }
     }
@@ -838,7 +876,12 @@ mod tests {
                 "out_c={out_c} group={group} k={kernel} s={stride} relu={relu}"
             );
             if kernel == 1 && stride == 1 && pad == 0 && group == 1 {
-                let g = conv1x1_gemm(&w, &x, relu);
+                let g = conv1x1_gemm(
+                    &w,
+                    &x,
+                    relu,
+                    &super::super::tensor_ctx::TensorCtx::scalar(),
+                );
                 assert_eq!(g, s, "1x1 out_c={out_c} relu={relu}");
             }
         }
@@ -926,6 +969,7 @@ mod tests {
         let tctx = super::super::tensor_ctx::TensorCtx {
             device: super::super::runtime::cpu_device(),
             enabled: true,
+            vnni: false,
         };
         for (tag, ctx) in [
             ("scalar", super::super::tensor_ctx::TensorCtx::scalar()),

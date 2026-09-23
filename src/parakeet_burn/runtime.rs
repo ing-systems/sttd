@@ -101,6 +101,20 @@ pub(crate) fn parse_pin_flag(v: Option<&str>) -> bool {
     !matches!(v, Some("0") | Some("false"))
 }
 
+/// VNNI path selector (Phase 11, option (b)): `STTD_BURN_VNNI=0`/`false`
+/// forces the bit-exact `vpmaddwd` i16 path even on VNNI-capable CPUs.
+/// Default on: when the CPU reports `avx512vnni`, production uses the
+/// requantized `vpdpbusd` u8*s8 kernels; otherwise it falls back
+/// automatically. Pure for tests (env is read once at load).
+pub(crate) fn parse_vnni_flag(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("false"))
+}
+
+/// Read once at load (never in tests: env vars are process-global).
+pub(crate) fn vnni_enabled() -> bool {
+    parse_vnni_flag(std::env::var("STTD_BURN_VNNI").ok().as_deref())
+}
+
 /// First CPU of every physical core, from the Linux sysfs topology
 /// (`cpuN/topology/thread_siblings_list`); falls back to `0..physical`
 /// when the topology is unreadable. Sorted ascending, duplicates removed.
@@ -169,6 +183,16 @@ mod tests {
         assert!(super::parse_pin_flag(Some("true")));
         assert!(!super::parse_pin_flag(Some("0")));
         assert!(!super::parse_pin_flag(Some("false")));
+    }
+
+    #[test]
+    fn vnni_flag_parsing() {
+        // Default on; only explicit 0/false opts out (same shape as tensor/pin).
+        assert!(super::parse_vnni_flag(None));
+        assert!(super::parse_vnni_flag(Some("1")));
+        assert!(super::parse_vnni_flag(Some("true")));
+        assert!(!super::parse_vnni_flag(Some("0")));
+        assert!(!super::parse_vnni_flag(Some("false")));
     }
 
     #[test]

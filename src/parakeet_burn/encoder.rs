@@ -431,6 +431,7 @@ mod tests {
         let tctx = TensorCtx {
             device: super::super::runtime::cpu_device(),
             enabled: true,
+            vnni: false,
         };
         for (tag, ctx) in [("scalar", sctx), ("tensor", tctx)] {
             // Sanity per path: pre-encode output matches the golden
@@ -486,6 +487,110 @@ mod tests {
             }
             prev = want;
             }
+        }
+    }
+
+    /// VNNI parity on real weights (Phase 11, option (b)): same isolated
+    /// per-layer protocol as [`ort_full_encoder_parity`] but through the
+    /// requantized `vpdpbusd` path (`vnni: true`). Bounds are the relaxed
+    /// policy (b): 5% rel for layers 0-22, 0.05 abs for the tiny final
+    /// layer — a broken rowsum/correction would spike to ~100%+, so these
+    /// still catch wiring bugs while allowing requant noise.
+    /// Ignored: needs converted weights on disk.
+    /// `cargo test --release --features parakeet-burn -- --ignored vnni`.
+    #[test]
+    #[ignore]
+    fn ort_vnni_encoder_parity() {
+        use super::super::weights::load_selected;
+        let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
+        let json = std::fs::read_to_string(dir.join("encoder-manifest.json")).unwrap();
+        let manifest = load_manifest(&json).unwrap();
+        assert_eq!(manifest.n_layers(), 24);
+        let want = required_tensors(&manifest).unwrap();
+        let tensors =
+            load_selected(&dir.join("encoder-burn.safetensors"), &want).unwrap();
+        let enc = BurnEncoder::load(&tensors, &manifest).unwrap();
+        // Warm both twins (i16 + s8) so forwards never pay lazy builds.
+        enc.prime_cache(&super::super::runtime::cpu_device());
+
+        let bytes =
+            std::fs::read("src/parakeet_burn/testdata/encoder_full_golden.safetensors").unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let f32mat = |name: &str, rows: usize, cols: usize| -> Vec<Vec<f32>> {
+            let v = st.tensor(name).unwrap();
+            assert_eq!(v.shape(), &[rows, cols]);
+            v.data()
+                .chunks(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<f32>>()
+                .chunks(cols)
+                .map(|c| c.to_vec())
+                .collect()
+        };
+        let mel = f32mat("mel_T128", 64, 128);
+        let pre_bytes =
+            std::fs::read("src/parakeet_burn/testdata/pre_encode_golden.safetensors").unwrap();
+        let pre_st = safetensors::SafeTensors::deserialize(&pre_bytes).unwrap();
+        let pv = pre_st.tensor("pre_ref").unwrap();
+        let pre_ref: Vec<Vec<f32>> = pv
+            .data()
+            .chunks(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect::<Vec<f32>>()
+            .chunks(1024)
+            .map(|c| c.to_vec())
+            .collect();
+        let vctx = TensorCtx {
+            device: super::super::runtime::cpu_device(),
+            enabled: true,
+            vnni: true,
+        };
+        // Pre-encode sanity (1x1s run VNNI, strided convs stay exact):
+        // same 5% bound as the i16 path — VNNI must not exceed it here.
+        let own_pre = enc.pre.forward(&mel, &vctx).unwrap();
+        let (mut pre_max, mut pre_ref_max) = (0.0f32, 0.0f32);
+        for (a, b) in own_pre.iter().zip(pre_ref.iter()) {
+            for (x, g) in a.iter().zip(b.iter()) {
+                pre_max = pre_max.max((x - g).abs());
+                pre_ref_max = pre_ref_max.max(g.abs());
+            }
+        }
+        eprintln!("vnni pre: max_abs={pre_max:.4} ref_max={pre_ref_max:.4}");
+        assert!(
+            pre_max < 0.05 * pre_ref_max.max(1.0),
+            "vnni pre drift: max_abs={pre_max} ref_max={pre_ref_max}"
+        );
+        let win = super::super::conformer_block::relative_position_window(&enc.pos_table, 8);
+        let mut prev = pre_ref.clone();
+        for (layer, b) in enc.blocks.iter().enumerate() {
+            let want = f32mat(&format!("layer{layer}_ref"), 8, 1024);
+            let got = super::super::conformer_block::conformer_forward(&prev, b, &win, &vctx);
+            let (mut max_abs, mut sum_abs) = (0.0f32, 0.0f32);
+            let mut ref_max = 0.0f32;
+            for (yr, wr) in got.iter().zip(want.iter()) {
+                for (a, c) in yr.iter().zip(wr.iter()) {
+                    max_abs = max_abs.max((a - c).abs());
+                    sum_abs += (a - c).abs();
+                    ref_max = ref_max.max(c.abs());
+                }
+            }
+            let mean_abs = sum_abs / (8.0 * 1024.0);
+            eprintln!(
+                "vnni isolated layer{layer}: max_abs={max_abs:.4} mean_abs={mean_abs:.4} ref_max={ref_max:.4} rel={:.4}",
+                max_abs / ref_max.max(1e-6)
+            );
+            if layer < 23 {
+                assert!(
+                    max_abs < 0.05 * ref_max.max(1.0),
+                    "vnni layer{layer} drift: max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"
+                );
+            } else {
+                assert!(
+                    max_abs < 0.05,
+                    "vnni layer{layer} drift: max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"
+                );
+            }
+            prev = want;
         }
     }
 
@@ -546,6 +651,7 @@ mod tests {
         let tctx = TensorCtx {
             device: super::super::runtime::cpu_device(),
             enabled: true,
+            vnni: false,
         };
         for (tag, ctx) in [("scalar", sctx), ("tensor", tctx)] {
             let pre = enc.pre.forward(&mel, &ctx).unwrap();
@@ -738,10 +844,12 @@ mod tests {
             };
             let mel256: Vec<Vec<f32>> =
                 (0..256).map(|_| (0..128).map(|_| rnd()).collect()).collect();
-            for (tag, ctx) in [("scalar", sctx), ("tensor", tctx)] {
-                if tag == "scalar" {
-                    continue; // scalar path timing already covered; skip 1 s+ burn
-                }
+            let vctx = TensorCtx {
+                device: super::super::runtime::cpu_device(),
+                enabled: true,
+                vnni: true,
+            };
+            for (tag, ctx) in [("tensor-i16", tctx), ("tensor-vnni", vctx)] {
                 let mut pre_ms = f64::INFINITY;
                 for _ in 0..5 {
                     let t = Instant::now();

@@ -142,3 +142,38 @@ weight-streaming bound) plus VNNI; the elementwise bucket is now
 layernorm + softmax + residual adds, and per-layer `Vec<Vec<f32>>`
 scratch still allocates (the deferred arena refactor). Options (a), (b)
 and (d) from Phase 9 stand unchanged.
+
+## Phase 11: VNNI requantization (2026-09-23, same day)
+
+Option (b): explicit exactness-policy change. Weights requantized
+offline-per-row to symmetric s8 (`int_gemm::requant_u8_to_s8`: `s' =
+max|d|/127`, `w' = round(d/s')`, `rowsum = sum(w')`); forward runs `y =
+sx*s'*(dot(q,w') - zpx*rowsum) + b` with raw u8 activations through
+`vpdpbusd` (64 MACs/instr, half the weight traffic of the i16
+`vpmaddwd` path). `STTD_BURN_VNNI=0` forces the bit-exact i16 path for
+A/B; non-VNNI CPUs fall back automatically. Direct strided/depthwise
+convs stay on the exact u8 path (already 1 B/param — VNNI would not halve
+traffic there); all 217 `MatMulInteger`s + the two 1x1 convs (via GEMM)
++ the three joint projections requantize.
+
+| Stage (T'=32) | Phase 10 i16, 16T pinned | Phase 11 VNNI, 16T pinned |
+|---|---|---|
+| pre-encode (T=256 mel) | 7.8–8.1 ms | 8.1 ms (unchanged: strided exact) |
+| 24 blocks | 62.3–62.9 ms (2.60/layer) | 43.3 ms (1.80/layer) |
+| attn / layer | 0.53–0.55 ms | 0.41 ms |
+| conv / layer | 0.36–0.37 ms | 0.28 ms (pw VNNI, dw exact) |
+| ffn / layer | 0.50–0.52 ms | 0.35 ms |
+| joint decode (T=32) | 16.8–16.9 ms | 16.9 ms (LSTM Flex dominates) |
+
+| Engine (2.5 s WAV, `--threads 0`) | transcribe | rtf |
+|---|---|---|
+| burn i16 (`STTD_BURN_VNNI=0`) | 79–81 ms | 0.032 |
+| burn VNNI (default) | 60–62 ms | 0.024 |
+| ort | 55–58 ms | 0.022 |
+
+Gap closed from ~1.6x to ~1.1x ORT. Isolated per-layer VNNI drift is
+0.4–2.9% rel (bound 5%; `ort_vnni_encoder_parity`), pre-encode 2.3%
+(bound 5%). File-mode: en_test/silence/pl2/en2 word-exact vs ORT on all
+three paths; pl_test matches ORT on VNNI (i16 flips one word-piece on
+the robotic boundary — both in the known ambiguous class); pl3_test 1/3
+exact on both burn paths as before.

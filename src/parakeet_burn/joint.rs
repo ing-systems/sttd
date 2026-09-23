@@ -388,6 +388,7 @@ fn take_matmul(
         out_dim,
         cache: std::sync::OnceLock::new(),
         w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
     })
 }
 
@@ -567,15 +568,15 @@ impl BurnJoint {
         self.embed.lookup_into(token, embed);
         self.l0.step_into(embed, &self.h[0], &self.c[0], ctx, l0);
         self.l1.step_into(&l0.h, &self.h[1], &self.c[1], ctx, l1);
-        let pe = self.enc.forward_dispatch(enc_frame, ctx);
-        let pp = self.pred.forward_dispatch(&l1.h, ctx);
+        let pe = self.enc.forward_dispatch_auto(enc_frame, ctx);
+        let pp = self.pred.forward_dispatch_auto(&l1.h, ctx);
         let mut hsum: Vec<f32> = pe.iter().zip(pp.iter()).map(|(a, b)| a + b).collect();
         for v in hsum.iter_mut() {
             if *v < 0.0 {
                 *v = 0.0;
             }
         }
-        let logits = self.out.forward_dispatch(&hsum, ctx);
+        let logits = self.out.forward_dispatch_auto(&hsum, ctx);
         let tok = TdtGreedy::argmax(&logits[..self.vocab_size]);
         if tok != self.blank_id {
             self.h = [l0.h.clone(), l1.h.clone()];
@@ -870,6 +871,7 @@ mod tests {
         let tctx = TensorCtx {
             device: super::super::runtime::cpu_device(),
             enabled: true,
+            vnni: false,
         };
         let (ss, _) = {
             joint.reset();

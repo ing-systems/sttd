@@ -161,6 +161,17 @@ pub(crate) struct QuantizedRows<'a> {
     pub(crate) src: &'a [Vec<f32>],
 }
 
+/// VNNI shared-A form: raw u8 activations + scale/zp for the requantized
+/// kernels (`vnni_gemm_rows`). Same window as [`QuantizedRows`]; no `src`
+/// needed (the VNNI path never falls back to Flex mid-layer).
+pub(crate) struct VnniQuantizedRows {
+    pub(crate) q: Vec<u8>,
+    pub(crate) sx: f32,
+    pub(crate) zpx: u8,
+    pub(crate) t: usize,
+    pub(crate) k: usize,
+}
+
 /// Unfused epilogue (Flex fallback and test reference): applies exactly
 /// the per-element arithmetic the GEMM-fused variants apply in `igemm`
 /// (same expressions, same order), so switching paths changes nothing.
@@ -249,6 +260,11 @@ pub(crate) struct Uint8Linear {
     /// as the u8 store): the integer-GEMM fast path's read-only weights.
     /// Built at prime_cache on fast-path machines, on first use otherwise.
     pub(crate) w_i16: std::sync::OnceLock<Vec<i16>>,
+    /// Lazily-requantized s8 twin (`int_gemm::requant_u8_to_s8`): the VNNI
+    /// path's read-only weights + scales + row-sums. Built at prime_cache
+    /// on VNNI machines alongside `w_i16` (dual-path during tests keeps
+    /// both; steady-state uses one). `None` until first VNNI use.
+    pub(crate) w_vnni: std::sync::OnceLock<super::int_gemm::VnniWeights>,
 }
 
 /// Dequantized tensor twins of a [`Uint8Linear`]'s weights, built once and
@@ -351,10 +367,14 @@ impl Uint8Linear {
     /// what the first tensor-path call would build, so the first
     /// utterance never pays the ~4 s cold-build stall. Builds the i16
     /// weight twin on integer-GEMM machines, the f32 Flex twins
-    /// otherwise — never both.
+    /// otherwise — never both. The VNNI s8 twin builds alongside the i16
+    /// one where the CPU has `avx512vnni` (dual-path during tests).
     pub(crate) fn prime_cache(&self, device: &CpuDevice) {
         if super::int_gemm::has_avx512_int_gemm() {
             let _ = self.widened();
+            if super::int_gemm::has_avx512_vnni() {
+                let _ = self.widened_vnni();
+            }
         } else {
             let _ = self.cached(device);
         }
@@ -367,6 +387,20 @@ impl Uint8Linear {
                 &self.weight_u8,
                 self.out_dim,
                 self.in_dim,
+                &self.zero_point,
+            )
+        })
+    }
+
+    /// Requantized s8 twin, built once (see `int_gemm::requant_u8_to_s8`).
+    /// Approximate (see its docs); the VNNI path's read-only weights.
+    pub(crate) fn widened_vnni(&self) -> &super::int_gemm::VnniWeights {
+        self.w_vnni.get_or_init(|| {
+            super::int_gemm::requant_u8_to_s8(
+                &self.weight_u8,
+                self.out_dim,
+                self.in_dim,
+                &self.scale,
                 &self.zero_point,
             )
         })
@@ -410,6 +444,10 @@ impl Uint8Linear {
     /// Flex path below stays as the fallback for machines without
     /// AVX-512 (its residual vs the integer path is f32 summation order
     /// only, measured 9e-8 relative on synthetic inputs).
+    ///
+    /// NOTE: this is the bit-exact i16 path. The VNNI twin is
+    /// [`Self::forward_batch_t_vnni`]; production uses
+    /// [`Self::forward_batch_t_auto`] (ctx selects).
     pub(crate) fn forward_batch_t(
         &self,
         xs: &[Vec<f32>],
@@ -458,6 +496,53 @@ impl Uint8Linear {
         super::tensor_ctx::tensor_to_rows(y)
     }
 
+    /// VNNI twin of [`Self::forward_batch_t`]: same per-tensor activation
+    /// window, but weights run requantized s8 through `vpdpbusd`
+    /// (`int_gemm::vnni_gemm_epi`). APPROXIMATE (requant noise, ~1-3%
+    /// rel); `STTD_BURN_VNNI=0` / non-VNNI CPUs fall back to the scalar
+    /// VNNI reference (same requant math, no SIMD).
+    pub(crate) fn forward_batch_t_vnni(&self, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        assert!(xs.iter().all(|r| r.len() == self.in_dim));
+        if xs.is_empty() {
+            return Vec::new();
+        }
+        let t = xs.len();
+        let (q, sx, zpx) = super::int_gemm::quantize_u8_from_rows(xs);
+        let vw = self.widened_vnni();
+        let mut out = vec![0.0f32; t * self.out_dim];
+        super::int_gemm::vnni_gemm_epi(
+            &q,
+            t,
+            self.in_dim,
+            &vw.w_s8,
+            &vw.rowsum,
+            self.out_dim,
+            &vw.s_prime,
+            self.bias.as_deref(),
+            sx,
+            zpx as i32,
+            &mut out,
+            super::int_gemm::Epilogue::None,
+        );
+        out.chunks(self.out_dim).map(|c| c.to_vec()).collect()
+    }
+
+    /// Auto dispatch for production: scalar when `ctx` is off, VNNI when
+    /// `ctx.use_vnni()`, otherwise the bit-exact i16 tensor path.
+    pub(crate) fn forward_batch_t_auto(
+        &self,
+        xs: &[Vec<f32>],
+        ctx: &super::tensor_ctx::TensorCtx,
+    ) -> Vec<Vec<f32>> {
+        if !ctx.enabled {
+            return self.forward_batch(xs);
+        }
+        if ctx.use_vnni() {
+            return self.forward_batch_t_vnni(xs);
+        }
+        self.forward_batch_t(xs, &ctx.device)
+    }
+
     /// Quantize `xs` once for sharing across several linears (see
     /// [`QuantizedRows`]): the same window / scale / i16 values
     /// `forward_batch_t` would build internally, built once. Exact by
@@ -481,11 +566,43 @@ impl Uint8Linear {
     /// `ctx` selects the integer path (which consumes the i16 rows),
     /// `None` on the Flex fallback (which re-reads `xs` per linear, so
     /// building `A` would be dead work).
+    ///
+    /// NOTE: bit-exact i16 path. VNNI uses [`Self::shared_activation_vnni`];
+    /// production attention uses [`Self::shared_activation_auto`] + the
+    /// matching `*_auto` forwards below.
     pub(crate) fn shared_activation<'a>(
         ctx: &super::tensor_ctx::TensorCtx,
         xs: &'a [Vec<f32>],
     ) -> Option<QuantizedRows<'a>> {
-        (ctx.enabled && super::int_gemm::has_avx512_int_gemm()).then(|| Self::quantize_activations(xs))
+        (ctx.enabled && !ctx.use_vnni() && super::int_gemm::has_avx512_int_gemm())
+            .then(|| Self::quantize_activations(xs))
+    }
+
+    /// VNNI shared activation: one u8 quantization shared across the
+    /// linears reading the same input (attention Q/K/V). Same window as
+    /// [`Self::quantize_activations`]; the u8 values match its i16 values
+    /// plus `zpx` (see `quantize_u8_from_rows`).
+    pub(crate) fn quantize_activations_vnni(xs: &[Vec<f32>]) -> VnniQuantizedRows {
+        assert!(!xs.is_empty());
+        assert!(xs.iter().all(|r| r.len() == xs[0].len()));
+        let (q, sx, zpx) = super::int_gemm::quantize_u8_from_rows(xs);
+        VnniQuantizedRows {
+            q,
+            sx,
+            zpx,
+            t: xs.len(),
+            k: xs[0].len(),
+        }
+    }
+
+    /// VNNI shared activation only where it pays off: `Some` when `ctx`
+    /// selects the VNNI path, else `None` (caller falls back to per-linear
+    /// VNNI quantize, or the i16/Flex paths).
+    pub(crate) fn shared_activation_vnni(xs: &[Vec<f32>]) -> Option<VnniQuantizedRows> {
+        if xs.is_empty() {
+            return None;
+        }
+        Some(Self::quantize_activations_vnni(xs))
     }
 
     /// [`Self::forward_batch_t`] with the epilogue fused into the GEMM's
@@ -557,9 +674,110 @@ impl Uint8Linear {
         );
     }
 
+    fn gemm_vnni_quantized_into(
+        &self,
+        q: &[u8],
+        t: usize,
+        sx: f32,
+        zpx: u8,
+        out: &mut [Vec<f32>],
+        epi: super::int_gemm::Epilogue<'_>,
+    ) {
+        let vw = self.widened_vnni();
+        super::int_gemm::vnni_gemm_rows(
+            q,
+            t,
+            self.in_dim,
+            &vw.w_s8,
+            &vw.rowsum,
+            self.out_dim,
+            &vw.s_prime,
+            self.bias.as_deref(),
+            sx,
+            zpx as i32,
+            out,
+            epi,
+        );
+    }
+
+    /// VNNI twin of [`Self::forward_batch_into`]: same window, requantized
+    /// weights, epilogue fused at the VNNI scale-up. Approximate.
+    pub(crate) fn forward_batch_into_vnni(
+        &self,
+        xs: &[Vec<f32>],
+        out: &mut [Vec<f32>],
+        epi: super::int_gemm::Epilogue<'_>,
+    ) {
+        assert!(xs.iter().all(|r| r.len() == self.in_dim));
+        if xs.is_empty() {
+            return;
+        }
+        assert_eq!(out.len(), xs.len());
+        let (q, sx, zpx) = super::int_gemm::quantize_u8_from_rows(xs);
+        self.gemm_vnni_quantized_into(&q, xs.len(), sx, zpx, out, epi);
+    }
+
+    /// VNNI twin of [`Self::forward_quantized_into`] against a shared
+    /// [`VnniQuantizedRows`]. Approximate.
+    pub(crate) fn forward_vnni_quantized_into(
+        &self,
+        q: &VnniQuantizedRows,
+        out: &mut [Vec<f32>],
+        epi: super::int_gemm::Epilogue<'_>,
+    ) {
+        assert_eq!(q.k, self.in_dim);
+        assert_eq!(out.len(), q.t);
+        self.gemm_vnni_quantized_into(&q.q, q.t, q.sx, q.zpx, out, epi);
+    }
+
+    /// Auto dispatch for production fused forwards: scalar when off, VNNI
+    /// when `ctx.use_vnni()`, otherwise the bit-exact i16 path.
+    pub(crate) fn forward_batch_into_auto(
+        &self,
+        xs: &[Vec<f32>],
+        ctx: &super::tensor_ctx::TensorCtx,
+        out: &mut [Vec<f32>],
+        epi: super::int_gemm::Epilogue<'_>,
+    ) {
+        if ctx.use_vnni() {
+            self.forward_batch_into_vnni(xs, out, epi);
+            return;
+        }
+        self.forward_batch_into(xs, ctx, out, epi);
+    }
+
+    /// Auto dispatch for the shared-A forwards: VNNI shared rows when
+    /// `ctx.use_vnni()` (caller holds the [`VnniQuantizedRows`]), else the
+    /// i16 shared / Flex-fallback contract of [`Self::forward_quantized_into`].
+    pub(crate) fn forward_quantized_into_auto(
+        &self,
+        q: &QuantizedRows<'_>,
+        qv: Option<&VnniQuantizedRows>,
+        ctx: &super::tensor_ctx::TensorCtx,
+        out: &mut [Vec<f32>],
+        epi: super::int_gemm::Epilogue<'_>,
+    ) {
+        if ctx.use_vnni() {
+            if let Some(v) = qv {
+                assert_eq!(v.k, self.in_dim);
+                assert_eq!(out.len(), v.t);
+                self.forward_vnni_quantized_into(v, out, epi);
+                return;
+            }
+            // No shared VNNI rows (should not happen in production — the
+            // attention builds them): per-linear VNNI quantize from source.
+            let (qq, sx, zpx) = super::int_gemm::quantize_u8_from_rows(q.src);
+            self.gemm_vnni_quantized_into(&qq, q.t, sx, zpx, out, epi);
+            return;
+        }
+        self.forward_quantized_into(q, ctx, out, epi);
+    }
+
     /// Dispatch: scalar `forward_batch` (exact integer path, default)
     /// or its tensor twin, per `ctx`. All tensor-path call sites funnel
     /// through here, so `STTD_BURN_TENSOR` flips the whole encoder at once.
+    ///
+    /// NOTE: bit-exact path. Production uses [`Self::batch_dispatch_auto`].
     pub(crate) fn batch_dispatch(
         &self,
         xs: &[Vec<f32>],
@@ -572,9 +790,27 @@ impl Uint8Linear {
         }
     }
 
+    /// Auto dispatch for production unfused forwards (joint projections,
+    /// pre-encode out via `batch_dispatch` sites).
+    pub(crate) fn batch_dispatch_auto(
+        &self,
+        xs: &[Vec<f32>],
+        ctx: &super::tensor_ctx::TensorCtx,
+    ) -> Vec<Vec<f32>> {
+        if !ctx.enabled {
+            return self.forward_batch(xs);
+        }
+        if ctx.use_vnni() {
+            return self.forward_batch_t_vnni(xs);
+        }
+        self.forward_batch_t(xs, &ctx.device)
+    }
+
     /// Single-row dispatch (joint `enc`/`pred`/`out` projections).
     /// Tensor side runs the batch twin over the one row: identical
     /// quantization span to `forward`, so identical semantics.
+    ///
+    /// NOTE: bit-exact path. Production uses [`Self::forward_dispatch_auto`].
     pub(crate) fn forward_dispatch(
         &self,
         x: &[f32],
@@ -587,6 +823,26 @@ impl Uint8Linear {
         } else {
             self.forward(x)
         }
+    }
+
+    /// Auto single-row dispatch for production (joint projections).
+    pub(crate) fn forward_dispatch_auto(
+        &self,
+        x: &[f32],
+        ctx: &super::tensor_ctx::TensorCtx,
+    ) -> Vec<f32> {
+        if !ctx.enabled {
+            return self.forward(x);
+        }
+        if ctx.use_vnni() {
+            return self
+                .forward_batch_t_vnni(&[x.to_vec()])
+                .pop()
+                .expect("forward_dispatch_auto: one row in, one row out");
+        }
+        self.forward_batch_t(&[x.to_vec()], &ctx.device)
+            .pop()
+            .expect("forward_dispatch_auto: one row in, one row out")
     }
 }
 
@@ -633,6 +889,7 @@ mod tests {
             out_dim: 2,
             cache: std::sync::OnceLock::new(),
         w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
         };
         let batched = lin.forward_batch(&[vec![1.0, -2.0], vec![3.0, 0.5]]);
         assert_eq!(batched.len(), 2);
@@ -696,6 +953,7 @@ mod tests {
             out_dim: 2,
             cache: std::sync::OnceLock::new(),
         w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
         };
         let y = lin.forward(&[1.0, 1.0]);
         assert!((y[0] + 4.78).abs() < 1e-4, "y={y:?}");
@@ -721,6 +979,7 @@ mod tests {
             out_dim: 2,
             cache: std::sync::OnceLock::new(),
         w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
         };
         // y[0] = 1*x0 + 3*x1 + 5*x2 (column 0 of the (K,N) store).
         // Approximate: the integer path scales by 1/255, which is not
@@ -744,6 +1003,7 @@ mod tests {
             out_dim: 2,
             cache: std::sync::OnceLock::new(),
         w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
         };
         let xs = vec![
             vec![1.0, -2.0, 3.0],
@@ -786,6 +1046,7 @@ mod tests {
             out_dim: 4,
             cache: std::sync::OnceLock::new(),
             w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
         };
         let xs = vec![
             vec![1.0, -2.0, 3.0],
@@ -797,6 +1058,7 @@ mod tests {
         let ctx = TensorCtx {
             device: dev,
             enabled: true,
+            vnni: false,
         };
         let reference = lin.forward_batch_t(&xs, &dev);
         for epi in [
@@ -847,6 +1109,7 @@ mod tests {
             out_dim: 1,
             cache: std::sync::OnceLock::new(),
         w_i16: std::sync::OnceLock::new(),
+            w_vnni: std::sync::OnceLock::new(),
         };
         let empty: Vec<Vec<f32>> = Vec::new();
         assert_eq!(lin.forward_batch_t(&empty, &cpu_device()), empty);

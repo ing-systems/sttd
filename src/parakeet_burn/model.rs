@@ -16,6 +16,7 @@ pub(crate) struct ParakeetBurnModel {
     joint: super::joint::BurnJoint,
     ready_line: String,
     tensor: bool,
+    vnni: bool,
     device: super::runtime::CpuDevice,
 }
 
@@ -85,11 +86,17 @@ impl ParakeetBurnModel {
         // Tensor-path selector, read once (never in tests: env vars
         // are process-global). Tensor is the default since Phase 7
         // (goldens + file-mode proven); STTD_BURN_TENSOR=0 keeps the
-        // scalar fallback for debugging regressions.
+        // scalar fallback for debugging regressions. VNNI (Phase 11,
+        // option (b)) defaults on where the CPU has `avx512vnni`;
+        // STTD_BURN_VNNI=0 forces the bit-exact i16 path for A/B.
         let tensor = super::runtime::tensor_path_enabled();
+        let vnni = super::runtime::vnni_enabled();
         let cpu = super::runtime::cpu_device();
         if !tensor {
             log::info!("burn parakeet: scalar path forced (STTD_BURN_TENSOR=0)");
+        }
+        if tensor && !vnni {
+            log::info!("burn parakeet: VNNI off (STTD_BURN_VNNI=0), bit-exact i16 path");
         }
         Ok(Self {
             vocab,
@@ -97,10 +104,11 @@ impl ParakeetBurnModel {
             encoder,
             joint,
             ready_line: format!(
-                "burn parakeet ready (model={}, threads={intra_threads}, device={device:?}, tensor={tensor})",
+                "burn parakeet ready (model={}, threads={intra_threads}, device={device:?}, tensor={tensor}, vnni={vnni})",
                 opts.model_spec
             ),
             tensor,
+            vnni,
             device: cpu,
         })
     }
@@ -127,10 +135,12 @@ impl SpeechModel for ParakeetBurnModel {
         // decode -> text. Like the ORT engine, greedy decoding
         // reports no per-token probability (`confidence: None`).
         // `ctx` flips every linear between its scalar twin (exact
-        // integer path) and the Flex matmul twin at once.
+        // integer path) and the tensor twins at once (`vnni` selects
+        // the VNNI requantized kernels vs the bit-exact i16 ones).
         let ctx = super::tensor_ctx::TensorCtx {
             device: self.device,
             enabled: self.tensor,
+            vnni: self.vnni,
         };
         let mel = self.frontend.extract(pcm)?;
         let enc = self.encoder.forward(&mel, &ctx)?;
