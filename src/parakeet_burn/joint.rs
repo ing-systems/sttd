@@ -30,6 +30,7 @@ use anyhow::{Context, Result};
 
 use super::decode::{JointStep, TdtGreedy};
 use super::quant::Uint8Linear;
+use super::tensor::TensorCtx;
 use super::weights::RawTensor;
 
 /// Joint config resolved from converted weights at load.
@@ -359,20 +360,25 @@ impl BurnJoint {
     /// candidates commit to `self` only when the step emits a non-blank
     /// token — exactly the `output_states_*` copy-back rule in
     /// `model_tdt.rs::greedy_decode`.
-    pub(crate) fn step_for(&mut self, enc_frame: &[f32], token: usize) -> (JointStep, StepStates) {
+    pub(crate) fn step_for(
+        &mut self,
+        enc_frame: &[f32],
+        token: usize,
+        ctx: &TensorCtx,
+    ) -> (JointStep, StepStates) {
         assert_eq!(enc_frame.len(), 1024);
         let e = self.embed.lookup(token);
         let (h0n, c0n) = self.l0.step(&e, &self.h[0], &self.c[0]);
         let (h1n, c1n) = self.l1.step(&h0n, &self.h[1], &self.c[1]);
-        let pe = self.enc.forward(enc_frame);
-        let pp = self.pred.forward(&h1n);
+        let pe = self.enc.forward_dispatch(enc_frame, ctx);
+        let pp = self.pred.forward_dispatch(&h1n, ctx);
         let mut hsum: Vec<f32> = pe.iter().zip(pp.iter()).map(|(a, b)| a + b).collect();
         for v in hsum.iter_mut() {
             if *v < 0.0 {
                 *v = 0.0;
             }
         }
-        let logits = self.out.forward(&hsum);
+        let logits = self.out.forward_dispatch(&hsum, ctx);
         let tok = TdtGreedy::argmax(&logits[..self.vocab_size]);
         if tok != self.blank_id {
             self.h = [h0n.clone(), h1n.clone()];
@@ -392,10 +398,11 @@ impl BurnJoint {
     pub(crate) fn decode(
         &mut self,
         enc: &[Vec<f32>],
+        ctx: &TensorCtx,
     ) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
         self.reset();
         let greedy = TdtGreedy::new(self.vocab_size);
-        greedy.decode(enc.len(), |t, last| self.step_for(&enc[t], last).0)
+        greedy.decode(enc.len(), |t, last| self.step_for(&enc[t], last, ctx).0)
     }
 }
 
@@ -536,6 +543,7 @@ mod tests {
                 .collect()
         };
         let frame = f32vec("enc_frame", 1024);
+        let sctx = TensorCtx::scalar();
         let cmp = |got: &[f32], want: &[f32], tag: &str| {
             assert_eq!(got.len(), want.len(), "{tag} len");
             let mut max_abs: f32 = 0.0;
@@ -555,7 +563,7 @@ mod tests {
 
         // Step 0: blank in, zero states. Blank emits nothing, so the
         // running states must stay zero while the candidates match ORT.
-        let (s0, cand0) = joint.step_for(&frame, 8192);
+        let (s0, cand0) = joint.step_for(&frame, 8192, &sctx);
         let want0 = f32vec("logits0", 8198);
         let all0: Vec<f32> = s0
             .token_logits
@@ -583,7 +591,7 @@ mod tests {
         let tok_v = st.tensor("token0").unwrap();
         let tok0 = i64::from_le_bytes(tok_v.data().try_into().unwrap()) as usize;
         assert_eq!(tok0, 8192);
-        let (s1, cand1) = joint.step_for(&frame, tok0);
+        let (s1, cand1) = joint.step_for(&frame, tok0, &sctx);
         let want1 = f32vec("logits1", 8198);
         let all1: Vec<f32> = s1
             .token_logits
@@ -604,7 +612,7 @@ mod tests {
 
         // Non-blank step: pins a non-blank embed row and the commit path.
         joint.set_states([h1[0].clone(), h1[1].clone()], [c1[0].clone(), c1[1].clone()]);
-        let (snb, candnb) = joint.step_for(&frame, 0);
+        let (snb, candnb) = joint.step_for(&frame, 0, &sctx);
         let wantnb = f32vec("logits_nb", 8198);
         let allnb: Vec<f32> = snb
             .token_logits
@@ -629,6 +637,51 @@ mod tests {
             h.iter().any(|r| r.iter().any(|&v| v != 0.0)),
             "non-blank must commit"
         );
+    }
+
+    /// Tensor-vs-scalar dispatch parity on real joint weights: same step
+    /// through both paths, logits compared tightly (f32 order only —
+    /// the LSTM/embed stay scalar on both sides, only the three
+    /// projections dispatch). Ignored: needs converted weights on disk.
+    /// `cargo test --features parakeet-burn -- --ignored`.
+    #[test]
+    #[ignore]
+    fn tensor_joint_step_matches_scalar() {
+        use super::super::weights::load_selected;
+        let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
+        let want = joint_want();
+        let tensors =
+            load_selected(&dir.join("decoder_joint-burn.safetensors"), &want).unwrap();
+        let mut joint = BurnJoint::load(&tensors, 8193).unwrap();
+        // Deterministic pseudo-random encoder frame.
+        let mut seed: u64 = 0xB17;
+        let frame: Vec<f32> = (0..1024)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+            })
+            .collect();
+        let tctx = TensorCtx {
+            device: super::super::backend::cpu_device(),
+            enabled: true,
+        };
+        let (ss, _) = {
+            joint.reset();
+            joint.step_for(&frame, 0, &TensorCtx::scalar())
+        };
+        let (st, _) = {
+            joint.reset();
+            joint.step_for(&frame, 0, &tctx)
+        };
+        let all_s: Vec<f32> = ss.token_logits.iter().chain(ss.duration_logits.iter()).copied().collect();
+        let all_t: Vec<f32> = st.token_logits.iter().chain(st.duration_logits.iter()).copied().collect();
+        let (mut mx, mut rm) = (0.0f32, 0.0f32);
+        for (a, b) in all_s.iter().zip(all_t.iter()) {
+            mx = mx.max((a - b).abs());
+            rm = rm.max(b.abs());
+        }
+        eprintln!("joint tensor-vs-scalar: max_abs={mx:.2e} ref_max={rm:.3}");
+        assert!(mx < 1e-3 * rm.max(1.0), "mx={mx} rm={rm}");
     }
 
     }

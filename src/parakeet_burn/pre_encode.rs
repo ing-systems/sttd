@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 
 use super::encoder::EncoderManifest;
 use super::quant::Uint8Linear;
+use super::tensor::TensorCtx;
 use super::weights::RawTensor;
 
 /// Exact staged output length: three stride-2 (k=3, p=1) stages, each
@@ -289,7 +290,7 @@ impl PreEncodeWeights {
     }
 
     /// Mel `[T][128]` -> `[T'][1024]`. Empty in, empty out.
-    pub(crate) fn forward(&self, mel: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+    pub(crate) fn forward(&self, mel: &[Vec<f32>], ctx: &TensorCtx) -> Result<Vec<Vec<f32>>> {
         if mel.is_empty() {
             return Ok(Vec::new());
         }
@@ -334,7 +335,9 @@ impl PreEncodeWeights {
         }
         // Batched: the out-projection's activation quantization spans
         // the whole `[T',4096]` input like ORT's (see `quant` docs).
-        Ok(self.out.forward_batch(&flat))
+        // Only the out-projection follows `ctx`; the five convs stay
+        // scalar until Phase 5.
+        Ok(self.out.batch_dispatch(&flat, ctx))
     }
 }
 
@@ -505,9 +508,10 @@ mod tests {
 
     #[test]
     fn forward_rejects_bad_width() {
+        use super::super::tensor::TensorCtx;
         let w = tiny_weights();
-        assert!(w.forward(&[vec![0.0; 127]]).is_err());
-        assert!(w.forward(&[]).unwrap().is_empty());
+        assert!(w.forward(&[vec![0.0; 127]], &TensorCtx::scalar()).is_err());
+        assert!(w.forward(&[], &TensorCtx::scalar()).unwrap().is_empty());
     }
 
     /// Loads real pre-encode weights. Ignored: needs converted weights on
@@ -533,11 +537,11 @@ mod tests {
             ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
         };
         let mel: Vec<Vec<f32>> = (0..64).map(|_| (0..128).map(|_| rnd()).collect()).collect();
-        let y1 = w.forward(&mel).unwrap();
+        let y1 = w.forward(&mel, &super::super::tensor::TensorCtx::scalar()).unwrap();
         assert_eq!(y1.len(), 8, "T=64 -> T'=8");
         assert!(y1.iter().all(|r| r.len() == 1024));
         assert!(y1.iter().all(|r| r.iter().all(|v| v.is_finite())));
-        let y2 = w.forward(&mel).unwrap();
+        let y2 = w.forward(&mel, &super::super::tensor::TensorCtx::scalar()).unwrap();
         assert_eq!(y1, y2, "forward is deterministic");
         // Output spans a sane range (projection of normalized mel).
         let max: f32 = y1.iter().flat_map(|r| r.iter()).fold(0.0f32, |a, &b| a.max(b.abs()));
@@ -578,7 +582,7 @@ mod tests {
         let mel_f = f32row(mel_v);
         let ref_f = f32row(ref_v);
         let mel: Vec<Vec<f32>> = mel_f.chunks(128).map(|c| c.to_vec()).collect();
-        let y = w.forward(&mel).unwrap();
+        let y = w.forward(&mel, &super::super::tensor::TensorCtx::scalar()).unwrap();
         assert_eq!((y.len(), y[0].len()), (8, 1024));
         let flat: Vec<f32> = y.iter().flat_map(|r| r.iter().copied()).collect();
         let max_abs = flat

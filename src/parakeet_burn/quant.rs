@@ -267,6 +267,38 @@ impl Uint8Linear {
         }
         super::tensor::tensor_to_rows(y)
     }
+
+    /// Dispatch: scalar `forward_batch` (exact integer path, default)
+    /// or its tensor twin, per `ctx`. All tensor-path call sites funnel
+    /// through here, so `STTD_BURN_TENSOR` flips the whole encoder at once.
+    pub(crate) fn batch_dispatch(
+        &self,
+        xs: &[Vec<f32>],
+        ctx: &super::tensor::TensorCtx,
+    ) -> Vec<Vec<f32>> {
+        if ctx.enabled {
+            self.forward_batch_t::<super::backend::CpuBackend>(xs, &ctx.device)
+        } else {
+            self.forward_batch(xs)
+        }
+    }
+
+    /// Single-row dispatch (joint `enc`/`pred`/`out` projections).
+    /// Tensor side runs the batch twin over the one row: identical
+    /// quantization span to `forward`, so identical semantics.
+    pub(crate) fn forward_dispatch(
+        &self,
+        x: &[f32],
+        ctx: &super::tensor::TensorCtx,
+    ) -> Vec<f32> {
+        if ctx.enabled {
+            self.forward_batch_t::<super::backend::CpuBackend>(&[x.to_vec()], &ctx.device)
+                .pop()
+                .expect("forward_dispatch: one row in, one row out")
+        } else {
+            self.forward(x)
+        }
+    }
 }
 
 #[cfg(test)]

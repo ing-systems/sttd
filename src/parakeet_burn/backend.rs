@@ -4,6 +4,11 @@
 #[cfg(feature = "parakeet-burn")]
 pub(crate) type CpuBackend = burn_flex::Flex;
 
+/// Concrete CPU device handle type (see `cpu_device`).
+#[cfg(feature = "parakeet-burn")]
+pub(crate) type CpuDevice =
+    <CpuBackend as burn::tensor::backend::BackendTypes>::Device;
+
 #[cfg(feature = "parakeet-burn-cuda")]
 pub(crate) type CudaBackend = burn_cuda::Cuda;
 

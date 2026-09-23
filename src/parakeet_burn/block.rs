@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 
 use super::encoder::EncoderManifest;
 use super::quant::Uint8Linear;
+use super::tensor::TensorCtx;
 use super::weights::RawTensor;
 
 /// LayerNorm params (gamma/beta, eps fixed 1e-5 per graph).
@@ -333,10 +334,11 @@ pub(crate) fn pos_window(table: &[Vec<f32>], t: usize) -> Vec<Vec<f32>> {
     table[5000 - t..5000 + t - 1].to_vec()
 }
 
-fn linear_batch(lin: &Uint8Linear, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+fn linear_batch(lin: &Uint8Linear, x: &[Vec<f32>], ctx: &TensorCtx) -> Vec<Vec<f32>> {
     // Batched: the activation quantization spans the whole `[T,K]` input
     // tensor, as ORT's `DynamicQuantizeLinear` does (see `quant` docs).
-    lin.forward_batch(x)
+    // Tensor path replicates that span exactly (see `forward_batch_t`).
+    lin.batch_dispatch(x, ctx)
 }
 
 fn add_inplace(a: &mut [Vec<f32>], b: &[Vec<f32>]) {
@@ -373,12 +375,13 @@ pub(crate) fn rel_scores(
     x: &[Vec<f32>],
     w: &BlockWeights,
     pos_window: &[Vec<f32>],
+    ctx: &TensorCtx,
 ) -> Vec<Vec<Vec<f32>>> {
     let t = x.len();
     let (h, dh) = (w.n_heads, w.d_head);
-    let q = split_heads(&linear_batch(&w.wq, x), h, dh);
-    let k = split_heads(&linear_batch(&w.wk, x), h, dh);
-    let p = split_heads(&linear_batch(&w.wpos, pos_window), h, dh);
+    let q = split_heads(&linear_batch(&w.wq, x, ctx), h, dh);
+    let k = split_heads(&linear_batch(&w.wk, x, ctx), h, dh);
+    let p = split_heads(&linear_batch(&w.wpos, pos_window, ctx), h, dh);
     assert_eq!(p.len(), 2 * t - 1);
     let scale = 1.0 / (dh as f32).sqrt();
     let mut out = Vec::with_capacity(t);
@@ -420,15 +423,16 @@ pub(crate) fn rel_attention(
     x: &[Vec<f32>],
     w: &BlockWeights,
     pos_window: &[Vec<f32>],
+    ctx: &TensorCtx,
 ) -> Vec<Vec<f32>> {
     let t = x.len();
     let (h, dh) = (w.n_heads, w.d_head);
     let v = split_heads(
-        &linear_batch(&w.wv, x),
+        &linear_batch(&w.wv, x, ctx),
         h,
         dh,
     );
-    let scores = rel_scores(x, w, pos_window);
+    let scores = rel_scores(x, w, pos_window, ctx);
     // scores is [T][H][T]; softmax over keys per (frame, head).
     let mut heads_out = Vec::with_capacity(h);
     for hh in 0..h {
@@ -453,19 +457,19 @@ pub(crate) fn rel_attention(
                 .collect()
         })
         .collect();
-    linear_batch(&w.wout, &merged)
+    linear_batch(&w.wout, &merged, ctx)
 }
 
-pub(crate) fn ffn(x: &[Vec<f32>], l1: &Uint8Linear, l2: &Uint8Linear) -> Vec<Vec<f32>> {
-    let mut h = linear_batch(l1, x);
+pub(crate) fn ffn(x: &[Vec<f32>], l1: &Uint8Linear, l2: &Uint8Linear, ctx: &TensorCtx) -> Vec<Vec<f32>> {
+    let mut h = linear_batch(l1, x, ctx);
     for row in h.iter_mut() {
         swish_inplace(row);
     }
-    linear_batch(l2, &h)
+    linear_batch(l2, &h, ctx)
 }
 
-pub(crate) fn conv_block(x: &[Vec<f32>], w: &BlockWeights) -> Vec<Vec<f32>> {
-    let gated: Vec<Vec<f32>> = linear_batch(&w.pw1, x).iter().map(|r| glu(r)).collect();
+pub(crate) fn conv_block(x: &[Vec<f32>], w: &BlockWeights, ctx: &TensorCtx) -> Vec<Vec<f32>> {
+    let gated: Vec<Vec<f32>> = linear_batch(&w.pw1, x, ctx).iter().map(|r| glu(r)).collect();
     let mut dwed = w.dw.forward(&gated);
     // SAME padding (k=9, pads 4/4) preserves length; trim defensively.
     dwed.truncate(x.len());
@@ -475,7 +479,7 @@ pub(crate) fn conv_block(x: &[Vec<f32>], w: &BlockWeights) -> Vec<Vec<f32>> {
     for row in dwed.iter_mut() {
         swish_inplace(row);
     }
-    linear_batch(&w.pw2, &dwed)
+    linear_batch(&w.pw2, &dwed, ctx)
 }
 
 /// One full block: half-step FFN sandwich + final norm.
@@ -483,16 +487,17 @@ pub(crate) fn block_forward(
     x: &[Vec<f32>],
     w: &BlockWeights,
     pos_window: &[Vec<f32>],
+    ctx: &TensorCtx,
 ) -> Vec<Vec<f32>> {
     let mut h = x.to_vec();
-    let mut f = ffn(&layernorm_batch(&h, &w.norm_ff1), &w.ffn1_l1, &w.ffn1_l2);
+    let mut f = ffn(&layernorm_batch(&h, &w.norm_ff1), &w.ffn1_l1, &w.ffn1_l2, ctx);
     scale_inplace(&mut f, 0.5);
     add_inplace(&mut h, &f);
-    let a = rel_attention(&layernorm_batch(&h, &w.norm_att), w, pos_window);
+    let a = rel_attention(&layernorm_batch(&h, &w.norm_att), w, pos_window, ctx);
     add_inplace(&mut h, &a);
-    let c = conv_block(&layernorm_batch(&h, &w.norm_conv), w);
+    let c = conv_block(&layernorm_batch(&h, &w.norm_conv), w, ctx);
     add_inplace(&mut h, &c);
-    let mut f2 = ffn(&layernorm_batch(&h, &w.norm_ff2), &w.ffn2_l1, &w.ffn2_l2);
+    let mut f2 = ffn(&layernorm_batch(&h, &w.norm_ff2), &w.ffn2_l1, &w.ffn2_l2, ctx);
     scale_inplace(&mut f2, 0.5);
     add_inplace(&mut h, &f2);
     layernorm_batch(&h, &w.norm_out)
@@ -629,7 +634,7 @@ mod tests {
         };
         let x = vec![vec![1.0], vec![0.0]];
         let pw = vec![vec![10.0], vec![20.0], vec![30.0]];
-        let y = rel_attention(&x, &w, &pw);
+        let y = rel_attention(&x, &w, &pw, &TensorCtx::scalar());
         assert_eq!(y.len(), 2);
         // Row 0: scores [1+20, 0+30] -> attends to key 1 (v=0).
         assert!(y[0][0] < 0.1, "y={y:?}");
@@ -638,7 +643,7 @@ mod tests {
         // Full block preserves shape and stays finite.
         let table: Vec<Vec<f32>> = (0..9999).map(|i| vec![i as f32]).collect();
         let win = pos_window(&table, 2);
-        let z = block_forward(&vec![vec![1.0], vec![0.0]], &w, &win);
+        let z = block_forward(&vec![vec![1.0], vec![0.0]], &w, &win, &TensorCtx::scalar());
         assert_eq!(z.len(), 2);
         assert!(z.iter().all(|r| r.len() == 1 && r.iter().all(|v| v.is_finite())));
     }
@@ -705,7 +710,7 @@ mod tests {
         let x: Vec<Vec<f32>> = (0..8).map(|_| (0..1024).map(|_| rnd()).collect()).collect();
         let win = pos_window(&table, 8);
         assert_eq!(win.len(), 15);
-        let y = block_forward(&x, &bw, &win);
+        let y = block_forward(&x, &bw, &win, &TensorCtx::scalar());
         assert_eq!(y.len(), 8);
         assert!(y.iter().all(|r| r.len() == 1024 && r.iter().all(|v| v.is_finite())));
         // norm_out invariant: (y - beta) / gamma has ~zero mean and
@@ -751,7 +756,7 @@ mod tests {
         let x = f32mat("blk_in_T1024", 8, 1024);
         let want = f32mat("blk_ref", 8, 1024);
         let win = pos_window(&table, 8);
-        let y = block_forward(&x, &bw, &win);
+        let y = block_forward(&x, &bw, &win, &TensorCtx::scalar());
         let (mut max_abs, mut sum_abs) = (0.0f32, 0.0f32);
         let mut ref_max = 0.0f32;
         for (yr, wr) in y.iter().zip(want.iter()) {
@@ -828,7 +833,8 @@ mod tests {
         };
         // Residual chain: add0 = x+f1, add1 = add0+a, add2 = add1+c,
         // add3 = add2+f2. Each branch input is layernormed above.
-        let mut f1 = ffn(&layernorm_batch(&x, &bw.norm_ff1), &bw.ffn1_l1, &bw.ffn1_l2);
+        let ctx = TensorCtx::scalar();
+        let mut f1 = ffn(&layernorm_batch(&x, &bw.norm_ff1), &bw.ffn1_l1, &bw.ffn1_l2, &ctx);
         for r in f1.iter_mut() {
             for v in r.iter_mut() {
                 *v *= 0.5;
@@ -836,11 +842,11 @@ mod tests {
         }
         check("ffn1", &f1, &sub(&add0, &x));
         let win = pos_window(&table, 8);
-        let a = rel_attention(&layernorm_batch(&add0, &bw.norm_att), &bw, &win);
+        let a = rel_attention(&layernorm_batch(&add0, &bw.norm_att), &bw, &win, &ctx);
         check("attn", &a, &sub(&add1, &add0));
-        let c = conv_block(&layernorm_batch(&add1, &bw.norm_conv), &bw);
+        let c = conv_block(&layernorm_batch(&add1, &bw.norm_conv), &bw, &ctx);
         check("conv", &c, &sub(&add2, &add1));
-        let mut f2 = ffn(&layernorm_batch(&add2, &bw.norm_ff2), &bw.ffn2_l1, &bw.ffn2_l2);
+        let mut f2 = ffn(&layernorm_batch(&add2, &bw.norm_ff2), &bw.ffn2_l1, &bw.ffn2_l2, &ctx);
         for r in f2.iter_mut() {
             for v in r.iter_mut() {
                 *v *= 0.5;
@@ -856,7 +862,7 @@ mod tests {
             .chunks(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        let sc = rel_scores(&layernorm_batch(&add0, &bw.norm_att), &bw, &win);
+        let sc = rel_scores(&layernorm_batch(&add0, &bw.norm_att), &bw, &win, &ctx);
         let mut flat_htt = vec![0.0f32; 512];
         for i in 0..8 {
             for hh in 0..8 {
@@ -874,6 +880,62 @@ mod tests {
         }
         eprintln!("scores: max_abs={mx:.6} mean_abs={:.6} ref_max={rm:.3}", sm / 512.0);
         assert!(mx < 0.001, "scores: max_abs={mx} ref_max={rm}");
+    }
+
+    /// Tensor-path layer-0 parity: same golden as `ort_layer0_parity`,
+    /// but through `block_forward` with the tensor linears. Compared
+    /// against ORT (same 0.1% bound — policy (b) allows re-baselining
+    /// here if Flex summation order exceeds it while transcripts stay
+    /// word-exact) and against the scalar twin (tight: f32 order only).
+    /// Ignored: needs converted weights on disk.
+    /// `cargo test --features parakeet-burn -- --ignored`.
+    #[test]
+    #[ignore]
+    fn ort_layer0_parity_tensor() {
+        let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
+        let (bw, table) = load_layer0(dir);
+        let bytes =
+            std::fs::read("src/parakeet_burn/testdata/layer0_golden.safetensors").unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let f32mat = |name: &str, rows: usize, cols: usize| -> Vec<Vec<f32>> {
+            let v = st.tensor(name).unwrap();
+            assert_eq!(v.shape(), &[rows, cols]);
+            v.data()
+                .chunks(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<f32>>()
+                .chunks(cols)
+                .map(|c| c.to_vec())
+                .collect()
+        };
+        let x = f32mat("blk_in_T1024", 8, 1024);
+        let want = f32mat("blk_ref", 8, 1024);
+        let win = pos_window(&table, 8);
+        let tctx = TensorCtx {
+            device: super::super::backend::cpu_device(),
+            enabled: true,
+        };
+        let y = block_forward(&x, &bw, &win, &tctx);
+        let ys = block_forward(&x, &bw, &win, &TensorCtx::scalar());
+        let (mut max_abs, mut sum_abs) = (0.0f32, 0.0f32);
+        let (mut max_vs, mut ref_max) = (0.0f32, 0.0f32);
+        for ((yt, ys), wr) in y.iter().zip(ys.iter()).zip(want.iter()) {
+            for ((a, s), b) in yt.iter().zip(ys.iter()).zip(wr.iter()) {
+                max_abs = max_abs.max((a - b).abs());
+                sum_abs += (a - b).abs();
+                max_vs = max_vs.max((a - s).abs());
+                ref_max = ref_max.max(b.abs());
+            }
+        }
+        eprintln!(
+            "layer0 tensor: max_abs={max_abs:.6} mean_abs={:.6} vs_scalar={max_vs:.2e} ref_max={ref_max:.3}",
+            sum_abs / (8.0 * 1024.0)
+        );
+        assert!(
+            max_abs < 0.001 * ref_max.max(1.0),
+            "max_abs={max_abs} ref_max={ref_max}"
+        );
+        assert!(max_vs < 1e-3 * ref_max.max(1.0), "vs_scalar={max_vs}");
     }
 
     }

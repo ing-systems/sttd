@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 
 use super::block::{block_forward, pos_window, BlockWeights};
 use super::pre_encode::{pre_encode_want, PreEncodeWeights};
+use super::tensor::TensorCtx;
 use super::weights::RawTensor;
 
 /// One Conformer block config (FastConformer-TDT-0.6B-v3 shapes, read off
@@ -133,14 +134,14 @@ impl BurnEncoder {
     }
 
     /// Mel `[T][128]` -> encoder states `[T'][1024]`. Empty in, empty out.
-    pub(crate) fn forward(&self, mel: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-        let mut h = self.pre.forward(mel)?;
+    pub(crate) fn forward(&self, mel: &[Vec<f32>], ctx: &TensorCtx) -> Result<Vec<Vec<f32>>> {
+        let mut h = self.pre.forward(mel, ctx)?;
         if h.is_empty() {
             return Ok(h);
         }
         let win = pos_window(&self.pos_table, h.len());
         for b in &self.blocks {
-            h = block_forward(&h, b, &win);
+            h = block_forward(&h, b, &win, ctx);
         }
         Ok(h)
     }
@@ -536,11 +537,12 @@ mod tests {
                 .collect()
         };
         let mel = f32mat("mel_T128", 64, 128);
-        // `forward` plumbing: shape, finiteness, determinism.
-        let y = enc.forward(&mel).unwrap();
+        // `forward` plumbing: shape, finiteness, determinism (scalar path).
+        let sctx = TensorCtx::scalar();
+        let y = enc.forward(&mel, &sctx).unwrap();
         assert_eq!((y.len(), y[0].len()), (8, 1024));
         assert!(y.iter().all(|r| r.iter().all(|v| v.is_finite())));
-        let y2 = enc.forward(&mel).unwrap();
+        let y2 = enc.forward(&mel, &sctx).unwrap();
         assert_eq!(y, y2, "forward is deterministic");
         // Informational chained residual only (no assert): with the
         // integer quantized paths the full-depth drift is down to ~0.01
@@ -579,26 +581,37 @@ mod tests {
             .chunks(1024)
             .map(|c| c.to_vec())
             .collect();
-        // Sanity: our pre-encode output matches the golden block input
-        // (same 5% fp32-vs-int8 bound as `pre_encode.rs`).
-        let own_pre = enc.pre.forward(&mel).unwrap();
-        let mut pre_max = 0.0f32;
-        let mut pre_ref_max = 0.0f32;
-        for (a, b) in own_pre.iter().zip(pre_ref.iter()) {
-            for (x, g) in a.iter().zip(b.iter()) {
-                pre_max = pre_max.max((x - g).abs());
-                pre_ref_max = pre_ref_max.max(g.abs());
-            }
-        }
-        assert!(
-            pre_max < 0.05 * pre_ref_max.max(1.0),
-            "pre drift: max_abs={pre_max} ref_max={pre_ref_max}"
-        );
+        // Isolated per-block parity runs on BOTH paths (scalar fallback
+        // + tensor): each block runs on ORT's exact input for its depth,
+        // so error never compounds. Tensor bounds match scalar per
+        // policy (b) — loosened only if Flex summation order exceeds
+        // them while transcripts stay word-exact.
         let win = super::super::block::pos_window(&enc.pos_table, 8);
-        let mut prev = pre_ref;
-        for (layer, b) in enc.blocks.iter().enumerate() {
-            let want = f32mat(&format!("layer{layer}_ref"), 8, 1024);
-            let got = super::super::block::block_forward(&prev, b, &win);
+        let tctx = TensorCtx {
+            device: super::super::backend::cpu_device(),
+            enabled: true,
+        };
+        for (tag, ctx) in [("scalar", sctx), ("tensor", tctx)] {
+            // Sanity per path: pre-encode output matches the golden
+            // block input (same 5% fp32-vs-int8 bound as `pre_encode.rs`;
+            // this also covers the pre-encode out-projection tensor twin).
+            let own_pre = enc.pre.forward(&mel, &ctx).unwrap();
+            let mut pre_max = 0.0f32;
+            let mut pre_ref_max = 0.0f32;
+            for (a, b) in own_pre.iter().zip(pre_ref.iter()) {
+                for (x, g) in a.iter().zip(b.iter()) {
+                    pre_max = pre_max.max((x - g).abs());
+                    pre_ref_max = pre_ref_max.max(g.abs());
+                }
+            }
+            assert!(
+                pre_max < 0.05 * pre_ref_max.max(1.0),
+                "{tag} pre drift: max_abs={pre_max} ref_max={pre_ref_max}"
+            );
+            let mut prev = pre_ref.clone();
+            for (layer, b) in enc.blocks.iter().enumerate() {
+                let want = f32mat(&format!("layer{layer}_ref"), 8, 1024);
+                let got = super::super::block::block_forward(&prev, b, &win, &ctx);
             let (mut max_abs, mut sum_abs) = (0.0f32, 0.0f32);
             let mut ref_max = 0.0f32;
             for (yr, wr) in got.iter().zip(want.iter()) {
@@ -610,7 +623,7 @@ mod tests {
             }
             let mean_abs = sum_abs / (8.0 * 1024.0);
             eprintln!(
-                "isolated layer{layer}: max_abs={max_abs:.4} mean_abs={mean_abs:.4} ref_max={ref_max:.4} rel_max={:.4}",
+                "{tag} isolated layer{layer}: max_abs={max_abs:.4} mean_abs={mean_abs:.4} ref_max={ref_max:.4} rel_max={:.4}",
                 max_abs / ref_max.max(1e-6)
             );
             if layer < 23 {
@@ -620,17 +633,18 @@ mod tests {
                 // ~3x margin over the worst measured.
                 assert!(
                     max_abs < 0.02 * ref_max.max(1.0),
-                    "layer{layer} drift: max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"
+                    "{tag} layer{layer} drift: max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"
                 );
             } else {
                 // Final states are tiny (ref_max ~0.12): absolute bound
                 // with ~3x margin over measured (0.0063).
                 assert!(
                     max_abs < 0.02,
-                    "layer{layer} drift: max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"
+                    "{tag} layer{layer} drift: max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"
                 );
             }
             prev = want;
+            }
         }
     }
 }

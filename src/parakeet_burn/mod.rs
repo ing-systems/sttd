@@ -78,6 +78,8 @@ mod model {
         encoder: super::encoder::BurnEncoder,
         joint: super::joint::BurnJoint,
         ready_line: String,
+        tensor: bool,
+        device: super::backend::CpuDevice,
     }
 
     impl ParakeetBurnModel {
@@ -136,15 +138,26 @@ mod model {
                 Ok::<_, anyhow::Error>((encoder, joint))
             })?;
 
+            // Tensor-path selector, read once (never in tests: env vars
+            // are process-global). Scalar stays the default during
+            // bring-up; Phase 7 flips it. The scalar fallback remains
+            // available via STTD_BURN_TENSOR=0 for debugging regressions.
+            let tensor = super::backend::use_tensor_path();
+            let cpu = super::backend::cpu_device();
+            if tensor {
+                log::info!("burn parakeet: tensor path enabled (STTD_BURN_TENSOR=1)");
+            }
             Ok(Self {
                 vocab,
                 frontend,
                 encoder,
                 joint,
                 ready_line: format!(
-                    "burn parakeet ready (model={}, threads={intra_threads}, device={device:?})",
+                    "burn parakeet ready (model={}, threads={intra_threads}, device={device:?}, tensor={tensor})",
                     opts.model_spec
                 ),
+                tensor,
+                device: cpu,
             })
         }
     }
@@ -169,9 +182,15 @@ mod model {
             // Full native path: mel -> encoder states -> TDT greedy
             // decode -> text rebuild. Like the ORT engine, greedy decoding
             // reports no per-token probability (`confidence: None`).
+            // `ctx` flips every linear between its scalar twin (exact
+            // integer path) and the Flex matmul twin at once.
+            let ctx = super::tensor::TensorCtx {
+                device: self.device,
+                enabled: self.tensor,
+            };
             let mel = self.frontend.extract(pcm)?;
-            let enc = self.encoder.forward(&mel)?;
-            let (tokens, _frames, _durations) = self.joint.decode(&enc);
+            let enc = self.encoder.forward(&mel, &ctx)?;
+            let (tokens, _frames, _durations) = self.joint.decode(&enc, &ctx);
             Ok(Transcript {
                 text: self.vocab.rebuild(&tokens),
                 confidence: None,

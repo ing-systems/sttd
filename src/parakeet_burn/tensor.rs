@@ -10,6 +10,8 @@
 use burn::tensor::{backend::Backend, Tensor, TensorData};
 use burn::tensor::backend::BackendTypes;
 
+use super::backend::CpuBackend;
+
 /// `&[Vec<f32>]` rows (`[T][K]`, non-empty, rectangular) -> `Tensor<B, 2>`.
 /// Panics on empty/ragged input: callers return early on empty (as the
 /// scalar forwards do) instead of guessing a width.
@@ -25,6 +27,26 @@ pub(crate) fn rows_to_tensor<B: Backend>(rows: &[Vec<f32>], device: &<B as Backe
         TensorData::new(flat, [rows.len(), cols]),
         device,
     )
+}
+
+/// Threaded handle for the tensor path: where to allocate + kill-switch.
+/// `enabled = false` dispatches every op back to its scalar twin, so the
+/// scalar fallback (decision 2: kept for debugging parity regressions)
+/// is always one flag away. `FlexDevice` is `Copy`, so this rides along
+/// by value through every forward signature from Phase 2b on.
+#[derive(Clone, Copy)]
+pub(crate) struct TensorCtx {
+    pub(crate) device: <CpuBackend as BackendTypes>::Device,
+    pub(crate) enabled: bool,
+}
+
+impl TensorCtx {
+    pub(crate) fn scalar() -> Self {
+        Self {
+            device: super::backend::cpu_device(),
+            enabled: false,
+        }
+    }
 }
 
 /// `Tensor<B, 2>` -> `Vec<Vec<f32>>` rows.
