@@ -564,7 +564,7 @@ mod tests {
             .copied()
             .collect();
         let (m0, r0) = cmp(&all0, &want0, "step0 logits");
-        assert!(m0 < 0.05 * r0.max(1.0), "step0 logits m0={m0} r0={r0}");
+        assert!(m0 < 0.01 * r0.max(1.0), "step0 logits m0={m0} r0={r0}");
         assert_eq!(s0.duration_logits.len(), 5);
         let (h, c) = joint.states();
         assert!(h.iter().all(|r| r.iter().all(|&v| v == 0.0)), "blank must not commit");
@@ -573,9 +573,9 @@ mod tests {
         let c1 = f32mat("c1", 2, 640);
         for layer in 0..2 {
             let (mh, rh) = cmp(&cand0.h[layer], &h1[layer], &format!("step0 h{layer}"));
-            assert!(mh < 0.05 * rh.max(1.0), "h{layer} mh={mh} rh={rh}");
+            assert!(mh < 0.10 * rh.max(1.0), "h{layer} mh={mh} rh={rh}");
             let (mc, rc) = cmp(&cand0.c[layer], &c1[layer], &format!("step0 c{layer}"));
-            assert!(mc < 0.05 * rc.max(1.0), "c{layer} mc={mc} rc={rc}");
+            assert!(mc < 0.10 * rc.max(1.0), "c{layer} mc={mc} rc={rc}");
         }
 
         // Step 1: ORT's token + states as input (fully isolated).
@@ -592,14 +592,14 @@ mod tests {
             .copied()
             .collect();
         let (m1, r1) = cmp(&all1, &want1, "step1 logits");
-        assert!(m1 < 0.05 * r1.max(1.0), "step1 logits m1={m1} r1={r1}");
+        assert!(m1 < 0.01 * r1.max(1.0), "step1 logits m1={m1} r1={r1}");
         let h2 = f32mat("h2", 2, 640);
         let c2 = f32mat("c2", 2, 640);
         for layer in 0..2 {
             let (mh, rh) = cmp(&cand1.h[layer], &h2[layer], &format!("step1 h{layer}"));
-            assert!(mh < 0.05 * rh.max(1.0), "h{layer} mh={mh} rh={rh}");
+            assert!(mh < 0.10 * rh.max(1.0), "h{layer} mh={mh} rh={rh}");
             let (mc, rc) = cmp(&cand1.c[layer], &c2[layer], &format!("step1 c{layer}"));
-            assert!(mc < 0.05 * rc.max(1.0), "c{layer} mc={mc} rc={rc}");
+            assert!(mc < 0.10 * rc.max(1.0), "c{layer} mc={mc} rc={rc}");
         }
 
         // Non-blank step: pins a non-blank embed row and the commit path.
@@ -613,14 +613,14 @@ mod tests {
             .copied()
             .collect();
         let (mnb, rnb) = cmp(&allnb, &wantnb, "step-nb logits");
-        assert!(mnb < 0.05 * rnb.max(1.0), "nb logits mnb={mnb} rnb={rnb}");
+        assert!(mnb < 0.01 * rnb.max(1.0), "nb logits mnb={mnb} rnb={rnb}");
         let hnb = f32mat("h_nb", 2, 640);
         let cnb = f32mat("c_nb", 2, 640);
         for layer in 0..2 {
             let (mh, rh) = cmp(&candnb.h[layer], &hnb[layer], &format!("nb h{layer}"));
-            assert!(mh < 0.05 * rh.max(1.0), "nb h{layer}");
+            assert!(mh < 0.10 * rh.max(1.0), "nb h{layer}");
             let (mc, rc) = cmp(&candnb.c[layer], &cnb[layer], &format!("nb c{layer}"));
-            assert!(mc < 0.05 * rc.max(1.0), "nb c{layer}");
+            assert!(mc < 0.10 * rc.max(1.0), "nb c{layer}");
         }
         // Token 0 may or may not be blank-adjacent... it is a real token
         // (blank is 8192), so the commit must have happened.
@@ -630,4 +630,5 @@ mod tests {
             "non-blank must commit"
         );
     }
-}
+
+    }

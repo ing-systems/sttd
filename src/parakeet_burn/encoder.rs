@@ -542,9 +542,10 @@ mod tests {
         assert!(y.iter().all(|r| r.iter().all(|v| v.is_finite())));
         let y2 = enc.forward(&mel).unwrap();
         assert_eq!(y, y2, "forward is deterministic");
-        // Informational chain drift only (no assert): fp32 math without
-        // dynamic activation quantization accumulates requant noise down
-        // the stack — see the isolated bounds below and docs.
+        // Informational chained residual only (no assert): with the
+        // integer quantized paths the full-depth drift is down to ~0.01
+        // absolute (was 0.05 pre-quantization). Isolated per-layer bounds
+        // below are the real gates; the file-mode smoke test covers e2e.
         let enc_ref = f32mat("enc_ref", 8, 1024);
         let (mut cmax, mut csum) = (0.0f32, 0.0f32);
         for (yr, wr) in y.iter().zip(enc_ref.iter()) {
@@ -554,17 +555,17 @@ mod tests {
             }
         }
         eprintln!(
-            "chained full depth: max_abs={cmax:.4} mean_abs={:.4} (known requant drift, not asserted)",
+            "chained full depth: max_abs={cmax:.4} mean_abs={:.4} (informational, not asserted)",
             csum / (8.0 * 1024.0)
         );
 
         // Isolated per-block parity: each block runs on ORT's exact
         // input for that depth (pre_ref for layer 0, layer{N-1}_ref
-        // otherwise), so error never compounds across layers. The curve
-        // is flat at ~2-15% relative — activation-requantization noise,
-        // not a mis-mapped layer (a wrong weight would spike one depth
-        // to ~100%+). Bounds hold margin over measured (worst isolated
-        // max 14.7% at layers 9-11, 10% at 12-13, 5.5% at 23).
+        // otherwise), so error never compounds across layers. With the
+        // integer quantized paths + f64 layernorm + voted shift, most
+        // layers land <= 2e-4 absolute; layers 10/11/16/21 keep <= 0.94
+        // (0.6% rel, last-ULP accumulation inside ORT's own reductions).
+        // A mis-mapped weight would spike one depth to ~100%+ instead.
         let pre_bytes =
             std::fs::read("src/parakeet_burn/testdata/pre_encode_golden.safetensors").unwrap();
         let pre_st = safetensors::SafeTensors::deserialize(&pre_bytes).unwrap();
@@ -613,13 +614,17 @@ mod tests {
                 max_abs / ref_max.max(1e-6)
             );
             if layer < 23 {
+                // Near-exact integer paths: most layers land <= 2e-4;
+                // layers 10/11/16/21 keep <= 0.94 (0.6% rel, last-ULP
+                // accumulation in ORT's own reductions). Bound holds
+                // ~3x margin over the worst measured.
                 assert!(
-                    max_abs < 0.20 * ref_max.max(1.0),
+                    max_abs < 0.02 * ref_max.max(1.0),
                     "layer{layer} drift: max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"
                 );
             } else {
                 // Final states are tiny (ref_max ~0.12): absolute bound
-                // with ~3x margin over measured (0.0068).
+                // with ~3x margin over measured (0.0063).
                 assert!(
                     max_abs < 0.02,
                     "layer{layer} drift: max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"

@@ -17,7 +17,10 @@
 //   a lengths mask, a no-op for full-length offline utterances.
 // - Relative attention: frozen table (9999, 1024), window
 //   table[5000-T .. 5000+T-1], distance-0 at window index T-1;
-//   B[i,j] = (q_i + v) . P[(i-j) + (T-1)], scores / sqrt(128).
+//   B[i,j] = (q_i + v) . P[(j-i) + (T-1)] (sign voted off ORT's own
+//   Add_2 = AC + shift(BD); the table is position-reversed, see
+//   `pos_window`), scores / sqrt(128). QK^T/BD/AV run in fp32 — the
+//   graph uses plain `MatMul` there (only the projections quantize).
 
 use std::collections::HashMap;
 
@@ -38,13 +41,18 @@ pub(crate) const LN_EPS: f32 = 1e-5;
 
 pub(crate) fn layernorm_row(x: &[f32], p: &LayerNormP) -> Vec<f32> {
     assert_eq!(x.len(), p.gamma.len());
-    let n = x.len() as f32;
-    let mean = x.iter().sum::<f32>() / n;
-    let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
-    let inv = 1.0 / (var + LN_EPS).sqrt();
+    // f64 accumulators: the mean/variance sums span 1024 elements, and a
+    // sequential f32 sum rounds enough to matter downstream (a ~1e-6
+    // normalized error amplifies 4096-wide through the FFN to ~1.0 at
+    // ref_max 600 — bisected via the staged parity test below). ORT's own
+    // vectorized reduction lands within 1e-7 of this.
+    let n = x.len() as f64;
+    let mean: f64 = x.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let var: f64 = x.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+    let inv = 1.0 / (var + LN_EPS as f64).sqrt();
     x.iter()
         .enumerate()
-        .map(|(i, v)| (v - mean) * inv * p.gamma[i] + p.beta[i])
+        .map(|(i, &v)| ((v as f64 - mean) * inv * p.gamma[i] as f64 + p.beta[i] as f64) as f32)
         .collect()
 }
 
@@ -93,29 +101,34 @@ pub(crate) struct DwConv {
 
 impl DwConv {
     pub(crate) fn forward(&self, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        use super::quant::dynamic_quantize_u8;
         let t = x.len();
         let c = self.channels;
         assert!(x.iter().all(|r| r.len() == c));
-        // dequantize once per call (weights are small: 1024x9)
-        let w: Vec<f32> = self
-            .weight_u8
-            .iter()
-            .map(|&q| (q as f32 - self.zero_point) * self.scale)
-            .collect();
-        let mut padded = vec![vec![0.0f32; c]; self.pad_left + t + self.pad_right];
+        // Per-tensor dynamic quantization over the whole `[T,C]` input,
+        // integer MAC per tap (mirrors `ConvInteger`; see `quant` docs).
+        let flat: Vec<f32> = x.iter().flat_map(|r| r.iter().copied()).collect();
+        let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
+        let zpw = self.zero_point.round() as i64;
+        let mut padded = vec![zpx; c * (self.pad_left + t + self.pad_right)];
         for (i, row) in x.iter().enumerate() {
-            padded[self.pad_left + i].copy_from_slice(row);
+            let base = (self.pad_left + i) * c;
+            let qbase = i * c;
+            padded[base..base + c].copy_from_slice(&xq[qbase..qbase + c]);
         }
-        let out_len = padded.len() - self.kernel + 1;
+        // NOTE: zero-padding in quantized space is `zpx` (= real 0), so
+        // padded taps contribute nothing after zp subtraction.
+        let out_len = self.pad_left + t + self.pad_right - self.kernel + 1;
         let mut out = vec![vec![0.0f32; c]; out_len];
         for (t_out, row) in out.iter_mut().enumerate() {
             for ch in 0..c {
-                let mut acc = self.bias[ch];
+                let mut acc = 0i64;
                 let base = ch * self.kernel;
                 for k in 0..self.kernel {
-                    acc += w[base + k] * padded[t_out + k][ch];
+                    let q = padded[(t_out + k) * c + ch] as i64 - zpx as i64;
+                    acc += (self.weight_u8[base + k] as i64 - zpw) * q;
                 }
-                row[ch] = acc;
+                row[ch] = acc as f32 * (self.scale * sx) + self.bias[ch];
             }
         }
         out
@@ -321,7 +334,9 @@ pub(crate) fn pos_window(table: &[Vec<f32>], t: usize) -> Vec<Vec<f32>> {
 }
 
 fn linear_batch(lin: &Uint8Linear, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
-    x.iter().map(|r| lin.forward(r)).collect()
+    // Batched: the activation quantization spans the whole `[T,K]` input
+    // tensor, as ORT's `DynamicQuantizeLinear` does (see `quant` docs).
+    lin.forward_batch(x)
 }
 
 fn add_inplace(a: &mut [Vec<f32>], b: &[Vec<f32>]) {
@@ -350,8 +365,57 @@ fn split_heads(x: &[Vec<f32>], n_heads: usize, d_head: usize) -> Vec<Vec<Vec<f32
         .collect()
 }
 
+/// Pre-softmax relative scores `[T][H][T]`: AC + XL-shifted BD, scaled.
+/// B[i,j] = (q_i + u) . k_j + (q_i + v) . P[(j-i) + (T-1)].
+/// Split out of `rel_attention` so parity tests can compare scores
+/// directly against the graph's pre-softmax `Div` output.
+pub(crate) fn rel_scores(
+    x: &[Vec<f32>],
+    w: &BlockWeights,
+    pos_window: &[Vec<f32>],
+) -> Vec<Vec<Vec<f32>>> {
+    let t = x.len();
+    let (h, dh) = (w.n_heads, w.d_head);
+    let q = split_heads(&linear_batch(&w.wq, x), h, dh);
+    let k = split_heads(&linear_batch(&w.wk, x), h, dh);
+    let p = split_heads(&linear_batch(&w.wpos, pos_window), h, dh);
+    assert_eq!(p.len(), 2 * t - 1);
+    let scale = 1.0 / (dh as f32).sqrt();
+    let mut out = Vec::with_capacity(t);
+    for i in 0..t {
+        out.push(Vec::with_capacity(h));
+        for hh in 0..h {
+            let qu: Vec<f32> = q[i][hh]
+                .iter()
+                .zip(w.pos_bias_u[hh].iter())
+                .map(|(a, b)| a + b)
+                .collect();
+            let qv: Vec<f32> = q[i][hh]
+                .iter()
+                .zip(w.pos_bias_v[hh].iter())
+                .map(|(a, b)| a + b)
+                .collect();
+            let mut row = vec![0.0f32; t];
+            for j in 0..t {
+                let ac: f32 = qu.iter().zip(k[j][hh].iter()).map(|(a, b)| a * b).sum();
+                // Window index runs opposite to the query-key distance:
+                // voted off ORT's own Add_2 = AC + shift(BD) during staged
+                // bring-up (see `ort_layer0_stages_parity`), kk = (j-i)+(T-1).
+                // The table itself is position-reversed
+                // (table[i] = PE(4999-i)), which is why the sign looks
+                // backwards.
+                let kk = (j as isize - i as isize + t as isize - 1) as usize;
+                let bd: f32 = qv.iter().zip(p[kk][hh].iter()).map(|(a, b)| a * b).sum();
+                row[j] = (ac + bd) * scale;
+            }
+            out[i].push(row);
+        }
+    }
+    out
+}
 /// Relative multi-head attention (Transformer-XL shift):
-/// B[i,j] = (q_i + v) . P[(i-j) + (T-1)], scores / sqrt(dh).
+/// B[i,j] = (q_i + v) . P[(j-i) + (T-1)], scores / sqrt(dh).
+/// Scores come from `rel_scores`; this adds softmax + value mixing.
 pub(crate) fn rel_attention(
     x: &[Vec<f32>],
     w: &BlockWeights,
@@ -359,44 +423,21 @@ pub(crate) fn rel_attention(
 ) -> Vec<Vec<f32>> {
     let t = x.len();
     let (h, dh) = (w.n_heads, w.d_head);
-    let q = split_heads(&linear_batch(&w.wq, x), h, dh);
-    let k = split_heads(&linear_batch(&w.wk, x), h, dh);
-    let v = split_heads(&linear_batch(&w.wv, x), h, dh);
-    let p = split_heads(&linear_batch(&w.wpos, pos_window), h, dh);
-    assert_eq!(p.len(), 2 * t - 1);
-    let scale = 1.0 / (dh as f32).sqrt();
+    let v = split_heads(
+        &linear_batch(&w.wv, x),
+        h,
+        dh,
+    );
+    let mut scores = rel_scores(x, w, pos_window);
+    // scores is [T][H][T]; softmax over keys per (frame, head).
     let mut heads_out = Vec::with_capacity(h);
     for hh in 0..h {
-        let mut scores = vec![vec![0.0f32; t]; t];
-        // BD[k] for all window positions once per query row.
-        let mut bd = vec![vec![0.0f32; 2 * t - 1]; t];
-        for i in 0..t {
-            let qv: Vec<f32> = q[i][hh]
-                .iter()
-                .zip(w.pos_bias_v[hh].iter())
-                .map(|(a, b)| a + b)
-                .collect();
-            for (kk, pk) in p.iter().enumerate() {
-                bd[i][kk] = qv.iter().zip(pk[hh].iter()).map(|(a, b)| a * b).sum();
-            }
-        }
-        for i in 0..t {
-            let qu: Vec<f32> = q[i][hh]
-                .iter()
-                .zip(w.pos_bias_u[hh].iter())
-                .map(|(a, b)| a + b)
-                .collect();
-            for j in 0..t {
-                let ac: f32 = qu.iter().zip(k[j][hh].iter()).map(|(a, b)| a * b).sum();
-                let kk = (i as isize - j as isize + t as isize - 1) as usize;
-                scores[i][j] = (ac + bd[i][kk]) * scale;
-            }
-        }
-        softmax_rows(&mut scores);
+        let mut per_head: Vec<Vec<f32>> = (0..t).map(|i| scores[i][hh].clone()).collect();
+        softmax_rows(&mut per_head);
         let mut o = vec![vec![0.0f32; dh]; t];
         for i in 0..t {
             for j in 0..t {
-                let a = scores[i][j];
+                let a = per_head[i][j];
                 for d in 0..dh {
                     o[i][d] += a * v[j][hh][d];
                 }
@@ -462,18 +503,6 @@ mod tests {
     use super::*;
     use crate::parakeet_burn::quant::Uint8Linear;
 
-    fn tiny_linear(w: Vec<u8>, zp: f32, s: f32, in_dim: usize, out_dim: usize) -> Uint8Linear {
-        // hand-quantized stand-in: exact when values fit (w-zp)*s
-        Uint8Linear {
-            weight_u8: w,
-            scale: vec![s; out_dim],
-            zero_point: vec![zp; out_dim],
-            bias: None,
-            in_dim,
-            out_dim,
-        }
-    }
-
     #[test]
     fn layernorm_matches_biased_definition() {
         let p = LayerNormP {
@@ -500,8 +529,10 @@ mod tests {
 
     #[test]
     fn dw_identity_kernel_preserves_interior() {
-        // k=3, center tap zp+1 with side taps at zp (dequant 0):
-        // out == in everywhere (zero pad contributes nothing).
+        // k=3, center tap zp+1 with side taps at zp (dequant 0).
+        // Constant input quantizes exactly (guard: s=1, zp=0), so out == in
+        // everywhere (zero pad contributes nothing, and the quantized pad
+        // value `zpx` likewise subtracts to zero).
         let dw = DwConv {
             weight_u8: vec![128, 129, 128],
             scale: 1.0,
@@ -512,7 +543,7 @@ mod tests {
             pad_left: 1,
             pad_right: 1,
         };
-        let x = vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]];
+        let x = vec![vec![2.0], vec![2.0], vec![2.0], vec![2.0]];
         let y = dw.forward(&x);
         assert_eq!(y.len(), 4);
         for (a, b) in y.iter().zip(x.iter()) {
@@ -533,31 +564,31 @@ mod tests {
 
     #[test]
     fn attention_relative_index_uses_distance() {
-        // 1 head, dh=2, d=2, T=2: identity projections, zero bias.
-        // pos window rows are distinct markers: P[k] = [10+k, 0].
-        // q=k=v=x=[[1,0],[0,1]].
-        let d = 2;
-        let ident = tiny_linear(vec![129, 128, 128, 129], 128.0, 1.0 / 127.0, d, d);
-        // dequant check: row0 = [(129-128)/127, 0] = [1/127, 0] — NOT identity!
-        // Build exact identity instead via scale trick below.
-        let _ = ident;
-        // exact identity: zp=0, s=1, w=[[1,0],[0,1]] needs u8 0/1 — fine.
+        // 1 head, dh=1, d=1, T=2: identity projections, zero bias.
+        // Markers increase with window index: P = [10, 20, 30].
+        // x = [[1], [0]] kills AC/BD on row 1 (uniform -> mean) while row
+        // 0 sees AC = [1, 0], BD = [P[1], P[2]] = [20, 30] under the
+        // correct kk = (j-i)+(T-1). Row 0 must therefore prefer key 1
+        // (output near v1 = 0); the flipped sign would put P[0] = 10 on
+        // key 1 and prefer key 0 instead. This pins the shift direction
+        // voted off ORT's Add_2 (see `rel_scores`).
         let eye = Uint8Linear {
-            weight_u8: vec![1, 0, 0, 1],
-            scale: vec![1.0, 1.0],
-            zero_point: vec![0.0, 0.0],
+            weight_u8: vec![1],
+            scale: vec![1.0],
+            zero_point: vec![0.0],
             bias: None,
-            in_dim: 2,
-            out_dim: 2,
+            in_dim: 1,
+            out_dim: 1,
         };
+        let one = LayerNormP { gamma: vec![1.0], beta: vec![0.0] };
         let w = BlockWeights {
             n_heads: 1,
-            d_head: 2,
-            norm_ff1: LayerNormP { gamma: vec![1.0, 1.0], beta: vec![0.0, 0.0] },
-            norm_att: LayerNormP { gamma: vec![1.0, 1.0], beta: vec![0.0, 0.0] },
-            norm_conv: LayerNormP { gamma: vec![1.0, 1.0], beta: vec![0.0, 0.0] },
-            norm_ff2: LayerNormP { gamma: vec![1.0, 1.0], beta: vec![0.0, 0.0] },
-            norm_out: LayerNormP { gamma: vec![1.0, 1.0], beta: vec![0.0, 0.0] },
+            d_head: 1,
+            norm_ff1: one.clone(),
+            norm_att: one.clone(),
+            norm_conv: one.clone(),
+            norm_ff2: one.clone(),
+            norm_out: one.clone(),
             ffn1_l1: eye.clone(),
             ffn1_l2: eye.clone(),
             ffn2_l1: eye.clone(),
@@ -567,51 +598,49 @@ mod tests {
             wv: eye.clone(),
             wpos: eye.clone(),
             wout: eye.clone(),
-            pos_bias_u: vec![vec![0.0, 0.0]],
-            pos_bias_v: vec![vec![0.0, 0.0]],
+            pos_bias_u: vec![vec![0.0]],
+            pos_bias_v: vec![vec![0.0]],
             pw1: Uint8Linear {
-                weight_u8: vec![1, 0, 0, 1, 0, 0, 0, 0],
-                scale: vec![1.0; 4],
-                zero_point: vec![0.0; 4],
-                bias: None,
-                in_dim: 2,
-                out_dim: 4,
-            },
-            pw2: Uint8Linear {
-                weight_u8: vec![1, 0, 0, 1],
+                weight_u8: vec![1, 0],
                 scale: vec![1.0, 1.0],
                 zero_point: vec![0.0, 0.0],
                 bias: None,
-                in_dim: 2,
+                in_dim: 1,
                 out_dim: 2,
             },
+            pw2: Uint8Linear {
+                weight_u8: vec![1],
+                scale: vec![1.0],
+                zero_point: vec![0.0],
+                bias: None,
+                in_dim: 1,
+                out_dim: 1,
+            },
             dw: DwConv {
-                weight_u8: vec![0, 1, 0, 0, 1, 0],
+                weight_u8: vec![0, 1, 0],
                 scale: 1.0,
                 zero_point: 0.0,
-                bias: vec![0.0, 0.0],
-                channels: 2,
+                bias: vec![0.0],
+                channels: 1,
                 kernel: 3,
                 pad_left: 1,
                 pad_right: 1,
             },
         };
-        // layernorm first: use pre-normalized inputs to keep them exact.
-        // x rows already zero-mean/unit-var-ish; attention on raw rows:
-        let x = vec![vec![1.0, -1.0], vec![-1.0, 1.0]];
-        let pw = vec![vec![10.0, 0.0], vec![20.0, 0.0], vec![30.0, 0.0]];
+        let x = vec![vec![1.0], vec![0.0]];
+        let pw = vec![vec![10.0], vec![20.0], vec![30.0]];
         let y = rel_attention(&x, &w, &pw);
         assert_eq!(y.len(), 2);
-        assert!(y.iter().all(|r| r.len() == 2 && r.iter().all(|v| v.is_finite())));
-        // Row 0 must attend more to j=0 (q0.k0=2 > q0.k1=-2, plus pos terms
-        // bounded by marker gaps): output closer to v0=[1,-1] than v1.
-        assert!(y[0][0] > 0.0 && y[0][1] < 0.0, "y={y:?}");
+        // Row 0: scores [1+20, 0+30] -> attends to key 1 (v=0).
+        assert!(y[0][0] < 0.1, "y={y:?}");
+        // Row 1: all-zero scores -> uniform mean of v = 0.5.
+        assert!((y[1][0] - 0.5).abs() < 1e-5, "y={y:?}");
         // Full block preserves shape and stays finite.
-        let table: Vec<Vec<f32>> = (0..9999).map(|i| vec![i as f32, 0.0]).collect();
+        let table: Vec<Vec<f32>> = (0..9999).map(|i| vec![i as f32]).collect();
         let win = pos_window(&table, 2);
-        let z = block_forward(&x, &w, &win);
+        let z = block_forward(&vec![vec![1.0], vec![0.0]], &w, &win);
         assert_eq!(z.len(), 2);
-        assert!(z.iter().all(|r| r.len() == 2 && r.iter().all(|v| v.is_finite())));
+        assert!(z.iter().all(|r| r.len() == 1 && r.iter().all(|v| v.is_finite())));
     }
 
     fn load_layer0(dir: &std::path::Path) -> (BlockWeights, Vec<Vec<f32>>) {
@@ -693,8 +722,7 @@ mod tests {
         assert!((var - 1.0).abs() < 5e-2, "var={var}");
     }
 
-    /// ORT parity for one full Conformer block: golden input is the real
-    /// pre-encode output for the T=64 seed-1234 mel (`layer0_golden`,
+    /// ORT parity for one full Conformer block: golden input is the real    /// pre-encode output for the T=64 seed-1234 mel (`layer0_golden`,
     /// `/layers.0/norm_out/LayerNormalization_output_0` from onnxruntime).
     /// This is the test that pins the MatMul `(K, N)` -> `[out][in]`
     /// transpose (see `Uint8Linear` docs): without it every Conformer
@@ -734,13 +762,118 @@ mod tests {
             }
         }
         let mean_abs = sum_abs / (8.0 * 1024.0);
-        // fp32 math vs dynamic int8 activations through 12 quantized
-        // linears: ~1% relative is activation-requantization noise.
-        // Bound holds ~2.5x margin over measured (max 0.85, mean 0.12
-        // at ref_max 75.8).
+        eprintln!("layer0: max_abs={max_abs:.6} mean_abs={mean_abs:.6} ref_max={ref_max:.3}");
+        // Full block is now numerically near-exact (integer quantized
+        // paths + f64 layernorm + voted shift; see the staged test).
+        // Measured 1.5e-5 at ref_max 75.8; bound holds wide margin.
         assert!(
-            max_abs < 0.03 * ref_max.max(1.0),
+            max_abs < 0.001 * ref_max.max(1.0),
             "max_abs={max_abs} mean_abs={mean_abs} ref_max={ref_max}"
         );
     }
-}
+
+    /// Staged ORT parity: each branch output (0.5*FFN1, attention,
+    /// conv, 0.5*FFN2) against ORT residual differences, plus pre-softmax
+    /// scores against the graph's `Div` output (`layer0_stages`,
+    /// `/layers.0/Add*` + `/layers.0/self_attn/Div`). Every branch runs on
+    /// ORT's own intermediate as input, so error never compounds: a
+    /// divergent sub-block (e.g. a flipped relative shift, or a new
+    /// rounding path) shows up at its own stage. Bounds hold ~20x margin
+    /// over measured (branches <= 4.3e-4, scores 2e-5).
+    /// Ignored: needs converted weights on disk.
+    /// `cargo test --features parakeet-burn -- --ignored`.
+    #[test]
+    #[ignore]
+    fn ort_layer0_stages_parity() {
+        let dir = std::path::Path::new("models/parakeet-tdt-0.6b-v3-int8");
+        let (bw, table) = load_layer0(dir);
+        let gbytes = std::fs::read("src/parakeet_burn/testdata/layer0_golden.safetensors").unwrap();
+        let gst = safetensors::SafeTensors::deserialize(&gbytes).unwrap();
+        let f32mat = |st: &safetensors::SafeTensors<'_>, name: &str, rows: usize, cols: usize| -> Vec<Vec<f32>> {
+            let v = st.tensor(name).unwrap();
+            assert_eq!(v.shape(), &[rows, cols]);
+            v.data()
+                .chunks(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<f32>>()
+                .chunks(cols)
+                .map(|c| c.to_vec())
+                .collect()
+        };
+        let x = f32mat(&gst, "blk_in_T1024", 8, 1024);
+        let sbytes = std::fs::read("src/parakeet_burn/testdata/layer0_stages.safetensors").unwrap();
+        let sst = safetensors::SafeTensors::deserialize(&sbytes).unwrap();
+        let add0 = f32mat(&sst, "Add", 8, 1024);
+        let add1 = f32mat(&sst, "Add_1", 8, 1024);
+        let add2 = f32mat(&sst, "Add_2", 8, 1024);
+        let add3 = f32mat(&sst, "Add_3", 8, 1024);
+        let sub = |a: &[Vec<f32>], b: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            a.iter()
+                .zip(b.iter())
+                .map(|(ra, rb)| ra.iter().zip(rb.iter()).map(|(p, q)| p - q).collect())
+                .collect()
+        };
+        let check = |tag: &str, got: &[Vec<f32>], want: &[Vec<f32>]| {
+            let (mut mx, mut sm) = (0.0f32, 0.0f32);
+            let mut rm = 0.0f32;
+            for (a, b) in got.iter().zip(want.iter()) {
+                for (p, q) in a.iter().zip(b.iter()) {
+                    mx = mx.max((p - q).abs());
+                    sm += (p - q).abs();
+                    rm = rm.max(q.abs());
+                }
+            }
+            eprintln!("{tag}: max_abs={mx:.6} mean_abs={:.6} ref_max={rm:.3}", sm / 8192.0);
+            assert!(mx < 0.01, "{tag}: max_abs={mx} ref_max={rm}");
+        };
+        // Residual chain: add0 = x+f1, add1 = add0+a, add2 = add1+c,
+        // add3 = add2+f2. Each branch input is layernormed above.
+        let mut f1 = ffn(&layernorm_batch(&x, &bw.norm_ff1), &bw.ffn1_l1, &bw.ffn1_l2);
+        for r in f1.iter_mut() {
+            for v in r.iter_mut() {
+                *v *= 0.5;
+            }
+        }
+        check("ffn1", &f1, &sub(&add0, &x));
+        let win = pos_window(&table, 8);
+        let a = rel_attention(&layernorm_batch(&add0, &bw.norm_att), &bw, &win);
+        check("attn", &a, &sub(&add1, &add0));
+        let c = conv_block(&layernorm_batch(&add1, &bw.norm_conv), &bw);
+        check("conv", &c, &sub(&add2, &add1));
+        let mut f2 = ffn(&layernorm_batch(&add2, &bw.norm_ff2), &bw.ffn2_l1, &bw.ffn2_l2);
+        for r in f2.iter_mut() {
+            for v in r.iter_mut() {
+                *v *= 0.5;
+            }
+        }
+        check("ffn2", &f2, &sub(&add3, &add2));
+        // Pre-softmax scores: ORT's Div is [H,T,T]; `rel_scores` returns
+        // [T,H,T], transposed here for the comparison.
+        let div_v = sst.tensor("self_attn_Div").unwrap();
+        assert_eq!(div_v.shape(), &[8, 8, 8]);
+        let divf: Vec<f32> = div_v
+            .data()
+            .chunks(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let sc = rel_scores(&layernorm_batch(&add0, &bw.norm_att), &bw, &win);
+        let mut flat_htt = vec![0.0f32; 512];
+        for i in 0..8 {
+            for hh in 0..8 {
+                for j in 0..8 {
+                    flat_htt[(hh * 8 + i) * 8 + j] = sc[i][hh][j];
+                }
+            }
+        }
+        let (mut mx, mut sm) = (0.0f32, 0.0f32);
+        let mut rm = 0.0f32;
+        for (p, q) in flat_htt.iter().zip(divf.iter()) {
+            mx = mx.max((p - q).abs());
+            sm += (p - q).abs();
+            rm = rm.max(q.abs());
+        }
+        eprintln!("scores: max_abs={mx:.6} mean_abs={:.6} ref_max={rm:.3}", sm / 512.0);
+        assert!(mx < 0.001, "scores: max_abs={mx} ref_max={rm}");
+    }
+
+    }

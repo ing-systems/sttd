@@ -4,11 +4,12 @@
 // for encoder MatMuls/Convs and the decoder embed/joint, int8 for the
 // decoder LSTMs) plus *dynamic* activation quantization
 // (`DynamicQuantizeLinear` + `MatMulInteger` + `ConvInteger`,
-// `DynamicQuantizeLSTM`). Burn's native 8-bit GEMM coverage is still
-// maturing, so this module stores weights as 8-bit + scale (+ zero-point)
-// — 8-bit-now on disk/VRAM — and dequantizes to f32 for the Burn matmul.
-// Swapping the inner matmul for a native quantized kernel later changes
-// no call sites — only `forward`.
+// `DynamicQuantizeLSTM`). This module stores weights as 8-bit + scale
+// (+ zero-point) — 8-bit-now on disk/VRAM — and mirrors the graph's
+// dynamic path in integer arithmetic (`dynamic_quantize_u8` +
+// i64 MAC + one f32 scale-up), so the residual vs ORT is f32 rounding
+// only (1-op probe: 1.5e-6). Swapping the inner loops for native Burn
+// tensor ops later changes speed, not numerics.
 
 /// One row-quantized int8 Linear: `y = ((w_i8 - zp) * scale) @ x + bias`.
 #[derive(Debug, Clone)]
@@ -98,17 +99,44 @@ pub(crate) fn transpose_u8(d: &[u8], rows: usize, cols: usize) -> Vec<u8> {
     t
 }
 
-/// Dynamically quantize activations to int8 (mirrors ONNX
-/// `DynamicQuantizeLinear`: per-row scale, no zero-point).
-pub(crate) fn dynamic_quantize_row(x: &[f32]) -> (Vec<i8>, f32) {
-    Int8Linear::quantize_row(x)
+/// Dynamically quantize activations the way ORT's `DynamicQuantizeLinear`
+/// does (pinned by 1-node probe models: asymmetric uint8, per-tensor over
+/// the whole input, with the range forced to include zero —
+/// `lo = min(0, min)`, `hi = max(0, max)`, `s = (hi - lo) / 255`,
+/// `zp = clamp(round(-lo / s))`, `q = clamp(round(x / s) + zp)`).
+/// All-zero input yields `s = 1.0`, `zp = 0` (also probed).
+/// Returns `(quantized, scale, zero_point)`.
+///
+/// One deliberate unknown: the exact .5 rounding mode (Rust `round`
+/// rounds half away from zero; no probe produced an exact .5 to tell).
+/// At most 1 LSB on a negligible share of values.
+pub(crate) fn dynamic_quantize_u8(xs: &[f32]) -> (Vec<u8>, f32, u8) {
+    assert!(!xs.is_empty());
+    let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &v in xs {
+        mn = mn.min(v);
+        mx = mx.max(v);
+    }
+    let (lo, hi) = (mn.min(0.0), mx.max(0.0));
+    let range = hi - lo;
+    if !(range > 0.0) {
+        return (vec![0; xs.len()], 1.0, 0);
+    }
+    let s = range / 255.0;
+    let zp = ((-lo / s).round() as i32).clamp(0, 255) as u8;
+    let q = xs
+        .iter()
+        .map(|&v| ((v / s).round() as i32 + zp as i32).clamp(0, 255) as u8)
+        .collect();
+    (q, s, zp)
 }
 
 /// One asymmetrically-quantized uint8 Linear (encoder MatMuls/Convs,
-/// decoder embed + joint):
-/// `y = (((w_u8 - zp) * scale)) @ x + bias`, zp scalar-or-per-row.
-///
-/// Storage is ALWAYS `[out][in]` row-major. ONNX `MatMul` weights are
+/// decoder embed + joint). Mirrors the graph's
+/// `DynamicQuantizeLinear -> MatMulInteger -> Mul(scales) -> Add(bias)`
+/// chain in integer arithmetic: `y = Σ(Xq-zpx)(Wq-zpw) * sx*sw + b`,
+/// zp scalar-or-per-row.
+////// Storage is ALWAYS `[out][in]` row-major. ONNX `MatMul` weights are
 /// `(K, N) = (in, out)` — transpose them with `transpose_u8` at load
 /// (a no-op only for square shapes, which is why square-only tests
 /// never caught a missing transpose). ONNX 1x1 `Conv` weights are
@@ -133,14 +161,50 @@ impl Uint8Linear {
             .collect()
     }
 
-    /// `y = W x + b`, `x: [in]`, returns `[out]`.
+    /// Integer MAC of one quantized activation row against weight row
+    /// `o`: `Σ (xq - zpx) * (wq - zpw)` in i64 (no overflow: at most
+    /// 4096 terms of ±127×±255).
+    fn mac_row(&self, xq: &[u8], zpx: u8, o: usize) -> i64 {
+        let zpw = self.zero_point[o.min(self.zero_point.len() - 1)].round() as i64;
+        let base = o * self.in_dim;
+        let mut acc = 0i64;
+        for (k, &q) in xq.iter().enumerate() {
+            acc += (q as i64 - zpx as i64) * (self.weight_u8[base + k] as i64 - zpw);
+        }
+        acc
+    }
+
+    /// `y = W x + b` with `x` dynamically quantized per-tensor over the
+    /// single row (matches the graph for 1-row inputs such as the joint's
+    /// `[1,1,K]` frames). Multi-row callers must use `forward_batch` so
+    /// the quantization spans the whole input tensor like ORT's does.
     pub(crate) fn forward(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), self.in_dim);
+        let (xq, sx, zpx) = dynamic_quantize_u8(x);
+        self.mac_all(&xq, sx, zpx)
+    }
+
+    /// Batched `forward`: the activation quantization spans every row
+    /// (per-tensor, as ORT quantizes the whole `[T,K]` input at once).
+    pub(crate) fn forward_batch(&self, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        assert!(xs.iter().all(|r| r.len() == self.in_dim));
+        let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
+        if flat.is_empty() {
+            return Vec::new();
+        }
+        let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
+        xq.chunks(self.in_dim)
+            .map(|row| self.mac_all(row, sx, zpx))
+            .collect()
+    }
+
+    /// Scale one quantized row's MACs into fp32 outputs (+ bias).
+    fn mac_all(&self, xq: &[u8], sx: f32, zpx: u8) -> Vec<f32> {
         let rows = self.weight_u8.len() / self.in_dim;
         let mut y = vec![0.0f32; rows];
         for (o, yo) in y.iter_mut().enumerate() {
-            let dq = self.dequant_row(o);
-            let mut acc: f32 = dq.iter().zip(x.iter()).map(|(w, xi)| w * xi).sum();
+            let s = self.scale[o.min(self.scale.len() - 1)];
+            let mut acc = self.mac_row(xq, zpx, o) as f32 * (sx * s);
             if let Some(b) = &self.bias {
                 acc += b[o];
             }
@@ -153,6 +217,57 @@ impl Uint8Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_quantize_matches_ort_probe() {
+        // Values from the 1-node ORT probe (`probe_dql.py`): asymmetric
+        // uint8, per-tensor — s=(3-(-2))/255, zp=102, rows as observed.
+        let (q, s, zp) = dynamic_quantize_u8(&[1.0, -2.0, 3.0, 0.5, 0.5, 0.5]);
+        assert!((s - 0.019607844).abs() < 1e-7, "s={s}");
+        assert_eq!(zp, 102);
+        assert_eq!(q, vec![153, 0, 255, 128, 128, 128]);
+    }
+
+    #[test]
+    fn dynamic_quantize_constant_input_stays_exact() {
+        // Positive-constant input: range forced to [0, max], so
+        // s = max/255, zp = 0, q saturates high — and reconstructs max.
+        let (q, s, zp) = dynamic_quantize_u8(&[1.0, 1.0]);
+        assert!((s - 1.0 / 255.0).abs() < 1e-9, "s={s}");
+        assert_eq!((q, zp), (vec![255, 255], 0));
+    }
+
+    #[test]
+    fn dynamic_quantize_all_zero_is_guarded() {
+        // Probed ORT behavior: s = 1.0, zp = 0, all-zero output.
+        assert_eq!(dynamic_quantize_u8(&[0.0, 0.0]), (vec![0, 0], 1.0, 0));
+    }
+
+    #[test]
+    fn forward_batch_quantizes_per_tensor() {
+        // Identity weights, zp 0: outputs reconstruct the inputs up to
+        // 1-LSB rounding. Two rows quantized jointly (min=-2, max=3 over
+        // all 4 elements): row0 -> [153, 0], row1 -> [255, 128].
+        let lin = Uint8Linear {
+            weight_u8: vec![1, 0, 0, 1],
+            scale: vec![1.0, 1.0],
+            zero_point: vec![0.0, 0.0],
+            bias: None,
+            in_dim: 2,
+            out_dim: 2,
+        };
+        let batched = lin.forward_batch(&[vec![1.0, -2.0], vec![3.0, 0.5]]);
+        assert_eq!(batched.len(), 2);
+        for (got, want) in batched.iter().zip([vec![1.0, -2.0], vec![3.0, 0.5]]) {
+            for (a, b) in got.iter().zip(want.iter()) {
+                assert!((a - b).abs() < 0.02, "got={batched:?}");
+            }
+        }
+        // Solo spans only its own row (min=-2, max=1): same values back
+        // within its own coarser scale.
+        let solo = lin.forward(&[1.0, -2.0]);
+        assert!((solo[0] - 1.0).abs() < 0.02 && (solo[1] + 2.0).abs() < 0.02);
+    }
 
     #[test]
     fn int8_linear_matches_fp32_matmul() {
@@ -226,6 +341,9 @@ mod tests {
             out_dim: 2,
         };
         // y[0] = 1*x0 + 3*x1 + 5*x2 (column 0 of the (K,N) store).
-        assert_eq!(lin.forward(&[1.0, 1.0, 1.0]), vec![9.0, 12.0]);
+        // Approximate: the integer path scales by 1/255, which is not
+        // exactly representable in f32 (1-ULP error).
+        let y = lin.forward(&[1.0, 1.0, 1.0]);
+        assert!((y[0] - 9.0).abs() < 1e-4 && (y[1] - 12.0).abs() < 1e-4, "y={y:?}");
     }
 }

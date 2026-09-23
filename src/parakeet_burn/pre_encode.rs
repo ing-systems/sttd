@@ -65,14 +65,22 @@ impl Conv2dW {
 }
 
 /// `[C][H][W]` in, `[C'][H'][W']` out. `H' = (H + 2*pad - k)/s + 1`.
+/// Mirrors `ConvInteger -> Mul(scales)`: the input is dynamically
+/// quantized per-tensor (see `quant` docs) and the MAC runs in integer
+/// arithmetic; the weight scale applies after. Bias lands later via
+/// `add_bias_relu`, matching the graph's Add order.
 fn conv2d_forward(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
+    use super::quant::dynamic_quantize_u8;
     assert_eq!(x.len(), w.in_c);
     let h = x[0].len();
     let wd = x[0][0].len();
     assert!(x.iter().all(|c| c.len() == h && c.iter().all(|r| r.len() == wd)));
     let oh = (h + 2 * w.pad - w.kernel) / w.stride + 1;
     let ow = (wd + 2 * w.pad - w.kernel) / w.stride + 1;
-    let wf = w.dequant();
+    let flat: Vec<f32> = x.iter().flat_map(|c| c.iter().flat_map(|r| r.iter().copied())).collect();
+    let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
+    let xq3: Vec<&[u8]> = xq.chunks(h * wd).collect();
+    let zpw = w.zero_point.round() as i64;
     let icg = w.in_c / w.group; // input channels per group
     let k2 = w.kernel * w.kernel;
     // weight base offset for (oc, ic): ((oc * icg) + ic) * k2
@@ -81,7 +89,7 @@ fn conv2d_forward(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
         let g = oc / (w.out_c / w.group);
         for oy in 0..oh {
             for ox in 0..ow {
-                let mut acc = 0.0f32;
+                let mut acc = 0i64;
                 for ic in 0..icg {
                     let c = g * icg + ic;
                     let base = (oc * icg + ic) * k2;
@@ -95,11 +103,12 @@ fn conv2d_forward(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
                             if ix < w.pad || ix >= wd + w.pad {
                                 continue;
                             }
-                            acc += wf[base + ky * w.kernel + kx] * x[c][iy - w.pad][ix - w.pad];
+                            acc += (xq3[c][(iy - w.pad) * wd + (ix - w.pad)] as i64 - zpx as i64)
+                                * (w.weight_u8[base + ky * w.kernel + kx] as i64 - zpw);
                         }
                     }
                 }
-                y[oc][oy][ox] = acc;
+                y[oc][oy][ox] = acc as f32 * (sx * w.scale);
             }
         }
     }
@@ -323,7 +332,9 @@ impl PreEncodeWeights {
                 self.out.in_dim
             );
         }
-        Ok(flat.iter().map(|r| self.out.forward(r)).collect())
+        // Batched: the out-projection's activation quantization spans
+        // the whole `[T',4096]` input like ORT's (see `quant` docs).
+        Ok(self.out.forward_batch(&flat))
     }
 }
 
@@ -371,7 +382,9 @@ mod tests {
 
     #[test]
     fn conv_stride_pad_geometry_is_exact() {
-        // 1ch 4x4, all-ones k3 s2 p1, no bias: hand-computed sums.
+        // 1ch 4x4 constant 2.0, all-ones k3 s2 p1, no bias. Constant input
+        // quantizes exactly, so the hand-computed window sums hold:
+        // window [0,0] covers 4 real cells, [0,1]/[1,0] cover 6, [1,1] 9.
         let w = Conv2dW {
             weight_u8: vec![1; 9],
             scale: 1.0,
@@ -384,23 +397,25 @@ mod tests {
             stride: 2,
             pad: 1,
         };
-        let x = vec![vec![
-            vec![1.0, 2.0, 3.0, 4.0],
-            vec![5.0, 6.0, 7.0, 8.0],
-            vec![9.0, 10.0, 11.0, 12.0],
-            vec![13.0, 14.0, 15.0, 16.0],
-        ]];
+        let x = vec![vec![vec![2.0; 4]; 4]];
         let y = conv2d_forward(&w, &x);
         assert_eq!(y.len(), 1);
         assert_eq!(y[0].len(), 2);
-        // Window [0,0] covers the zero pad row/col: 0+0+0+0+1+2+0+5+6.
-        assert_eq!(y[0][0], vec![14.0, 30.0]);
-        assert_eq!(y[0][1], vec![57.0, 99.0]);
+        // Approximate: the integer path scales by max/255, which is not
+        // exactly representable in f32 (1-ULP error).
+        for (got, want) in y[0][0].iter().zip([8.0, 12.0]) {
+            assert!((got - want).abs() < 1e-4, "y={y:?}");
+        }
+        for (got, want) in y[0][1].iter().zip([12.0, 18.0]) {
+            assert!((got - want).abs() < 1e-4, "y={y:?}");
+        }
     }
 
     #[test]
     fn depthwise_routes_channels() {
-        // group=2, k1 s1: out[ch] = w_ch * in[ch].
+        // group=2, k1 s1: out[ch] = w_ch * in[ch]. Zero-centered values
+        // quantize without saturation (see `quant` docs); the 1-LSB
+        // rounding rides through the small weights.
         let w = Conv2dW {
             weight_u8: vec![3, 5],
             scale: 1.0,
@@ -413,10 +428,10 @@ mod tests {
             stride: 1,
             pad: 0,
         };
-        let x = vec![vec![vec![2.0]], vec![vec![4.0]]];
+        let x = vec![vec![vec![-2.0]], vec![vec![4.0]]];
         let y = conv2d_forward(&w, &x);
-        assert_eq!(y[0][0][0], 6.0);
-        assert_eq!(y[1][0][0], 20.0);
+        assert!((y[0][0][0] + 6.0).abs() < 0.1, "y={y:?}");
+        assert!((y[1][0][0] - 20.0).abs() < 0.1, "y={y:?}");
     }
 
     #[test]
@@ -464,14 +479,10 @@ mod tests {
     #[test]
     fn forward_plumbing_preserves_order() {
         let w = tiny_weights();
-        // width must be 128 for the real loader path; the tiny net uses
-        // width 2 and bypasses that check via direct struct build.
-        let mel = vec![
-            vec![1.0, 2.0],
-            vec![3.0, 4.0],
-            vec![5.0, 6.0],
-            vec![7.0, 8.0],
-        ];
+        // Constant mel quantizes exactly, so the identity stages preserve
+        // it bit-for-bit; the width-128 check is bypassed by staging
+        // manually (see `forward_rejects_bad_width` for the real entry).
+        let mel = vec![vec![3.0, 3.0]; 4];
         // forward() asserts width 128, so call stages manually here.
         let mut x = vec![mel.clone()];
         for (c, relu) in [
@@ -489,7 +500,7 @@ mod tests {
         // flatten [1][4][2] -> [4][2], out sums + bias.
         let flat: Vec<Vec<f32>> = (0..4).map(|t| x[0][t].clone()).collect();
         let y: Vec<Vec<f32>> = flat.iter().map(|r| w.out.forward(r)).collect();
-        assert_eq!(y, vec![vec![13.0], vec![17.0], vec![21.0], vec![25.0]]);
+        assert_eq!(y, vec![vec![16.0]; 4]);
     }
 
     #[test]
@@ -576,13 +587,12 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let ref_max = ref_f.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-        // fp32 math vs the graph's dynamic int8 activations: exact
-        // structure, activation-requantization noise only. Cross-checked
-        // with an independent numpy fp32 replication (max_abs 85.646 vs
-        // 85.650 here, bias 0.10): the residual is ORT-side rounding,
-        // not a layout error. Bound holds 2x margin over measured.
+        eprintln!("pre_encode: max_abs={max_abs:.5} ref_max={ref_max:.3}");
+        // Integer emulation of the graph's DynamicQuantizeLinear /
+        // ConvInteger chain (see `quant` docs): residual is f32 rounding
+        // only (measured < 5e-6 at ref_max 3921). Bound holds wide margin.
         assert!(
-            max_abs < 0.05 * ref_max.max(1.0),
+            max_abs < 0.001 * ref_max.max(1.0),
             "max_abs={max_abs} ref_max={ref_max}"
         );
     }
