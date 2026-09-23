@@ -1040,6 +1040,9 @@ fn transcribe_and_emit(
     let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let decoded_samples = model.decoded_sample_count(conditioned.len());
     let (audio_sec, rtf) = infer_rtf(decoded_samples, infer_ms);
+    log::info!(
+        "{tag}: transcribe took {infer_ms:.0} ms ({audio_sec:.1} s audio, rtf={rtf:.2})"
+    );
     if rtf > RTF_WARN_RTF {
         log::warn!(
             "{tag}: inference slower than realtime (rtf={rtf:.2}, {infer_ms:.0} ms for \

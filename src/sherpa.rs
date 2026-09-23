@@ -739,6 +739,9 @@ fn emit_stream_final(
     // What was actually decoded (post-pad), so RTF reflects the model input.
     let decoded_samples = conditioned.len().max(PARAKEET_MIN_SAMPLES);
     let (audio_sec, rtf) = crate::asr::infer_rtf(decoded_samples, infer_ms);
+    log::info!(
+        "{tag}: transcribe took {infer_ms:.0} ms ({audio_sec:.1} s audio, rtf={rtf:.2})"
+    );
     if rtf > RTF_WARN_RTF {
         log::warn!(
             "{tag}: inference slower than realtime (rtf={rtf:.2}, {infer_ms:.0} ms for \
