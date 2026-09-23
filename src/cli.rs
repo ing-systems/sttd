@@ -21,6 +21,18 @@ use crate::dsp::{parse_channel_sel, ChannelSel};
 #[cfg(feature = "whisper")]
 use crate::whisper::Language;
 
+/// How `--paste` inserts text via `ydotool` (Wayland only).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PasteMode {
+    /// LEFTCTRL+V (default).
+    #[default]
+    CtrlV,
+    /// LEFTCTRL+LEFTSHIFT+V (terminals).
+    CtrlShiftV,
+    /// `ydotool type` via stdin (no clipboard, layout-dependent).
+    Type,
+}
+
 /// Real-time Polish-English speech-to-text.
 ///
 /// Precedence for every tunable is: CLI flag > environment variable >
@@ -222,6 +234,20 @@ pub(crate) struct Cli {
     )]
     pub(crate) min_conf_strong: f32,
 
+    /// Remove hesitation/filler words (yyy, eee, um, ...) from emitted
+    /// transcripts. Off by default: the list is stripped whatever the
+    /// language, so it can delete real words.
+    #[arg(
+        long,
+        env = "STTD_REMOVE_HESITATIONS",
+        default_value_t = false,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Transcript gates"
+    )]
+    pub(crate) remove_hesitations: bool,
+
     /// Copy each accepted transcript to the Wayland clipboard via `wl-copy`.
     /// Gates auto-paste together with `--paste`: paste only runs on fresh
     /// content, so both must be true for anything to be inserted.
@@ -236,9 +262,10 @@ pub(crate) struct Cli {
     )]
     pub(crate) copy: bool,
 
-    /// Paste the clipboard at the cursor via `ydotool key` (fixed Ctrl+V,
-    /// Wayland only, requires `ydotoold` running). Skipped when the copy
-    /// above did not run.
+    /// Paste the clipboard at the cursor via `ydotool` (Wayland only,
+    /// requires `ydotoold` running). Skipped when the copy above did not run.
+    /// `--paste-mode` selects the key sequence (`ctrl-v` default,
+    /// `ctrl-shift-v` for terminals, `type` to type via `ydotool type`).
     #[arg(
         long,
         env = "STTD_PASTE",
@@ -249,6 +276,28 @@ pub(crate) struct Cli {
         help_heading = "Emission"
     )]
     pub(crate) paste: bool,
+
+    /// How `--paste` inserts: `ctrl-v` (LEFTCTRL+V), `ctrl-shift-v`
+    /// (LEFTCTRL+LEFTSHIFT+V for terminals), or `type` (`ydotool type`
+    /// via stdin, no clipboard). Wayland only.
+    #[arg(
+        long,
+        env = "STTD_PASTE_MODE",
+        value_enum,
+        ignore_case = true,
+        default_value_t = PasteMode::CtrlV,
+        help_heading = "Emission"
+    )]
+    pub(crate) paste_mode: PasteMode,
+
+    /// Re-copy and re-paste the last emitted transcription and exit.
+    /// Reads the daemon's last-text file; warns when none exists yet.
+    #[arg(
+        long,
+        help_heading = "Emission",
+        conflicts_with_all = ["file", "list_devices", "list_models", "start", "stop", "status"]
+    )]
+    pub(crate) paste_last: bool,
 
     /// Print each accepted transcript to stdout (one line per utterance).
     /// Opt-in: off by default.
@@ -517,6 +566,9 @@ mod tests {
         assert_eq!(cli.vad_adapt, DEFAULT_VAD_ADAPT);
         assert!(!cli.copy);
         assert!(!cli.paste);
+        assert_eq!(cli.paste_mode, PasteMode::CtrlV);
+        assert!(!cli.paste_last);
+        assert!(!cli.remove_hesitations);
         assert!(!cli.stdout);
         assert!(cli.start_paused);
         assert!(!cli.autopause);
@@ -728,6 +780,30 @@ mod tests {
         assert!(Cli::try_parse_from(["sttd", "--start", "--list-devices"]).is_err());
         assert!(Cli::try_parse_from(["sttd", "--start", "--list-models"]).is_err());
         assert!(Cli::try_parse_from(["sttd", "--stop", "--status"]).is_err());
+    }
+
+    #[test]
+    fn cli_paste_last_conflicts_and_parses() {
+        assert!(Cli::try_parse_from(["sttd", "--paste-last", "--file", "a.wav"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--paste-last", "--start"]).is_err());
+        let cli = Cli::try_parse_from(["sttd", "--paste-last"]).expect("must parse");
+        assert!(cli.paste_last);
+    }
+
+    #[test]
+    fn cli_paste_mode_and_hesitations_parse() {
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert_eq!(cli.paste_mode, PasteMode::CtrlV);
+        assert!(!cli.remove_hesitations);
+        let cli = Cli::try_parse_from(["sttd", "--paste-mode", "ctrl-shift-v"])
+            .expect("must parse");
+        assert_eq!(cli.paste_mode, PasteMode::CtrlShiftV);
+        let cli =
+            Cli::try_parse_from(["sttd", "--paste-mode", "type"]).expect("must parse");
+        assert_eq!(cli.paste_mode, PasteMode::Type);
+        let cli =
+            Cli::try_parse_from(["sttd", "--remove-hesitations"]).expect("bare flag must parse");
+        assert!(cli.remove_hesitations);
     }
 
     #[test]

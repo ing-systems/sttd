@@ -77,6 +77,7 @@ use config::{parakeet_entry_for_spec, DEFAULT_MODELS_DIR, PARAKEET_CATALOG};
 use config::{model_file_for_spec, DEFAULT_PROMPT, DEFAULT_TRANSLATE_PROMPT, MODEL_CATALOG};
 mod capture;
 use capture::*;
+mod clean;
 mod daemon;
 mod denoise;
 mod dictionary;
@@ -124,6 +125,9 @@ fn main() -> Result<()> {
     if cli.list_models {
         print_available_models(&cli);
         return Ok(());
+    }
+    if cli.paste_last {
+        return run_paste_last(&cli);
     }
     if let Some(path) = cli.file.clone() {
         return run_file_mode(&path, &cli);
@@ -1062,7 +1066,37 @@ fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
         metrics_path: cli.metrics.clone(),
         shed_stale,
         dictionary: load_dictionary_or_warn(cli),
+        remove_hesitations: cli.remove_hesitations,
     }
+}
+
+/// Re-copy and re-paste the last emitted transcription. One-shot: reads the
+/// daemon's last-text file written on every emission. `type` mode types
+/// directly without touching the clipboard; key modes copy via `wl-copy`
+/// then paste via `ydotool`. Warns (no failure) when no emission exists yet.
+fn run_paste_last(cli: &Cli) -> Result<()> {
+    let path = crate::emit::last_text_path();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let text = text.trim();
+    if text.is_empty() {
+        log::warn!("paste-last: no emitted transcription yet ({})", path.display());
+        return Ok(());
+    }
+    if !crate::emit::is_wayland_session_env() {
+        log::warn!("paste-last: not a Wayland session; copy attempted anyway");
+    }
+    if cli.paste_mode == crate::cli::PasteMode::Type {
+        crate::emit::type_via_ydotool(text)
+            .context("paste-last: ydotool type failed (is ydotoold running?)")?;
+        log::info!("paste-last: typed {} chars", text.chars().count());
+        return Ok(());
+    }
+    crate::emit::copy_to_clipboard(text).context("paste-last: wl-copy failed")?;
+    log::info!("paste-last: copied {} chars", text.chars().count());
+    crate::emit::paste_via_ydotool(cli.paste_mode).context(
+        "paste-last: ydotool failed (is ydotoold running?)",
+    )?;
+    Ok(())
 }
 
 /// Load `--dictionary` once at startup. A broken path warns and disables
@@ -1104,7 +1138,13 @@ fn load_dictionary_or_warn(cli: &Cli) -> Vec<String> {
 /// `Cli`. Runs on the main thread before the worker spawns, so a bad dump
 /// dir fails fast like the model load it precedes.
 fn make_emitter(cli: &Cli) -> Result<SystemEmitter> {
-    SystemEmitter::new(cli.dump_dir.clone(), cli.copy, cli.paste, cli.stdout)
+    SystemEmitter::new(
+        cli.dump_dir.clone(),
+        cli.copy,
+        cli.paste,
+        cli.paste_mode,
+        cli.stdout,
+    )
 }
 
 

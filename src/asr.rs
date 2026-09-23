@@ -187,6 +187,9 @@ pub(crate) struct AsrOptions {
     /// Custom vocabulary for post-gate correction (see `dictionary`).
     /// Empty = off. Loaded once at startup, fixed for the process lifetime.
     pub(crate) dictionary: Vec<String>,
+    /// Strip hesitation/filler words in post-gate cleaning (see `clean`).
+    /// Off by default.
+    pub(crate) remove_hesitations: bool,
     /// Append per-utterance JSON metrics here when `Some` (see `--metrics`).
     /// Opened by the worker at startup; open errors only warn, never fail
     /// transcription.
@@ -381,6 +384,7 @@ fn asr_init_and_run(
     let shed_stale = opts.shed_stale;
     let gate = opts.gate.clone();
     let dictionary = opts.dictionary.clone();
+    let remove_hesitations = opts.remove_hesitations;
     let unload_after = Duration::from_secs(auto_unload_after_secs);
     // Observability only: a broken metrics path must never take down
     // transcription, so open errors warn once and disable the log.
@@ -476,6 +480,7 @@ fn asr_init_and_run(
                 emitter,
                 &mut metrics,
                 &dictionary,
+                remove_hesitations,
                 &mut prev_emit_text,
             );
             if should_autopause(autopause_enabled, emitted) {
@@ -613,6 +618,7 @@ fn asr_init_and_run(
                             emitter,
                             &mut metrics,
                             &dictionary,
+                            remove_hesitations,
                             &mut prev_emit_text,
                         );
                         if should_autopause(autopause_enabled, emitted) {
@@ -1005,6 +1011,7 @@ fn transcribe_and_emit(
     emitter: &mut impl Emitter,
     metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
     dictionary: &[String],
+    remove_hesitations: bool,
     prev_emit_text: &mut String,
 ) -> bool {
     let tag = format!("utt_{utterance_no:06}");
@@ -1060,17 +1067,17 @@ fn transcribe_and_emit(
             let deduped_trimmed = deduped.trim();
             let prob = t.confidence.as_ref().map(|c| c.prob);
             let logprob = t.confidence.as_ref().map(|c| c.logprob);
-            let verdict = gate.decide_transcript(
+            let mut verdict = gate.decide_transcript(
                 utterance.evidence.speech_frames,
                 utterance.evidence.rms,
                 deduped_trimmed,
                 prob,
             );
-            let emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit { .. });
+            let mut emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit { .. });
             // Post-gate dictionary polish only: drops stay drops, so a
             // near-miss key cannot resurrect boilerplate. `None` confidences
             // = Phase A ungated (see `dictionary`).
-            let final_text = if emitted && !dictionary.is_empty() {
+            let mut final_text = if emitted && !dictionary.is_empty() {
                 let corrected =
                     crate::dictionary::correct_transcription(deduped_trimmed, dictionary, None);
                 if corrected != deduped_trimmed {
@@ -1080,6 +1087,20 @@ fn transcribe_and_emit(
             } else {
                 deduped_trimmed.to_string()
             };
+            // Post-gate cleaning: collapse 3+ repeats to 2, optionally strip
+            // fillers. Gate ran first, so pathological loops already dropped.
+            if emitted {
+                let cleaned = crate::clean::clean_transcription(&final_text, remove_hesitations);
+                if cleaned != final_text {
+                    log::debug!("{tag}: clean {final_text:?} -> {cleaned:?}");
+                }
+                final_text = cleaned;
+                if final_text.trim().is_empty() {
+                    verdict = crate::gate::TranscriptVerdict::DropEmpty;
+                    emitted = false;
+                    final_text.clear();
+                }
+            }
             let final_trimmed = final_text.trim();
             // Only prompt-consuming engines grow the conversational tail —
             // see `SpeechModel::uses_prompt`.
@@ -1759,6 +1780,7 @@ mod tests {
             metrics_path: None,
             shed_stale: false,
             dictionary: Vec::new(),
+            remove_hesitations: false,
         };
         let bad = ModelRef::Whisper(std::path::PathBuf::from("/nonexistent/ggml-bogus.bin"));
         let (handle, ready) = spawn_asr_worker(

@@ -105,6 +105,7 @@ struct EmitterWorker {
     dump_dir: Option<PathBuf>,
     clipboard_available: bool,
     paste_available: bool,
+    paste_mode: crate::cli::PasteMode,
     stdout_enabled: bool,
 }
 
@@ -117,6 +118,7 @@ impl SystemEmitter {
         dump_dir: Option<PathBuf>,
         copy_enabled: bool,
         paste_enabled: bool,
+        paste_mode: crate::cli::PasteMode,
         stdout_enabled: bool,
     ) -> Result<Self> {
         if let Some(dir) = &dump_dir {
@@ -132,6 +134,7 @@ impl SystemEmitter {
             dump_dir,
             clipboard_available: copy_enabled,
             paste_available: paste_enabled,
+            paste_mode,
             stdout_enabled,
         };
         if !copy_enabled {
@@ -246,6 +249,13 @@ impl EmitterWorker {
                 return;
             }
             TranscriptVerdict::Emit { floor, strength } => {
+                // Never clobber the clipboard with empty text (e.g. cleaning
+                // removed everything, or an image is currently copied): keep
+                // any image/content the user has there instead.
+                if text.trim().is_empty() {
+                    dump_drop_reason(&self.dump_dir, tag, "DROPPED(empty-cleaned)");
+                    return;
+                }
                 log::info!(
                     "{tag}: avg_p={} avg_logprob={} threshold={floor:.3} \
                      ({strength} evidence, density={:.3})",
@@ -291,7 +301,7 @@ impl EmitterWorker {
             }
         }
         // Track whether this utterance actually refreshed the
-        // clipboard: paste synthesizes Ctrl+V, so it must only run
+        // clipboard: paste synthesizes keys, so it must only run
         // on fresh content, never on stale clipboard or a failed
         // copy.
         let mut copied = false;
@@ -307,8 +317,25 @@ impl EmitterWorker {
                 Err(e) => log::warn!("{tag}: clipboard copy failed: {e:?}"),
             }
         }
+        // Remember the last emitted text for `--paste-last`, independent of
+        // `--copy`: one-shot re-paste must work even when copy was off.
+        write_last_text(text);
         if self.paste_available && copied {
-            match paste_via_ydotool() {
+            match paste_via_ydotool(self.paste_mode) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    log::warn!(
+                        "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste"
+                    );
+                    self.paste_available = false;
+                }
+                Err(e) => log::warn!("{tag}: auto-paste failed (is ydotoold running?): {e:?}"),
+            }
+        } else if self.paste_available && !copied && self.paste_mode == crate::cli::PasteMode::Type
+        {
+            // `type` mode needs no clipboard: paste directly even when copy
+            // is off or failed.
+            match type_via_ydotool(text) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     log::warn!(
@@ -502,23 +529,75 @@ pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 }
 
 /// Paste the clipboard at the current cursor position via `ydotool`
-/// (requires the `ydotoold` daemon). Synthesizes a single Ctrl+V
-/// (`29:1 47:1 47:0 29:0`, i.e. LEFTCTRL down, V down/up, LEFTCTRL up) instead
-/// of typing the transcript key-by-key: a fixed 4-event sequence, so it is
-/// fast and preserves non-ASCII text already on the clipboard. Returns
-/// `io::Error` unwrapped so the caller can match `NotFound` and disable
-/// itself with a single warning on machines without `ydotool`.
-pub(crate) fn paste_via_ydotool() -> std::io::Result<()> {
+/// (requires the `ydotoold` daemon). `CtrlV` synthesizes LEFTCTRL+V
+/// (`29:1 47:1 47:0 29:0`); `CtrlShiftV` adds LEFTSHIFT for terminals;
+/// `Type` types via `ydotool type` on stdin (no clipboard, layout-dependent).
+/// Returns `io::Error` unwrapped so the caller can match `NotFound` and
+/// disable itself with a single warning on machines without `ydotool`.
+pub(crate) fn paste_via_ydotool(mode: crate::cli::PasteMode) -> std::io::Result<()> {
+    use crate::cli::PasteMode;
+    match mode {
+        PasteMode::CtrlV => run_ydotool_key(&["29:1", "47:1", "47:0", "29:0"]),
+        PasteMode::CtrlShiftV => run_ydotool_key(&["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]),
+        PasteMode::Type => {
+            // No clipboard text available here (one-shot path passes text
+            // explicitly via `type_via_ydotool`); without text there is
+            // nothing to type.
+            Err(std::io::Error::other("paste-mode=type needs text; nothing to paste"))
+        }
+    }
+}
+
+/// Type `text` via `ydotool type --file -` (stdin). Used by `Type` paste mode
+/// and never touches the clipboard.
+pub(crate) fn type_via_ydotool(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("ydotool")
+        .args(["type", "--file", "-"])
+        .stdin(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("ydotool type stdin unavailable"))?
+        .write_all(text.as_bytes())?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("ydotool type exited with {status}")))
+    }
+}
+
+fn run_ydotool_key(events: &[&str]) -> std::io::Result<()> {
     use std::process::Command;
     let status = Command::new("ydotool")
-        .args(["key", "29:1", "47:1", "47:0", "29:0"])
+        .arg("key")
+        .args(events)
         .status()?;
     if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other(format!(
-            "ydotool exited with {status}"
-        )))
+        Err(std::io::Error::other(format!("ydotool exited with {status}")))
+    }
+}
+
+/// Path of the last-emitted-transcription file for `--paste-last`:
+/// `<tmp>/sttd-last.txt` (owner-only, overwritten per emission).
+pub(crate) fn last_text_path() -> PathBuf {
+    std::env::temp_dir().join("sttd-last.txt")
+}
+
+/// Remember the last emitted text for `--paste-last`. Best-effort only:
+/// failures warn, never fail transcription.
+fn write_last_text(text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let path = last_text_path();
+    if let Err(e) = write_owner_only_text(&path, text) {
+        log::warn!("failed to write {}: {e:?}", path.display());
     }
 }
 
@@ -575,6 +654,11 @@ impl Emitter for RecordingEmitter {
             wav_samples,
         };
         if let TranscriptVerdict::Emit { .. } = emission.verdict {
+            // Mirror prod guard: empty Emit never touches clipboard.
+            if emission.text.trim().is_empty() {
+                self.records.push(record);
+                return;
+            }
             record.emitted = true;
             record.copied = !self.fail_copy;
             // Same AND semantics as the prod adapter: paste only runs on
@@ -847,7 +931,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let evidence = strong_evidence();
         {
-            let mut emitter = SystemEmitter::new(Some(dir.clone()), false, false, false).unwrap();
+            let mut emitter = SystemEmitter::new(
+                Some(dir.clone()),
+                false,
+                false,
+                crate::cli::PasteMode::CtrlV,
+                false,
+            )
+            .unwrap();
             let pcm = vec![0.01f32; 1600];
             emitter.emit(Emission {
                 tag: "utt_000001",
@@ -923,7 +1014,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sttd-emit-nb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let evidence = strong_evidence();
-        let mut emitter = SystemEmitter::new(Some(dir.clone()), false, false, false).unwrap();
+        let mut emitter = SystemEmitter::new(
+            Some(dir.clone()),
+            false,
+            false,
+            crate::cli::PasteMode::CtrlV,
+            false,
+        )
+        .unwrap();
         let pcm = vec![0.01f32; 1600];
         let t0 = std::time::Instant::now();
         for i in 0..200 {
@@ -1004,8 +1102,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         let evidence = strong_evidence();
         {
-            let mut emitter =
-                SystemEmitter::new(Some(dir.clone()), false, false, false).unwrap();
+            let mut emitter = SystemEmitter::new(
+                Some(dir.clone()),
+                false,
+                false,
+                crate::cli::PasteMode::CtrlV,
+                false,
+            )
+            .unwrap();
             let pcm = vec![0.01f32; 1600];
             for i in 0..(DUMP_KEEP_FILES + 5) {
                 let tag = format!("utt_{i:06}");
@@ -1037,5 +1141,61 @@ mod tests {
         let newest = format!("utt_{:06}.wav", DUMP_KEEP_FILES + 4);
         assert!(dir.join(newest).exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_emit_never_copies() {
+        let evidence = strong_evidence();
+        let verdict =
+            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
+        let mut emitter = RecordingEmitter::new();
+        let pcm = vec![0.01f32; 1600];
+        emit(&mut emitter, "utt_000001", &pcm, "   ", verdict, &evidence);
+        let r = &emitter.records[0];
+        assert!(!r.emitted);
+        assert!(!r.copied);
+        assert!(!r.pasted);
+    }
+
+    #[test]
+    fn empty_emit_dumped_as_cleaned_drop() {
+        let dir = std::env::temp_dir().join(format!("sttd-emit-empty-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let evidence = strong_evidence();
+        {
+            let mut emitter = SystemEmitter::new(
+                Some(dir.clone()),
+                false,
+                false,
+                crate::cli::PasteMode::CtrlV,
+                false,
+            )
+            .unwrap();
+            let pcm = vec![0.01f32; 1600];
+            emitter.emit(Emission {
+                tag: "utt_000001",
+                pcm: &pcm,
+                text: "   ",
+                verdict: gate().decide_transcript(
+                    evidence.speech_frames,
+                    evidence.rms,
+                    "Dzień dobry",
+                    Some(0.9),
+                ),
+                prob: Some(0.9),
+                logprob: Some(-0.1),
+                evidence: &evidence,
+            });
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("utt_000001.txt")).unwrap(),
+            "DROPPED(empty-cleaned)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn last_text_path_is_tmp_file() {
+        assert!(last_text_path().ends_with("sttd-last.txt"));
     }
 }
