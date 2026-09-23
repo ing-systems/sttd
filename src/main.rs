@@ -1067,6 +1067,8 @@ fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
 
 /// Load `--dictionary` once at startup. A broken path warns and disables
 /// correction (never fails transcription); success logs the entry count.
+/// Large dictionaries warn: above `POSTCORR_WARN_DICT_WORDS` the false-positive
+/// risk grows, at or above `POSTCORR_MAX_DICT_WORDS` fuzzy is off (exact stays).
 fn load_dictionary_or_warn(cli: &Cli) -> Vec<String> {
     let Some(path) = cli.dictionary.as_deref() else {
         return Vec::new();
@@ -1074,6 +1076,18 @@ fn load_dictionary_or_warn(cli: &Cli) -> Vec<String> {
     match crate::dictionary::load_dictionary(path) {
         Ok(words) => {
             log::info!("dictionary: {} entr(y/ies) from {}", words.len(), path.display());
+            if words.len() > crate::dictionary::POSTCORR_MAX_DICT_WORDS {
+                log::warn!(
+                    "dictionary: {} entries, fuzzy correction disabled (over {}); exact casing restore stays on",
+                    words.len(),
+                    crate::dictionary::POSTCORR_MAX_DICT_WORDS
+                );
+            } else if words.len() > crate::dictionary::POSTCORR_WARN_DICT_WORDS {
+                log::warn!(
+                    "dictionary: {} entries, false-positive risk grows; keep the list small and targeted",
+                    words.len()
+                );
+            }
             words
         }
         Err(e) => {

@@ -21,6 +21,13 @@
 // - > 100 dictionary words disables fuzzy entirely (exact restore stays);
 // - distance ties are left untouched;
 // - bigram join repairs `app image -> AppImage` splits (TDT segmentation).
+//
+// Entry safeguards (mirroring Murmure's `validate_dictionary_format`):
+// - entries with ASCII digits are rejected (use formatting rules for numbers);
+// - entries with more than one space (> 2 words) are rejected (matcher only
+//   handles unigrams + bigrams);
+// - duplicates by normalized form (case/accent-insensitive) keep the first;
+// - UTF-8 BOM stripped, surrounding whitespace trimmed, empties dropped.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,6 +39,9 @@ pub(crate) const POSTCORR_LONG_LEN: usize = 8;
 /// Above this many dictionary words fuzzy is disabled entirely; exact
 /// normalized restore (casing/accents) stays on.
 pub(crate) const POSTCORR_MAX_DICT_WORDS: usize = 100;
+/// Above this many words log a false-positive warning (yellow zone); at or
+/// above `POSTCORR_MAX_DICT_WORDS` fuzzy is off entirely (red zone).
+pub(crate) const POSTCORR_WARN_DICT_WORDS: usize = 50;
 /// Model-confidence gate for Phase B (per-word min token prob). Unused while
 /// callers pass `None`; kept so the threshold is not re-tuned later.
 pub(crate) const POSTCORR_CONF_THRESHOLD: f32 = 0.45;
@@ -48,14 +58,64 @@ fn normalize_word(word: &str) -> String {
 /// Load a `--dictionary` file: UTF-8, one phrase per line, trimmed, empties
 /// dropped, canonical casing preserved as written. Missing path returns an
 /// error for the caller to warn-and-disable (never fail transcription).
+///
+/// Invalid entries are skipped with a warning (never fail the whole file):
+/// entries with ASCII digits, entries with more than one space (> 2 words),
+/// and normalized duplicates (case/accent-insensitive, first wins).
 pub(crate) fn load_dictionary(path: &Path) -> anyhow::Result<Vec<String>> {
     let text = std::fs::read_to_string(path)?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect())
+    Ok(sanitize_entries(text.lines().map(|l| l.trim())))
+}
+
+/// Pure entry filter shared by `load_dictionary` and tests: strips a leading
+/// BOM, trims, drops empties, rejects digits / > 1 space, dedups by
+/// normalized form keeping the first occurrence.
+pub(crate) fn sanitize_entries<'a, I>(lines: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    let mut kept = Vec::new();
+    let mut skipped_digits = 0usize;
+    let mut skipped_spaces = 0usize;
+    let mut skipped_dupes = 0usize;
+    for raw in lines {
+        let line = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.chars().any(|c| c.is_ascii_digit()) {
+            skipped_digits += 1;
+            continue;
+        }
+        if line.chars().filter(|&c| c == ' ').count() > 1 {
+            skipped_spaces += 1;
+            continue;
+        }
+        let key = normalize_word(line);
+        if seen.contains_key(&key) {
+            skipped_dupes += 1;
+            continue;
+        }
+        seen.insert(key, ());
+        kept.push(line.to_string());
+    }
+    if skipped_digits > 0 {
+        log::warn!(
+            "dictionary: skipped {skipped_digits} entr(y/ies) with digits (numbers are not supported)"
+        );
+    }
+    if skipped_spaces > 0 {
+        log::warn!(
+            "dictionary: skipped {skipped_spaces} entr(y/ies) with more than two words (at most one space allowed)"
+        );
+    }
+    if skipped_dupes > 0 {
+        log::warn!(
+            "dictionary: skipped {skipped_dupes} duplicate entr(y/ies) (case/accent-insensitive)"
+        );
+    }
+    kept
 }
 
 /// Production path: correct `text` against `dictionary`.
@@ -333,5 +393,35 @@ mod tests {
         assert_eq!(words, vec!["Syntocinon".to_string(), "żółć".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
         assert!(load_dictionary(&dir.join("missing.txt")).is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_digits_and_long_entries() {
+        assert!(sanitize_entries(["abc123"]).is_empty());
+        assert!(sanitize_entries(["a b c"]).is_empty());
+        assert_eq!(
+            sanitize_entries(["New York", "AppImage", "a b c", "paracetamol2"]),
+            vec!["New York".to_string(), "AppImage".to_string()]
+        );
+    }
+
+    #[test]
+    fn sanitize_dedups_case_and_accent_insensitive() {
+        assert_eq!(
+            sanitize_entries(["Syntocinon", "syntocinon", "SYNTOCINON"]),
+            vec!["Syntocinon".to_string()]
+        );
+        assert_eq!(
+            sanitize_entries(["żółć", "zolc"]),
+            vec!["żółć".to_string()]
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_bom_and_trims() {
+        assert_eq!(
+            sanitize_entries(["\u{feff}Kubernetes", "  Parakeet  ", "", "   "]),
+            vec!["Kubernetes".to_string(), "Parakeet".to_string()]
+        );
     }
 }
