@@ -9,7 +9,7 @@ use crate::config::{
 };
 use crate::gate::GateConfig;
 
-/// What the acoustics observed about an utterance, independent of what whisper
+/// What the acoustics observed about an utterance, independent of what the model
 /// made of it: how many frames the VAD judged to be speech, and how loud that
 /// speech was. A downstream gate needs this to tell "the model is unsure about
 /// real speech" apart from "the model invented something over silence" — the
@@ -20,7 +20,7 @@ pub(crate) struct Evidence {
     /// Total VAD-flagged speech frames over the utterance's life (see
     /// `UtteranceBuffer::speech_frames`).
     pub(crate) speech_frames: u32,
-    /// Transmitted frames whisper actually receives (post-trim, i.e.
+    /// Transmitted frames the model actually receives (post-trim, i.e.
     /// `samples_at_last_speech + TAIL_KEEP_SAMPLES` in frames) — the
     /// denominator for the speech-density gate.
     pub(crate) total_frames: u32,
@@ -37,7 +37,7 @@ impl Evidence {
 }
 
 /// One utterance that cleared `UtteranceBuffer::close` and is ready for
-/// whisper: the trimmed 16 kHz audio plus the `Evidence` gathered while
+/// Model input: the trimmed 16 kHz audio plus the `Evidence` gathered while
 /// buffering it. Evidence that used to be computed and then thrown away at the
 /// queue boundary.
 pub(crate) struct Utterance {
@@ -74,9 +74,9 @@ pub(crate) enum FrameAction {
 /// never touch it, and `Default` carries the compiled-in default so existing
 /// struct literals keep behaving.
 pub(crate) struct UtteranceBuffer {
-    /// Rolling ~300 ms of recent whisper-branch audio (see the struct doc).
+    /// Rolling ~300 ms of recent model-branch audio (see the struct doc).
     preroll: VecDeque<f32>,
-    /// Whisper-branch audio (16 kHz), from the moment the utterance opens.
+    /// Model-branch audio (16 kHz), from the moment the utterance opens.
     buf: Vec<f32>,
     /// Consecutive non-speech frames since the last speech frame, once the
     /// utterance is open. Drives the close decision (`hangover_frames`).
@@ -185,21 +185,18 @@ impl UtteranceBuffer {
     }
 
     /// Same as `push_frame`, but scores acoustic evidence
-    /// (`speech_energy_sum_sq`/`speech_frame_rms`, hence `Evidence.rms` and
-    /// the weak/strong confidence split — see `gate::GateConfig::floor_for`)
+    /// (`speech_energy_sum_sq`/`speech_frame_rms`, hence `Evidence.rms`)
     /// from `evidence_rms` instead of `frame`'s own RMS. `frame` is still
-    /// what gets appended to the buffered utterance (and sent to whisper) and
+    /// what gets appended to the buffered utterance (and sent to the model) and
     /// still drives the quiet-run/early-split RMS check below — only the
     /// acoustic-evidence accounting is redirected.
     ///
-    /// `FrameProcessor::process_frame` passes the *pre-AGC* whisper-frame RMS
+    /// `FrameProcessor::process_frame` passes the *pre-AGC* model-frame RMS
     /// (`Agc::process_pair`'s return value) here, so evidence describes what
     /// the microphone actually heard rather than what the shared-gain AGC did
     /// to it afterward: `Agc` can amplify quiet-but-real speech up to 8x
-    /// toward `--target-rms`, which used to make almost every utterance read
-    /// as strong acoustic evidence (`STRONG_RMS_FACTOR` measured against
-    /// AGC output, not the microphone) regardless of how quiet the speech
-    /// actually was.
+    /// toward `--target-rms`, which used to amplify the evidence RMS
+    /// regardless of how quiet the speech actually was.
     pub(crate) fn push_frame_evidenced(
         &mut self,
         frame: &[f32],
@@ -295,7 +292,7 @@ impl UtteranceBuffer {
                 && (self.silence_frames >= EARLY_SPLIT_SILENCE_FRAMES
                     || self.quiet_run >= EARLY_SPLIT_QUIET_FRAMES)
             {
-                // Near whisper's 30 s cap with a real pause — or a 50 ms
+                // Near the 30 s cap with a real pause — or a 50 ms
                 // energy dip — in progress: cut here (in quiet) instead of
                 // riding into the hard cap and cutting mid-word. `close`
                 // still trims to last speech + adaptive tail.
@@ -389,9 +386,7 @@ impl UtteranceBuffer {
     /// Three gates, all defending against the same failure mode: a VAD false
     /// positive (a click, a breath, mains hum) opening an utterance that
     /// pre-roll and silence hangover then pad out to ~1-2s of near-silence —
-    /// which whisper, lacking any working confidence gate of its own (see
-    /// `DEFAULT_MIN_CONFIDENCE`'s doc comment), would otherwise happily
-    /// hallucinate a sentence for:
+    /// which the model would otherwise happily hallucinate a sentence for:
     /// - `MIN_SPEECH_FRAMES`: not enough VAD-flagged speech overall.
     /// - `min_density`: energy-weighted speech share below the floor (long
     ///   utterances exempt, see `DENSITY_LONG_EXEMPT_SAMPLES`). Quiet frames
@@ -443,14 +438,14 @@ impl UtteranceBuffer {
 
         // Trim the tail: the hangover decided *when* to close this
         // utterance, but everything past the adaptive tail is silence
-        // hangover that doesn't need to reach whisper.
+        // hangover that doesn't need to reach the model.
         self.buf.truncate(tail_end);
 
         let pcm = std::mem::take(&mut self.buf);
         let (peak, clip_ratio) = mic_level(&pcm);
         log::info!(
             "utterance: {} samples ({speech_frames} speech frames, \
-             density={density:.3} weighted={weighted:.3}, rms={rms:.5}, peak={peak:.3}) -> whisper",
+             density={density:.3} weighted={weighted:.3}, rms={rms:.5}, peak={peak:.3}) -> model",
             pcm.len()
         );
         if peak < MIC_LOW_PEAK {
@@ -534,7 +529,7 @@ fn weighted_density(speech_frame_rms: &[f32], min_rms: f32, total_frames: u32) -
 /// Adaptive tail end (sample index into `buf`): at least `TAIL_MIN` past
 /// the last speech frame, at most `TAIL_MAX`, extending while 10 ms tail
 /// frames stay at/above `min_rms`. Quiet tails cut at the minimum (less
-/// silence to whisper, higher density); reverberant tails keep what is
+/// silence to the model, higher density); reverberant tails keep what is
 /// still energetic. `min_rms <= 0` keeps the legacy fixed tail for tests
 /// that disable the rms gate.
 fn adaptive_tail_end(buf: &[f32], samples_at_last_speech: usize, min_rms: f32) -> usize {
@@ -584,7 +579,7 @@ fn mic_level(pcm: &[f32]) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
+        DEFAULT_MIN_DENSITY,
         DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES, EARLY_SPLIT_QUIET_FRAMES,
         EARLY_SPLIT_QUIET_RMS, EARLY_SPLIT_SAMPLES, EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K,
         INTERIM_SPLIT_SAMPLES,
@@ -594,12 +589,7 @@ mod tests {
     };
 
     fn gate_for(min_rms: f32, min_density: f32) -> GateConfig {
-        GateConfig::new(
-            min_rms,
-            min_density,
-            DEFAULT_MIN_CONFIDENCE,
-            DEFAULT_MIN_CONFIDENCE_STRONG,
-        )
+        GateConfig::new(min_rms, min_density)
     }
 
     #[test]
@@ -775,7 +765,7 @@ mod tests {
     fn utterance_from_log_is_rejected() {
         // Regression for the production log: a 7-speech-frame VAD blip,
         // padded by pre-roll and a full silence hangover, used to produce
-        // an utterance that whisper then hallucinated "Dziękuje za uwagę."
+        // an utterance that the model then hallucinated "Dziękuje za uwagę."
         // for.
         let mut buffer = UtteranceBuffer::new();
         let speech = vec![0.3f32; FRAME_16K];
@@ -818,7 +808,7 @@ mod tests {
 
         let utterance = buffer
             .close(&gate_for(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY))
-            .expect("real speech must be sent to whisper");
+            .expect("real speech must be sent to the model");
         assert!(!utterance.pcm.is_empty());
         assert_eq!(utterance.evidence.speech_frames, 25);
         assert!(utterance.evidence.total_frames > 0);
@@ -854,13 +844,12 @@ mod tests {
             "Evidence.rms must be the pre-AGC value, got {} (buffered frame was 0.04)",
             utterance.evidence.rms
         );
-        let gate = gate_for(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY);
-        let (_, strength) =
-            gate.floor_for(utterance.evidence.speech_frames, utterance.evidence.rms);
-        assert_eq!(
-            strength,
-            crate::gate::EvidenceStrength::Weak,
-            "quiet mic evidence must stay Weak even though the buffered audio was gained to 0.04"
+        // Evidence RMS stays at the quiet mic level even though the
+        // buffered audio was gained up.
+        assert!(
+            utterance.evidence.rms < 0.01,
+            "evidence must stay quiet, got {}",
+            utterance.evidence.rms
         );
     }
 
@@ -870,7 +859,7 @@ mod tests {
         // long silence span (VAD flicker on noise, never 81 silent frames in
         // a row so the utterance stays open). Post-trim the transmitted audio
         // is ~200 frames with only 25 of them speech: mostly silence that
-        // whisper would hallucinate boilerplate for.
+        // the model would hallucinate boilerplate for.
         let mut buffer = UtteranceBuffer::new();
         let speech = vec![0.3f32; FRAME_16K];
         let silence = vec![0.0f32; FRAME_16K];
@@ -911,7 +900,7 @@ mod tests {
         }
         let utterance = buffer
             .close(&gate_for(0.0, DEFAULT_MIN_DENSITY))
-            .expect("dense speech must be sent to whisper");
+            .expect("dense speech must be sent to the model");
         assert!(utterance.evidence.density() >= DEFAULT_MIN_DENSITY);
     }
 

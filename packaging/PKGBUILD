@@ -62,7 +62,7 @@ build() {
   cd "$startdir/.."
   # cd to the repo root so cargo discovers .cargo/config.toml (config is
   # searched from the *cwd* upward, not from the manifest): target-cpu=native
-  # and the WHISPER/CUDA knobs apply. No RUSTFLAGS override -- native is
+  # applies. No RUSTFLAGS override -- native is
   # wanted here.
   # STTD_MODELS_DIR is scoped to this call only: it bakes the system model
   # dir into the binary, and check() deliberately runs without it so the

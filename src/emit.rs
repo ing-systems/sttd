@@ -3,13 +3,13 @@
 // ---------------------------------------------------------------------------
 //
 // One step — handing a decided transcript to the user — used to live inside
-// `whisper_init_and_run` alongside inference, conditioning and the gate call:
+// `asr_init_and_run` alongside inference, conditioning and the gate call:
 // `println!`, metrics `log::info!`, clipboard copy, auto-paste and WAV/TXT
 // dumps shared one loop with the decoder. To answer "was this emitted, and
 // where did it go" you had to run the model.
 //
 // This module owns verdict → action mapping plus every emission side effect,
-// so the whisper loop hands it one `Emission` per utterance and gets back
+// so the ASR loop hands it one `Emission` per utterance and gets back
 // nothing. `SystemEmitter` is the prod adapter (opt-in stdout, `wl-copy`,
 // `ydotool`, dump dir); `RecordingEmitter` is the in-memory adapter tests drive the
 // gate → emission composition through. Inference never sees either.
@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::config::{DUMP_KEEP_FILES, WHISPER_RATE};
+use crate::config::{DUMP_KEEP_FILES, SAMPLE_RATE};
 use crate::gate::{TranscriptDropKind, TranscriptVerdict};
 use crate::utterance::Evidence;
 use crate::wav::write_wav_mono16;
@@ -36,16 +36,11 @@ pub(crate) struct Emission<'a> {
     pub(crate) text: &'a str,
     /// Transcript gate disposition, decided by the caller.
     pub(crate) verdict: TranscriptVerdict,
-    /// Text-token average probability and log-probability, for metrics
-    /// lines. `None` for models that don't report per-token probabilities
-    /// (Parakeet) — see `GateConfig::decide_transcript`.
-    pub(crate) prob: Option<f32>,
-    pub(crate) logprob: Option<f32>,
     /// Acoustic evidence, for the metrics line's density.
     pub(crate) evidence: &'a Evidence,
 }
 
-/// Owned handoff across the async emission queue: the whisper thread builds
+/// Owned handoff across the async emission queue: the ASR thread builds
 /// this (one clone of tag/text/pcm) and sends it without blocking; the emit
 /// worker thread owns all side effects in FIFO order.
 pub(crate) struct OwnedEmission {
@@ -53,8 +48,6 @@ pub(crate) struct OwnedEmission {
     pub(crate) pcm: Vec<f32>,
     pub(crate) text: String,
     pub(crate) verdict: TranscriptVerdict,
-    pub(crate) prob: Option<f32>,
-    pub(crate) logprob: Option<f32>,
     pub(crate) evidence: Evidence,
 }
 
@@ -65,8 +58,6 @@ impl OwnedEmission {
             pcm: e.pcm.to_vec(),
             text: e.text.to_string(),
             verdict: e.verdict,
-            prob: e.prob,
-            logprob: e.logprob,
             evidence: *e.evidence,
         }
     }
@@ -81,9 +72,9 @@ pub(crate) trait Emitter {
 ///
 /// Async by design: `emit()` only clones into an `OwnedEmission` and does a
 /// non-blocking `rtrb` push, so a stuck `wl-copy`/`ydotool`/disk never
-/// stalls whisper inference. A single `emit` worker thread owns all side
+/// stalls inference. A single `emit` worker thread owns all side
 /// effects in FIFO order; `Drop` closes the channel and joins it, so shutdown
-/// (`whisper_handle.join()`) flushes the queue before the process exits.
+/// (`asr_handle.join()`) flushes the queue before the process exits.
 /// Untested glue by design — the logic worth testing (verdict → action) is
 /// exercised through `RecordingEmitter`; this only shells out to binaries
 /// and files.
@@ -229,8 +220,6 @@ impl EmitterWorker {
             pcm,
             text,
             verdict,
-            prob,
-            logprob,
             evidence,
         } = &owned;
         let tag: &str = tag.as_str();
@@ -239,7 +228,7 @@ impl EmitterWorker {
         // WAV dump first, for every utterance (including drops), as before.
         if let Some(dir) = &self.dump_dir {
             let wav_path = dir.join(format!("{tag}.wav"));
-            if let Err(e) = write_wav_mono16(&wav_path, pcm, WHISPER_RATE) {
+            if let Err(e) = write_wav_mono16(&wav_path, pcm, SAMPLE_RATE) {
                 log::warn!("failed to dump {}: {e:?}", wav_path.display());
             }
         }
@@ -248,7 +237,7 @@ impl EmitterWorker {
                 dump_drop_reason(&self.dump_dir, tag, "DROPPED(empty)");
                 return;
             }
-            TranscriptVerdict::Emit { floor, strength } => {
+            TranscriptVerdict::Emit => {
                 // Never clobber the clipboard with empty text (e.g. cleaning
                 // removed everything, or an image is currently copied): keep
                 // any image/content the user has there instead.
@@ -256,33 +245,14 @@ impl EmitterWorker {
                     dump_drop_reason(&self.dump_dir, tag, "DROPPED(empty-cleaned)");
                     return;
                 }
-                log::info!(
-                    "{tag}: avg_p={} avg_logprob={} threshold={floor:.3} \
-                     ({strength} evidence, density={:.3})",
-                    fmt_prob(*prob),
-                    fmt_prob(*logprob),
-                    evidence.density()
-                );
+                log::info!("{tag}: emitted (density={:.3})", evidence.density());
                 if self.stdout_enabled {
                     println!("{text}");
                 }
             }
-            TranscriptVerdict::Drop {
-                kind,
-                floor,
-                strength,
-            } => {
-                log::info!(
-                    "{tag}: avg_p={} avg_logprob={} threshold={floor:.3} \
-                     ({strength} evidence, density={:.3})",
-                    fmt_prob(*prob),
-                    fmt_prob(*logprob),
-                    evidence.density()
-                );
+            TranscriptVerdict::Drop { kind } => {
+                log::info!("{tag}: dropped (density={:.3})", evidence.density());
                 match kind {
-                    TranscriptDropKind::LowConfidence => {
-                        log::info!("{tag}: dropped low-confidence transcript: {text:?}");
-                    }
                     TranscriptDropKind::Hallucination => {
                         log::info!("{tag}: dropped likely hallucination: {text:?}");
                     }
@@ -290,12 +260,7 @@ impl EmitterWorker {
                         log::info!("{tag}: dropped repetition-loop decode: {text:?}");
                     }
                 }
-                let reason = TranscriptVerdict::Drop {
-                    kind: *kind,
-                    floor: *floor,
-                    strength: *strength,
-                }
-                .dump_reason(text, *prob);
+                let reason = TranscriptVerdict::Drop { kind: *kind }.dump_reason(text);
                 dump_drop_reason(&self.dump_dir, tag, &reason);
                 return;
             }
@@ -352,15 +317,6 @@ impl EmitterWorker {
                 log::warn!("failed to write {}: {e:?}", txt_path.display());
             }
         }
-    }
-}
-
-/// Render an optional probability/log-probability for a log line: `n/a` when
-/// the model reports none (Parakeet), 3 decimals otherwise.
-fn fmt_prob(p: Option<f32>) -> String {
-    match p {
-        Some(p) => format!("{p:.3}"),
-        None => "n/a".to_string(),
     }
 }
 
@@ -653,7 +609,7 @@ impl Emitter for RecordingEmitter {
             printed: false,
             wav_samples,
         };
-        if let TranscriptVerdict::Emit { .. } = emission.verdict {
+        if let TranscriptVerdict::Emit = emission.verdict {
             // Mirror prod guard: empty Emit never touches clipboard.
             if emission.text.trim().is_empty() {
                 self.records.push(record);
@@ -675,22 +631,14 @@ impl Emitter for RecordingEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-        DEFAULT_MIN_SPEECH_RMS, MIN_SPEECH_FRAMES,
-    };
+    use crate::config::{DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS};
     use crate::gate::GateConfig;
 
     fn gate() -> GateConfig {
-        GateConfig::new(
-            DEFAULT_MIN_SPEECH_RMS,
-            DEFAULT_MIN_DENSITY,
-            DEFAULT_MIN_CONFIDENCE,
-            DEFAULT_MIN_CONFIDENCE_STRONG,
-        )
+        GateConfig::new(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY)
     }
 
-    fn strong_evidence() -> Evidence {
+    fn evidence() -> Evidence {
         Evidence {
             speech_frames: 137,
             total_frames: 200,
@@ -698,12 +646,12 @@ mod tests {
         }
     }
 
+    fn strong_evidence() -> Evidence {
+        evidence()
+    }
+
     fn weak_evidence() -> Evidence {
-        Evidence {
-            speech_frames: MIN_SPEECH_FRAMES,
-            total_frames: 131,
-            rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
-        }
+        evidence()
     }
 
     fn emit<'a>(
@@ -719,8 +667,6 @@ mod tests {
             pcm,
             text,
             verdict,
-            prob: Some(0.9),
-            logprob: Some(-0.1),
             evidence,
         });
     }
@@ -729,7 +675,7 @@ mod tests {
     fn confident_transcript_is_emitted_with_copy_and_paste() {
         let evidence = strong_evidence();
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
+            gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
         emit(
@@ -755,7 +701,7 @@ mod tests {
     fn stdout_print_is_opt_in() {
         let evidence = strong_evidence();
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
+            gate().decide_transcript("Dzień dobry");
         let pcm = vec![0.01f32; 1600];
         let mut emitter = RecordingEmitter::new();
         emit(
@@ -770,7 +716,7 @@ mod tests {
         assert!(!emitter.records[0].printed);
 
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
+            gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         emitter.stdout_enabled = true;
         emit(
@@ -785,12 +731,7 @@ mod tests {
         assert!(emitter.records[0].printed);
 
         // Drops never print, even when stdout is enabled.
-        let verdict = gate().decide_transcript(
-            evidence.speech_frames,
-            evidence.rms,
-            "tak tak tak tak tak tak",
-            Some(0.9),
-        );
+        let verdict = gate().decide_transcript("tak tak tak tak tak tak");
         emit(
             &mut emitter,
             "utt_000003",
@@ -808,7 +749,7 @@ mod tests {
     fn paste_only_runs_on_fresh_copy() {
         let evidence = strong_evidence();
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
+            gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         emitter.fail_copy = true;
         let pcm = vec![0.01f32; 1600];
@@ -828,41 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_drop_emits_nothing() {
-        let evidence = weak_evidence();
-        let verdict = gate().decide_transcript(
-            evidence.speech_frames,
-            evidence.rms,
-            "To jest prawdziwe zdanie testowe",
-            Some(0.1),
-        );
-        assert!(matches!(
-            verdict,
-            TranscriptVerdict::Drop {
-                kind: TranscriptDropKind::LowConfidence,
-                ..
-            }
-        ));
-        let mut emitter = RecordingEmitter::new();
-        let pcm = vec![0.01f32; 1600];
-        emit(
-            &mut emitter,
-            "utt_000002",
-            &pcm,
-            "To jest prawdziwe zdanie testowe",
-            verdict,
-            &evidence,
-        );
-        let r = &emitter.records[0];
-        assert!(!r.emitted);
-        assert_eq!(r.drop_kind, Some(TranscriptDropKind::LowConfidence));
-        assert!(!r.copied);
-        assert!(!r.pasted);
-        assert!(!r.printed);
-        assert_eq!(r.wav_samples, 1600);
-    }
-
-    #[test]
     fn hallucination_and_repetition_drops_record_kind() {
         let evidence = strong_evidence();
         for (text, kind) in [
@@ -872,7 +778,7 @@ mod tests {
             ),
             ("tak tak tak tak tak tak", TranscriptDropKind::Repetition),
         ] {
-            let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, text, Some(0.9));
+            let verdict = gate().decide_transcript(text);
             assert!(matches!(verdict, TranscriptVerdict::Drop { kind: k, .. } if k == kind));
             let mut emitter = RecordingEmitter::new();
             let pcm = vec![0.01f32; 1600];
@@ -887,7 +793,7 @@ mod tests {
     #[test]
     fn empty_transcript_drops_but_wav_still_recorded() {
         let evidence = weak_evidence();
-        let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, "   ", Some(0.0));
+        let verdict = gate().decide_transcript("   ");
         assert_eq!(verdict, TranscriptVerdict::DropEmpty);
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
@@ -896,30 +802,6 @@ mod tests {
         assert!(!r.emitted);
         assert_eq!(r.drop_kind, None);
         assert_eq!(r.wav_samples, 1600);
-    }
-
-    #[test]
-    fn strong_evidence_relaxes_floor_through_the_seam() {
-        // Same production numbers as the whisper-side regression test, now
-        // asserted through the emission seam: avg_p=0.478 over strong
-        // evidence must emit (and copy), not drop.
-        let evidence = strong_evidence();
-        let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.478));
-        assert!(matches!(verdict, TranscriptVerdict::Emit { .. }));
-        let mut emitter = RecordingEmitter::new();
-        let pcm = vec![0.01f32; 1600];
-        emit(
-            &mut emitter,
-            "utt_000005",
-            &pcm,
-            "Dzień dobry",
-            verdict,
-            &evidence,
-        );
-        let r = &emitter.records[0];
-        assert!(r.emitted);
-        assert!(r.copied);
     }
 
     #[test]
@@ -944,14 +826,7 @@ mod tests {
                 tag: "utt_000001",
                 pcm: &pcm,
                 text: "Dzień dobry",
-                verdict: gate().decide_transcript(
-                    evidence.speech_frames,
-                    evidence.rms,
-                    "Dzień dobry",
-                    Some(0.9),
-                ),
-                prob: Some(0.9),
-                logprob: Some(-0.1),
+                verdict: gate().decide_transcript("Dzień dobry"),
                 evidence: &evidence,
             });
             emitter.emit(Emission {
@@ -959,8 +834,6 @@ mod tests {
                 pcm: &pcm,
                 text: "   ",
                 verdict: TranscriptVerdict::DropEmpty,
-                prob: None,
-                logprob: None,
                 evidence: &evidence,
             });
             // No join yet: Drop at scope end must flush.
@@ -977,13 +850,11 @@ mod tests {
     }
 
     #[test]
-    fn no_confidence_signal_still_emits_and_copies() {
-        // Parakeet-shaped emission: `prob`/`logprob` are `None`, the gate
-        // never scored a confidence floor (see gate.rs), yet the emission
-        // path must treat this exactly like any other Emit verdict.
+    fn emission_still_copies() {
+        // The emission path must treat Emit exactly like any other Emit verdict.
         let evidence = strong_evidence();
-        let verdict = gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", None);
-        assert!(matches!(verdict, TranscriptVerdict::Emit { .. }));
+        let verdict = gate().decide_transcript("Dzień dobry");
+        assert!(matches!(verdict, TranscriptVerdict::Emit));
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
         emitter.emit(Emission {
@@ -991,25 +862,18 @@ mod tests {
             pcm: &pcm,
             text: "Dzień dobry",
             verdict,
-            prob: None,
-            logprob: None,
-            evidence: &evidence,
+                        evidence: &evidence,
         });
         let r = &emitter.records[0];
         assert!(r.emitted);
         assert!(r.copied);
     }
 
-    #[test]
-    fn fmt_prob_renders_none_as_na() {
-        assert_eq!(fmt_prob(Some(0.9)), "0.900");
-        assert_eq!(fmt_prob(None), "n/a");
-    }
 
     #[test]
     fn system_emitter_emit_never_blocks_inference() {
         // `emit()` is a single clone + bounded push: 200 rapid emits must
-        // finish well under a whisper inference (seconds), even with disk I/O
+        // finish well under an inference (seconds), even with disk I/O
         // still draining on the worker.
         let dir = std::env::temp_dir().join(format!("sttd-emit-nb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1031,14 +895,7 @@ mod tests {
                 tag: &tag,
                 pcm: &pcm,
                 text: "Dzień dobry",
-                verdict: gate().decide_transcript(
-                    evidence.speech_frames,
-                    evidence.rms,
-                    "Dzień dobry",
-                    Some(0.9),
-                ),
-                prob: Some(0.9),
-                logprob: Some(-0.1),
+                verdict: gate().decide_transcript("Dzień dobry"),
                 evidence: &evidence,
             });
         }
@@ -1117,15 +974,8 @@ mod tests {
                     tag: &tag,
                     pcm: &pcm,
                     text: "Dzień dobry",
-                    verdict: gate().decide_transcript(
-                        evidence.speech_frames,
-                        evidence.rms,
-                        "Dzień dobry",
-                        Some(0.9),
-                    ),
-                    prob: Some(0.9),
-                    logprob: Some(-0.1),
-                    evidence: &evidence,
+                    verdict: gate().decide_transcript("Dzień dobry"),
+                        evidence: &evidence,
                 });
             }
             // Drop at scope end flushes the async queue.
@@ -1147,7 +997,7 @@ mod tests {
     fn empty_emit_never_copies() {
         let evidence = strong_evidence();
         let verdict =
-            gate().decide_transcript(evidence.speech_frames, evidence.rms, "Dzień dobry", Some(0.9));
+            gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
         emit(&mut emitter, "utt_000001", &pcm, "   ", verdict, &evidence);
@@ -1176,14 +1026,7 @@ mod tests {
                 tag: "utt_000001",
                 pcm: &pcm,
                 text: "   ",
-                verdict: gate().decide_transcript(
-                    evidence.speech_frames,
-                    evidence.rms,
-                    "Dzień dobry",
-                    Some(0.9),
-                ),
-                prob: Some(0.9),
-                logprob: Some(-0.1),
+                verdict: gate().decide_transcript("Dzień dobry"),
                 evidence: &evidence,
             });
         }

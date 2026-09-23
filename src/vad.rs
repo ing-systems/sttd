@@ -9,7 +9,7 @@ use earshot::Detector;
 // window doesn't line up with that cadence.
 // ---------------------------------------------------------------------------
 
-/// Samples earshot requires per prediction, at `WHISPER_RATE` (16 kHz): 16 ms.
+/// Samples earshot requires per prediction, at `SAMPLE_RATE` (16 kHz): 16 ms.
 const EARSHOT_WINDOW: usize = 256;
 /// Step between consecutive earshot windows: 128 samples (8 ms, 50%
 /// overlap). Overlapping doubles the prediction rate (~10 windows per 8
@@ -37,7 +37,7 @@ const MEDIAN_WINDOWS: usize = 3;
 /// advance by `EARSHOT_STEP` (128, 50% overlap), so ~10 predictions land per
 /// 8 frames; a frame that doesn't complete a window re-reports the last
 /// verdict instead of guessing. Input arrives already 80 Hz high-passed
-/// (`Hp` in `signal`, shared with the whisper branch) so hum never reaches
+/// (`Hp` in `signal`, shared with the model branch) so hum never reaches
 /// earshot or the floor. Each window's score passes through hysteresis first
 /// (enter at `enter`, hold until below `exit`), then through a majority
 /// vote over the last `MEDIAN_WINDOWS` raw window decisions: a single

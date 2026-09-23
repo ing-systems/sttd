@@ -106,7 +106,7 @@ pub(crate) fn read_wav_mono_f32_with_channel(path: &Path, sel: ChannelSel) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WHISPER_RATE;
+    use crate::config::SAMPLE_RATE;
 
     fn test_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("sttd_test_{}_{name}", std::process::id()));
@@ -121,9 +121,9 @@ mod tests {
         let pcm: Vec<f32> = (0..1600)
             .map(|i| ((i % 100) as f32 / 100.0) - 0.5)
             .collect();
-        write_wav_mono16(&path, &pcm, WHISPER_RATE).unwrap();
+        write_wav_mono16(&path, &pcm, SAMPLE_RATE).unwrap();
         let wav = read_wav_mono_f32_with_channel(&path, ChannelSel::Mix).unwrap();
-        assert_eq!(wav.sample_rate, WHISPER_RATE);
+        assert_eq!(wav.sample_rate, SAMPLE_RATE);
         assert_eq!(wav.samples.len(), pcm.len());
         for (a, b) in wav.samples.iter().zip(pcm.iter()) {
             assert!((a - b).abs() < 1e-4, "{a} vs {b}");
@@ -137,7 +137,7 @@ mod tests {
         let path = dir.join("stereo.wav");
         let spec = hound::WavSpec {
             channels: 2,
-            sample_rate: WHISPER_RATE,
+            sample_rate: SAMPLE_RATE,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
@@ -148,7 +148,7 @@ mod tests {
         }
         writer.finalize().unwrap();
         let wav = read_wav_mono_f32_with_channel(&path, ChannelSel::Mix).unwrap();
-        assert_eq!(wav.sample_rate, WHISPER_RATE);
+        assert_eq!(wav.sample_rate, SAMPLE_RATE);
         assert_eq!(wav.samples.len(), 160);
         for s in wav.samples {
             assert!(s.abs() < 1e-6, "{s}");
@@ -163,7 +163,7 @@ mod tests {
         let path = dir.join("auto.wav");
         let spec = hound::WavSpec {
             channels: 2,
-            sample_rate: WHISPER_RATE,
+            sample_rate: SAMPLE_RATE,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
@@ -193,7 +193,7 @@ mod tests {
         let path = dir.join("float.wav");
         let spec = hound::WavSpec {
             channels: 1,
-            sample_rate: WHISPER_RATE,
+            sample_rate: SAMPLE_RATE,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
@@ -215,7 +215,7 @@ mod tests {
         let dir = test_dir("truncated");
         let path = dir.join("truncated.wav");
         let pcm = vec![0.1f32; 160];
-        write_wav_mono16(&path, &pcm, WHISPER_RATE).unwrap();
+        write_wav_mono16(&path, &pcm, SAMPLE_RATE).unwrap();
         // Cut the file mid-data so the data chunk is truncated.
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.truncate(bytes.len() - 100);

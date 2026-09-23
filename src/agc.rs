@@ -3,7 +3,7 @@
 // utterance.
 // ---------------------------------------------------------------------------
 //
-// One instance applies the same `cur_gain` to both the VAD and whisper frames
+// One instance applies the same `cur_gain` to both the VAD and model frames
 // so the verdict always describes the audio being buffered. Gating uses the
 // previous frame's verdict (1-frame delay breaks the VAD<->gain feedback
 // loop): silence frames pass through at unity and never adapt, speech frames
@@ -14,7 +14,7 @@
 // normalized — the RMS/density gates then see rescued quiet speech, as
 // intended.
 
-use crate::config::{AGC_ATTACK_MS, AGC_RELEASE_MS, WHISPER_RATE};
+use crate::config::{AGC_ATTACK_MS, AGC_RELEASE_MS, SAMPLE_RATE};
 
 /// Below this frame RMS the frame never adapts (activation threshold, ~-50 dBFS).
 pub(crate) const AGC_MIN_RMS: f32 = crate::config::DEFAULT_MIN_SPEECH_RMS;
@@ -31,7 +31,7 @@ pub(crate) struct Agc {
 
 impl Agc {
     pub(crate) fn new(target: f32, max_gain: f32) -> Self {
-        let sr = WHISPER_RATE as f32;
+        let sr = SAMPLE_RATE as f32;
         let attack_coef = (-1.0 / (AGC_ATTACK_MS * 0.001 * sr)).exp();
         let release_coef = (-1.0 / (AGC_RELEASE_MS * 0.001 * sr)).exp();
         Self {
@@ -98,13 +98,13 @@ impl Agc {
         }
     }
 
-    /// Process a VAD/whisper pair with shared gain, gated by the previous
+    /// Process a VAD/model pair with shared gain, gated by the previous
     /// verdict (1-frame delay breaks the VAD<->gain loop). Silence passes
     /// through at unity with no adaptation; speech adapts the envelope from
-    /// the whisper (stored) branch then applies the same gain to both so the
+    /// the model (stored) branch then applies the same gain to both so the
     /// verdict always describes the buffered audio.
     ///
-    /// Returns `whisper`'s RMS *before* any gain is applied, on every code
+    /// Returns the model frame's RMS *before* any gain is applied, on every code
     /// path (including the silence/gated-off early returns). Callers use
     /// this as the utterance buffer's acoustic evidence (`Evidence.rms`,
     /// `gate::floor_for`'s weak/strong split) instead of `frame_rms` on the
@@ -113,17 +113,17 @@ impl Agc {
     pub(crate) fn process_pair(
         &mut self,
         vad: &mut [f32],
-        whisper: &mut [f32],
+        model: &mut [f32],
         prev_speech: bool,
     ) -> f32 {
-        let rms = frame_rms(whisper);
+        let rms = frame_rms(model);
         if !prev_speech || self.target <= 0.0 {
             return rms;
         }
         if rms < AGC_MIN_RMS || !rms.is_finite() {
             return rms;
         }
-        let n = whisper.len().max(1) as f32;
+        let n = model.len().max(1) as f32;
         let frame_attack = self.attack_coef.powf(n);
         let frame_release = self.release_coef.powf(n);
         if rms > self.envelope {
@@ -139,7 +139,7 @@ impl Agc {
         };
         self.cur_gain = (frame_coef * self.cur_gain + (1.0 - frame_coef) * goal)
             .clamp(1.0, self.max_gain);
-        for buf in [vad, whisper] {
+        for buf in [vad, model] {
             let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
             let applied = if peak > 0.0 {
                 self.cur_gain.min(0.99 / peak).max(1.0)
@@ -242,16 +242,16 @@ mod tests {
         // unity gain.
         for _ in 0..50 {
             let mut vad = vec![0.005f32; FRAME_16K];
-            let mut whisper = vec![0.005f32; FRAME_16K];
-            agc.process_pair(&mut vad, &mut whisper, true);
+            let mut model = vec![0.005f32; FRAME_16K];
+            agc.process_pair(&mut vad, &mut model, true);
         }
         assert!(agc.gain() > 1.0, "gain must have risen, got {}", agc.gain());
 
         let mut vad = vec![0.005f32; FRAME_16K];
-        let mut whisper = vec![0.005f32; FRAME_16K];
-        let pre_gain_rms = agc.process_pair(&mut vad, &mut whisper, true);
+        let mut model = vec![0.005f32; FRAME_16K];
+        let pre_gain_rms = agc.process_pair(&mut vad, &mut model, true);
         // The buffer itself was amplified...
-        let post_gain_rms = frame_rms(&whisper);
+        let post_gain_rms = frame_rms(&model);
         assert!(
             post_gain_rms > pre_gain_rms * 1.2,
             "sanity: frame must actually have been amplified, pre={pre_gain_rms} post={post_gain_rms}"
@@ -271,15 +271,15 @@ mod tests {
         // value just as much as on an adapted one.
         let mut agc = Agc::new(0.04, 8.0);
         let mut vad = vec![0.01f32; FRAME_16K];
-        let mut whisper = vec![0.01f32; FRAME_16K];
-        let rms = agc.process_pair(&mut vad, &mut whisper, false); // prev_speech=false
+        let mut model = vec![0.01f32; FRAME_16K];
+        let rms = agc.process_pair(&mut vad, &mut model, false); // prev_speech=false
         assert!((rms - 0.01).abs() < 1e-4, "got {rms}");
-        assert_eq!(whisper, vec![0.01f32; FRAME_16K], "gated-off frame must pass through untouched");
+        assert_eq!(model, vec![0.01f32; FRAME_16K], "gated-off frame must pass through untouched");
 
         let mut agc_off = Agc::new(0.0, 8.0); // target <= 0 disables entirely
         let mut vad2 = vec![0.01f32; FRAME_16K];
-        let mut whisper2 = vec![0.01f32; FRAME_16K];
-        let rms2 = agc_off.process_pair(&mut vad2, &mut whisper2, true);
+        let mut model2 = vec![0.01f32; FRAME_16K];
+        let rms2 = agc_off.process_pair(&mut vad2, &mut model2, true);
         assert!((rms2 - 0.01).abs() < 1e-4, "got {rms2}");
     }
 }

@@ -434,7 +434,7 @@ impl FirStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DENOISE_RATE, FRAME_16K, FRAME_48K, WHISPER_RATE};
+    use crate::config::{DENOISE_RATE, FRAME_16K, FRAME_48K, SAMPLE_RATE};
 
     /// Test oracle for the raw hw-rate chunk size `hw_input_frames` settles
     /// on: a 10 ms slice of the hardware rate.
@@ -606,7 +606,7 @@ mod tests {
         // 200 input frames of 480 must yield ~200 output frames of 160:
         // FIR streaming may shift the count by a few frames at startup
         // (delay fill), but every drained frame is exactly sized.
-        let mut s = FirStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K).unwrap();
+        let mut s = FirStream::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K).unwrap();
         let mut count = 0;
         for _ in 0..200 {
             for f in s.feed(&vec![0.0f32; FRAME_48K]) {
@@ -632,7 +632,7 @@ mod tests {
         for hw in [16_000, 44_100, 48_000, 96_000] {
             let hw_chunk = hw_input_frames(hw);
             let mut s48 = FirStream::new(hw, DENOISE_RATE, FRAME_48K).unwrap();
-            let mut s16 = FirStream::new(hw, WHISPER_RATE, FRAME_16K).unwrap();
+            let mut s16 = FirStream::new(hw, SAMPLE_RATE, FRAME_16K).unwrap();
             let (mut n48, mut n16) = (0, 0);
             for _ in 0..200 {
                 let input = vec![0.0f32; hw_chunk];
@@ -665,7 +665,7 @@ mod tests {
         // FIR supports any integer rate pair (FFT did not): 8k/11k/24k must
         // construct and track input instead of erroring.
         for hw in [8_000, 11_025, 24_000] {
-            let mut s = FirStream::new(hw, WHISPER_RATE, FRAME_16K).unwrap();
+            let mut s = FirStream::new(hw, SAMPLE_RATE, FRAME_16K).unwrap();
             let hw_chunk = hw_input_frames(hw);
             let mut n = 0;
             for _ in 0..50 {
@@ -680,7 +680,7 @@ mod tests {
     fn flush_recovers_trailing_audio() {
         // FIR buffers delay + lookahead: fed frames plus zero-drain flush must
         // recover the tail instead of losing it at shutdown.
-        let mut s = FirStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K).unwrap();
+        let mut s = FirStream::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K).unwrap();
         let fed: usize = (0..2).map(|_| s.feed(&vec![0.1f32; FRAME_48K]).len()).sum();
         let flushed = s.flush();
         assert!(!flushed.is_empty(), "flush must recover the tail");
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn clear_drops_buffered_state() {
-        let mut s = FirStream::new(DENOISE_RATE, WHISPER_RATE, FRAME_16K).unwrap();
+        let mut s = FirStream::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K).unwrap();
         let _ = s.feed(&vec![0.1f32; FRAME_48K]);
         s.clear();
         // After clear + only zero-drain, at most delay-fill silence may appear;

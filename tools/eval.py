@@ -33,8 +33,7 @@ false_accepts / empty_ref). `elapsed_s` per row is subprocess wall time
 for that file (model load amortized only across files — treat small-corpus
 absolutes with care, compare combos relatively).
 
-Sequential by design: every `--file` run loads the whisper model (GPU
-VRAM), so parallel jobs would OOM or thrash. Model load dominates small
+Sequential by design: every `--file` run loads the model, so parallel jobs would thrash. Model load dominates small
 corpora — that is expected, not a harness bug.
 
 Stdlib only. Self-test: `tools/eval.py --self-test`.

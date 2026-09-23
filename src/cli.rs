@@ -5,21 +5,11 @@ use clap::Parser;
 use crate::config::{
     parse_bool, parse_fraction, parse_hangover_ms, parse_linear_rms, parse_threads,
     DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_HANGOVER_MS,
-    DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS,
+    DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS,
     DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
-};
-#[cfg(feature = "whisper")]
-use crate::config::{
-    parse_beam_size, parse_context_chars, parse_entropy_thold, parse_logprob_thold,
-    parse_temperature, parse_temperature_inc, DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD,
-    DEFAULT_LOGPROB_THOLD, DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TEMPERATURE,
-    DEFAULT_TEMPERATURE_INC, DEFAULT_TRANSLATE,
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
-#[cfg(feature = "whisper")]
-use crate::whisper::Language;
 
 /// How `--paste` inserts text via `ydotool` (Wayland only).
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -36,9 +26,7 @@ pub(crate) enum PasteMode {
 /// Real-time Polish-English speech-to-text.
 ///
 /// Precedence for every tunable is: CLI flag > environment variable >
-/// compiled-in default. Env names use the `STTD_*` spellings;
-/// `WHISPER_MODEL_PATH` remains a silent fallback for `--model` so current
-/// setups keep working.
+/// compiled-in default. Env names use the `STTD_*` spellings.
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "sttd",
@@ -67,11 +55,9 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_CHANNEL", value_name = "MIX|AUTO|N", default_value = "mix", value_parser = parse_channel_sel, help_heading = "Input")]
     pub(crate) channel: ChannelSel,
 
-    /// Model spec (e.g. `parakeet`, `parakeet-tdt-0.6b-v3-int8`, or with the
-    /// `whisper` Cargo feature also `small`, `large-v3-turbo-q8_0`)
-    /// or path to model weights (a Parakeet model directory, or with
-    /// `whisper` a ggml `.bin` file; auto-downloaded if missing). `STTD_MODEL`
-    /// wins over the legacy `WHISPER_MODEL_PATH` fallback; CLI wins over both.
+    /// Model spec (e.g. `parakeet`, `parakeet-tdt-0.6b-v3-int8`)
+    /// or path to model weights (a Parakeet model directory;
+    /// auto-downloaded if missing).
     #[arg(
         short,
         long,
@@ -91,50 +77,6 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_DICTIONARY", value_name = "PATH", help_heading = "Model")]
     pub(crate) dictionary: Option<PathBuf>,
 
-    /// Whisper decoding language: `pl` forces Polish, `en` forces English,
-    /// `auto` detects per utterance. Whisper-only (requires the `whisper`
-    /// Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(
-        short,
-        long,
-        env = "STTD_LANGUAGE",
-        value_enum,
-        ignore_case = true,
-        default_value_t = Language::Polish,
-        help_heading = "Model"
-    )]
-    pub(crate) language: Language,
-
-    /// Translate non-English speech to English instead of transcribing it
-    /// (`set_translate(true)`). `--language` still selects the source
-    /// language (`pl` forces Polish, `auto` detects per utterance).
-    /// Whisper-only (requires the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(
-        long,
-        env = "STTD_TRANSLATE",
-        default_value_t = DEFAULT_TRANSLATE,
-        value_parser = parse_bool,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        help_heading = "Model"
-    )]
-    pub(crate) translate: bool,
-
-    /// Override the whisper initial prompt. Whisper-only (requires the
-    /// `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(short, long, env = "STTD_PROMPT", default_value = DEFAULT_PROMPT, help_heading = "Model")]
-    pub(crate) prompt: String,
-
-    /// Trailing chars of accepted transcripts appended to the initial prompt
-    /// (`0` = off). Only emitted transcripts feed it — drops never do.
-    /// Whisper-only (requires the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(long, env = "STTD_PROMPT_CONTEXT_CHARS", default_value_t = DEFAULT_PROMPT_CONTEXT_CHARS, value_parser = parse_context_chars, value_name = "N", help_heading = "Model")]
-    pub(crate) prompt_context_chars: usize,
-
     /// VAD-branch denoiser (`deepfilter` requires the `denoise` Cargo feature).
     #[arg(
         long,
@@ -145,37 +87,6 @@ pub(crate) struct Cli {
         help_heading = "Model"
     )]
     pub(crate) denoiser: DenoiserKind,
-
-    /// Beam width of whisper's beam-search decoder (`1` = greedy).
-    /// Whisper-only (requires the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(long, env = "STTD_BEAM_SIZE", default_value_t = DEFAULT_BEAM_SIZE, value_parser = parse_beam_size, value_name = "N", help_heading = "Model")]
-    pub(crate) beam_size: i32,
-
-    /// Initial decoding temperature (`0.0` = greedy, deterministic).
-    /// Whisper-only (requires the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(long, env = "STTD_TEMPERATURE", default_value_t = DEFAULT_TEMPERATURE, value_parser = parse_temperature, value_name = "T", help_heading = "Model")]
-    pub(crate) temperature: f32,
-
-    /// Temperature increment for the fallback ladder (`0.0` = single-temp,
-    /// no re-tries; `0.2` = the historical `[temp, .., 1.0]` ladder).
-    /// Whisper-only (requires the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(long, env = "STTD_TEMPERATURE_INC", default_value_t = DEFAULT_TEMPERATURE_INC, value_parser = parse_temperature_inc, value_name = "DT", help_heading = "Model")]
-    pub(crate) temperature_inc: f32,
-
-    /// Entropy threshold for the fallback ladder (higher = fewer re-tries).
-    /// Whisper-only (requires the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(long, env = "STTD_ENTROPY_THOLD", default_value_t = DEFAULT_ENTROPY_THOLD, value_parser = parse_entropy_thold, value_name = "E", help_heading = "Model")]
-    pub(crate) entropy_thold: f32,
-
-    /// Logprob threshold for the fallback ladder (more negative = fewer re-tries).
-    /// Whisper-only (requires the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(long, env = "STTD_LOGPROB_THOLD", default_value_t = DEFAULT_LOGPROB_THOLD, value_parser = parse_logprob_thold, value_name = "LP", help_heading = "Model", allow_negative_numbers = true)]
-    pub(crate) logprob_thold: f32,
 
     /// Decoder thread count; `0` = auto (physical cores).
     #[arg(long, env = "STTD_THREADS", default_value_t = 0, value_parser = parse_threads, value_name = "N", help_heading = "Model")]
@@ -211,28 +122,13 @@ pub(crate) struct Cli {
     pub(crate) min_density: f32,
 
     /// Silence hangover before an utterance closes (ms, step 10). Lower =
-    /// faster emission, more sentence splits; the prompt context keeps split
-    /// decodes coherent.
+    /// faster emission, more sentence splits.
     #[arg(long, env = "STTD_HANGOVER_MS", default_value_t = DEFAULT_HANGOVER_MS, value_parser = parse_hangover_ms, value_name = "MS", help_heading = "Acoustic gates")]
     pub(crate) hangover_ms: u64,
 
     /// Frame-level Agc target RMS (VAD-gated shared gain, speech-only), 0 disables.
     #[arg(long, env = "STTD_TARGET_RMS", default_value_t = DEFAULT_TARGET_RMS, value_parser = parse_linear_rms, help_heading = "Acoustic gates")]
     pub(crate) target_rms: f32,
-
-    /// Min avg token confidence, weak acoustic evidence.
-    #[arg(long, env = "STTD_MIN_CONF", default_value_t = DEFAULT_MIN_CONFIDENCE, value_parser = parse_fraction, help_heading = "Transcript gates")]
-    pub(crate) min_conf: f32,
-
-    /// Min avg token confidence, strong acoustic evidence.
-    #[arg(
-        long,
-        env = "STTD_MIN_CONF_STRONG",
-        default_value_t = DEFAULT_MIN_CONFIDENCE_STRONG,
-        value_parser = parse_fraction,
-        help_heading = "Transcript gates"
-    )]
-    pub(crate) min_conf_strong: f32,
 
     /// Remove hesitation/filler words (yyy, eee, um, ...) from emitted
     /// transcripts. Off by default: the list is stripped whatever the
@@ -347,23 +243,9 @@ pub(crate) struct Cli {
     )]
     pub(crate) autopause: bool,
 
-    /// Dump per-token id/text/p/plog/is_timestamp to stderr.
-    /// Whisper-only (requires the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    #[arg(
-        long,
-        env = "STTD_DEBUG_TOKENS",
-        default_value_t = false,
-        value_parser = parse_bool,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        help_heading = "Runtime"
-    )]
-    pub(crate) debug_tokens: bool,
-
     /// Append one JSON object per transcribed utterance to this file
     /// (tag, audio length, inference time, RTF, acoustic evidence,
-    /// confidence, verdict, text). For offline tuning and regression
+    /// verdict, text). For offline tuning and regression
     /// analysis; transcription never depends on it (open errors only warn).
     #[arg(
         long,
@@ -470,12 +352,9 @@ pub(crate) struct Cli {
 
 impl Cli {
     /// Raw `--model` value with env precedence resolved: CLI (`STTD_MODEL`
-    /// via clap) > legacy `WHISPER_MODEL_PATH` > compiled-in default spec.
+    /// via clap) or compiled-in default spec.
     pub(crate) fn model_input(&self) -> String {
-        effective_model_input(
-            self.model.as_deref(),
-            std::env::var("WHISPER_MODEL_PATH").ok(),
-        )
+        effective_model_input(self.model.as_deref())
     }
 
     /// Effective pid-file path: `--pid-file`/`STTD_PID_FILE` or `<tmp>/sttd.pid`.
@@ -493,16 +372,10 @@ impl Cli {
     }
 }
 
-/// Pure precedence helper (see `Cli::model_input`), split out for tests so
-/// they don't touch the process environment.
-pub(crate) fn effective_model_input(cli_model: Option<&str>, legacy_env: Option<String>) -> String {
+/// Pure precedence helper (see `Cli::model_input`), split out for tests.
+pub(crate) fn effective_model_input(cli_model: Option<&str>) -> String {
     if let Some(m) = cli_model {
         return m.to_string();
-    }
-    if let Some(legacy) = legacy_env {
-        if !legacy.trim().is_empty() {
-            return legacy;
-        }
     }
     DEFAULT_MODEL_SPEC.to_string()
 }
@@ -517,7 +390,7 @@ mod tests {
         assert_eq!(cli.model, None);
         assert!(!cli.list_models);
         assert_eq!(
-            effective_model_input(cli.model.as_deref(), None),
+            effective_model_input(cli.model.as_deref()),
             DEFAULT_MODEL_SPEC
         );
         // Default spec resolves to the Parakeet model directory.
@@ -525,7 +398,7 @@ mod tests {
             .expect("default spec must resolve");
         assert_eq!(
             resolved,
-            crate::model_store::ModelRef::Parakeet {
+            crate::model_store::ModelRef {
                 dir: PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"),
                 assets: &[
                     "encoder-model.int8.onnx",
@@ -535,33 +408,12 @@ mod tests {
                 ],
             }
         );
-        #[cfg(feature = "whisper")]
-        {
-            use crate::config::{
-                DEFAULT_BEAM_SIZE, DEFAULT_ENTROPY_THOLD, DEFAULT_LOGPROB_THOLD,
-                DEFAULT_PROMPT, DEFAULT_PROMPT_CONTEXT_CHARS, DEFAULT_TEMPERATURE,
-                DEFAULT_TEMPERATURE_INC, DEFAULT_TRANSLATE,
-            };
-            assert_eq!(cli.prompt, DEFAULT_PROMPT);
-            assert_eq!(cli.prompt_context_chars, DEFAULT_PROMPT_CONTEXT_CHARS);
-            assert_eq!(cli.language, crate::whisper::Language::Polish);
-            assert_eq!(cli.translate, DEFAULT_TRANSLATE);
-            assert!(!cli.translate);
-            assert_eq!(cli.beam_size, DEFAULT_BEAM_SIZE);
-            assert_eq!(cli.temperature, DEFAULT_TEMPERATURE);
-            assert_eq!(cli.temperature_inc, DEFAULT_TEMPERATURE_INC);
-            assert_eq!(cli.entropy_thold, DEFAULT_ENTROPY_THOLD);
-            assert_eq!(cli.logprob_thold, DEFAULT_LOGPROB_THOLD);
-            assert!(!cli.debug_tokens);
-        }
         assert_eq!(cli.hangover_ms, DEFAULT_HANGOVER_MS);
         assert_eq!(cli.channel, ChannelSel::Mix);
         assert_eq!(cli.threads, 0);
         assert_eq!(cli.gpu, DEFAULT_USE_GPU);
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
         assert_eq!(cli.min_density, DEFAULT_MIN_DENSITY);
-        assert_eq!(cli.min_conf, DEFAULT_MIN_CONFIDENCE);
-        assert_eq!(cli.min_conf_strong, DEFAULT_MIN_CONFIDENCE_STRONG);
         assert_eq!(cli.target_rms, DEFAULT_TARGET_RMS);
         assert_eq!(cli.vad_threshold, DEFAULT_VAD_THRESHOLD);
         assert_eq!(cli.vad_adapt, DEFAULT_VAD_ADAPT);
@@ -587,73 +439,6 @@ mod tests {
         assert_eq!(cli.auto_unload_after, DEFAULT_AUTO_UNLOAD_AFTER_SECS);
     }
 
-    #[cfg(feature = "whisper")]
-    #[test]
-    fn cli_flags_override_defaults() {
-        #[cfg(feature = "denoise")]
-        let cli = Cli::try_parse_from([
-            "sttd",
-            "--denoiser",
-            "deepfilter",
-            "--min-rms",
-            "0.01",
-            "--copy",
-            "off",
-            "--stdout",
-            "--debug-tokens",
-            "1",
-            "--start-paused",
-            "off",
-            "--autopause",
-            "on",
-            "--beam-size",
-            "3",
-            "--threads",
-            "0",
-            "--gpu",
-            "off",
-        ])
-        .expect("flags must parse");
-        #[cfg(not(feature = "denoise"))]
-        let cli = Cli::try_parse_from([
-            "sttd",
-            "--denoiser",
-            "none",
-            "--min-rms",
-            "0.01",
-            "--copy",
-            "off",
-            "--stdout",
-            "--debug-tokens",
-            "1",
-            "--start-paused",
-            "off",
-            "--autopause",
-            "on",
-            "--beam-size",
-            "3",
-            "--threads",
-            "0",
-            "--gpu",
-            "off",
-        ])
-        .expect("flags must parse");
-        #[cfg(feature = "denoise")]
-        assert_eq!(cli.denoiser, DenoiserKind::DeepFilter);
-        #[cfg(not(feature = "denoise"))]
-        assert_eq!(cli.denoiser, DenoiserKind::Bypass);
-        assert!((cli.min_rms - 0.01).abs() < 1e-6);
-        assert!(!cli.copy);
-        assert!(cli.stdout);
-        assert!(cli.debug_tokens);
-        assert!(!cli.start_paused);
-        assert!(cli.autopause);
-        assert_eq!(cli.beam_size, 3);
-        assert_eq!(cli.threads, 0);
-        assert!(!cli.gpu);
-    }
-
-    #[cfg(not(feature = "whisper"))]
     #[test]
     fn cli_flags_override_defaults() {
         #[cfg(feature = "denoise")]
@@ -707,33 +492,6 @@ mod tests {
         assert!(cli.autopause);
         assert_eq!(cli.threads, 0);
         assert!(!cli.gpu);
-    }
-
-    #[cfg(feature = "whisper")]
-    #[test]
-    fn cli_decoder_tunables_override_and_reject() {
-        let cli = Cli::try_parse_from([
-            "sttd",
-            "--temperature",
-            "0.2",
-            "--temperature-inc",
-            "0.0",
-            "--entropy-thold",
-            "3.0",
-            "--logprob-thold",
-            "-0.5",
-        ])
-        .expect("decoder tunables must parse");
-        assert!((cli.temperature - 0.2).abs() < 1e-6);
-        assert!((cli.temperature_inc - 0.0).abs() < 1e-6);
-        assert!((cli.entropy_thold - 3.0).abs() < 1e-6);
-        assert!((cli.logprob_thold + 0.5).abs() < 1e-6);
-        assert!(Cli::try_parse_from(["sttd", "--temperature", "2.1"]).is_err());
-        assert!(Cli::try_parse_from(["sttd", "--temperature", "-0.1"]).is_err());
-        assert!(Cli::try_parse_from(["sttd", "--temperature-inc", "1.1"]).is_err());
-        assert!(Cli::try_parse_from(["sttd", "--entropy-thold", "-1.0"]).is_err());
-        assert!(Cli::try_parse_from(["sttd", "--logprob-thold", "0.1"]).is_err());
-        assert!(Cli::try_parse_from(["sttd", "--logprob-thold", "-10.1"]).is_err());
     }
 
     #[cfg(not(feature = "denoise"))]
@@ -761,8 +519,8 @@ mod tests {
 
     #[test]
     fn cli_model_accepts_spec_and_path() {
-        let cli = Cli::try_parse_from(["sttd", "--model", "small"]).expect("spec must parse");
-        assert_eq!(cli.model.as_deref(), Some("small"));
+        let cli = Cli::try_parse_from(["sttd", "--model", "parakeet"]).expect("spec must parse");
+        assert_eq!(cli.model.as_deref(), Some("parakeet"));
         let cli =
             Cli::try_parse_from(["sttd", "--model", "models/custom.bin"]).expect("path must parse");
         assert_eq!(cli.model.as_deref(), Some("models/custom.bin"));
@@ -844,78 +602,16 @@ mod tests {
         assert!(!cli.vad_adapt);
     }
 
-    #[cfg(feature = "whisper")]
-    #[test]
-    fn cli_language_accepts_pl_en_auto() {
-        use crate::whisper::Language;
-        let cli = Cli::try_parse_from(["sttd", "--language", "en"]).expect("en must parse");
-        assert_eq!(cli.language, Language::English);
-        let cli = Cli::try_parse_from(["sttd", "--language", "auto"]).expect("auto must parse");
-        assert_eq!(cli.language, Language::Auto);
-        let cli = Cli::try_parse_from(["sttd", "--language", "PL"]).expect("case-insensitive");
-        assert_eq!(cli.language, Language::Polish);
-        assert!(Cli::try_parse_from(["sttd", "--language", "de"]).is_err());
-    }
-
-    #[cfg(feature = "whisper")]
-    #[test]
-    fn cli_translate_toggles() {
-        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
-        assert!(!cli.translate);
-        let cli = Cli::try_parse_from(["sttd", "--translate"]).expect("bare flag must parse");
-        assert!(cli.translate);
-        let cli =
-            Cli::try_parse_from(["sttd", "--translate", "off"]).expect("off must parse");
-        assert!(!cli.translate);
-    }
-
-    #[cfg(not(feature = "whisper"))]
-    #[test]
-    fn cli_whisper_flags_are_unknown_without_feature() {
-        // Whisper-only flags disappear from `--help` when the feature is off:
-        // clap must reject them as unknown arguments.
-        for args in [
-            vec!["sttd", "--language", "en"],
-            vec!["sttd", "--translate"],
-            vec!["sttd", "--prompt", "hi"],
-            vec!["sttd", "--prompt-context-chars", "10"],
-            vec!["sttd", "--beam-size", "3"],
-            vec!["sttd", "--temperature", "0.2"],
-            vec!["sttd", "--temperature-inc", "0.0"],
-            vec!["sttd", "--entropy-thold", "3.0"],
-            vec!["sttd", "--logprob-thold", "-0.5"],
-            vec!["sttd", "--debug-tokens"],
-        ] {
-            assert!(Cli::try_parse_from(args.clone()).is_err(), "args={args:?}");
-        }
-    }
-
     #[test]
     fn cli_inference_tunables_reject_out_of_range() {
-        #[cfg(feature = "whisper")]
-        {
-            assert!(Cli::try_parse_from(["sttd", "--beam-size", "0"]).is_err());
-            assert!(Cli::try_parse_from(["sttd", "--beam-size", "-1"]).is_err());
-        }
         assert!(Cli::try_parse_from(["sttd", "--threads", "-1"]).is_err());
         let cli = Cli::try_parse_from(["sttd", "--threads", "0"]).expect("0 = auto");
         assert_eq!(cli.threads, 0);
     }
 
     #[test]
-    fn model_precedence_is_cli_over_legacy_over_default() {
-        assert_eq!(
-            effective_model_input(Some("small"), Some("models/legacy.bin".into())),
-            "small"
-        );
-        assert_eq!(
-            effective_model_input(None, Some("models/legacy.bin".into())),
-            "models/legacy.bin"
-        );
-        assert_eq!(
-            effective_model_input(None, Some("  ".into())),
-            DEFAULT_MODEL_SPEC
-        );
-        assert_eq!(effective_model_input(None, None), DEFAULT_MODEL_SPEC);
+    fn model_precedence_is_cli_over_default() {
+        assert_eq!(effective_model_input(Some("parakeet")), "parakeet");
+        assert_eq!(effective_model_input(None), DEFAULT_MODEL_SPEC);
     }
 }

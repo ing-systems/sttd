@@ -8,9 +8,7 @@
 // per-word confidences, so the dictionary fuzzy correction runs gated
 // (Phase B) instead of ungated.
 //
-// Runs on CPU. `--gpu` warns and falls back to CPU: the prebuilt ORT CUDA
-// EP targets older CUDA/cuDNN than the CUDA 13.4/sm_120 toolchain
-// whisper.cpp is built against here.
+// Runs on CPU. `--gpu` warns and falls back to CPU.
 // ---------------------------------------------------------------------------
 
 use std::path::Path;
@@ -70,20 +68,18 @@ impl SpeechModel for ParakeetModel {
     fn transcribe(
         &mut self,
         pcm_16k: &[f32],
-        _prompt: &str,
         running: &Arc<AtomicBool>,
     ) -> Result<Transcript> {
-        // `ort` has no abort callback, unlike whisper.cpp: a single
-        // utterance's inference is hundreds of ms, not minutes, so a
-        // pre-call check (rather than aborting mid-inference) is enough to
-        // avoid running needless work after shutdown was requested.
+        // `ort` has no abort callback: a single utterance's inference is
+        // hundreds of ms, not minutes, so a pre-call check (rather than
+        // aborting mid-inference) is enough to avoid running needless work
+        // after shutdown was requested.
         if !running.load(Ordering::Relaxed) {
             anyhow::bail!("shutdown requested");
         }
         // Encoder does 8x subsampling; a very short clip can yield too few
         // frames for the TDT greedy decoder to emit anything (see
-        // PARAKEET_MIN_SAMPLES's doc comment). Reuses the shared dither-pad
-        // helper — the technique isn't whisper-specific.
+        // PARAKEET_MIN_SAMPLES's doc comment).
         let padded;
         let pcm = if pcm_16k.len() < PARAKEET_MIN_SAMPLES {
             padded = crate::asr::pad_with_dither(pcm_16k, PARAKEET_MIN_SAMPLES);
@@ -97,17 +93,9 @@ impl SpeechModel for ParakeetModel {
             .map_err(|e| anyhow::anyhow!("parakeet inference failed: {e}"))?;
         Ok(Transcript {
             text: result.text,
-            // Greedy TDT decode reports no utterance-level average
-            // probability, so the transcript gate's confidence-floor arm
-            // stays a no-op (as with `parakeet-rs` before); per-word
-            // confidences below still gate the dictionary correction.
-            confidence: None,
+            // Per-word confidences gate the dictionary correction.
             word_confidences: result.word_confidences,
         })
-    }
-
-    fn uses_prompt(&self) -> bool {
-        false
     }
 
     fn describe(&self) -> String {

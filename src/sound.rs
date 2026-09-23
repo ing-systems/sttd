@@ -2,7 +2,7 @@
 // Audible pause/resume/ready cues, behind one seam.
 // ---------------------------------------------------------------------------
 //
-// Mic mode starts paused by default and the whisper load (plus the reload
+// Mic mode starts paused by default and the model load (plus the reload
 // after a long pause) takes tens of seconds with only a log line to mark
 // readiness — invisible in daemon mode. Three short synthesized tones mark
 // the transitions instead: paused (low ack), resumed (mid ack), ready
@@ -10,7 +10,7 @@
 //
 // Zero new dependencies: `cpal` (already used for capture) opens the default
 // output device and plays a synthesized sine. Playback is fire-and-forget on
-// a detached thread so signal/whisper threads never block; failures (no
+// a detached thread so signal/ASR threads never block; failures (no
 // output device, busy) log once per cue and never propagate. Tone synthesis
 // (`tone_buffer`, `sequence_buffer`) is pure and unit-tested; device I/O is
 // untested glue by design.

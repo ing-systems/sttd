@@ -4,62 +4,34 @@
 //
 // A single domain idea — `gate` — used to live in two modules with a thin
 // `Evidence` carrier across the channel seam: `UtteranceBuffer::close` owned
-// the acoustic gates, `whisper_loop` owned the transcript gates. To answer
+// the acoustic gates, the ASR loop owned the transcript gates. To answer
 // "why was this utterance dropped" you had to read both plus the stderr logs.
 // The pure helpers were tested in isolation; composition through call order
 // was not.
 //
 // This module owns both halves with leverage over thresholds + ordering, so
 // callers pass measurements + text and get a disposition. `Utterance` stays
-// data; conditioning / gain / transcription stay outside (see `whisper`).
+// data; conditioning / gain / transcription stay outside (see `asr`).
 
 use crate::config::{
     DENSITY_LONG_EXEMPT_SAMPLES, HALLUCINATION_FUZZ_MAX_DIST, HALLUCINATION_FUZZ_MIN_LEN,
-    HALLUCINATION_PATTERNS, MIN_SPEECH_FRAMES, REPETITION_BIGRAM_COUNT, STRONG_RMS_FACTOR,
-    STRONG_SPEECH_FRAMES,
+    HALLUCINATION_PATTERNS, MIN_SPEECH_FRAMES, REPETITION_BIGRAM_COUNT,
 };
-
-/// How much trust an utterance's acoustics have already earned, which selects
-/// the confidence floor its transcript then has to clear.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub(crate) enum EvidenceStrength {
-    Weak,
-    Strong,
-}
-
-impl std::fmt::Display for EvidenceStrength {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Weak => "weak",
-            Self::Strong => "strong",
-        })
-    }
-}
 
 /// Thresholds for deciding-not-to-emit, resolved once at startup from `Cli`
 /// and shared by the acoustic path (`UtteranceBuffer::close` via
-/// `FrameProcessor`) and the transcript path (`whisper_loop` via
-/// `WhisperOptions`). Previously threaded as separate `f32`s through both.
+/// `FrameProcessor`) and the transcript path (ASR loop).
 #[derive(Debug, Clone)]
 pub(crate) struct GateConfig {
     pub(crate) min_speech_rms: f32,
     pub(crate) min_density: f32,
-    pub(crate) min_confidence: f32,
-    pub(crate) min_confidence_strong: f32,
 }
 
 impl GateConfig {
-    pub(crate) fn new(
-        min_speech_rms: f32,
-        min_density: f32,
-        min_confidence: f32,
-        min_confidence_strong: f32,
-    ) -> Self {
+    pub(crate) fn new(min_speech_rms: f32, min_density: f32) -> Self {
         Self {
             min_speech_rms,
             min_density,
-            min_confidence,
-            min_confidence_strong,
         }
     }
 
@@ -105,66 +77,27 @@ impl GateConfig {
         Ok(())
     }
 
-    /// Confidence floor for a transcript, paired with the `EvidenceStrength`
-    /// that selected it. Same rule as before: strong acoustic evidence relaxes
-    /// the floor; weak keeps it strict. Computed from acoustics alone, so it
-    /// is still meaningful (and logged) for models that never check it
-    /// against a `prob` — see `decide_transcript`.
-    pub(crate) fn floor_for(&self, speech_frames: u32, rms: f32) -> (f32, EvidenceStrength) {
-        if speech_frames >= STRONG_SPEECH_FRAMES && rms >= self.min_speech_rms * STRONG_RMS_FACTOR
-        {
-            (self.min_confidence_strong, EvidenceStrength::Strong)
-        } else {
-            (self.min_confidence, EvidenceStrength::Weak)
-        }
-    }
-
-    /// Transcript gate: owns the order empty -> confidence floor ->
-    /// hallucination -> repetition. Callers pass the already-trimmed text and
-    /// its text-token average probability, when the model reports one:
-    /// `prob: None` (Parakeet, which decodes greedily with no per-token
-    /// probability) skips the confidence-floor arm entirely and falls
-    /// straight through to hallucination/repetition — there is no signal to
-    /// check a floor against. `floor`/`strength` are still computed from
-    /// acoustics and carried in the verdict either way, so logs and
-    /// `--metrics` stay comparable across engines.
-    pub(crate) fn decide_transcript(
-        &self,
-        speech_frames: u32,
-        rms: f32,
-        trimmed: &str,
-        prob: Option<f32>,
-    ) -> TranscriptVerdict {
+    /// Transcript gate: owns the order empty -> hallucination -> repetition.
+    /// Callers pass the already-trimmed text.
+    pub(crate) fn decide_transcript(&self, trimmed: &str) -> TranscriptVerdict {
         if trimmed.trim().is_empty() {
             return TranscriptVerdict::DropEmpty;
-        }
-        let (floor, strength) = self.floor_for(speech_frames, rms);
-        if prob.is_some_and(|p| p < floor) {
-            return TranscriptVerdict::Drop {
-                kind: TranscriptDropKind::LowConfidence,
-                floor,
-                strength,
-            };
         }
         if is_hallucination(trimmed) {
             return TranscriptVerdict::Drop {
                 kind: TranscriptDropKind::Hallucination,
-                floor,
-                strength,
             };
         }
         if is_repetition(trimmed) {
             return TranscriptVerdict::Drop {
                 kind: TranscriptDropKind::Repetition,
-                floor,
-                strength,
             };
         }
-        TranscriptVerdict::Emit { floor, strength }
+        TranscriptVerdict::Emit
     }
 }
 
-/// Why an utterance never reached whisper.
+/// Why an utterance never reached the model.
 #[derive(PartialEq, Debug)]
 pub(crate) enum AcousticDrop {
     TooFewFrames { speech_frames: u32, samples: usize },
@@ -213,38 +146,27 @@ impl AcousticDrop {
 /// Transcript disposition for non-empty text (plus the empty case).
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub(crate) enum TranscriptVerdict {
-    Emit { floor: f32, strength: EvidenceStrength },
+    Emit,
     DropEmpty,
-    Drop {
-        kind: TranscriptDropKind,
-        floor: f32,
-        strength: EvidenceStrength,
-    },
+    Drop { kind: TranscriptDropKind },
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub(crate) enum TranscriptDropKind {
-    LowConfidence,
     Hallucination,
     Repetition,
 }
 
 impl TranscriptVerdict {
     /// `<dump_dir>/<tag>.txt` body, matching historical `DROPPED(...)` strings.
-    /// `LowConfidence` is unreachable when `prob` is `None` (see
-    /// `decide_transcript`), so that arm can always format a real value.
-    pub(crate) fn dump_reason(&self, trimmed: &str, prob: Option<f32>) -> String {
+    pub(crate) fn dump_reason(&self, trimmed: &str) -> String {
         match self {
             Self::DropEmpty => "DROPPED(empty)".to_string(),
-            Self::Drop { kind, floor, strength } => match kind {
-                TranscriptDropKind::LowConfidence => {
-                    let prob = prob.expect("LowConfidence verdict implies a probability");
-                    format!("DROPPED(low-conf avg_p={prob:.3} < {floor:.3}, {strength}): {trimmed}")
-                }
+            Self::Drop { kind } => match kind {
                 TranscriptDropKind::Hallucination => format!("DROPPED(hallucination): {trimmed}"),
                 TranscriptDropKind::Repetition => format!("DROPPED(repetition): {trimmed}"),
             },
-            Self::Emit { .. } => format!("EMIT: {trimmed}"),
+            Self::Emit => format!("EMIT: {trimmed}"),
         }
     }
 }
@@ -277,7 +199,7 @@ pub(crate) fn normalize_transcript(text: &str) -> String {
     normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whether `text` is a Whisper repetition-loop decode: 6+ words with at most
+/// Whether `text` is a repetition-loop decode: 6+ words with at most
 /// half unique, or any word bigram repeated `REPETITION_BIGRAM_COUNT`+ times
 /// (tight loops the ratio rule can miss on barely-6-word texts).
 pub(crate) fn is_repetition(text: &str) -> bool {
@@ -330,7 +252,7 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Whether `text` is a known Whisper hallucination on silence/noise: exact
+/// Whether `text` is a known hallucination on silence/noise: exact
 /// match after normalization, or (for lines of at least
 /// `HALLUCINATION_FUZZ_MIN_LEN` chars) within `HALLUCINATION_FUZZ_MAX_DIST`
 /// edits of a long pattern. The fuzzy arm catches single-letter variants the
@@ -365,17 +287,11 @@ pub(crate) fn is_hallucination(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-        DEFAULT_MIN_SPEECH_RMS, MIN_SPEECH_FRAMES,
+        DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, MIN_SPEECH_FRAMES,
     };
 
     fn default_gate() -> GateConfig {
-        GateConfig::new(
-            DEFAULT_MIN_SPEECH_RMS,
-            DEFAULT_MIN_DENSITY,
-            DEFAULT_MIN_CONFIDENCE,
-            DEFAULT_MIN_CONFIDENCE_STRONG,
-        )
+        GateConfig::new(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY)
     }
 
     #[test]
@@ -399,7 +315,7 @@ mod tests {
 
     #[test]
     fn acoustic_exempts_long_utterances_from_density() {
-        let gate = GateConfig::new(DEFAULT_MIN_SPEECH_RMS, 1.0, 0.6, 0.35);
+        let gate = GateConfig::new(DEFAULT_MIN_SPEECH_RMS, 1.0);
         assert!(gate
             .check_acoustic(25, 0.08, 0.3, DENSITY_LONG_EXEMPT_SAMPLES + 2_000, 300, 60_000)
             .is_ok());
@@ -407,66 +323,16 @@ mod tests {
     }
 
     #[test]
-    fn strong_evidence_relaxes_floor() {
+    fn transcript_clean_text_emits() {
         let gate = default_gate();
-        let (floor, strength) = gate.floor_for(137, 0.01178);
-        assert_eq!(strength, EvidenceStrength::Strong);
-        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE_STRONG);
-        assert!(0.478 >= floor);
+        let v = gate.decide_transcript("Zrób commit i wypchnij zmiany do repozytorium.");
+        assert!(matches!(v, TranscriptVerdict::Emit));
     }
 
     #[test]
-    fn short_word_with_strong_rms_earns_strong_evidence() {
+    fn transcript_boilerplate_hits_hallucination() {
         let gate = default_gate();
-        // 25 speech frames (e.g. "Ale" ~250 ms) with high RMS (0.05) earns strong evidence.
-        let (floor, strength) = gate.floor_for(25, 0.05);
-        assert_eq!(strength, EvidenceStrength::Strong);
-        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE_STRONG);
-    }
-
-    #[test]
-    fn weak_evidence_keeps_strict_floor() {
-        let gate = default_gate();
-        let (floor, strength) = gate.floor_for(MIN_SPEECH_FRAMES, DEFAULT_MIN_SPEECH_RMS + 0.0005);
-        assert_eq!(strength, EvidenceStrength::Weak);
-        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE);
-        assert!(0.478 < floor);
-    }
-
-    #[test]
-    fn transcript_composition_weak_low_conf_drops_before_patterns() {
-        let gate = default_gate();
-        // avg_p 0.478 < strict 0.6: low-conf, even though text is clean.
-        let v = gate.decide_transcript(
-            MIN_SPEECH_FRAMES,
-            DEFAULT_MIN_SPEECH_RMS + 0.0005,
-            "Zrób commit i wypchnij zmiany do repozytorium.",
-            Some(0.478),
-        );
-        assert!(matches!(
-            v,
-            TranscriptVerdict::Drop { kind: TranscriptDropKind::LowConfidence, .. }
-        ));
-    }
-
-    #[test]
-    fn transcript_composition_strong_passes_same_confidence() {
-        let gate = default_gate();
-        let v = gate.decide_transcript(
-            137,
-            0.01178,
-            "Zrób commit i wypchnij zmiany do repozytorium.",
-            Some(0.478),
-        );
-        assert!(matches!(v, TranscriptVerdict::Emit { .. }));
-    }
-
-    #[test]
-    fn transcript_composition_high_conf_boilerplate_hits_hallucination() {
-        // White-noise decode at avg_p 0.89 clears either floor; pattern list
-        // is the only gate. Must not be reported as low-conf.
-        let gate = default_gate();
-        let v = gate.decide_transcript(137, 0.01178, "Wszelkie prawa zastrzeżone.", Some(0.89));
+        let v = gate.decide_transcript("Wszelkie prawa zastrzeżone.");
         assert!(matches!(
             v,
             TranscriptVerdict::Drop { kind: TranscriptDropKind::Hallucination, .. }
@@ -477,10 +343,7 @@ mod tests {
     fn transcript_composition_repetition_loop_caught() {
         let gate = default_gate();
         let v = gate.decide_transcript(
-            137,
-            0.01178,
             "Współpraca w Współpraca w Współpraca w Współpraca w Współpraca.",
-            Some(0.741),
         );
         assert!(matches!(
             v,
@@ -489,42 +352,10 @@ mod tests {
     }
 
     #[test]
-    fn transcript_empty_drops_without_floor() {
+    fn transcript_empty_drops() {
         let gate = default_gate();
-        assert_eq!(
-            gate.decide_transcript(137, 0.01178, "   ", Some(0.99)),
-            TranscriptVerdict::DropEmpty
-        );
-        assert_eq!(
-            gate.decide_transcript(137, 0.01178, "", Some(0.99)),
-            TranscriptVerdict::DropEmpty
-        );
-    }
-
-    #[test]
-    fn transcript_composition_no_confidence_signal_skips_low_confidence_arm() {
-        // Parakeet reports no per-token probability: `prob: None` must never
-        // produce a LowConfidence verdict, even for text that would fail the
-        // strict floor if scored. Hallucination/repetition still apply.
-        let gate = default_gate();
-        let v = gate.decide_transcript(
-            MIN_SPEECH_FRAMES,
-            DEFAULT_MIN_SPEECH_RMS + 0.0005,
-            "Zrób commit i wypchnij zmiany do repozytorium.",
-            None,
-        );
-        assert!(matches!(v, TranscriptVerdict::Emit { .. }));
-
-        let v = gate.decide_transcript(137, 0.01178, "Wszelkie prawa zastrzeżone.", None);
-        assert!(matches!(
-            v,
-            TranscriptVerdict::Drop { kind: TranscriptDropKind::Hallucination, .. }
-        ));
-
-        assert_eq!(
-            gate.decide_transcript(137, 0.01178, "   ", None),
-            TranscriptVerdict::DropEmpty
-        );
+        assert_eq!(gate.decide_transcript("   "), TranscriptVerdict::DropEmpty);
+        assert_eq!(gate.decide_transcript(""), TranscriptVerdict::DropEmpty);
     }
 
     #[test]

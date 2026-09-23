@@ -14,7 +14,7 @@ use biquad::{Biquad, Coefficients, DirectForm2Transposed, Q_BUTTERWORTH_F32, Typ
 pub(crate) const HP_HZ: f32 = 80.0;
 /// Rate the filter is designed for. All Hp instances run at 16 kHz (post-
 /// resample); no hw-rate instances exist.
-pub(crate) const HP_RATE_HZ: u32 = crate::config::WHISPER_RATE;
+pub(crate) const HP_RATE_HZ: u32 = crate::config::SAMPLE_RATE;
 
 /// Streaming 80 Hz biquad high-pass (Butterworth Q, 12 dB/oct).
 pub(crate) struct Hp {

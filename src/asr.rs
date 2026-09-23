@@ -1,23 +1,15 @@
 // ---------------------------------------------------------------------------
-// ASR seam: the engine-agnostic worker loop, gates, metrics, conditioning.
+// ASR seam: the worker loop, gates, metrics, conditioning.
 // ---------------------------------------------------------------------------
 //
-// Two speech models exist (`whisper`: whisper.cpp via whisper-rs; `parakeet`:
-// NVIDIA Parakeet-TDT-0.6B-v3 via direct `ort` sessions, see `parakeet_core`),
-// selected once at startup by `--model` (see `model_store::ModelRef`) and fixed
-// for the process's lifetime.
-// This module owns everything that doesn't change between them: the worker
-// thread and its load/unload/pause/shed loop, the transcript gate call,
-// `--metrics` JSONL, audio conditioning, and the prompt-context tail. Each
-// engine's own file (`whisper`, `parakeet`) owns only what's genuinely
-// engine-specific — decode parameters, the actual inference call, and enough
-// of a description to log — behind the `SpeechModel` trait.
-//
-// A model that reports no per-token probability (Parakeet decodes greedily,
-// no logprobs) returns `Transcript { confidence: None, .. }`; the confidence
-// floor in `GateConfig::decide_transcript` treats `None` as "nothing to
-// check" rather than as a failure, so hallucination/repetition/empty gates
-// still run for such a model.
+// One speech model exists (Parakeet-TDT-0.6B-v3 via direct `ort` sessions,
+// see `parakeet_core`), selected once at startup by `--model`
+// (see `model_store::ModelRef`) and fixed for the process's lifetime.
+// This module owns the worker thread and its load/unload/pause/shed loop,
+// the transcript gate call, `--metrics` JSONL, audio conditioning, and the
+// split-seam dedup. The engine's own file (`parakeet`) owns only what's
+// genuinely engine-specific — the actual inference call, and enough of a
+// description to log — behind the `SpeechModel` trait.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,67 +21,29 @@ use anyhow::Result;
 use rtrb::Consumer;
 
 use crate::config::{
-    CONDITION_FADE_SAMPLES, DEFAULT_THREADS, INFERENCE_PAD_SAMPLES, RTF_WARN_RTF, WHISPER_RATE,
+    CONDITION_FADE_SAMPLES, DEFAULT_THREADS, INFERENCE_PAD_SAMPLES, RTF_WARN_RTF, SAMPLE_RATE,
 };
 use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
 use crate::utterance::Utterance;
 use crate::model_store::ModelRef;
-#[cfg(feature = "whisper")]
-use crate::whisper::Language;
 
-/// Confidence of one inference, averaged over *text* tokens only (see
-/// `whisper::average_text_confidence` when the `whisper` feature is enabled).
-/// Engine-agnostic: lives here so `Transcript` needs no `whisper` import;
-/// `None` for engines with no per-token probability (Parakeet).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TokenConfidence {
-    /// `sttd`'s stand-in for whisper.cpp's `no_speech_thold`, which is
-    /// declared in `whisper_full_params` but never actually read by the
-    /// decoder (see `DEFAULT_MIN_CONFIDENCE`'s doc comment) — so whisper.cpp
-    /// itself never rejects a low-confidence segment, and the caller must
-    /// do it based on this value.
-    pub(crate) prob: f32,
-    /// Same average, in log space — the statistic whisper.cpp's own
-    /// fallback ladder uses internally (`whisper.cpp`: `avg_logprobs`),
-    /// logged alongside `prob` for comparable-scale tuning.
-    pub(crate) logprob: f32,
-}
-
-/// Result of one inference: the joined text plus its confidence, when the
-/// engine reports one. `None` for engines with no utterance-level
-/// per-token probability (Parakeet decodes greedily) — see this module's
-/// doc comment. `word_confidences` carries per-word model confidences when
-/// the engine reports them (Parakeet, for the dictionary gate); empty
-/// otherwise (whisper).
+/// Result of one inference: the joined text plus per-word model confidences
+/// when the engine reports them (Parakeet, for the dictionary gate).
 pub(crate) struct Transcript {
     pub(crate) text: String,
-    pub(crate) confidence: Option<TokenConfidence>,
     pub(crate) word_confidences: Vec<(String, f32)>,
 }
 
-/// One loaded, ready-to-run speech model. Implementors own everything
-/// engine-specific (decode params, the ONNX/ggml session); the worker loop
-/// in this module only ever sees this trait.
+/// One loaded, ready-to-run speech model. The worker loop in this module
+/// only ever sees this trait.
 pub(crate) trait SpeechModel {
     /// Run one inference over already-conditioned 16 kHz mono audio.
-    /// `prompt` is the effective `initial_prompt` (base + conversational
-    /// tail) when `uses_prompt()` is true; implementations that return
-    /// `false` from `uses_prompt()` receive an empty string here and should
-    /// ignore it.
     fn transcribe(
         &mut self,
         pcm_16k: &[f32],
-        prompt: &str,
         running: &Arc<AtomicBool>,
     ) -> Result<Transcript>;
-
-    /// Whether this engine consumes `initial_prompt` / grows the
-    /// conversational tail. `false` skips both `build_effective_prompt` and
-    /// `push_prompt_context` for this model (Parakeet: no prompt support at
-    /// all; whisper in `--translate` mode: a prior would bias the next
-    /// translation — see `WhisperModel::uses_prompt`).
-    fn uses_prompt(&self) -> bool;
 
     /// First-load readiness log line (full config summary).
     fn describe(&self) -> String;
@@ -104,26 +58,20 @@ pub(crate) trait SpeechModel {
 
     /// Samples this engine actually decoded for a conditioned utterance of
     /// `conditioned_len` samples, accounting for any internal short-utterance
-    /// padding (e.g. whisper's `pad_with_dither`), so RTF and the
-    /// `--metrics` `audio_sec` column reflect what was fed to the model
-    /// rather than the raw utterance length.
+    /// padding, so RTF and the `--metrics` `audio_sec` column reflect what
+    /// was fed to the model rather than the raw utterance length.
     fn decoded_sample_count(&self, conditioned_len: usize) -> usize;
 }
 
-/// Load the model `ModelRef` names, dispatching to the matching engine.
-/// Called once per load/reload cycle by `asr_init_and_run`.
+/// Load the model `ModelRef` names. Called once per load/reload cycle by
+/// `asr_init_and_run`.
 pub(crate) fn load_model(model: &ModelRef, opts: &AsrOptions) -> Result<Box<dyn SpeechModel>> {
-    match model {
-        #[cfg(feature = "whisper")]
-        ModelRef::Whisper(path) => Ok(Box::new(crate::whisper::WhisperModel::load(path, opts)?)),
-        ModelRef::Parakeet { dir, .. } => Ok(Box::new(crate::parakeet::ParakeetModel::load(dir, opts)?)),
-    }
+    Ok(Box::new(crate::parakeet::ParakeetModel::load(&model.dir, opts)?))
 }
 
 /// Runs `f` while ticking `"loading {label}... Ns"` once per second on a
 /// side thread. Model construction can block for tens of seconds with no
-/// progress callback, on either engine (a large whisper ggml file or a
-/// Parakeet fp32 encoder), so this exists to keep that wait from looking
+/// progress callback (a Parakeet fp32 encoder), so this exists to keep that
 /// hung. Joins the ticker before returning `f`'s result.
 pub(crate) fn with_loading_ticker<T>(label: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let load_done = Arc::new(AtomicBool::new(false));
@@ -154,39 +102,13 @@ pub(crate) fn with_loading_ticker<T>(label: &str, f: impl FnOnce() -> Result<T>)
     result
 }
 
-/// Tunables the ASR worker needs, resolved once from `Cli`. Carries every
-/// engine's decode parameters (whisper's beam/temperature/etc. included when
-/// the `whisper` feature is enabled) even though a given run only loads one
-/// engine — `load_model` picks out what its engine needs and ignores the rest
-/// (see `main::unsupported_parakeet_flags` for the corresponding warning when
-/// a whisper-only flag is set alongside a Parakeet model, whisper builds
-/// only). Emission policy (`dump_dir`, clipboard, paste) lives with the
+/// Tunables the ASR worker needs, resolved once from `Cli`.
+/// Emission policy (`dump_dir`, clipboard, paste) lives with the
 /// `Emitter`, not here.
 #[derive(Debug, Clone)]
 pub(crate) struct AsrOptions {
     pub(crate) model_spec: String,
-    pub(crate) prompt: String,
-    pub(crate) prompt_context_chars: usize,
-    #[cfg(feature = "whisper")]
-    pub(crate) language: Language,
-    /// Translate non-English speech to English (`FullParams::set_translate`,
-    /// whisper only). `--language` selects the source language when enabled.
-    /// Whisper-only (see the `whisper` Cargo feature).
-    #[cfg(feature = "whisper")]
-    pub(crate) translate: bool,
     pub(crate) gate: GateConfig,
-    #[cfg(feature = "whisper")]
-    pub(crate) debug_tokens: bool,
-    #[cfg(feature = "whisper")]
-    pub(crate) beam_size: i32,
-    #[cfg(feature = "whisper")]
-    pub(crate) temperature: f32,
-    #[cfg(feature = "whisper")]
-    pub(crate) temperature_inc: f32,
-    #[cfg(feature = "whisper")]
-    pub(crate) entropy_thold: f32,
-    #[cfg(feature = "whisper")]
-    pub(crate) logprob_thold: f32,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
     /// Custom vocabulary for post-gate correction (see `dictionary`).
@@ -384,8 +306,6 @@ fn asr_init_and_run(
     sound_enabled: bool,
     autopause_enabled: bool,
 ) -> Result<()> {
-    let prompt = opts.prompt.clone();
-    let prompt_context_chars = opts.prompt_context_chars;
     let shed_stale = opts.shed_stale;
     let gate = opts.gate.clone();
     let dictionary = opts.dictionary.clone();
@@ -397,15 +317,10 @@ fn asr_init_and_run(
 
     let mut first_load = true;
     let mut utterance_no: u64 = 0;
-    // Sliding conversational context: tail of accepted transcripts, appended
-    // to `initial_prompt` per inference. Survives model reloads (same
-    // conversation); only emits feed it, drops never do. Fresh per process —
-    // file mode gets a new worker per run.
-    let mut prompt_tail = String::new();
     // Previous emission's final text for split-seam dedup (see
     // `remove_split_overlap`): only emits update it, drops never do, and it
-    // survives reloads like `prompt_tail` so a split prefix is not lost to
-    // an unload racing the continuation.
+    // survives reloads so a split prefix is not lost to an unload racing
+    // the continuation.
     let mut prev_emit_text = String::new();
     // Utterances that arrive while the model is unloaded (resume raced the
     // reload, or shutdown raced it): replayed in order after the next load.
@@ -477,9 +392,6 @@ fn asr_init_and_run(
                 model.as_mut(),
                 &utterance,
                 utterance_no,
-                &prompt,
-                &mut prompt_tail,
-                prompt_context_chars,
                 &gate,
                 running,
                 emitter,
@@ -574,8 +486,8 @@ fn asr_init_and_run(
                     // Backlogged GPU: shed the weakest utterances (lowest
                     // density, then lowest rms) so the transcripts that
                     // follow are the best evidence, not minutes-late noise.
-                    // Survivors transcribe in arrival order so prompt
-                    // context stays chronological (see `shed_survivors`).
+                    // Survivors transcribe in arrival order (see
+                    // `shed_survivors`).
                     let backlog = if shed_stale && rx.slots() > ASR_SHED_KEEP {
                         let mut backlog = vec![utterance];
                         while let Ok(u) = rx.pop() {
@@ -615,9 +527,6 @@ fn asr_init_and_run(
                             model.as_mut(),
                             &utterance,
                             utterance_no,
-                            &prompt,
-                            &mut prompt_tail,
-                            prompt_context_chars,
                             &gate,
                             running,
                             emitter,
@@ -675,7 +584,7 @@ fn asr_init_and_run(
             return Ok(());
         }
         let engine_name = model.engine_name();
-        // Scope exit frees VRAM (whisper: state/ctx; Parakeet: ORT sessions).
+        // Scope exit frees VRAM (Parakeet: ORT sessions).
         drop(model);
         log::info!("{engine_name} model unloaded (paused, VRAM freed)");
 
@@ -707,121 +616,6 @@ fn asr_init_and_run(
             }
         }
     }
-}
-
-/// Build the `initial_prompt` for one inference: base prompt plus the tail
-/// of accepted transcripts. Drops never enter the tail (the caller only
-/// pushes on emit), so noise can't poison later decodes. `0` chars disables
-/// the carryover entirely.
-pub(crate) fn build_effective_prompt(base: &str, context_tail: &str) -> String {
-    let tail = context_tail.trim();
-    if tail.is_empty() {
-        return base.to_string();
-    }
-    let base_trimmed = base.trim_end();
-    if base_trimmed.is_empty() {
-        return tail.to_string();
-    }
-    format!("{base_trimmed} {tail}")
-}
-
-/// Append an emitted transcript to the prompt-context tail, keeping only the
-/// last `max_chars` chars on a char boundary. `0` disables (clears, so a
-/// runtime toggle can't leave stale context). Empty text is a no-op.
-///
-/// The cut then snaps forward to the next sentence boundary (`.`, `!`,
-/// `?`, `…`), falling back to the next word boundary: whisper.cpp feeds
-/// `initial_prompt` as prior context, and a tail starting mid-word invites
-/// the decoder to continue the fragment instead of the conversation.
-pub(crate) fn push_prompt_context(tail: &mut String, emitted_text: &str, max_chars: usize) {
-    if max_chars == 0 {
-        tail.clear();
-        return;
-    }
-    let text = emitted_text.trim();
-    if text.is_empty() {
-        return;
-    }
-    if !tail.is_empty() {
-        tail.push(' ');
-    }
-    tail.push_str(text);
-    // Truncate to the last `max_chars` chars without splitting UTF-8.
-    if tail.chars().count() > max_chars {
-        let skip = tail.chars().count() - max_chars;
-        let mut byte_idx = tail
-            .char_indices()
-            .nth(skip)
-            .map(|(i, _)| i)
-            .unwrap_or(tail.len());
-        byte_idx = snap_tail_cut_forward(tail, byte_idx);
-        tail.drain(..byte_idx);
-    }
-}
-
-/// Move a truncation cut forward to the next sentence boundary (first
-/// `.`, `!`, `?` or `…` at or after `cut`), skipping past following
-/// closing punctuation and whitespace so the tail starts clean. Falls back
-/// to the next word boundary, but only when `cut` lands mid-word — a cut
-/// already at a word start stays put. Final fallback is the char cut
-/// itself. Always lands on a char boundary; never moves past the end.
-fn snap_tail_cut_forward(tail: &str, cut: usize) -> usize {
-    let cut = cut.min(tail.len());
-    // Never start the tail with whitespace.
-    let mut cut = cut;
-    while tail[cut..].starts_with(|c: char| c.is_whitespace()) {
-        cut += 1;
-    }
-    if cut >= tail.len() {
-        return tail.len().min(cut);
-    }
-    let after: Vec<(usize, char)> = tail[cut..].char_indices().collect();
-    // Sentence end first: keep the terminator behind, start after it.
-    for (rel, c) in &after {
-        if matches!(c, '.' | '!' | '?' | '…') {
-            let mut idx = cut + rel + c.len_utf8();
-            // Skip closing quotes/brackets and whitespace after the stop.
-            for (_, c2) in tail[idx..].char_indices() {
-                if matches!(c2, '"' | '\'' | '”' | '’' | ')' | ']' | '}') || c2.is_whitespace()
-                {
-                    idx += c2.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            if idx < tail.len() {
-                return idx;
-            }
-            break;
-        }
-    }
-    // No sentence stop ahead (or nothing after it): advance only when
-    // mid-word, i.e. the char before the cut is not whitespace.
-    let at_word_start = cut == 0
-        || tail[..cut]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_whitespace());
-    if at_word_start {
-        return cut;
-    }
-    for (rel, c) in &after {
-        if c.is_whitespace() {
-            let mut idx = cut + rel;
-            for (_, c2) in tail[idx..].char_indices() {
-                if c2.is_whitespace() {
-                    idx += c2.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            if idx < tail.len() {
-                return idx;
-            }
-            break;
-        }
-    }
-    cut
 }
 
 /// Open the `--metrics` JSONL log for appending (creating parent dirs).
@@ -862,10 +656,9 @@ fn open_metrics_log(path: Option<&std::path::Path>) -> Option<std::io::BufWriter
 /// `DROPPED(...)` strings stay in the dump dir via `dump_reason`).
 pub(crate) fn verdict_slug(verdict: crate::gate::TranscriptVerdict) -> &'static str {
     match verdict {
-        crate::gate::TranscriptVerdict::Emit { .. } => "emit",
+        crate::gate::TranscriptVerdict::Emit => "emit",
         crate::gate::TranscriptVerdict::DropEmpty => "drop:empty",
         crate::gate::TranscriptVerdict::Drop { kind, .. } => match kind {
-            crate::gate::TranscriptDropKind::LowConfidence => "drop:low-conf",
             crate::gate::TranscriptDropKind::Hallucination => "drop:hallucination",
             crate::gate::TranscriptDropKind::Repetition => "drop:repetition",
         },
@@ -890,20 +683,11 @@ fn escape_json_string(s: &str) -> String {
     out
 }
 
-/// Render an optional probability for a JSON field: `null` when the model
-/// reports none (Parakeet), 3 decimals otherwise.
-fn json_opt_f32(v: Option<f32>) -> String {
-    match v {
-        Some(v) => format!("{v:.3}"),
-        None => "null".to_string(),
-    }
-}
-
 /// Inference seconds per audio second for one utterance: `(audio_sec,
 /// rtf)`. `rtf > 1` means slower than realtime. Pure for tests; the same
 /// pair feeds the `--metrics` row and the slower-than-realtime warn.
 pub(crate) fn infer_rtf(samples: usize, infer_ms: f64) -> (f64, f64) {
-    let audio_sec = samples as f64 / WHISPER_RATE as f64;
+    let audio_sec = samples as f64 / SAMPLE_RATE as f64;
     let rtf = if audio_sec > 0.0 {
         infer_ms / 1000.0 / audio_sec
     } else {
@@ -915,7 +699,7 @@ pub(crate) fn infer_rtf(samples: usize, infer_ms: f64) -> (f64, f64) {
 /// Pick which backlog utterances survive shedding: top `keep` by
 /// (density, rms), ties to newer arrivals; survivors return as
 /// chronological indices. Pure for tests; the worker transcribes the
-/// survivors in order so prompt context stays chronological.
+/// survivors in arrival order.
 pub(crate) fn shed_survivors(scores: &[(f32, f32)], keep: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..scores.len()).collect();
     // Best first: higher density, then higher rms, then newer arrival.
@@ -934,15 +718,12 @@ pub(crate) fn shed_survivors(scores: &[(f32, f32)], keep: usize) -> Vec<usize> {
 /// One `--metrics` JSONL row for a transcribed utterance. Pure over its
 /// inputs (formatting only) so tests don't touch the filesystem or GPU.
 /// `infer_ms` covers inference alone (conditioning/gain excluded); `rtf` is
-/// inference seconds per audio second (>1 = slower than realtime). `prob`/
-/// `logprob` are `null` for engines that report no per-token probability.
+/// inference seconds per audio second (>1 = slower than realtime).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn format_metrics_row(
     tag: &str,
     samples: usize,
     evidence: &crate::utterance::Evidence,
-    prob: Option<f32>,
-    logprob: Option<f32>,
     verdict: crate::gate::TranscriptVerdict,
     text: &str,
     infer_ms: f64,
@@ -951,7 +732,7 @@ pub(crate) fn format_metrics_row(
     format!(
         "{{\"tag\":\"{}\",\"samples\":{},\"audio_sec\":{:.3},\"infer_ms\":{:.1},\"rtf\":{:.3},\
          \"speech_frames\":{},\"total_frames\":{},\"density\":{:.3},\"rms\":{:.5},\
-         \"prob\":{},\"logprob\":{},\"verdict\":\"{}\",\"text\":\"{}\"}}",
+         \"verdict\":\"{}\",\"text\":\"{}\"}}",
         escape_json_string(tag),
         samples,
         audio_sec,
@@ -961,8 +742,6 @@ pub(crate) fn format_metrics_row(
         evidence.total_frames,
         evidence.density(),
         evidence.rms,
-        json_opt_f32(prob),
-        json_opt_f32(logprob),
         verdict_slug(verdict),
         escape_json_string(text),
     )
@@ -978,15 +757,13 @@ fn write_metrics_row(
     tag: &str,
     samples: usize,
     evidence: &crate::utterance::Evidence,
-    prob: Option<f32>,
-    logprob: Option<f32>,
     verdict: crate::gate::TranscriptVerdict,
     text: &str,
     infer_ms: f64,
 ) {
     use std::io::Write;
     let Some(w) = metrics else { return };
-    let row = format_metrics_row(tag, samples, evidence, prob, logprob, verdict, text, infer_ms);
+    let row = format_metrics_row(tag, samples, evidence, verdict, text, infer_ms);
     if let Err(e) = writeln!(w, "{row}") {
         log::warn!("metrics: write failed: {e:?} (metrics disabled)");
         *metrics = None;
@@ -1008,9 +785,6 @@ fn transcribe_and_emit(
     model: &mut dyn SpeechModel,
     utterance: &Utterance,
     utterance_no: u64,
-    base_prompt: &str,
-    prompt_tail: &mut String,
-    prompt_context_chars: usize,
     gate: &GateConfig,
     running: &Arc<AtomicBool>,
     emitter: &mut impl Emitter,
@@ -1028,20 +802,14 @@ fn transcribe_and_emit(
     // (dithered, not digital zero — see `INFERENCE_PAD_SAMPLES`). No leading
     // pad: the utterance already starts with pre-roll. The WAV
     // dump still uses raw `utterance.pcm`; metrics/RTF count what the model
-    // actually decoded (padded length, plus each engine's short-input floor
-    // via `decoded_sample_count`).
+    // actually decoded (padded length, plus the short-input floor via
+    // `decoded_sample_count`).
     let padded = pad_trailing_with_dither(&conditioned, INFERENCE_PAD_SAMPLES);
-    let uses_prompt = model.uses_prompt();
-    let effective_prompt = if uses_prompt {
-        build_effective_prompt(base_prompt, prompt_tail)
-    } else {
-        String::new()
-    };
 
     // Inference time only (conditioning + edge pad excluded): feeds the RTF
     // column of the `--metrics` JSONL log.
     let t0 = Instant::now();
-    let result = model.transcribe(&padded, &effective_prompt, running);
+    let result = model.transcribe(&padded, running);
     let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let decoded_samples = model.decoded_sample_count(padded.len());
     let (audio_sec, rtf) = infer_rtf(decoded_samples, infer_ms);
@@ -1059,8 +827,6 @@ fn transcribe_and_emit(
             let raw_trimmed = t.text.trim();
             // Split-seam dedup before the gate: a continuation re-decodes the
             // boundary words, so strip the overlap vs the previous emission.
-            // Drops never feed the tail, so a stale prefix cannot eat real
-            // words after a dropped utterance.
             let deduped = if utterance.split_continuation && !prev_emit_text.is_empty() {
                 let d = remove_split_overlap(prev_emit_text, raw_trimmed);
                 if d.len() != raw_trimmed.len() {
@@ -1071,20 +837,11 @@ fn transcribe_and_emit(
                 raw_trimmed.to_string()
             };
             let deduped_trimmed = deduped.trim();
-            let prob = t.confidence.as_ref().map(|c| c.prob);
-            let logprob = t.confidence.as_ref().map(|c| c.logprob);
-            let mut verdict = gate.decide_transcript(
-                utterance.evidence.speech_frames,
-                utterance.evidence.rms,
-                deduped_trimmed,
-                prob,
-            );
-            let mut emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit { .. });
+            let mut verdict = gate.decide_transcript(deduped_trimmed);
+            let mut emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit);
             // Post-gate dictionary polish only: drops stay drops, so a
-            // near-miss key cannot resurrect boilerplate. Engines that
-            // report per-word confidences (Parakeet) gate the fuzzy step
-            // on them (Phase B); without (whisper) correction is exact
-            // plus ungated fuzzy (see `dictionary`).
+            // near-miss key cannot resurrect boilerplate. Per-word
+            // confidences gate the fuzzy step (see `dictionary`).
             let mut final_text = if emitted && !dictionary.is_empty() {
                 let confidences = crate::dictionary::confidence_map(&t.word_confidences);
                 let gated = (!t.word_confidences.is_empty()).then_some(&confidences);
@@ -1112,11 +869,6 @@ fn transcribe_and_emit(
                 }
             }
             let final_trimmed = final_text.trim();
-            // Only prompt-consuming engines grow the conversational tail —
-            // see `SpeechModel::uses_prompt`.
-            if emitted && uses_prompt {
-                push_prompt_context(prompt_tail, final_trimmed, prompt_context_chars);
-            }
             if emitted {
                 *prev_emit_text = final_trimmed.to_string();
             }
@@ -1125,8 +877,6 @@ fn transcribe_and_emit(
                 &tag,
                 decoded_samples,
                 &utterance.evidence,
-                prob,
-                logprob,
                 verdict,
                 final_trimmed,
                 infer_ms,
@@ -1136,16 +886,13 @@ fn transcribe_and_emit(
                 pcm: &utterance.pcm,
                 text: final_trimmed,
                 verdict,
-                prob,
-                logprob,
                 evidence: &utterance.evidence,
             });
             emitted
         }
         Err(e) => {
-            // Shutdown aborts in-flight inference (whisper: abort callback;
-            // Parakeet: a pre-call running check, see `ParakeetModel`): not
-            // a failure, just a fast exit.
+            // Shutdown skips in-flight inference via a pre-call running
+            // check (see `ParakeetModel`): not a failure, just a fast exit.
             if !running.load(Ordering::Relaxed) {
                 log::info!("{tag}: transcription aborted (shutdown)");
             } else {
@@ -1159,8 +906,6 @@ fn transcribe_and_emit(
 /// Condition an utterance for the model: DC removal, short linear fades at
 /// both ends, and peak safety to 0.99. Hum/rumble already removed upstream by
 /// `Hp` (80 Hz biquad after resampling); levels already normalized by `Agc`.
-/// Shared by every engine — the frontend benefits (no DC bias, no clipped
-/// resampler overshoot) aren't specific to whisper.
 ///
 /// Kept deliberately light: the 5 ms fades land in pre-roll/tail silence
 /// rather than speech.
@@ -1195,10 +940,8 @@ pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
 }
 
 /// Pad sub-second audio with quiet dithered noise instead of exact digital
-/// silence: a long run of true zero is a hallucination trigger for
-/// whisper's mel front-end, and a poor input for any model's short-utterance
-/// handling in general. Shared by both engines (whisper's `WHISPER_MIN_SAMPLES`
-/// floor, Parakeet's `PARAKEET_MIN_SAMPLES` floor).
+/// silence: a long run of true zero is a hallucination trigger for the mel
+/// front-end, and a poor input for short-utterance handling in general.
 pub(crate) fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(min_samples.max(pcm_16k.len()));
     out.extend_from_slice(pcm_16k);
@@ -1271,108 +1014,21 @@ pub(crate) fn remove_split_overlap(prev: &str, cur: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG, DEFAULT_MIN_DENSITY,
-        DEFAULT_MIN_SPEECH_RMS, MIN_SPEECH_FRAMES,
-    };
-    use crate::gate::{is_hallucination, is_repetition, EvidenceStrength};
+    use crate::config::{DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS};
+    use crate::gate::{is_hallucination, is_repetition};
     use crate::utterance::Evidence;
-
-    #[test]
-    fn prompt_context_builds_and_truncates() {
-        // Empty tail -> base unchanged (hot path, no allocation surprise).
-        assert_eq!(build_effective_prompt("base", ""), "base");
-        assert_eq!(build_effective_prompt("base", "   "), "base");
-        assert_eq!(
-            build_effective_prompt("base.", "Dzień dobry"),
-            "base. Dzień dobry"
-        );
-        // Empty base -> bare tail (custom --prompt "").
-        assert_eq!(build_effective_prompt("", "hej"), "hej");
-
-        // Push appends with a space, truncates to last N chars.
-        let mut tail = String::new();
-        push_prompt_context(&mut tail, "pierwsze zdanie.", 150);
-        assert_eq!(tail, "pierwsze zdanie.");
-        push_prompt_context(&mut tail, "Drugie zdanie.", 150);
-        assert_eq!(tail, "pierwsze zdanie. Drugie zdanie.");
-
-        // Overflow keeps the tail, drops the head.
-        let mut long = String::new();
-        push_prompt_context(&mut long, "aaa bbb ccc", 7);
-        assert_eq!(long, "bbb ccc", "tail={long:?}");
-
-        // Polish diacritics are never split: truncation lands on a char
-        // boundary even mid-ogonek.
-        let mut diac = String::new();
-        push_prompt_context(&mut diac, "ąęłńóśźż", 4);
-        assert_eq!(diac.chars().count(), 4);
-        assert_eq!(diac, "óśźż");
-
-        // Disabled clears; empty text is a no-op (drops never reach here,
-        // but double-guard the seam).
-        push_prompt_context(&mut tail, "ignored", 0);
-        assert!(tail.is_empty());
-        push_prompt_context(&mut tail, "   ", 150);
-        assert!(tail.is_empty());
-    }
-
-    #[test]
-    fn prompt_context_snaps_to_sentence_boundary() {
-        // Cut mid-sentence advances past the next stop: no headless
-        // fragment stays as decoder prior.
-        let mut tail = String::new();
-        push_prompt_context(
-            &mut tail,
-            "Pierwsze zdanie. Drugie zdanie. Trzecie zdanie.",
-            20,
-        );
-        assert_eq!(tail, "Trzecie zdanie.", "tail={tail:?}");
-
-        // Question/exclamation stops count too.
-        let mut tail = String::new();
-        push_prompt_context(&mut tail, "Co słychać? Dobrze słychać! Dalej raz.", 22);
-        assert_eq!(tail, "Dalej raz.", "tail={tail:?}");
-
-        // No stop ahead: falls back to the next word boundary, never
-        // mid-word.
-        let mut tail = String::new();
-        push_prompt_context(&mut tail, "aaabbb ccc ddd", 9);
-        assert_eq!(tail, "ccc ddd", "tail={tail:?}");
-
-        // Cut already at a word start without a stop ahead stays put.
-        let mut tail = String::new();
-        push_prompt_context(&mut tail, "aaa bbb ccc", 7);
-        assert_eq!(tail, "bbb ccc", "tail={tail:?}");
-
-        // Fits without truncation: untouched, even mid-sentence.
-        let mut tail = String::new();
-        push_prompt_context(&mut tail, "Niepełne zdanie bez kropki", 150);
-        assert_eq!(tail, "Niepełne zdanie bez kropki");
-    }
 
     #[test]
     fn verdict_slug_covers_every_disposition() {
         use crate::gate::{TranscriptDropKind, TranscriptVerdict};
-        assert_eq!(
-            verdict_slug(TranscriptVerdict::Emit {
-                floor: 0.35,
-                strength: EvidenceStrength::Strong
-            }),
-            "emit"
-        );
+        assert_eq!(verdict_slug(TranscriptVerdict::Emit), "emit");
         assert_eq!(verdict_slug(TranscriptVerdict::DropEmpty), "drop:empty");
         for (kind, slug) in [
-            (TranscriptDropKind::LowConfidence, "drop:low-conf"),
             (TranscriptDropKind::Hallucination, "drop:hallucination"),
             (TranscriptDropKind::Repetition, "drop:repetition"),
         ] {
             assert_eq!(
-                verdict_slug(TranscriptVerdict::Drop {
-                    kind,
-                    floor: 0.6,
-                    strength: EvidenceStrength::Weak
-                }),
+                verdict_slug(TranscriptVerdict::Drop { kind }),
                 slug
             );
         }
@@ -1391,12 +1047,7 @@ mod tests {
             "utt_000001",
             16_000,
             &evidence,
-            Some(0.9),
-            Some(-0.1),
-            TranscriptVerdict::Emit {
-                floor: 0.35,
-                strength: EvidenceStrength::Strong,
-            },
+            TranscriptVerdict::Emit,
             "Dzień dobry",
             250.0,
         );
@@ -1411,32 +1062,6 @@ mod tests {
     }
 
     #[test]
-    fn metrics_row_uses_null_for_missing_confidence() {
-        // Parakeet-shaped row: no per-token probability at all.
-        use crate::gate::TranscriptVerdict;
-        let evidence = Evidence {
-            speech_frames: 100,
-            total_frames: 200,
-            rms: 0.02,
-        };
-        let row = format_metrics_row(
-            "utt_000003",
-            16_000,
-            &evidence,
-            None,
-            None,
-            TranscriptVerdict::Emit {
-                floor: 0.35,
-                strength: EvidenceStrength::Strong,
-            },
-            "Dzień dobry",
-            250.0,
-        );
-        assert!(row.contains("\"prob\":null"), "{row}");
-        assert!(row.contains("\"logprob\":null"), "{row}");
-    }
-
-    #[test]
     fn metrics_row_escapes_text_for_json() {
         use crate::gate::TranscriptVerdict;
         let evidence = Evidence {
@@ -1448,8 +1073,6 @@ mod tests {
             "utt_000002",
             16_000,
             &evidence,
-            Some(0.5),
-            Some(-0.7),
             TranscriptVerdict::DropEmpty,
             "quote \"here\"\nnewline",
             0.0,
@@ -1474,7 +1097,7 @@ mod tests {
     #[test]
     fn shed_survivors_keep_best_by_density_then_rms() {
         // 6 backlogged, keep 4: the two weakest densities drop, order stays
-        // chronological for prompt context.
+        // chronological.
         let scores = vec![
             (0.9, 0.02), // 0 keep
             (0.1, 0.05), // 1 drop (worst density)
@@ -1500,56 +1123,7 @@ mod tests {
     }
 
     fn default_gate() -> GateConfig {
-        GateConfig::new(
-            DEFAULT_MIN_SPEECH_RMS,
-            DEFAULT_MIN_DENSITY,
-            DEFAULT_MIN_CONFIDENCE,
-            DEFAULT_MIN_CONFIDENCE_STRONG,
-        )
-    }
-
-    #[test]
-    fn strong_acoustic_evidence_relaxes_confidence_gate() {
-        // Exact numbers from the production log this fix addresses:
-        // "[sttd] utterance: 34720 samples (137 speech frames, rms=0.01178)
-        // -> whisper" followed by "dropped low-confidence transcript
-        // (avg_p=0.478 < 0.600)" for a transcript the user confirmed was
-        // close to correct (one misheard word), not a hallucination.
-        let evidence = Evidence {
-            speech_frames: 137,
-            total_frames: 200,
-            rms: 0.01178,
-        };
-        let gate = default_gate();
-        let (floor, strength) = gate.floor_for(evidence.speech_frames, evidence.rms);
-        assert_eq!(strength, EvidenceStrength::Strong);
-        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE_STRONG);
-        assert!(
-            0.478 >= floor,
-            "avg_p=0.478 must clear the relaxed threshold {floor}"
-        );
-    }
-
-    #[test]
-    fn weak_evidence_keeps_strict_gate() {
-        // Regression for the hole 71c05b0 closed: an utterance with barely
-        // enough VAD-flagged speech to survive `close`'s own gates, and RMS
-        // just above the noise floor, must still face the strict confidence
-        // floor — even at the same avg_p (0.478) that the strong-evidence
-        // case above lets through.
-        let evidence = Evidence {
-            speech_frames: MIN_SPEECH_FRAMES,
-            total_frames: 131,
-            rms: DEFAULT_MIN_SPEECH_RMS + 0.0005,
-        };
-        let gate = default_gate();
-        let (floor, strength) = gate.floor_for(evidence.speech_frames, evidence.rms);
-        assert_eq!(strength, EvidenceStrength::Weak);
-        assert_eq!(floor, DEFAULT_MIN_CONFIDENCE);
-        assert!(
-            0.478 < floor,
-            "avg_p=0.478 must NOT clear the strict threshold {floor}"
-        );
+        GateConfig::new(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY)
     }
 
     #[test]
@@ -1760,25 +1334,14 @@ mod tests {
         assert_eq!(pick_auto_threads(0, 0), DEFAULT_THREADS);
     }
 
-    #[cfg(feature = "whisper")]
     #[test]
     fn asr_worker_signals_init_failure() {
-        // Bad model path must propagate via the ready channel instead of
+        // Bad model dir must propagate via the ready channel instead of
         // silently capturing into a dead queue.
         let (_tx, rx) = rtrb::RingBuffer::new(ASR_QUEUE_CAP);
         let opts = AsrOptions {
             model_spec: "bogus".to_string(),
-            prompt: String::new(),
-            prompt_context_chars: crate::config::DEFAULT_PROMPT_CONTEXT_CHARS,
-            language: Language::Polish,
-            translate: false,
             gate: default_gate(),
-            debug_tokens: false,
-            beam_size: crate::config::DEFAULT_BEAM_SIZE,
-            temperature: crate::config::DEFAULT_TEMPERATURE,
-            temperature_inc: crate::config::DEFAULT_TEMPERATURE_INC,
-            entropy_thold: crate::config::DEFAULT_ENTROPY_THOLD,
-            logprob_thold: crate::config::DEFAULT_LOGPROB_THOLD,
             n_threads: DEFAULT_THREADS,
             use_gpu: false,
             metrics_path: None,
@@ -1786,7 +1349,10 @@ mod tests {
             dictionary: Vec::new(),
             remove_hesitations: false,
         };
-        let bad = ModelRef::Whisper(std::path::PathBuf::from("/nonexistent/ggml-bogus.bin"));
+        let bad = ModelRef {
+            dir: std::path::PathBuf::from("/nonexistent/parakeet-bogus"),
+            assets: &[],
+        };
         let (handle, ready) = spawn_asr_worker(
             rx,
             bad,
@@ -1802,7 +1368,7 @@ mod tests {
         match ready.recv_timeout(std::time::Duration::from_secs(120)) {
             Ok(Ok(())) => panic!("bad model path must not signal ready"),
             Ok(Err(e)) => assert!(
-                e.contains("failed to load whisper model"),
+                e.contains("failed to load parakeet model"),
                 "unexpected error: {e}"
             ),
             Err(e) => panic!("ready channel must send once, got {e:?}"),

@@ -12,7 +12,7 @@
 // `parakeet-rs 0.3` is gone: `parakeet_core` reports per-word confidences, so
 // the production path (`asr::transcribe_and_emit`) passes a gated map and
 // Phase B is live — confident words are never fuzzy-corrected. Callers
-// without confidences (whisper, tests) pass `None` for the ungated form.
+// without confidences (tests) pass `None` for the ungated form.
 //
 // Strictness caps (same values as Murmure):
 // - words < 5 chars never fuzzy-corrected;

@@ -2,7 +2,7 @@
 name = "sttd"
 version = "0.1.0"
 edition = "2021"
-description = "Real-time Speech-to-Text pipeline: cpal + resampler + deep_filter + earshot + parakeet (+ whisper-rs with the `whisper` feature)"
+description = "Real-time Speech-to-Text pipeline: cpal + resampler + deep_filter + earshot + parakeet"
 license = "MIT"
 
 [dependencies]
@@ -21,12 +21,10 @@ ndarray = { version = "0.15", optional = true }
 # needs 0.15 for `deep_filter`.
 ndarray17 = { package = "ndarray", version = "0.17" }
 earshot = { version = "1.2", features = ["alloc"] }
-whisper-rs = { version = "0.13", features = ["cuda", "whisper-cpp-log"], optional = true }
 # Parakeet engine (see src/parakeet.rs + src/parakeet_core/): direct `ort`
 # sessions (vendored Murmure decoder) + Rust mel frontend (from
 # `parakeet-rs`). Default features pull in `ort`'s `download-binaries`, so
-# the ONNX Runtime native library is fetched by the build script the same
-# way whisper.cpp is compiled in. Note: `ort` logs through `tracing`, not
+# the ONNX Runtime native library is fetched at build time. Note: `ort` logs
 # `log`; without a tracing subscriber installed those messages are simply
 # dropped, which is fine here.
 ort = { version = "2.0.0-rc.13", features = ["download-binaries"] }
@@ -46,11 +44,6 @@ signal-hook = { version = "0.3", features = ["iterator"] }
 [features]
 default = []
 denoise = ["dep:deep_filter", "dep:ndarray"]
-# Whisper engine (see src/whisper.rs). Off by default: the default model is
-# Parakeet, and enabling this pulls in the whisper.cpp build (cmake + CUDA
-# knobs in .cargo/config.toml). When disabled, whisper specs/paths are
-# rejected and whisper-only CLI flags disappear from `--help`.
-whisper = ["dep:whisper-rs"]
 
 [profile.release]
 strip = true

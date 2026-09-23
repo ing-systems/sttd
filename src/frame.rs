@@ -66,7 +66,7 @@ impl FrameProcessor {
     }
 
     /// Unpaired frames currently waiting inside `SignalPath`, per branch
-    /// `(vad, whisper)`. Exposed for the main-loop backpressure warn so a
+    /// `(vad, model)`. Exposed for the main-loop backpressure warn so a
     /// resampler divergence shows up in the log instead of silent drift.
     pub(crate) fn signal_pending_depths(&self) -> (usize, usize) {
         self.signal.pending_depths()
@@ -98,7 +98,7 @@ impl FrameProcessor {
 
     /// Process one raw hw-rate chunk (`required_input_frames()` samples).
     /// Returns the closed utterance, if any — the caller owns the `rtrb`
-    /// handoff to the whisper thread. At most one utterance can close per
+    /// handoff to the ASR thread. At most one utterance can close per
     /// call (reopening needs `ONSET_SPEECH_FRAMES` fresh speech frames, which
     /// a chunk's few-pairs surplus past a hangover close can never supply).
     ///
@@ -111,21 +111,20 @@ impl FrameProcessor {
         debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);
 
         let mut closed = None;
-        for (vad16, whisper16) in self.signal.feed(frame_hw_raw) {
+        for (vad16, model16) in self.signal.feed(frame_hw_raw) {
             let mut vad_frame = (*vad16).clone();
-            let mut whisper_frame = (*whisper16).clone();
-            // Pre-AGC whisper RMS: the acoustic evidence `UtteranceBuffer`
-            // scores (`Evidence.rms`, `gate::floor_for`'s weak/strong split)
-            // must describe what the mic heard, not what the AGC did to it —
+            let mut model_frame = (*model16).clone();
+            // Pre-AGC model RMS: the acoustic evidence `UtteranceBuffer`
+            // scores (`Evidence.rms`) must describe what the mic heard,
             // see `push_frame_evidenced`.
             let pre_agc_rms =
                 self.agc
-                    .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
+                    .process_pair(&mut vad_frame, &mut model_frame, self.prev_speech);
             let is_speech = self.vad.verdict(&vad_frame);
             self.prev_speech = is_speech;
             if self
                 .utterance
-                .push_frame_evidenced(&whisper_frame, is_speech, pre_agc_rms)
+                .push_frame_evidenced(&model_frame, is_speech, pre_agc_rms)
                 == FrameAction::Flush
             {
                 closed = self.close_current();
@@ -137,7 +136,7 @@ impl FrameProcessor {
     /// Close the open utterance and return it if it cleared the acoustic
     /// gates. Separated from `UtteranceBuffer::close` so the accept/reject
     /// decision stays testable without a live channel. Stale-backlog
-    /// shedding lives in the whisper worker (see `WHISPER_SHED_KEEP`), which
+    /// shedding lives in the ASR worker (see `ASR_SHED_KEEP`), which
     /// owns the queue's consumer — this side never blocks the processing
     /// loop.
     fn close_current(&mut self) -> Option<Utterance> {
@@ -169,17 +168,17 @@ impl FrameProcessor {
     /// `process_frame`'s doc comment for why).
     pub(crate) fn flush_trailing_speech(&mut self) -> Option<Utterance> {
         let mut closed = None;
-        for (vad16, whisper16) in self.signal.flush() {
+        for (vad16, model16) in self.signal.flush() {
             let mut vad_frame = (*vad16).clone();
-            let mut whisper_frame = (*whisper16).clone();
+            let mut model_frame = (*model16).clone();
             let pre_agc_rms =
                 self.agc
-                    .process_pair(&mut vad_frame, &mut whisper_frame, self.prev_speech);
+                    .process_pair(&mut vad_frame, &mut model_frame, self.prev_speech);
             let is_speech = self.vad.verdict(&vad_frame);
             self.prev_speech = is_speech;
             if self
                 .utterance
-                .push_frame_evidenced(&whisper_frame, is_speech, pre_agc_rms)
+                .push_frame_evidenced(&model_frame, is_speech, pre_agc_rms)
                 == FrameAction::Flush
             {
                 closed = self.close_current();
@@ -195,7 +194,6 @@ impl FrameProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG};
 
     fn processor() -> FrameProcessor {
         FrameProcessor::new(
@@ -203,7 +201,7 @@ mod tests {
             DenoiserKind::Bypass,
             0.5,
             true,
-            GateConfig::new(0.003, 0.25, DEFAULT_MIN_CONFIDENCE, DEFAULT_MIN_CONFIDENCE_STRONG),
+            GateConfig::new(0.003, 0.25),
             80,
             0.0,
             8.0,
