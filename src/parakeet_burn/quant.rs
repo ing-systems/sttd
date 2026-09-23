@@ -212,6 +212,61 @@ impl Uint8Linear {
         }
         y
     }
+
+    /// Dequantize the full `[out][in]` weight store to f32 row-major.
+    /// Transient per call (the 8-bit store stays canonical in RAM: a
+    /// cached f32 copy of the 582 MB encoder would cost ~2.3 GB).
+    pub(crate) fn dequant_weights(&self) -> Vec<f32> {
+        let mut w = Vec::with_capacity(self.weight_u8.len());
+        for o in 0..self.out_dim {
+            let s = self.scale[o.min(self.scale.len() - 1)];
+            let z = self.zero_point[o.min(self.zero_point.len() - 1)];
+            let base = o * self.in_dim;
+            w.extend(
+                self.weight_u8[base..base + self.in_dim]
+                    .iter()
+                    .map(|&q| (q as f32 - z) * s),
+            );
+        }
+        w
+    }
+
+    /// Tensor twin of `forward_batch`: identical per-tensor activation
+    /// quantization, but the quantized activations are dequantized back
+    /// to f32 and the MAC runs as one Flex matmul against dequantized
+    /// weights. Activation-requantization noise is therefore replicated
+    /// exactly; the residual vs the integer path is f32 summation order
+    /// only (measured 9e-8 relative on synthetic inputs).
+    pub(crate) fn forward_batch_t<B: burn::tensor::backend::Backend>(
+        &self,
+        xs: &[Vec<f32>],
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+    ) -> Vec<Vec<f32>> {
+        use burn::tensor::Tensor;
+        assert!(xs.iter().all(|r| r.len() == self.in_dim));
+        if xs.is_empty() {
+            return Vec::new();
+        }
+        let flat: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
+        let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
+        let xd: Vec<f32> = xq.iter().map(|&q| (q as f32 - zpx as f32) * sx).collect();
+        let x_rows: Vec<Vec<f32>> = xd.chunks(self.in_dim).map(|c| c.to_vec()).collect();
+        let x = super::tensor::rows_to_tensor::<B>(&x_rows, device);
+        let w_rows: Vec<Vec<f32>> = self
+            .dequant_weights()
+            .chunks(self.in_dim)
+            .map(|c| c.to_vec())
+            .collect();
+        // Store is `[out][in]`; matmul wants `[K, N] = [in, out]`.
+        let w: Tensor<B, 2> = super::tensor::rows_to_tensor::<B>(&w_rows, device).transpose();
+        let mut y = x.matmul(w);
+        if let Some(b) = &self.bias {
+            // `[1, out]` broadcasts over the `[T, out]` rows.
+            let bt = super::tensor::rows_to_tensor::<B>(&[b.clone()], device);
+            y = y + bt;
+        }
+        super::tensor::tensor_to_rows(y)
+    }
 }
 
 #[cfg(test)]
@@ -345,5 +400,57 @@ mod tests {
         // exactly representable in f32 (1-ULP error).
         let y = lin.forward(&[1.0, 1.0, 1.0]);
         assert!((y[0] - 9.0).abs() < 1e-4 && (y[1] - 12.0).abs() < 1e-4, "y={y:?}");
+    }
+
+    #[test]
+    fn tensor_linear_matches_integer_path() {
+        use crate::parakeet_burn::backend::{cpu_device, CpuBackend};
+        // Non-square (3 -> 2) with per-row scales, distinct zero-points
+        // and bias, so a transposed weight read or a dropped bias shows
+        // up. Inputs span signs and magnitudes.
+        let lin = Uint8Linear {
+            weight_u8: vec![1, 2, 250, 4, 5, 6],
+            scale: vec![0.02, 0.03],
+            zero_point: vec![121.0, 5.0],
+            bias: Some(vec![0.5, -0.25]),
+            in_dim: 3,
+            out_dim: 2,
+        };
+        let xs = vec![
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 0.25, -1.5],
+            vec![10.0, 0.0, -7.0],
+        ];
+        let s = lin.forward_batch(&xs);
+        let t = lin.forward_batch_t::<CpuBackend>(&xs, &cpu_device());
+        assert_eq!(s.len(), 3);
+        assert_eq!(t.len(), 3);
+        assert!(t.iter().all(|r| r.len() == 2));
+        let (mut max_rel, mut ref_max) = (0.0f32, 0.0f32);
+        for (a, b) in s.iter().zip(t.iter()) {
+            for (p, q) in a.iter().zip(b.iter()) {
+                ref_max = ref_max.max(q.abs());
+                max_rel = max_rel.max((p - q).abs() / q.abs().max(1.0));
+            }
+        }
+        eprintln!("tensor linear: max_rel={max_rel:.2e} ref_max={ref_max:.3}");
+        // Activation requantization noise is replicated exactly, so the
+        // residual is f32 summation order only.
+        assert!(max_rel < 1e-4, "max_rel={max_rel} ref_max={ref_max}");
+    }
+
+    #[test]
+    fn tensor_linear_empty_matches_scalar() {
+        use crate::parakeet_burn::backend::{cpu_device, CpuBackend};
+        let lin = Uint8Linear {
+            weight_u8: vec![1, 2],
+            scale: vec![1.0],
+            zero_point: vec![0.0],
+            bias: None,
+            in_dim: 2,
+            out_dim: 1,
+        };
+        let empty: Vec<Vec<f32>> = Vec::new();
+        assert_eq!(lin.forward_batch_t::<CpuBackend>(&empty, &cpu_device()), empty);
     }
 }
