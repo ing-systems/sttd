@@ -147,6 +147,72 @@ impl DwConv {
         }
         out
     }
+
+    /// Tensor twin of `forward`: identical per-tensor activation
+    /// quantization, dequantized to f32, one Flex depthwise conv1d
+    /// (`groups == channels`) against dequantized weights with bias.
+    /// Zero-padding is real 0 on both sides (quantized `zpx` subtracts
+    /// to 0, Flex pads `Constant(0.0)`), and pads are symmetric
+    /// (`kernel / 2` each side), so plain `ConvOptions` suffices.
+    /// Residual is f32 summation order only.
+    pub(crate) fn forward_t<B: burn::tensor::backend::Backend>(
+        &self,
+        x: &[Vec<f32>],
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+    ) -> Vec<Vec<f32>> {
+        use burn::tensor::{module::conv1d, ops::ConvOptions, Tensor, TensorData};
+        use super::quant::dynamic_quantize_u8;
+        let t = x.len();
+        assert!(t >= 1, "dw forward_t: empty input");
+        let c = self.channels;
+        assert!(x.iter().all(|r| r.len() == c));
+        assert_eq!((self.pad_left, self.pad_right), (self.kernel / 2, self.kernel / 2));
+        let flat: Vec<f32> = x.iter().flat_map(|r| r.iter().copied()).collect();
+        let (xq, sx, zpx) = dynamic_quantize_u8(&flat);
+        // [T][C] rows -> [1, C, T].
+        let xd: Vec<f32> = xq.iter().map(|&q| (q as f32 - zpx as f32) * sx).collect();
+        let mut ncl = vec![0.0f32; c * t];
+        for (i, row) in xd.chunks(c).enumerate() {
+            for (ch, v) in row.iter().enumerate() {
+                ncl[ch * t + i] = *v;
+            }
+        }
+        let xt: Tensor<B, 3> = Tensor::from_data(TensorData::new(ncl, [1, c, t]), device);
+        // Store is `[c][k]` -> conv weight `[C, 1, K]`, dequantized.
+        let zpw = self.zero_point;
+        let wflat: Vec<f32> = self
+            .weight_u8
+            .iter()
+            .map(|&q| (q as f32 - zpw) * self.scale)
+            .collect();
+        let wt: Tensor<B, 3> = Tensor::from_data(TensorData::new(wflat, [c, 1, self.kernel]), device);
+        let bt: Tensor<B, 1> = Tensor::from_data(TensorData::new(self.bias.clone(), [c]), device);
+        let y = conv1d(
+            xt,
+            wt,
+            Some(bt),
+            ConvOptions::new([1], [self.pad_left], [1], c),
+        );
+        // [1, C, T] -> [T][C] rows.
+        let back: Vec<f32> = y.into_data().to_vec::<f32>().expect("dw forward_t: to_vec");
+        let mut out = vec![vec![0.0f32; c]; t];
+        for (ch, plane) in back.chunks(t).enumerate() {
+            for (i, v) in plane.iter().enumerate() {
+                out[i][ch] = *v;
+            }
+        }
+        out
+    }
+
+    /// Dispatch: scalar `forward` (exact integer path, default) or its
+    /// tensor twin, per `ctx`.
+    pub(crate) fn dispatch(&self, x: &[Vec<f32>], ctx: &super::tensor::TensorCtx) -> Vec<Vec<f32>> {
+        if ctx.enabled {
+            self.forward_t::<super::backend::CpuBackend>(x, &ctx.device)
+        } else {
+            self.forward(x)
+        }
+    }
 }
 
 /// GLU gate: split 2d in halves, `a * sigmoid(b)`.
@@ -537,7 +603,7 @@ pub(crate) fn ffn(x: &[Vec<f32>], l1: &Uint8Linear, l2: &Uint8Linear, ctx: &Tens
 
 pub(crate) fn conv_block(x: &[Vec<f32>], w: &BlockWeights, ctx: &TensorCtx) -> Vec<Vec<f32>> {
     let gated: Vec<Vec<f32>> = linear_batch(&w.pw1, x, ctx).iter().map(|r| glu(r)).collect();
-    let mut dwed = w.dw.forward(&gated);
+    let mut dwed = w.dw.dispatch(&gated, ctx);
     // SAME padding (k=9, pads 4/4) preserves length; trim defensively.
     dwed.truncate(x.len());
     while dwed.len() < x.len() {
@@ -621,6 +687,42 @@ mod tests {
         for (a, b) in y.iter().zip(x.iter()) {
             assert!((a[0] - b[0]).abs() < 1e-5, "y={y:?}");
         }
+    }
+
+    #[test]
+    fn dw_tensor_matches_scalar() {
+        use super::super::backend::{cpu_device, CpuBackend};
+        // 2 channels, k=3, non-trivial taps/scales/biases, mixed signs.
+        let dw = DwConv {
+            weight_u8: vec![3, 250, 7, 200, 10, 44],
+            scale: 0.02,
+            zero_point: 121.0,
+            bias: vec![0.5, -0.25],
+            channels: 2,
+            kernel: 3,
+            pad_left: 1,
+            pad_right: 1,
+        };
+        let x = vec![
+            vec![1.0, -2.0],
+            vec![0.5, 4.0],
+            vec![-3.0, 0.25],
+            vec![2.0, -0.75],
+            vec![-1.0, 1.5],
+        ];
+        let dev = cpu_device();
+        let s = dw.forward(&x);
+        let t = dw.forward_t::<CpuBackend>(&x, &dev);
+        assert_eq!((s.len(), t.len()), (5, 5));
+        let (mut mx, mut rm) = (0.0f32, 0.0f32);
+        for (a, b) in s.iter().zip(t.iter()) {
+            for (p, q) in a.iter().zip(b.iter()) {
+                mx = mx.max((p - q).abs());
+                rm = rm.max(q.abs());
+            }
+        }
+        eprintln!("dw tensor-vs-scalar: max_abs={mx:.2e} ref_max={rm:.3}");
+        assert!(mx < 1e-4 * rm.max(1.0), "mx={mx} rm={rm}");
     }
 
     #[test]

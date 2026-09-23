@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
+use super::backend::CpuBackend;
 use super::encoder::EncoderManifest;
 use super::quant::Uint8Linear;
 use super::tensor::TensorCtx;
@@ -114,6 +115,54 @@ fn conv2d_forward(w: &Conv2dW, x: &[Vec<Vec<f32>>]) -> Vec<Vec<Vec<f32>>> {
         }
     }
     y
+}
+
+/// Tensor twin of `conv2d_forward`: identical per-tensor activation
+/// quantization, dequantized to f32, one Flex conv2d against
+/// dequantized weights. No bias here: the caller runs the shared
+/// `add_bias_relu` tail exactly as the scalar path (matches the
+/// graph's Add order and keeps one bias site). Residual is f32
+/// summation order only. Pads are symmetric throughout the graph, so
+/// plain `ConvOptions` suffices (no `PaddedConvOptions`).
+fn conv2d_t<B: burn::tensor::backend::Backend>(
+    w: &Conv2dW,
+    x: &[Vec<Vec<f32>>],
+    device: &<B as burn::tensor::backend::BackendTypes>::Device,
+) -> Vec<Vec<Vec<f32>>> {
+    use burn::tensor::{module::conv2d, ops::ConvOptions, TensorData};
+    assert_eq!(x.len(), w.in_c);
+    let h = x[0].len();
+    let wd = x[0][0].len();
+    assert!(x.iter().all(|c| c.len() == h && c.iter().all(|r| r.len() == wd)));
+    let flat: Vec<f32> = x.iter().flat_map(|c| c.iter().flat_map(|r| r.iter().copied())).collect();
+    let (xq, sx, zpx) = super::quant::dynamic_quantize_u8(&flat);
+    let xd: Vec<f32> = xq.iter().map(|&q| (q as f32 - zpx as f32) * sx).collect();
+    let xt: burn::tensor::Tensor<B, 4> = burn::tensor::Tensor::from_data(
+        TensorData::new(xd, [1, w.in_c, h, wd]),
+        device,
+    );
+    let wflat: Vec<f32> = w
+        .weight_u8
+        .iter()
+        .map(|&q| (q as f32 - w.zero_point) * w.scale)
+        .collect();
+    let wt: burn::tensor::Tensor<B, 4> = burn::tensor::Tensor::from_data(
+        TensorData::new(wflat, [w.out_c, w.in_c / w.group, w.kernel, w.kernel]),
+        device,
+    );
+    let y = conv2d(
+        xt,
+        wt,
+        None,
+        ConvOptions::new([w.stride, w.stride], [w.pad, w.pad], [1, 1], w.group),
+    );
+    let dims = y.dims();
+    y.into_data()
+        .to_vec::<f32>()
+        .expect("conv2d_t: to_vec")
+        .chunks(dims[2] * dims[3])
+        .map(|c| c.chunks(dims[3]).map(|r| r.to_vec()).collect())
+        .collect()
 }
 
 fn add_bias_relu(y: &mut [Vec<Vec<f32>>], bias: &[f32], relu: bool) {
@@ -306,7 +355,13 @@ impl PreEncodeWeights {
             (&self.conv5, false),
             (&self.conv6, true),
         ] {
-            let mut y = conv2d_forward(w, &x);
+            // Convs follow `ctx` (tensor twin replicates the
+            // `ConvInteger` chain exactly); bias+Relu tail is shared.
+            let mut y = if ctx.enabled {
+                conv2d_t::<CpuBackend>(w, &x, &ctx.device)
+            } else {
+                conv2d_forward(w, &x)
+            };
             add_bias_relu(&mut y, &w.bias, relu);
             x = y;
         }
@@ -435,6 +490,46 @@ mod tests {
         let y = conv2d_forward(&w, &x);
         assert!((y[0][0][0] + 6.0).abs() < 0.1, "y={y:?}");
         assert!((y[1][0][0] - 20.0).abs() < 0.1, "y={y:?}");
+    }
+
+    #[test]
+    fn conv_tensor_matches_scalar() {
+        use super::super::backend::{cpu_device, CpuBackend};
+        // Dense k3s2p1 + depthwise k3s2p1 over small maps with mixed
+        // signs; tensor twin must match the integer chain to f32 order.
+        let dense = Conv2dW {
+            weight_u8: vec![7, 250, 3, 40, 128, 200, 1, 9, 77, 5, 5, 5, 0, 255, 128, 64, 32, 16],
+            scale: 0.02,
+            zero_point: 121.0,
+            bias: vec![0.0],
+            out_c: 2,
+            in_c: 1,
+            group: 1,
+            kernel: 3,
+            stride: 2,
+            pad: 1,
+        };
+        let x = vec![vec![
+            vec![1.0, -2.0, 3.0, -0.5],
+            vec![0.5, 4.0, -1.0, 2.0],
+            vec![-3.0, 0.25, 1.5, -2.5],
+            vec![2.0, -0.75, 0.0, 1.25],
+        ]];
+        let dev = cpu_device();
+        let s = conv2d_forward(&dense, &x);
+        let t = conv2d_t::<CpuBackend>(&dense, &x, &dev);
+        assert_eq!((s.len(), t.len()), (2, 2));
+        let (mut mx, mut rm) = (0.0f32, 0.0f32);
+        for (a, b) in s.iter().zip(t.iter()) {
+            for (r, q) in a.iter().zip(b.iter()) {
+                for (p, v) in r.iter().zip(q.iter()) {
+                    mx = mx.max((p - v).abs());
+                    rm = rm.max(v.abs());
+                }
+            }
+        }
+        eprintln!("conv tensor-vs-scalar: max_abs={mx:.2e} ref_max={rm:.3}");
+        assert!(mx < 1e-4 * rm.max(1.0), "mx={mx} rm={rm}");
     }
 
     #[test]
@@ -582,22 +677,31 @@ mod tests {
         let mel_f = f32row(mel_v);
         let ref_f = f32row(ref_v);
         let mel: Vec<Vec<f32>> = mel_f.chunks(128).map(|c| c.to_vec()).collect();
-        let y = w.forward(&mel, &super::super::tensor::TensorCtx::scalar()).unwrap();
-        assert_eq!((y.len(), y[0].len()), (8, 1024));
-        let flat: Vec<f32> = y.iter().flat_map(|r| r.iter().copied()).collect();
-        let max_abs = flat
-            .iter()
-            .zip(ref_f.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        let ref_max = ref_f.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-        eprintln!("pre_encode: max_abs={max_abs:.5} ref_max={ref_max:.3}");
-        // Integer emulation of the graph's DynamicQuantizeLinear /
-        // ConvInteger chain (see `quant` docs): residual is f32 rounding
-        // only (measured < 5e-6 at ref_max 3921). Bound holds wide margin.
-        assert!(
-            max_abs < 0.001 * ref_max.max(1.0),
-            "max_abs={max_abs} ref_max={ref_max}"
-        );
+        let tctx = super::super::tensor::TensorCtx {
+            device: super::super::backend::cpu_device(),
+            enabled: true,
+        };
+        for (tag, ctx) in [
+            ("scalar", super::super::tensor::TensorCtx::scalar()),
+            ("tensor", tctx),
+        ] {
+            let y = w.forward(&mel, &ctx).unwrap();
+            assert_eq!((y.len(), y[0].len()), (8, 1024));
+            let flat: Vec<f32> = y.iter().flat_map(|r| r.iter().copied()).collect();
+            let max_abs = flat
+                .iter()
+                .zip(ref_f.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let ref_max = ref_f.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            eprintln!("pre_encode {tag}: max_abs={max_abs:.5} ref_max={ref_max:.3}");
+            // Integer emulation of the graph's DynamicQuantizeLinear /
+            // ConvInteger chain (see `quant` docs): residual is f32 rounding
+            // only (measured < 5e-6 at ref_max 3921). Bound holds wide margin.
+            assert!(
+                max_abs < 0.001 * ref_max.max(1.0),
+                "{tag}: max_abs={max_abs} ref_max={ref_max}"
+            );
+        }
     }
 }
