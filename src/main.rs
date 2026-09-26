@@ -240,6 +240,67 @@ fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
     }
 }
 
+/// Drain complete frames from the utterance buffer into the VAD branch and
+/// the model branch, handing each closed utterance to `push` for emission.
+/// `push` preserves the microphone vs file difference (`push_utterance`
+/// drops under backpressure, `push_utterance_blocking` waits).
+fn drain_frames(
+    utterance_buffer: &mut Vec<f32>,
+    input_frames: usize,
+    fp: &mut FrameProcessor,
+    asr_tx: &mut Producer<Utterance>,
+    push: fn(&mut Producer<Utterance>, Utterance),
+) {
+    while utterance_buffer.len() >= input_frames {
+        if let Some(utterance) = fp.process_frame(&utterance_buffer[..input_frames]) {
+            push(asr_tx, utterance);
+        }
+        utterance_buffer.drain(..input_frames);
+    }
+}
+
+/// Throttled backpressure report state for the live capture loop. Pairs the
+/// last emission time with the last shed totals so growth in the utterance
+/// buffer path shows once per interval.
+struct BackpressureState<'a> {
+    last_queue_warn: &'a mut Instant,
+    last_drop_report: &'a mut (usize, usize),
+}
+
+/// Backpressure visibility: bounded rings shed under load, so report depths
+/// plus shed totals for the VAD branch and the model branch pairing.
+/// Throttled to one emission per 5 s. Preserves Ordering, timing, and log
+/// text exactly as in the inline loop body.
+fn report_backpressure(
+    state: BackpressureState<'_>,
+    raw_rx: &Consumer<f32>,
+    asr_tx: &Producer<Utterance>,
+    fp: &FrameProcessor,
+    telemetry: &StreamTelemetry,
+) {
+    if state.last_queue_warn.elapsed() >= Duration::from_secs(5) {
+        *state.last_queue_warn = Instant::now();
+        let raw_depth = raw_rx.slots();
+        let asr_depth = producer_occupied(asr_tx, crate::asr::ASR_QUEUE_CAP);
+        let (signal_vad, signal_model) = fp.signal_pending_depths();
+        let raw_dropped = telemetry.dropped_chunks.load(Ordering::Relaxed);
+        let stream_errors = telemetry.errors.load(Ordering::Relaxed);
+        let drops = (raw_dropped, stream_errors);
+        let drops_grew = drops != *state.last_drop_report;
+        *state.last_drop_report = drops;
+        if raw_depth > 64
+            || asr_depth > 4
+            || signal_vad > crate::signal::SIGNAL_PENDING_WARN
+            || signal_model > crate::signal::SIGNAL_PENDING_WARN
+            || drops_grew
+        {
+            log::warn!(
+                "queues (raw_rx={raw_depth}, asr={asr_depth}, signal_vad={signal_vad}, signal_model={signal_model}, dropped_chunks={raw_dropped}, stream_errors={stream_errors}): capture outruns resampling, branches diverged, or the model outruns real time"
+            );
+        }
+    }
+}
+
 /// Discard capture around sound-cue playback so cue tones are never
 /// transcribed. Full pipeline hold, drain, wait out the longest cue
 /// (`sound::CUE_QUIET_MS`), drain again. Skipped when an utterance is already
@@ -513,38 +574,22 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
         // Raw hw-rate samples -> FrameProcessor (denoise/VAD + model
         // branches, all resampling included).
-        while accumulator.len() >= input_frames {
-            if let Some(utterance) = fp.process_frame(&accumulator[..input_frames]) {
-                push_utterance(&mut asr_tx, utterance);
-            }
-            accumulator.drain(..input_frames);
-        }
+        drain_frames(&mut accumulator, input_frames, &mut fp, &mut asr_tx, push_utterance);
 
         // Backpressure visibility: bounded rings shed under load (callback
         // must never block, live speech must stay fresh), so report depths
         // plus shed totals — throttled to one line per 5 s. Signal-path
         // pairing depths catch a resampler divergence the others miss.
-        if last_queue_warn.elapsed() >= Duration::from_secs(5) {
-            last_queue_warn = Instant::now();
-            let raw_depth = raw_rx.slots();
-            let asr_depth = producer_occupied(&asr_tx, crate::asr::ASR_QUEUE_CAP);
-            let (signal_vad, signal_model) = fp.signal_pending_depths();
-            let raw_dropped = telemetry.dropped_chunks.load(Ordering::Relaxed);
-            let stream_errors = telemetry.errors.load(Ordering::Relaxed);
-            let drops = (raw_dropped, stream_errors);
-            let drops_grew = drops != last_drop_report;
-            last_drop_report = drops;
-            if raw_depth > 64
-                || asr_depth > 4
-                || signal_vad > crate::signal::SIGNAL_PENDING_WARN
-                || signal_model > crate::signal::SIGNAL_PENDING_WARN
-                || drops_grew
-            {
-                log::warn!(
-                    "queues (raw_rx={raw_depth}, asr={asr_depth}, signal_vad={signal_vad}, signal_model={signal_model}, dropped_chunks={raw_dropped}, stream_errors={stream_errors}): capture outruns resampling, branches diverged, or the model outruns real time"
-                );
-            }
-        }
+        report_backpressure(
+            BackpressureState {
+                last_queue_warn: &mut last_queue_warn,
+                last_drop_report: &mut last_drop_report,
+            },
+            &raw_rx,
+            &asr_tx,
+            &fp,
+            &telemetry,
+        );
     }
 
     // Stop capture before the trailing flush so no new audio races teardown.
@@ -552,12 +597,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // below only for full frames already accumulated.
     drop(stream);
     drain_raw_into(&mut raw_rx, &mut accumulator);
-    while accumulator.len() >= input_frames {
-        if let Some(utterance) = fp.process_frame(&accumulator[..input_frames]) {
-            push_utterance(&mut asr_tx, utterance);
-        }
-        accumulator.drain(..input_frames);
-    }
+    drain_frames(&mut accumulator, input_frames, &mut fp, &mut asr_tx, push_utterance);
     // Flush trailing speech, then wait for the ASR thread to actually
     // finish transcribing it (and any earlier backlog) before the process
     // exits — otherwise the last utterance can be silently dropped, and an
