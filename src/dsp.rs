@@ -39,10 +39,12 @@ pub(crate) fn downmix_to_mono_with_channel(
     }
 }
 
-/// Single-pass I16 -> mono f32 with channel select/mix. Same scale as the
-/// real-time callback in `capture` inlines per sample (`s / 32768.0`, no
-/// `Vec` there); this allocating variant remains as the tested reference.
-/// Same out-of-range rule as the f32 variant: silence.
+/// Single-pass I16 -> mono f32 with channel select/mix. Test reference only:
+/// same scale as the real-time callback in `capture::build_input_stream`
+/// inlines per sample (`s / 32768.0`). Do not call from that callback: this
+/// helper allocates a `Vec`, which the real-time path forbids (per-sample
+/// push only, no allocation). Same out-of-range rule as the f32 variant:
+/// silence.
 #[allow(dead_code)]
 pub(crate) fn downmix_i16_to_mono_with_channel(
     data: &[i16],
@@ -77,10 +79,11 @@ pub(crate) fn downmix_i16_to_mono_with_channel(
     }
 }
 
-/// Single-pass U16 -> mono f32 with channel select/mix. Same scale as the
-/// real-time callback in `capture` inlines per sample
-/// (`s / 65535.0 * 2.0 - 1.0`, no `Vec` there); this allocating variant
-/// remains as the tested reference. Same out-of-range rule: silence.
+/// Single-pass U16 -> mono f32 with channel select/mix. Test reference only:
+/// same scale as the real-time callback in `capture::build_input_stream`
+/// inlines per sample (`s / 65535.0 * 2.0 - 1.0`). Do not call from that
+/// callback: this helper allocates a `Vec`, which the real-time path forbids
+/// (per-sample push only, no allocation). Same out-of-range rule: silence.
 #[allow(dead_code)]
 pub(crate) fn downmix_u16_to_mono_with_channel(
     data: &[u16],

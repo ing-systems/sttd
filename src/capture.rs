@@ -105,7 +105,10 @@ pub(crate) fn probe_loudest_channel(
     // Temporary stream: same downmix-scale as the realtime callback in
     // `build_input_stream`, but appending interleaved f32 into a Mutex Vec
     // instead of an rtrb ring. Short-lived (hundreds of ms), so a lock per
-    // callback is fine — the realtime path never takes it.
+    // callback is fine — the realtime path never takes it. Note: that realtime
+    // callback inlines the same scales per sample and must not call the
+    // allocating `dsp` downmix helpers (test reference only) — no `Vec`,
+    // no allocation there.
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
             build_with_buffer_fallback(config, |cfg| {
