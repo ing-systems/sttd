@@ -292,6 +292,38 @@ pub(crate) fn should_drain_on_pause(was_paused: bool, now_paused: bool) -> bool 
     now_paused && !was_paused
 }
 
+/// Drain all queued utterances, returning how many were dropped. Pause-edge
+/// and paused-shutdown discards share this so stale utterances never survive
+/// a pause into a later emission.
+fn drain_queue(rx: &mut Consumer<Utterance>) -> usize {
+    let mut n = 0;
+    while rx.pop().is_ok() {
+        n += 1;
+    }
+    n
+}
+
+/// Fire single-shot autopause after an utterance the gate emitted: set the
+/// pause flag and the pause-edge state, log, and cue the paused sound.
+/// Drops and failed inferences never fire, so noise cannot steal the shot.
+fn fire_autopause(
+    autopause_enabled: bool,
+    emitted: bool,
+    paused: &Arc<AtomicBool>,
+    was_paused: &mut bool,
+    utterance_no: u64,
+    sound_enabled: bool,
+) {
+    if should_autopause(autopause_enabled, emitted) {
+        paused.store(true, Ordering::Release);
+        *was_paused = true;
+        log::info!("autopaused after utt_{utterance_no:06} (--autopause, single-shot)");
+        if sound_enabled {
+            crate::sound::play_paused();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn asr_init_and_run(
     rx: &mut Consumer<Utterance>,
@@ -400,14 +432,14 @@ fn asr_init_and_run(
                 remove_hesitations,
                 &mut prev_emit_text,
             );
-            if should_autopause(autopause_enabled, emitted) {
-                paused.store(true, Ordering::Release);
-                was_paused = true;
-                log::info!("autopaused after utt_{utterance_no:06} (--autopause, single-shot)");
-                if sound_enabled {
-                    crate::sound::play_paused();
-                }
-            }
+            fire_autopause(
+                autopause_enabled,
+                emitted,
+                paused,
+                &mut was_paused,
+                utterance_no,
+                sound_enabled,
+            );
         }
         // A re-pause mid-replay drops the rest of the stash outright, same
         // as the live queue's pause-edge drain (`should_drain_on_pause`):
@@ -441,10 +473,7 @@ fn asr_init_and_run(
                     // Consistent with the shutdown-while-paused drain a few
                     // lines below, and with `hold_pipeline`'s own discard
                     // semantics on the capture side of this same edge.
-                    let mut n = 0;
-                    while rx.pop().is_ok() {
-                        n += 1;
-                    }
+                    let n = drain_queue(rx);
                     if n > 0 {
                         log::warn!("dropping {n} queued utterance(s) (paused)");
                     }
@@ -462,10 +491,7 @@ fn asr_init_and_run(
                 if rx.is_abandoned() {
                     // Shutdown while paused with a held queue: drop it (paused
                     // shutdown has nothing worth flushing) and exit.
-                    let mut n = 0;
-                    while rx.pop().is_ok() {
-                        n += 1;
-                    }
+                    let n = drain_queue(rx);
                     if n > 0 {
                         log::warn!("dropping {n} queued utterance(s) (shut down while paused)");
                     }
@@ -535,16 +561,14 @@ fn asr_init_and_run(
                             remove_hesitations,
                             &mut prev_emit_text,
                         );
-                        if should_autopause(autopause_enabled, emitted) {
-                            paused.store(true, Ordering::Release);
-                            was_paused = true;
-                            log::info!(
-                                "autopaused after utt_{utterance_no:06} (--autopause, single-shot)"
-                            );
-                            if sound_enabled {
-                                crate::sound::play_paused();
-                            }
-                        }
+                        fire_autopause(
+                            autopause_enabled,
+                            emitted,
+                            paused,
+                            &mut was_paused,
+                            utterance_no,
+                            sound_enabled,
+                        );
                     }
                 }
                 Err(_) => {

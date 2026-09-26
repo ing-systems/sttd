@@ -208,6 +208,19 @@ impl UtteranceBuffer {
         action
     }
 
+    /// Record one open-utterance frame toward the quiet run that drives the
+    /// low-energy early-split gate. A quiet frame extends the run; a louder
+    /// frame resets it. Split checks stay with the caller: the speech arm
+    /// counts only past the early-split length while the VAD verdict still
+    /// says speech, the non-speech arm counts every frame.
+    fn note_quiet(&mut self, frame_rms: f32) {
+        if frame_rms < EARLY_SPLIT_QUIET_RMS {
+            self.quiet_run += 1;
+        } else {
+            self.quiet_run = 0;
+        }
+    }
+
     fn absorb(&mut self, frame: &[f32], is_speech: bool, evidence_rms: f32) -> FrameAction {
         // Frame loudness (of the buffered/transmitted signal) drives the
         // low-energy early split (any frame while open); `evidence_rms`
@@ -257,7 +270,7 @@ impl UtteranceBuffer {
                 // non-speech arm below for the shared flush). Must not reset
                 // to 0 first, or a run of quiet-but-VAD-flagged frames could
                 // never accumulate past 1.
-                self.quiet_run += 1;
+                self.note_quiet(frame_rms);
                 if self.quiet_run >= EARLY_SPLIT_QUIET_FRAMES {
                     self.pending_split = true;
                     FrameAction::Flush
@@ -280,11 +293,7 @@ impl UtteranceBuffer {
             }
             self.buf.extend_from_slice(frame);
             self.silence_frames += 1;
-            if frame_rms < EARLY_SPLIT_QUIET_RMS {
-                self.quiet_run += 1;
-            } else {
-                self.quiet_run = 0;
-            }
+            self.note_quiet(frame_rms);
             if self.silence_frames > self.hangover_frames {
                 self.pending_split = false;
                 FrameAction::Flush

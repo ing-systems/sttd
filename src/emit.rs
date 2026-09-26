@@ -214,6 +214,18 @@ impl EmitterWorker {
         }
     }
 
+    /// Emission helper: disable one emission tool on `NotFound`.
+    /// Warn once with the caller text, flip the flag off, report handled.
+    fn disable_on_not_found(available: &mut bool, e: &std::io::Error, warn_msg: &str) -> bool {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            log::warn!("{warn_msg}");
+            *available = false;
+            true
+        } else {
+            false
+        }
+    }
+
     fn handle_inner(&mut self, owned: &OwnedEmission) {
         let OwnedEmission {
             tag,
@@ -273,12 +285,12 @@ impl EmitterWorker {
         if self.clipboard_available {
             match copy_to_clipboard(text) {
                 Ok(()) => copied = true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    log::warn!(
-                        "--copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy"
-                    );
-                    self.clipboard_available = false;
-                }
+                Err(e)
+                    if Self::disable_on_not_found(
+                        &mut self.clipboard_available,
+                        &e,
+                        "--copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy",
+                    ) => {}
                 Err(e) => log::warn!("{tag}: clipboard copy failed: {e:?}"),
             }
         }
@@ -288,12 +300,12 @@ impl EmitterWorker {
         if self.paste_available && copied {
             match paste_via_ydotool(self.paste_mode) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    log::warn!(
-                        "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste"
-                    );
-                    self.paste_available = false;
-                }
+                Err(e)
+                    if Self::disable_on_not_found(
+                        &mut self.paste_available,
+                        &e,
+                        "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste",
+                    ) => {}
                 Err(e) => log::warn!("{tag}: auto-paste failed (is ydotoold running?): {e:?}"),
             }
         } else if self.paste_available && !copied && self.paste_mode == crate::cli::PasteMode::Type
@@ -302,12 +314,12 @@ impl EmitterWorker {
             // is off or failed.
             match type_via_ydotool(text) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    log::warn!(
-                        "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste"
-                    );
-                    self.paste_available = false;
-                }
+                Err(e)
+                    if Self::disable_on_not_found(
+                        &mut self.paste_available,
+                        &e,
+                        "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste",
+                    ) => {}
                 Err(e) => log::warn!("{tag}: auto-paste failed (is ydotoold running?): {e:?}"),
             }
         }
