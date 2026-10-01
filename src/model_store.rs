@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::{
-    parakeet_entry_for_spec, valid_model_specs, DEFAULT_MODELS_DIR,
-    PARAKEET_BASE_URL, PARAKEET_TOKENIZER_URL,
+    parakeet_entry_for_spec, valid_model_specs, DEFAULT_MODELS_DIR, PARAKEET_BASE_URL,
+    PARAKEET_TOKENIZER_URL,
 };
 
 /// Which ASR model a resolved `--model` value maps to, and where its

@@ -41,11 +41,14 @@ pub(crate) fn clean_transcription(text: &str, remove_hesitations: bool) -> Strin
         return String::new();
     }
     let mut result: Vec<&str> = Vec::with_capacity(words.len());
+    // One lowercase form per word, reused by the run comparison below: the
+    // inner loop used to allocate a fresh copy of the candidate word on
+    // every step.
+    let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
     let mut i = 0;
     while i < words.len() {
-        let current_lower = words[i].to_lowercase();
         let mut count = 1;
-        while i + count < words.len() && words[i + count].to_lowercase() == current_lower {
+        while i + count < words.len() && lower[i + count] == lower[i] {
             count += 1;
         }
         if count >= 3 {

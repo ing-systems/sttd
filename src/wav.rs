@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::dsp::{downmix_to_mono, downmix_to_mono_with_channel, pick_louder_channel, ChannelSel};
+use crate::dsp::{select_channel_and_downmix, ChannelSel};
 use crate::emit::owner_only_file;
 
 // ---------------------------------------------------------------------------
@@ -75,28 +75,25 @@ pub(crate) fn read_wav_mono_f32_with_channel(path: &Path, sel: ChannelSel) -> Re
             path.display()
         ),
     };
-    let samples = match sel {
-        ChannelSel::Mix => downmix_to_mono(&interleaved, channels),
-        ChannelSel::Pick(i) => {
-            crate::dsp::resolve_channel(Some(i), channels).with_context(|| {
-                format!(
-                    "--channel={i} out of range for {channels}-channel file {}",
-                    path.display()
-                )
-            })?;
-            downmix_to_mono_with_channel(&interleaved, channels, Some(i))
-        }
-        ChannelSel::Auto => match pick_louder_channel(&interleaved, channels) {
-            Some(i) => {
-                log::info!(
-                    "auto-channel: picked channel {i} of {channels} for {}",
-                    path.display()
-                );
-                downmix_to_mono_with_channel(&interleaved, channels, Some(i))
-            }
-            None => downmix_to_mono(&interleaved, channels),
+    // Shared select/mix with the live capture path (`dsp`), so `--channel`
+    // means the same thing for a file as for a microphone.
+    let (samples, picked) = select_channel_and_downmix(sel, &interleaved, channels).with_context(
+        || match sel {
+            ChannelSel::Pick(i) => format!(
+                "--channel={i} out of range for {channels}-channel file {}",
+                path.display()
+            ),
+            _ => format!("failed to select a channel of {}", path.display()),
         },
-    };
+    )?;
+    if sel == ChannelSel::Auto {
+        if let Some(i) = picked {
+            log::info!(
+                "auto-channel: picked channel {i} of {channels} for {}",
+                path.display()
+            );
+        }
+    }
     Ok(WavAudio {
         sample_rate,
         samples,

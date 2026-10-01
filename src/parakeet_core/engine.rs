@@ -106,11 +106,32 @@ fn top_k_threshold(logits: &[f32], k: usize) -> f32 {
         return f32::NEG_INFINITY;
     }
     let mut buf = logits.to_vec();
+    let kth = select_kth_largest(&mut buf, k);
+    *kth
+}
+
+// Both boost gates (BOOST_TOP_K and BOOST_TOP_K_DEEP) from a single copy of
+// the logits into `scratch`. The second selection runs on the permuted
+// scratch, which does not change the k-th largest value.
+fn top_k_thresholds_with_scratch(logits: &[f32], scratch: &mut Vec<f32>) -> (f32, f32) {
+    if logits.is_empty() {
+        return (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    }
+    scratch.clear();
+    scratch.extend_from_slice(logits);
+    let tight = *select_kth_largest(scratch, BOOST_TOP_K);
+    let deep = *select_kth_largest(scratch, BOOST_TOP_K_DEEP);
+    (tight, deep)
+}
+
+// Partition `buf` so that the k-th largest element is at index k - 1, and
+// return a reference to it.
+fn select_kth_largest(buf: &mut [f32], k: usize) -> &f32 {
     let k = k.min(buf.len());
     let (_, kth, _) = buf.select_nth_unstable_by(k - 1, |a, b| {
         b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
     });
-    *kth
+    kth
 }
 
 static DECODE_SPACE_RE: Lazy<Result<Regex, regex::Error>> =
@@ -128,6 +149,22 @@ fn softmax_prob(logits: &[f32], token: usize) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Encoder output `[1, time, features]` -> decoder layout `[1, features, time]`,
+/// owned and in standard (row-major) layout.
+///
+/// `as_standard_layout` is required, not cosmetic. The permuted view is
+/// contiguous in time-major order, and `to_owned` keeps the memory order of its
+/// input, so a plain `to_owned` yields strides `[1, T, features]`. Every
+/// per-frame row view `s![t, ..]` would then be strided by `T`, and `ort`
+/// rejects a non-contiguous tensor.
+fn to_decoder_layout(encoder_output: &ArrayViewD<f32>) -> ArrayD<f32> {
+    encoder_output
+        .view()
+        .permuted_axes(IxDyn(&[0, 2, 1]))
+        .as_standard_layout()
+        .into_owned()
 }
 
 fn argmax_token(logits: &[f32], blank_idx: i32) -> i32 {
@@ -401,9 +438,10 @@ impl ParakeetModel {
             .ok_or_else(|| ParakeetError::OutputNotFound("encoded_lengths".to_string()))?
             .try_extract_array()?;
 
-        let encoder_output = encoder_output.permuted_axes(IxDyn(&[0, 2, 1]));
-
-        Ok((encoder_output.to_owned(), encoded_lengths.to_owned()))
+        Ok((
+            to_decoder_layout(&encoder_output),
+            encoded_lengths.to_owned(),
+        ))
     }
 
     pub fn create_decoder_state(&self) -> Result<DecoderState, ParakeetError> {
@@ -412,20 +450,29 @@ impl ParakeetModel {
         Ok((Array::zeros((2, 1, 640)), Array::zeros((2, 1, 640))))
     }
 
+    /// One decoder step. `encoder_out` is a single `[1024]` encoder frame and
+    /// must be contiguous, so the `[1, time_steps, 1]` input is a stride-only
+    /// reshape of the caller's buffer.
     pub fn decode_step(
         &mut self,
         prev_tokens: &[i32],
         prev_state: &DecoderState,
-        encoder_out: &ArrayViewD<f32>, // [time_steps, 1024]
+        encoder_out: &ArrayViewD<f32>,
     ) -> Result<(ArrayD<f32>, DecoderState), ParakeetError> {
         log::trace!("Running decoder inference...");
 
         // Get last token or blank_idx if empty
         let target_token = prev_tokens.last().copied().unwrap_or(self.blank_idx);
 
-        // Prepare inputs matching Python: encoder_out[None, :, None] -> [1, time_steps, 1]
+        // Prepare inputs matching Python: encoder_out[None, :, None] -> [1, time_steps, 1].
+        // `insert_axis` on a view only reshapes the strides, so the decoder
+        // reads the frame in place instead of a per-step copy.
+        debug_assert!(
+            encoder_out.as_slice().is_some(),
+            "decode_step needs a contiguous encoder frame"
+        );
         let encoder_outputs = encoder_out
-            .to_owned()
+            .view()
             .insert_axis(ndarray17::Axis(0))
             .insert_axis(ndarray17::Axis(2));
         let targets = Array2::from_shape_vec((1, 1), vec![target_token])?;
@@ -462,9 +509,15 @@ impl ParakeetModel {
         // Squeeze outputs like Python (remove batch dimension)
         let logits = logits.remove_axis(ndarray17::Axis(0));
 
-        // Convert ArrayD back to Array3 to match expected return type
-        let state1_3d = state1.to_owned().into_dimensionality::<ndarray17::Ix3>()?;
-        let state2_3d = state2.to_owned().into_dimensionality::<ndarray17::Ix3>()?;
+        // Reshape on the view (free), then take ownership of the two state
+        // arrays once. They are 2 x 1 x 640 floats, so this copy is small
+        // next to the per-step inference itself.
+        let state1_3d = state1
+            .into_dimensionality::<ndarray17::Ix3>()?
+            .to_owned();
+        let state2_3d = state2
+            .into_dimensionality::<ndarray17::Ix3>()?
+            .to_owned();
 
         Ok((logits.to_owned(), (state1_3d, state2_3d)))
     }
@@ -473,25 +526,19 @@ impl ParakeetModel {
     /// encoder, greedy (optionally boosted) TDT decode.
     pub fn transcribe_samples(
         &mut self,
-        samples: Vec<f32>,
+        samples: &[f32],
     ) -> Result<TranscriptionResult, ParakeetError> {
-        let mel = self.frontend.extract(&samples)?;
-        let time_steps = mel.shape()[0];
-        let feature_size = mel.shape()[1];
+        // The frontend already returns the encoder layout [1, features, time].
+        let audio_signal = self.frontend.extract(samples)?;
+        let time_steps = audio_signal.shape()[2];
         if time_steps == 0 {
             return Ok(TranscriptionResult {
                 text: String::new(),
                 word_confidences: Vec::new(),
             });
         }
-        // Encoder layout is [batch, features, time].
-        let audio_signal = mel
-            .t()
-            .to_shape((1, feature_size, time_steps))
-            .map_err(ParakeetError::Shape)?
-            .to_owned()
-            .into_dyn();
         let length = Array1::from_vec(vec![time_steps as i64]).into_dyn();
+        let audio_signal = audio_signal.into_dyn();
 
         let (encoder_out, encoder_out_lens) = self.encode(&audio_signal.view(), &length.view())?;
         let encodings_len = encoder_out_lens.iter().next().copied().unwrap_or(0).max(0) as usize;
@@ -559,10 +606,10 @@ impl ParakeetModel {
         let mut emitted_tokens = 0;
 
         while t < encodings_len {
-            let encoder_step = encodings.slice(ndarray17::s![t, ..]);
-            let encoder_step_dyn = encoder_step.to_owned().into_dyn();
-            let (probs, new_state) =
-                self.decode_step(&tokens, &prev_state, &encoder_step_dyn.view())?;
+            // A row view of the encoder output: contiguous, so the decoder
+            // reads it without a per-step copy.
+            let encoder_step = encodings.slice(ndarray17::s![t, ..]).into_dyn();
+            let (probs, new_state) = self.decode_step(&tokens, &prev_state, &encoder_step)?;
 
             let (vocab_logits, dur_logits) = Self::tdt_logits(&probs, self.vocab_size)?;
             let token = argmax_token(vocab_logits, self.blank_idx);
@@ -641,19 +688,25 @@ impl ParakeetModel {
         let mut emitted_tokens = 0;
         let mut boost_state = tree.root();
 
-        while t < encodings_len {
-            let encoder_step = encodings.slice(ndarray17::s![t, ..]);
-            let encoder_step_dyn = encoder_step.to_owned().into_dyn();
+        // Reused across steps so the decode loop does not allocate per frame.
+        let mut candidates: Vec<BiasCandidate> = Vec::new();
+        let mut boosted: Vec<f32> = Vec::new();
+        let mut topk_scratch: Vec<f32> = Vec::new();
 
-            let (probs, new_state) =
-                self.decode_step(&tokens, &prev_state, &encoder_step_dyn.view())?;
+        while t < encodings_len {
+            // A row view of the encoder output: contiguous, so the decoder
+            // reads it without a per-step copy.
+            let encoder_step = encodings.slice(ndarray17::s![t, ..]).into_dyn();
+            let (probs, new_state) = self.decode_step(&tokens, &prev_state, &encoder_step)?;
             let (vocab_logits, dur_logits) = Self::tdt_logits(&probs, self.vocab_size)?;
 
-            let candidates = tree.bias(boost_state);
-            let mut boosted = vocab_logits.to_vec();
+            tree.bias_into(boost_state, &mut candidates);
+            if boosted.len() != vocab_logits.len() {
+                boosted.resize(vocab_logits.len(), 0.0);
+            }
+            boosted.copy_from_slice(vocab_logits);
             if !candidates.is_empty() {
-                let tight = top_k_threshold(vocab_logits, BOOST_TOP_K);
-                let deep = top_k_threshold(vocab_logits, BOOST_TOP_K_DEEP);
+                let (tight, deep) = top_k_thresholds_with_scratch(vocab_logits, &mut topk_scratch);
                 for cand in &candidates {
                     let idx = cand.token as usize;
                     let threshold = if top_k_for_depth(cand.depth) == BOOST_TOP_K_DEEP {
@@ -777,5 +830,72 @@ mod tests {
         assert_eq!(top_k_for_depth(2), BOOST_TOP_K);
         assert_eq!(top_k_for_depth(BOOST_DEEP_DEPTH), BOOST_TOP_K_DEEP);
         assert_eq!(top_k_for_depth(10), BOOST_TOP_K_DEEP);
+    }
+
+    // Regression: `to_owned` keeps the memory order of its input, so the
+    // permuted encoder output came out time-major with strides [1, T, F].
+    // Every `s![t, ..]` frame view was then strided by `T`, and `ort` rejected
+    // the `[1, F, 1]` decoder input as non-contiguous.
+    #[test]
+    fn decoder_layout_is_standard_so_every_frame_is_contiguous() {
+        let time = 5;
+        let features = 8;
+        // [1, time, features], the shape the encoder session returns.
+        let encoder_output = Array::from_shape_vec(
+            (1, time, features),
+            (0..time * features).map(|v| v as f32).collect(),
+        )
+        .unwrap();
+        let decoder = to_decoder_layout(&encoder_output.view().into_dyn());
+        assert_eq!(decoder.shape(), &[1, features, time]);
+        assert!(
+            decoder.is_standard_layout(),
+            "decoder layout must be row-major, got strides {:?}",
+            decoder.strides()
+        );
+        // Follow the real decode path: `transcribe_samples` iterates the batch
+        // axis, then each loop slices one time step out of the [time, features]
+        // view. Every such frame must be contiguous.
+        for encodings in decoder.outer_iter() {
+            for t in 0..time {
+                let frame = encodings.slice(ndarray17::s![t, ..]).into_dyn();
+                assert!(
+                    frame.as_slice().is_some(),
+                    "frame {t} must be contiguous, got strides {:?}",
+                    frame.strides()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_layout_keeps_the_encoder_values() {
+        let encoder_output = Array::from_shape_vec((1, 3, 4), (0..12).map(|v| v as f32).collect())
+            .unwrap();
+        let decoder = to_decoder_layout(&encoder_output.view().into_dyn());
+        for t in 0..3 {
+            for f in 0..4 {
+                assert_eq!(decoder[[0, f, t]], encoder_output[[0, t, f]]);
+            }
+        }
+    }
+
+    // The decoder feeds `encoder_outputs` straight from the frame view, so the
+    // `[1, F, 1]` shape built with `insert_axis` must stay standard layout.
+    #[test]
+    fn decoder_step_input_stays_standard_layout() {
+        let features = 1024;
+        let frame = Array1::<f32>::zeros(features);
+        let encoder_outputs = frame
+            .view()
+            .into_dyn()
+            .insert_axis(ndarray17::Axis(0))
+            .insert_axis(ndarray17::Axis(2));
+        assert_eq!(encoder_outputs.shape(), &[1, features, 1]);
+        assert!(
+            encoder_outputs.is_standard_layout(),
+            "insert_axis must not break contiguity, got strides {:?}",
+            encoder_outputs.strides()
+        );
     }
 }

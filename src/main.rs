@@ -242,8 +242,9 @@ fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
 
 /// Drain complete frames from the utterance buffer into the VAD branch and
 /// the model branch, handing each closed utterance to `push` for emission.
-/// `push` preserves the microphone vs file difference (`push_utterance`
-/// drops under backpressure, `push_utterance_blocking` waits).
+/// Frames are consumed through a cursor and the remainder is compacted once
+/// at the end, instead of a `drain` per frame (which memmoved the whole
+/// remainder every time).
 fn drain_frames(
     utterance_buffer: &mut Vec<f32>,
     input_frames: usize,
@@ -251,12 +252,15 @@ fn drain_frames(
     asr_tx: &mut Producer<Utterance>,
     push: fn(&mut Producer<Utterance>, Utterance),
 ) {
-    while utterance_buffer.len() >= input_frames {
-        if let Some(utterance) = fp.process_frame(&utterance_buffer[..input_frames]) {
+    let mut consumed = 0;
+    while utterance_buffer.len() - consumed >= input_frames {
+        let frame = &utterance_buffer[consumed..consumed + input_frames];
+        if let Some(utterance) = fp.process_frame(frame) {
             push(asr_tx, utterance);
         }
-        utterance_buffer.drain(..input_frames);
+        consumed += input_frames;
     }
+    utterance_buffer.drain(..consumed);
 }
 
 /// Throttled backpressure report state for the live capture loop. Pairs the
@@ -327,33 +331,29 @@ fn cue_guard(
     accumulator.clear();
 }
 
-/// Push a closed utterance into the bounded ASR ring. Never blocks the
-/// processing loop: a full ring drops the newest with a warn (in practice the
-/// worker-side weakest-first shed keeps the backlog small so this rarely
-/// fires). A dead worker (`is_abandoned`) is also just a warn. Microphone mode
-/// only — file mode uses `push_utterance_blocking` (see its doc comment for
-/// why dropping is wrong there).
-fn push_utterance(asr_tx: &mut Producer<Utterance>, utterance: Utterance) {
-    if asr_tx.is_abandoned() {
-        log::warn!("asr worker gone, dropping utterance");
-        return;
-    }
-    if let Err(rtrb::PushError::Full(_)) = asr_tx.push(utterance) {
-        log::warn!("asr queue full, dropping newest utterance");
-    }
+/// What a full ASR ring means, i.e. the one policy that differs between the
+/// two input paths.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backpressure {
+    /// Live capture: never block the processing loop, drop the newest
+    /// utterance with a warn. A dead worker (`is_abandoned`) is also just a
+    /// warn. In practice the worker-side weakest-first shed keeps the
+    /// backlog small so this rarely fires.
+    Drop,
+    /// Offline file mode (`shed_stale = false`) promises lossless decoding,
+    /// but resampling runs at ~100x realtime while inference runs at roughly
+    /// realtime, so the producer routinely outruns `ASR_QUEUE_CAP` (16) on any
+    /// recording longer than a few tens of seconds. Dropping there would
+    /// silently discard most of a long file, so wait for the worker to make
+    /// room instead: safe here because file mode has no realtime deadline to
+    /// protect.
+    Wait,
 }
 
-/// Push a closed utterance into the bounded ASR ring, retrying on
-/// backpressure instead of dropping. File mode (`shed_stale = false`)
-/// promises lossless offline decoding, but resampling runs at ~100x realtime
-/// while inference runs at roughly realtime, so the producer routinely
-/// outruns `ASR_QUEUE_CAP` (16) on any recording longer than a few tens
-/// of seconds. `push_utterance`'s drop-newest policy would silently discard
-/// most of a long file; this instead waits for the worker to make room,
-/// which is safe here because file mode has no realtime deadline to protect.
-/// Returns once pushed or the worker is gone (dead worker still just warns,
-/// same as `push_utterance`).
-fn push_utterance_blocking(asr_tx: &mut Producer<Utterance>, utterance: Utterance) {
+/// Push a closed utterance into the bounded ASR ring under `policy`
+/// (`Backpressure`). Returns once the utterance is queued or the worker is
+/// gone (a dead worker only warns, in both policies).
+fn push_utterance(asr_tx: &mut Producer<Utterance>, utterance: Utterance, policy: Backpressure) {
     if asr_tx.is_abandoned() {
         log::warn!("asr worker gone, dropping utterance");
         return;
@@ -362,21 +362,67 @@ fn push_utterance_blocking(asr_tx: &mut Producer<Utterance>, utterance: Utteranc
     loop {
         match asr_tx.push(pending) {
             Ok(()) => return,
-            Err(rtrb::PushError::Full(back)) => {
-                if asr_tx.is_abandoned() {
-                    log::warn!("asr worker gone, dropping utterance");
+            Err(rtrb::PushError::Full(back)) => match policy {
+                Backpressure::Drop => {
+                    log::warn!("asr queue full, dropping newest utterance");
                     return;
                 }
-                pending = back;
-                thread::sleep(Duration::from_millis(1));
-            }
+                Backpressure::Wait => {
+                    if asr_tx.is_abandoned() {
+                        log::warn!("asr worker gone, dropping utterance");
+                        return;
+                    }
+                    pending = back;
+                    thread::sleep(Duration::from_millis(1));
+                }
+            },
         }
     }
+}
+
+/// Microphone-mode push, as a plain function pointer for `drain_frames`.
+/// File mode calls `push_utterance` with `Backpressure::Wait` directly.
+fn push_live_utterance(asr_tx: &mut Producer<Utterance>, utterance: Utterance) {
+    push_utterance(asr_tx, utterance, Backpressure::Drop);
 }
 
 /// Occupied slots on the producer side (`Producer::slots` reports free).
 fn producer_occupied<T>(tx: &Producer<T>, cap: usize) -> usize {
     cap.saturating_sub(tx.slots())
+}
+
+/// Resolve/download the model and create the bounded utterance ring: the
+/// pre-capture work both input paths share, so a bad `--model` or a bad
+/// `--dump-dir` fails fast before any capture or heavy setup.
+///
+/// The ring is bounded (`ASR_QUEUE_CAP`, each utterance seconds of audio) and
+/// the ASR worker sheds weakest-first past `ASR_SHED_KEEP`, so live speech
+/// stays fresh instead of lagging minutes behind. It survives a device
+/// rebuild: the main loop owns the producer, the worker the consumer, and
+/// `FrameProcessor` just returns closed utterances.
+fn prepare_model(cli: &Cli) -> Result<(ModelRef, Producer<Utterance>, Consumer<Utterance>)> {
+    let model = resolve_model_input(cli)?;
+    log::info!("model: {model}");
+    validate_parakeet_model_flags(cli, &model)?;
+    let (tx, rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
+    Ok((model, tx, rx))
+}
+
+/// Shared shutdown tail for both input paths, in this order: drop the frame
+/// processor, then the utterance producer (so the worker sees `is_abandoned`
+/// and exits), then join it. Dropping the producer before the join is what
+/// keeps Ctrl-C/`--stop` from hanging forever; the join is what flushes the
+/// trailing utterance the worker is still transcribing.
+fn finish_run(
+    fp: FrameProcessor,
+    asr_tx: Producer<Utterance>,
+    asr_handle: thread::JoinHandle<()>,
+) -> Result<()> {
+    drop(fp);
+    drop(asr_tx);
+    asr_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("asr worker panicked"))
 }
 
 fn run_microphone_mode(cli: &Cli) -> Result<()> {
@@ -391,27 +437,20 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
     // Heavy but pre-capture: resolve/download the model before the stream
     // starts so the callback can't outrun the drain loop.
-    let model = resolve_model_input(cli)?;
-    log::info!("model: {model}");
-    validate_parakeet_model_flags(cli, &model)?;
+    let (model, mut asr_tx, asr_rx) = prepare_model(cli)?;
+    let acoustic = AcousticConfig::from_cli(cli);
+    let telemetry = StreamTelemetry::default();
 
     // Raw mono samples (hw rate, f32 in [-1, 1]) from the cpal callback via a
     // realtime-safe `rtrb` sample ring (no allocation in the callback;
     // overflow sheds counted samples instead of growing memory without
     // bound). Created inside `open_input_path` once the hw rate is known.
-    // Utterance queue is bounded (`ASR_QUEUE_CAP`, each utterance seconds
-    // of audio) and the ASR worker sheds weakest-first past
-    // `ASR_SHED_KEEP` so live speech stays fresh instead of lagging
-    // minutes behind.
-    let (mut asr_tx, asr_rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
-    let telemetry = StreamTelemetry::default();
-
+    //
     // First open fails fast (bad --device/--channel), like before; later
     // disconnects rebuild inside the loop (see `device_gone`). The raw ring
-    // is recreated per open (capacity follows the hw rate); the utterance
-    // ring survives rebuilds (main owns the producer, the worker the
-    // consumer, `FrameProcessor` just returns closed utterances).
-    let (mut hw_rate, mut stream, mut fp, mut raw_rx) = open_input_path(&host, cli, &telemetry)?;
+    // is recreated per open (capacity follows the hw rate).
+    let (mut hw_rate, mut stream, mut fp, mut raw_rx) =
+        open_input_path(&host, cli, &acoustic, &telemetry)?;
     let mut input_frames = fp.required_input_frames();
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
@@ -483,7 +522,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             log::warn!("input device lost, rebuild attempt #{rebuild_attempts}...");
             let warm_noise_floor = fp.noise_floor();
             thread::sleep(Duration::from_secs(2));
-            match open_input_path(&host, cli, &telemetry) {
+            match open_input_path(&host, cli, &acoustic, &telemetry) {
                 Ok((new_rate, new_stream, mut new_fp, new_raw_rx)) => {
                     new_fp.adopt_noise_floor(warm_noise_floor);
                     hw_rate = new_rate;
@@ -574,7 +613,13 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 
         // Raw hw-rate samples -> FrameProcessor (denoise/VAD + model
         // branches, all resampling included).
-        drain_frames(&mut accumulator, input_frames, &mut fp, &mut asr_tx, push_utterance);
+        drain_frames(
+            &mut accumulator,
+            input_frames,
+            &mut fp,
+            &mut asr_tx,
+            push_live_utterance,
+        );
 
         // Backpressure visibility: bounded rings shed under load (callback
         // must never block, live speech must stay fresh), so report depths
@@ -597,24 +642,23 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // below only for full frames already accumulated.
     drop(stream);
     drain_raw_into(&mut raw_rx, &mut accumulator);
-    drain_frames(&mut accumulator, input_frames, &mut fp, &mut asr_tx, push_utterance);
+    drain_frames(
+        &mut accumulator,
+        input_frames,
+        &mut fp,
+        &mut asr_tx,
+        push_live_utterance,
+    );
     // Flush trailing speech, then wait for the ASR thread to actually
     // finish transcribing it (and any earlier backlog) before the process
     // exits — otherwise the last utterance can be silently dropped, and an
     // in-flight CUDA op can race process teardown the same way an early `?`
     // above used to.
     if let Some(utterance) = fp.flush_trailing_speech() {
-        push_utterance(&mut asr_tx, utterance);
+        push_utterance(&mut asr_tx, utterance, Backpressure::Drop);
     }
-    drop(fp);
-    // Drop the last utterance producer so the ASR worker sees
-    // `is_abandoned` and exits; without this the `join` below hangs forever
-    // on Ctrl-C / SIGTERM.
-    drop(asr_tx);
     drop(raw_rx);
-    asr_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("asr worker panicked"))?;
+    finish_run(fp, asr_tx, asr_handle)?;
     log::info!("stopped");
     Ok(())
 }
@@ -636,6 +680,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 fn open_input_path(
     host: &cpal::Host,
     cli: &Cli,
+    acoustic: &AcousticConfig,
     telemetry: &StreamTelemetry,
 ) -> Result<(u32, cpal::Stream, FrameProcessor, Consumer<f32>)> {
     let device = select_input_device(host, cli.device.as_deref())?;
@@ -672,16 +717,7 @@ fn open_input_path(
     // `FrameProcessor` owns all resampling (a shared hw -> 16k hop by
     // default, or hw -> 48k -> denoise -> 48k -> 16k for the VAD branch plus
     // hw -> 16k for the model with `--denoiser deepfilter`).
-    let fp = FrameProcessor::new(
-        hw_rate,
-        cli.denoiser,
-        cli.vad_threshold,
-        cli.vad_adapt,
-        gate_config(cli),
-        crate::config::hangover_frames(cli.hangover_ms),
-        cli.target_rms,
-        crate::config::MAX_GAIN,
-    )?;
+    let fp = acoustic.make_frame_processor(hw_rate)?;
     let raw_cap = (hw_rate as usize).saturating_mul(RAW_RING_SECS).max(65536);
     let (raw_tx, raw_rx) = RingBuffer::<f32>::new(raw_cap);
     let stream = build_input_stream(
@@ -782,21 +818,8 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         cli.channel,
     );
 
-    let model = resolve_model_input(cli)?;
-    log::info!("model: {model}");
-    validate_parakeet_model_flags(cli, &model)?;
-
-    let (mut asr_tx, asr_rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
-    let mut fp = FrameProcessor::new(
-        wav.sample_rate,
-        cli.denoiser,
-        cli.vad_threshold,
-        cli.vad_adapt,
-        gate_config(cli),
-        crate::config::hangover_frames(cli.hangover_ms),
-        cli.target_rms,
-        crate::config::MAX_GAIN,
-    )?;
+    let (model, mut asr_tx, asr_rx) = prepare_model(cli)?;
+    let mut fp = AcousticConfig::from_cli(cli).make_frame_processor(wav.sample_rate)?;
     let input_frames = fp.required_input_frames();
 
     let (asr_handle, asr_ready) = spawn_asr_worker(
@@ -833,21 +856,17 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     let mut offset = 0usize;
     while offset + input_frames <= wav.samples.len() {
         if let Some(utterance) = fp.process_frame(&wav.samples[offset..offset + input_frames]) {
-            push_utterance_blocking(&mut asr_tx, utterance);
+            push_utterance(&mut asr_tx, utterance, Backpressure::Wait);
         }
         offset += input_frames;
     }
     // A trailing partial chunk (< input_frames samples, at most ~30 ms) is
     // dropped; fine for offline comparison runs.
     if let Some(utterance) = fp.flush_trailing_speech() {
-        push_utterance_blocking(&mut asr_tx, utterance);
+        push_utterance(&mut asr_tx, utterance, Backpressure::Wait);
     }
 
-    drop(fp);
-    drop(asr_tx);
-    asr_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("asr worker panicked"))?;
+    finish_run(fp, asr_tx, asr_handle)?;
     Ok(())
 }
 
@@ -889,7 +908,9 @@ fn validate_parakeet_model_flags(cli: &Cli, _model: &ModelRef) -> Result<()> {
 fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
     AsrOptions {
         model_spec: cli.model_input(),
-        gate: gate_config(cli),
+        // The transcript gate shares the acoustic thresholds, so both come
+        // from one resolved config.
+        gate: AcousticConfig::from_cli(cli).gate,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
         metrics_path: cli.metrics.clone(),
@@ -976,12 +997,49 @@ fn make_emitter(cli: &Cli) -> Result<SystemEmitter> {
     )
 }
 
+/// The capture-side tunables, resolved once from `Cli` and shared by both
+/// input paths: the microphone opens a `FrameProcessor` per device open (and
+/// per rebuild), file mode opens one, and the same thresholds reach the ASR
+/// worker through `AsrOptions::gate`. Keeping them in one struct is what
+/// stops the two paths from drifting apart, and it keeps `Utterance` free of
+/// config (only evidence).
+struct AcousticConfig {
+    denoiser: crate::denoise::DenoiserKind,
+    vad_threshold: f32,
+    vad_adapt: bool,
+    gate: gate::GateConfig,
+    hangover_frames: u32,
+    target_rms: f32,
+}
 
-/// Thresholds for deciding-not-to-emit, resolved once from `Cli` and shared
-/// by the acoustic path (`FrameProcessor`) and the transcript path
-/// . Keeps `Utterance` free of config, only evidence.
-fn gate_config(cli: &Cli) -> gate::GateConfig {
-    gate::GateConfig::new(cli.min_rms, cli.min_density)
+impl AcousticConfig {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            denoiser: cli.denoiser,
+            vad_threshold: cli.vad_threshold,
+            vad_adapt: cli.vad_adapt,
+            gate: gate::GateConfig::new(cli.min_rms, cli.min_density),
+            hangover_frames: crate::config::hangover_frames(cli.hangover_ms),
+            target_rms: cli.target_rms,
+        }
+    }
+
+    /// Build the frame processor for a given input rate. `FrameProcessor`
+    /// owns all resampling (a shared hw -> 16 kHz hop by default, or
+    /// hw -> 48 kHz -> denoise -> 48 kHz -> 16 kHz for the VAD branch plus
+    /// hw -> 16 kHz for the model with `--denoiser deepfilter`).
+    fn make_frame_processor(&self, hw_rate: u32) -> Result<FrameProcessor> {
+        FrameProcessor::new(
+            hw_rate,
+            self.denoiser,
+            self.vad_threshold,
+            self.vad_adapt,
+            self.gate.clone(),
+            self.hangover_frames,
+            self.target_rms,
+            crate::config::MAX_GAIN,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1044,5 +1102,57 @@ mod tests {
             assets: &[],
         };
         assert!(validate_parakeet_model_flags(&cli, &model).is_ok());
+    }
+
+    #[test]
+    fn acoustic_config_carries_the_cli_tunables() {
+        let cli = Cli::try_parse_from([
+            "sttd",
+            "--vad-threshold",
+            "0.4",
+            "--vad-adapt",
+            "off",
+            "--min-rms",
+            "0.01",
+            "--min-density",
+            "0.5",
+            "--hangover-ms",
+            "350",
+            "--target-rms",
+            "0.02",
+        ])
+        .expect("flags must parse");
+        let acoustic = AcousticConfig::from_cli(&cli);
+        assert_eq!(acoustic.vad_threshold, 0.4);
+        assert!(!acoustic.vad_adapt);
+        assert_eq!(acoustic.gate.min_speech_rms, 0.01);
+        assert_eq!(acoustic.gate.min_density, 0.5);
+        assert_eq!(acoustic.hangover_frames, 35);
+        assert_eq!(acoustic.target_rms, 0.02);
+        // The ASR worker gets the same thresholds, from the same builder.
+        assert_eq!(asr_options(&cli, true).gate.min_density, 0.5);
+    }
+
+    #[test]
+    fn drain_frames_consumes_whole_frames_and_keeps_the_remainder() {
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        let mut fp = AcousticConfig::from_cli(&cli)
+            .make_frame_processor(crate::config::SAMPLE_RATE)
+            .expect("frame processor must build");
+        let input_frames = fp.required_input_frames();
+        let (mut asr_tx, _asr_rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
+        // Two whole frames plus a partial one; silence opens no utterance, so
+        // nothing is handed to the worker.
+        let mut buffer = vec![0.0f32; input_frames * 2 + 7];
+        drain_frames(
+            &mut buffer,
+            input_frames,
+            &mut fp,
+            &mut asr_tx,
+            push_live_utterance,
+        );
+        assert_eq!(buffer.len(), 7);
+        assert!(buffer.iter().all(|&s| s == 0.0));
+        assert_eq!(asr_tx.slots(), crate::asr::ASR_QUEUE_CAP);
     }
 }

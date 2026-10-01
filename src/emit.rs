@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 //
 // One step — handing a decided transcript to the user — used to live inside
-// `asr_init_and_run` alongside inference, conditioning and the gate call:
+// the ASR worker loop alongside inference, conditioning and the gate call:
 // `println!`, metrics `log::info!`, clipboard copy, auto-paste and WAV/TXT
 // dumps shared one loop with the decoder. To answer "was this emitted, and
 // where did it go" you had to run the model.
@@ -52,6 +52,10 @@ pub(crate) struct OwnedEmission {
 }
 
 impl OwnedEmission {
+    /// The `pcm` copy is what keeps `emit()` non-blocking: the borrow comes
+    /// from the utterance the ASR thread still owns, so the samples have to
+    /// be duplicated for the queue. Seconds of audio per utterance, once,
+    /// against a disk write and a process spawn on the other side.
     fn from_borrowed(e: Emission<'_>) -> Self {
         Self {
             tag: e.tag.to_string(),
@@ -81,6 +85,9 @@ pub(crate) trait Emitter {
 pub(crate) struct SystemEmitter {
     tx: Option<Producer<OwnedEmission>>,
     worker: Option<JoinHandle<()>>,
+    /// Kept for the final prune in `Drop` (the worker thread owns the only
+    /// other copy).
+    dump_dir: Option<PathBuf>,
 }
 
 /// Bounded `rtrb` capacity for the emission queue. Emissions are seconds
@@ -98,6 +105,8 @@ struct EmitterWorker {
     paste_available: bool,
     paste_mode: crate::cli::PasteMode,
     stdout_enabled: bool,
+    /// Utterances handled since the last `prune_dump_dir` scan.
+    since_prune: usize,
 }
 
 impl SystemEmitter {
@@ -122,11 +131,12 @@ impl SystemEmitter {
             );
         }
         let mut worker = EmitterWorker {
-            dump_dir,
+            dump_dir: dump_dir.clone(),
             clipboard_available: copy_enabled,
             paste_available: paste_enabled,
             paste_mode,
             stdout_enabled,
+            since_prune: 0,
         };
         if !copy_enabled {
             log::info!("clipboard copy disabled (--copy=false)");
@@ -169,6 +179,7 @@ impl SystemEmitter {
         Ok(Self {
             tx: Some(tx),
             worker: Some(handle),
+            dump_dir,
         })
     }
 }
@@ -183,6 +194,11 @@ impl Drop for SystemEmitter {
             if h.join().is_err() {
                 log::warn!("emit worker panicked");
             }
+        }
+        // The worker's own scans stop at the last whole interval, so a clean
+        // shutdown is where the last few pairs past `DUMP_KEEP_FILES` go.
+        if let Some(dir) = &self.dump_dir {
+            prune_dump_dir(dir);
         }
     }
 }
@@ -204,11 +220,32 @@ impl Emitter for SystemEmitter {
     }
 }
 
+/// Utterances between two `prune_dump_dir` scans. Each scan is a `read_dir`
+/// plus a sort, which the emit thread has no reason to pay per utterance:
+/// between scans the directory can overshoot `DUMP_KEEP_FILES` by at most
+/// this many pairs, and `SystemEmitter::drop` runs a final scan, so a clean
+/// shutdown always leaves exactly the newest `DUMP_KEEP_FILES`.
+const DUMP_PRUNE_EVERY: usize = 20;
+
+/// Warn used for both ydotool arms (`key` and `type`): one line, then the
+/// auto-paste tool is disabled for the rest of the session.
+const YDOTOOL_MISSING_WARN: &str =
+    "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste";
+
 impl EmitterWorker {
     fn handle(&mut self, owned: OwnedEmission) {
         self.handle_inner(&owned);
         // Bound the directory: newest pairs win, oldest are deleted. Runs
-        // for every utterance (emits and drops alike).
+        // for every utterance (emits and drops alike), but only scans every
+        // `DUMP_PRUNE_EVERY` of them.
+        if self.dump_dir.is_none() {
+            return;
+        }
+        self.since_prune += 1;
+        if self.since_prune < DUMP_PRUNE_EVERY {
+            return;
+        }
+        self.since_prune = 0;
         if let Some(dir) = &self.dump_dir {
             prune_dump_dir(dir);
         }
@@ -226,6 +263,55 @@ impl EmitterWorker {
         }
     }
 
+    /// Clipboard + paste step of an emitted transcript. Pasted keys must only
+    /// run on content this emission actually copied, except in `type` mode,
+    /// which needs no clipboard at all.
+    fn copy_paste_and_remember(&mut self, tag: &str, text: &str) {
+        // Track whether this utterance actually refreshed the clipboard: paste
+        // synthesizes keys, so it must only run on fresh content, never on
+        // stale clipboard or a failed copy.
+        let mut copied = false;
+        if self.clipboard_available {
+            match copy_to_clipboard(text) {
+                Ok(()) => copied = true,
+                Err(e)
+                    if Self::disable_on_not_found(
+                        &mut self.clipboard_available,
+                        &e,
+                        "--copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy",
+                    ) => {}
+                Err(e) => log::warn!("{tag}: clipboard copy failed: {e:?}"),
+            }
+        }
+        // Remember the last emitted text for `--paste-last`, independent of
+        // `--copy`: one-shot re-paste must work even when copy was off.
+        write_last_text(text);
+        let mode = self.paste_mode;
+        if !self.paste_available {
+            return;
+        }
+        // `paste_via_ydotool` for CtrlV/CtrlShiftV (the clipboard holds the
+        // fresh text), `type_via_ydotool` for `type` mode (no clipboard).
+        let result = if copied {
+            paste_via_ydotool(mode)
+        } else if mode == crate::cli::PasteMode::Type {
+            type_via_ydotool(text)
+        } else {
+            return;
+        };
+        match result {
+            Ok(()) => {}
+            Err(e) if Self::disable_on_not_found(
+                &mut self.paste_available,
+                &e,
+                YDOTOOL_MISSING_WARN,
+            ) => {}
+            Err(e) => log::warn!("{tag}: auto-paste failed (is ydotoold running?): {e:?}"),
+        }
+    }
+
+    /// Verdict -> action: the WAV dump for every utterance, then either the
+    /// drop bookkeeping or the emission itself.
     fn handle_inner(&mut self, owned: &OwnedEmission) {
         let OwnedEmission {
             tag,
@@ -277,52 +363,7 @@ impl EmitterWorker {
                 return;
             }
         }
-        // Track whether this utterance actually refreshed the
-        // clipboard: paste synthesizes keys, so it must only run
-        // on fresh content, never on stale clipboard or a failed
-        // copy.
-        let mut copied = false;
-        if self.clipboard_available {
-            match copy_to_clipboard(text) {
-                Ok(()) => copied = true,
-                Err(e)
-                    if Self::disable_on_not_found(
-                        &mut self.clipboard_available,
-                        &e,
-                        "--copy is enabled but `wl-copy` was not found on PATH; disabling clipboard copy",
-                    ) => {}
-                Err(e) => log::warn!("{tag}: clipboard copy failed: {e:?}"),
-            }
-        }
-        // Remember the last emitted text for `--paste-last`, independent of
-        // `--copy`: one-shot re-paste must work even when copy was off.
-        write_last_text(text);
-        if self.paste_available && copied {
-            match paste_via_ydotool(self.paste_mode) {
-                Ok(()) => {}
-                Err(e)
-                    if Self::disable_on_not_found(
-                        &mut self.paste_available,
-                        &e,
-                        "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste",
-                    ) => {}
-                Err(e) => log::warn!("{tag}: auto-paste failed (is ydotoold running?): {e:?}"),
-            }
-        } else if self.paste_available && !copied && self.paste_mode == crate::cli::PasteMode::Type
-        {
-            // `type` mode needs no clipboard: paste directly even when copy
-            // is off or failed.
-            match type_via_ydotool(text) {
-                Ok(()) => {}
-                Err(e)
-                    if Self::disable_on_not_found(
-                        &mut self.paste_available,
-                        &e,
-                        "--paste is enabled but `ydotool` was not found on PATH; disabling auto-paste",
-                    ) => {}
-                Err(e) => log::warn!("{tag}: auto-paste failed (is ydotoold running?): {e:?}"),
-            }
-        }
+        self.copy_paste_and_remember(tag, text);
         if let Some(dir) = &self.dump_dir {
             let txt_path = dir.join(format!("{tag}.txt"));
             if let Err(e) = write_owner_only_text(&txt_path, text) {
@@ -409,15 +450,19 @@ fn prune_dump_dir(dir: &Path) {
     for stem in stems_to_prune(stems, DUMP_KEEP_FILES) {
         for ext in ["wav", "txt"] {
             let path = dir.join(format!("{stem}.{ext}"));
-            if path.exists() {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    log::warn!("dump prune: failed to remove {}: {e:?}", path.display());
-                }
+            // `remove_file` already reports a missing file as `NotFound`; the
+            // `exists()` probe this replaces only doubled the syscalls.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("dump prune: failed to remove {}: {e:?}", path.display()),
             }
         }
     }
 }
 
+/// Sorted `utt_NNNNNN` stems of the pairs in `dir` (the `.wav` names; the
+/// matching `.txt` is implied).
 fn dump_stems(dir: &Path) -> Result<Vec<String>> {
     let mut stems = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))? {
@@ -431,10 +476,9 @@ fn dump_stems(dir: &Path) -> Result<Vec<String>> {
     Ok(stems)
 }
 
-/// Pure selection: which stems to delete keeping the newest `keep`.
-/// Newest-first ordering comes from the caller-sorted names.
+/// Pure selection: which stems to delete keeping the newest `keep`. Takes
+/// the names already sorted by the caller (`dump_stems`), oldest first.
 fn stems_to_prune(mut stems: Vec<String>, keep: usize) -> Vec<String> {
-    stems.sort();
     if stems.len() > keep {
         stems.truncate(stems.len() - keep);
         stems

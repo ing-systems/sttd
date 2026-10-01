@@ -89,7 +89,7 @@ impl SpeechModel for ParakeetModel {
         };
         let result = self
             .inner
-            .transcribe_samples(pcm.to_vec())
+            .transcribe_samples(pcm)
             .map_err(|e| anyhow::anyhow!("parakeet inference failed: {e}"))?;
         Ok(Transcript {
             text: result.text,

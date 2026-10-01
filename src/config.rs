@@ -293,7 +293,6 @@ pub(crate) fn parakeet_entry_for_spec(
     PARAKEET_CATALOG.iter().find(|(s, ..)| *s == spec)
 }
 
-
 /// Transcripts that are near-exact matches for common hallucinations
 /// on silence/low-energy audio (subtitle-credit boilerplate picked up from
 /// training data), compared after lowercasing, stripping punctuation, and

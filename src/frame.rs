@@ -4,7 +4,8 @@ use crate::agc::Agc;
 use crate::denoise::DenoiserKind;
 use crate::dsp::hw_input_frames;
 use crate::gate::GateConfig;
-use crate::signal::SignalPath;
+use crate::noise::frame_rms;
+use crate::signal::{PairedFrames, SignalPath};
 use crate::utterance::{FrameAction, Utterance, UtteranceBuffer};
 use crate::vad::SpeechDetector;
 
@@ -111,26 +112,63 @@ impl FrameProcessor {
         debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);
 
         let mut closed = None;
-        for (vad16, model16) in self.signal.feed(frame_hw_raw) {
-            let mut vad_frame = (*vad16).clone();
-            let mut model_frame = (*model16).clone();
-            // Pre-AGC model RMS: the acoustic evidence `UtteranceBuffer`
-            // scores (`Evidence.rms`) must describe what the mic heard,
-            // see `push_frame_evidenced`.
-            let pre_agc_rms =
-                self.agc
-                    .process_pair(&mut vad_frame, &mut model_frame, self.prev_speech);
-            let is_speech = self.vad.verdict(&vad_frame);
-            self.prev_speech = is_speech;
-            if self
-                .utterance
-                .push_frame_evidenced(&model_frame, is_speech, pre_agc_rms)
-                == FrameAction::Flush
-            {
-                closed = self.close_current();
+        for pair in self.signal.feed(frame_hw_raw) {
+            if let Some(done) = self.absorb_pair(pair) {
+                closed = Some(done);
             }
         }
         closed
+    }
+
+    /// Agc + VAD verdict + buffering for one completed pair. Returns the
+    /// closed utterance when this frame asked for a flush.
+    ///
+    /// `Shared` is the default topology: one allocation serves both roles, so
+    /// the Agc applies the shared gain once and a single post-gain RMS serves
+    /// both the VAD floor and the utterance buffer. `evidence_rms` stays the
+    /// pre-AGC measurement either way — evidence must describe what the
+    /// microphone heard, not what the AGC did to it (see
+    /// `UtteranceBuffer::push_frame_evidenced`).
+    fn absorb_pair(&mut self, pair: PairedFrames) -> Option<Utterance> {
+        match pair {
+            PairedFrames::Shared(mut frame) => {
+                let evidence_rms = self.agc.process_shared(&mut frame, self.prev_speech);
+                let loudness = frame_rms(&frame);
+                let is_speech = self.vad.verdict(&frame, loudness);
+                self.prev_speech = is_speech;
+                self.absorb_frame(&frame, is_speech, evidence_rms, loudness)
+            }
+            PairedFrames::Split(mut vad_frame, mut model_frame) => {
+                let evidence_rms =
+                    self.agc
+                        .process_pair(&mut vad_frame, &mut model_frame, self.prev_speech);
+                let is_speech = self.vad.verdict(&vad_frame, frame_rms(&vad_frame));
+                self.prev_speech = is_speech;
+                let loudness = frame_rms(&model_frame);
+                self.absorb_frame(&model_frame, is_speech, evidence_rms, loudness)
+            }
+        }
+    }
+
+    /// Hand one gained frame to the utterance buffer with its two loudness
+    /// measurements: `evidence_rms` (pre-AGC, what the mic heard) and
+    /// `loudness` (post-Agc, what the buffer and the model get).
+    fn absorb_frame(
+        &mut self,
+        model_frame: &[f32],
+        is_speech: bool,
+        evidence_rms: f32,
+        loudness: f32,
+    ) -> Option<Utterance> {
+        if self
+            .utterance
+            .push_frame_evidenced(model_frame, is_speech, evidence_rms, loudness)
+            == FrameAction::Flush
+        {
+            self.close_current()
+        } else {
+            None
+        }
     }
 
     /// Close the open utterance and return it if it cleared the acoustic
@@ -168,20 +206,9 @@ impl FrameProcessor {
     /// `process_frame`'s doc comment for why).
     pub(crate) fn flush_trailing_speech(&mut self) -> Option<Utterance> {
         let mut closed = None;
-        for (vad16, model16) in self.signal.flush() {
-            let mut vad_frame = (*vad16).clone();
-            let mut model_frame = (*model16).clone();
-            let pre_agc_rms =
-                self.agc
-                    .process_pair(&mut vad_frame, &mut model_frame, self.prev_speech);
-            let is_speech = self.vad.verdict(&vad_frame);
-            self.prev_speech = is_speech;
-            if self
-                .utterance
-                .push_frame_evidenced(&model_frame, is_speech, pre_agc_rms)
-                == FrameAction::Flush
-            {
-                closed = self.close_current();
+        for pair in self.signal.flush() {
+            if let Some(done) = self.absorb_pair(pair) {
+                closed = Some(done);
             }
         }
         if closed.is_none() && self.utterance.is_open() {

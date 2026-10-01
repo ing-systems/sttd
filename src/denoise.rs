@@ -12,7 +12,8 @@ use crate::config::{DENOISE_RATE, FRAME_48K};
 // Denoiser: the one thing on the VAD branch that knows there's a choice of
 // noise-suppression model. Everything downstream (resample -> VAD ->
 // utterance buffer) only ever sees a clean 16 kHz frame; it doesn't know or
-// care whether a model produced it.
+// care whether a model produced it. Nothing here resamples: the 48 kHz
+// intermediate exists only for the model, and the model branch stays raw.
 // ---------------------------------------------------------------------------
 
 /// Which model cleans the VAD branch's 48 kHz frame before it's resampled
@@ -21,23 +22,24 @@ use crate::config::{DENOISE_RATE, FRAME_48K};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum DenoiserKind {
     /// DeepFilterNet3 (tract/onnx). Opt-in via `STTD_DENOISER=deepfilter`
-    /// (requires the `denoise` Cargo feature):
-    /// markedly better than raw audio on non-stationary noise, at the cost
-    /// of a 20 ms lookahead and a heavier per-frame model pass. Runs at
-    /// exactly `DENOISE_RATE`/`FRAME_48K`, so it drops into the pipeline's
-    /// 48 kHz VAD-branch frame with no resampling changes.
+    /// (requires the `denoise` Cargo feature): markedly better than raw
+    /// audio on non-stationary noise, at the cost of a 20 ms lookahead and a
+    /// heavier per-frame model pass. Runs at exactly
+    /// `DENOISE_RATE`/`FRAME_48K`, so it drops into the pipeline's 48 kHz
+    /// VAD-branch frame with no resampling change. The model branch stays
+    /// raw (see `signal::VadPath::Denoised`).
     #[cfg(feature = "denoise")]
     #[value(name = "deepfilter")]
     DeepFilter,
     /// No denoising (default): the VAD branch resamples straight from the
     /// hw rate to 16 kHz with no 48 kHz intermediate at all (see
-    /// `FrameProcessor`). Useful to isolate how much a denoiser is actually
-    /// helping (or hurting) VAD verdicts on a given recording.
+    /// `signal::VadPath`). Useful to isolate how much a denoiser is
+    /// actually helping (or hurting) VAD verdicts on a given recording.
     #[value(name = "none")]
     Bypass,
 }
 
-/// The active denoiser, built once by `FrameProcessor::new` when the
+/// The active denoiser, built once by `SignalPath::new` when the
 /// `DenoiserKind` chosen at startup is `DeepFilter`. There is no bypass
 /// variant: `Bypass` means no denoiser object and no 48 kHz path at all.
 /// Only available with the `denoise` Cargo feature.

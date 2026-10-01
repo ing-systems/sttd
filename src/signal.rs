@@ -10,11 +10,13 @@
 //
 // This module owns branch topology, resampling cadence, denoising, high-pass
 // filtering and verdict pairing internally. Callers feed hw-rate chunks and
-// receive ready `(vad16, model16)` pairs (already 80 Hz HP'd); they never
-// see `FirStream`, the denoiser's 48 kHz intermediate, or how pairing stays
-// in lockstep.
+// receive ready `PairedFrames` (already 80 Hz HP'd); they never see
+// `FirStream`, the denoiser's 48 kHz intermediate, or how pairing stays in
+// lockstep. `feed`/`flush`/`clear` each have one body per topology; only the
+// resampler call differs between feeding a chunk and flushing the tail.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -27,18 +29,46 @@ use crate::denoise::Denoiser;
 use crate::dsp::FirStream;
 use crate::hp::Hp;
 
-/// Shared 16 kHz frame: one audio allocation, cheap `Arc` clones. The
-/// default (`Direct`) path decodes one frame and hands it to both the VAD
-/// verdict and the utterance buffer — previously a `Vec::clone()` (640 B
-/// memcpy + second alloc) per 10 ms frame. `Arc::new(Vec)` moves the buffer
-/// without copying elements; clones are a single atomic increment.
-pub(crate) type SharedFrame = std::sync::Arc<Vec<f32>>;
+/// A queued 16 kHz frame, shared cheaply between the two branch queues. The
+/// default (`Direct`) path decodes one frame and queues it for both the VAD
+/// verdict and the utterance buffer; `Arc::new(Vec)` moves the buffer without
+/// copying elements and the second queue entry costs one atomic increment.
+pub(crate) type SharedFrame = Arc<Vec<f32>>;
 
-/// Paired 16 kHz frames: VAD-branch audio for the verdict + model-branch
-/// audio for the utterance buffer. Always 160 samples each. In `Direct` mode
-/// both `Arc`s point at the same allocation (`Arc::ptr_eq`); in `Denoised`
-/// mode they are independent allocations from separate resamplers.
-pub(crate) type PairedFrames = (SharedFrame, SharedFrame);
+/// One completed 10 ms frame pair, handed to the caller as owned buffers
+/// (always `FRAME_16K` samples each).
+///
+/// `Shared` is the default (`Direct`) topology: the two branch queues held
+/// `Arc` clones of one allocation, so the caller gets that single buffer back
+/// — the Agc applies the shared gain once and both roles read the same
+/// samples. `Split` is the opt-in `Denoised` topology, where the VAD branch
+/// (denoised) and the model branch (raw) come from independent resamplers and
+/// own independent buffers.
+pub(crate) enum PairedFrames {
+    Shared(Vec<f32>),
+    Split(Vec<f32>, Vec<f32>),
+}
+
+/// One pass over the branch topology: `Feed` consumes a raw hw-rate chunk,
+/// `Flush` zero-pads each resampler's trailing partial chunk so tail audio
+/// still reaches the utterance. Both end in the same queue-then-pair step, so
+/// `feed`/`flush` share one body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cadence {
+    Feed,
+    Flush,
+}
+
+impl Cadence {
+    /// Run `resampler` for this cadence into the caller's reused `scratch`.
+    /// `input` is unused on `Flush`: the resampler drains its own FIR state.
+    fn drain(self, resampler: &mut FirStream, input: &[f32], scratch: &mut Vec<Vec<f32>>) {
+        match self {
+            Cadence::Feed => resampler.feed_into(input, scratch),
+            Cadence::Flush => resampler.flush_into(scratch),
+        }
+    }
+}
 
 /// Warn threshold for unpaired frames waiting in `SignalPath` queues (see
 /// `pending_depths`). Both branches average 100 frames/s, so steady state is
@@ -154,21 +184,36 @@ impl SignalPath {
         (self.fed_chunks, self.paired_frames, self.max_pending)
     }
 
-    /// Feed one raw hw-rate chunk; returns every completed `(vad16,
-    /// model16)` pair in order. Each branch's `FirStream` may complete
-    /// zero, one, or (on catch-up) several 10 ms frames per call; a branch
-    /// running ahead waits in its queue. Both average 100 frames/s, so the
-    /// queues stay bounded at a frame or two.
+    /// Feed one raw hw-rate chunk; returns every completed pair in order. Each
+    /// branch's `FirStream` may complete zero, one, or (on catch-up) several
+    /// 10 ms frames per call; a branch running ahead waits in its queue. Both
+    /// average 100 frames/s, so the queues stay bounded at a frame or two.
     pub(crate) fn feed(&mut self, frame_hw_raw: &[f32]) -> Vec<PairedFrames> {
-        use std::sync::Arc;
         self.fed_chunks += 1;
+        self.run(frame_hw_raw, Cadence::Feed)
+    }
+
+    /// Zero-pad each resampler's trailing partial chunk so tail audio stuck
+    /// in an incomplete FFT chunk still reaches the utterance instead of
+    /// being lost at shutdown, then return every paired frame left buffered.
+    pub(crate) fn flush(&mut self) -> Vec<PairedFrames> {
+        self.run(&[], Cadence::Flush)
+    }
+
+    /// One pass over the branch topology — resample (and denoise, opt-in),
+    /// high-pass, queue — then hand every completed pair to the caller.
+    /// `feed` and `flush` differ only in `cadence`.
+    fn run(&mut self, frame_hw_raw: &[f32], cadence: Cadence) -> Vec<PairedFrames> {
         match &mut self.vad_path {
             VadPath::Direct { resampler, hp } => {
                 self.scratch.clear();
-                resampler.feed_into(frame_hw_raw, &mut self.scratch);
+                cadence.drain(resampler, frame_hw_raw, &mut self.scratch);
                 for mut frame in self.scratch.drain(..) {
                     hp.process(&mut frame);
-                    // One allocation shared by both branches: no 640 B memcpy.
+                    // One allocation for both branches: the queue entries are
+                    // `Arc` clones, and `drain_paired` recognizes the pair by
+                    // pointer and hands the buffer back untouched (no 640 B
+                    // memcpy, no second alloc per 10 ms frame).
                     let shared: SharedFrame = Arc::new(frame);
                     self.pending_model.push_back(Arc::clone(&shared));
                     self.pending_vad.push_back(shared);
@@ -185,7 +230,7 @@ impl SignalPath {
                 hp_model,
             } => {
                 self.scratch.clear();
-                resampler_hw48.feed_into(frame_hw_raw, &mut self.scratch);
+                cadence.drain(resampler_hw48, frame_hw_raw, &mut self.scratch);
                 for frame48 in self.scratch.drain(..) {
                     debug_assert_eq!(frame48.len(), FRAME_48K);
                     denoiser.denoise_frame(&frame48, clean48_vad);
@@ -197,60 +242,24 @@ impl SignalPath {
                         self.pending_vad.push_back(Arc::new(vad_frame));
                     }
                 }
-                self.scratch.clear();
-                resampler_model.feed_into(frame_hw_raw, &mut self.scratch);
-                for mut frame in self.scratch.drain(..) {
-                    hp_model.process(&mut frame);
-                    self.pending_model.push_back(Arc::new(frame));
-                }
-            }
-        }
-        self.note_pending();
-        self.drain_paired()
-    }
-
-    /// Zero-pad each resampler's trailing partial chunk so tail audio stuck
-    /// in an incomplete FFT chunk still reaches the utterance instead of
-    /// being lost at shutdown, then return every paired frame left buffered.
-    pub(crate) fn flush(&mut self) -> Vec<PairedFrames> {
-        use std::sync::Arc;
-        match &mut self.vad_path {
-            VadPath::Direct { resampler, hp } => {
-                self.scratch.clear();
-                resampler.flush_into(&mut self.scratch);
-                for mut frame16 in self.scratch.drain(..) {
-                    hp.process(&mut frame16);
-                    let shared: SharedFrame = Arc::new(frame16);
-                    self.pending_model.push_back(Arc::clone(&shared));
-                    self.pending_vad.push_back(shared);
-                }
-            }
-            #[cfg(feature = "denoise")]
-            VadPath::Denoised {
-                resampler_hw48,
-                resampler_vad,
-                resampler_model,
-                denoiser,
-                clean48_vad,
-                hp_vad,
-                hp_model,
-            } => {
-                self.scratch.clear();
-                resampler_hw48.flush_into(&mut self.scratch);
-                for frame48 in self.scratch.drain(..) {
-                    denoiser.denoise_frame(&frame48, clean48_vad);
-                    for mut vad_frame in resampler_vad.feed(&clean48_vad[..]) {
+                if cadence == Cadence::Flush {
+                    // The two 16 kHz branches still hold their own partial
+                    // chunks; zero-pad them before pairing.
+                    for mut vad_frame in resampler_vad.flush() {
                         hp_vad.process(&mut vad_frame);
                         self.pending_vad.push_back(Arc::new(vad_frame));
                     }
-                }
-                for mut vad_frame in resampler_vad.flush() {
-                    hp_vad.process(&mut vad_frame);
-                    self.pending_vad.push_back(Arc::new(vad_frame));
-                }
-                for mut model_frame in resampler_model.flush() {
-                    hp_model.process(&mut model_frame);
-                    self.pending_model.push_back(Arc::new(model_frame));
+                    for mut model_frame in resampler_model.flush() {
+                        hp_model.process(&mut model_frame);
+                        self.pending_model.push_back(Arc::new(model_frame));
+                    }
+                } else {
+                    self.scratch.clear();
+                    cadence.drain(resampler_model, frame_hw_raw, &mut self.scratch);
+                    for mut frame in self.scratch.drain(..) {
+                        hp_model.process(&mut frame);
+                        self.pending_model.push_back(Arc::new(frame));
+                    }
                 }
             }
         }
@@ -306,11 +315,32 @@ impl SignalPath {
         {
             debug_assert_eq!(vad16.len(), FRAME_16K);
             debug_assert_eq!(model16.len(), FRAME_16K);
-            out.push((vad16, model16));
+            if Arc::ptr_eq(&vad16, &model16) {
+                // `Direct` topology: both queue entries are `Arc` clones of one
+                // allocation. Drop the twin handle, then take the buffer.
+                drop(model16);
+                out.push(PairedFrames::Shared(into_buffer(vad16)));
+            } else {
+                out.push(PairedFrames::Split(
+                    into_buffer(vad16),
+                    into_buffer(model16),
+                ));
+            }
         }
         self.paired_frames += out.len() as u64;
         out
     }
+}
+
+/// Take the owned buffer out of a queued frame.
+///
+/// `drain_paired` drops every other handle to the allocation first (in the
+/// `Direct` topology the twin queue entry is an `Arc` clone of this same
+/// buffer), so the count is 1 here and the move costs nothing. The `Err` arm
+/// only keeps a broken invariant from panicking the audio loop; no code path
+/// reaches it.
+fn into_buffer(shared: SharedFrame) -> Vec<f32> {
+    Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
 }
 
 #[cfg(test)]
@@ -329,6 +359,15 @@ mod tests {
         pairs
     }
 
+    /// Both roles of one pair without copying: the `Shared` topology serves
+    /// them from the same allocation.
+    fn roles(pair: &PairedFrames) -> (&[f32], &[f32]) {
+        match pair {
+            PairedFrames::Shared(frame) => (frame, frame),
+            PairedFrames::Split(vad, model) => (vad, model),
+        }
+    }
+
     #[test]
     fn direct_pairs_one_to_one_with_exact_frames() {
         for hw in [16_000, 44_100, 48_000] {
@@ -336,7 +375,8 @@ mod tests {
             let hw_chunk = hw_input_frames(hw);
             let silence = vec![0.0f32; hw_chunk];
             for _ in 0..50 {
-                for (vad, model) in signal.feed(&silence) {
+                for pair in signal.feed(&silence) {
+                    let (vad, model) = roles(&pair);
                     assert_eq!(vad.len(), FRAME_16K, "hw={hw}");
                     assert_eq!(model.len(), FRAME_16K, "hw={hw}");
                     assert_eq!(vad, model, "hw={hw}: direct hop shares one hop");
@@ -348,17 +388,19 @@ mod tests {
     #[test]
     fn direct_shares_one_allocation_between_branches() {
         // Regression for the per-frame `Vec::clone()` (640 B memcpy + second
-        // alloc at 100 fps): both `Arc`s must point at the same allocation.
+        // alloc at 100 fps): the pair must come back as the one allocation
+        // both branch queues shared.
         let mut signal = SignalPath::new(48_000, DenoiserKind::Bypass).unwrap();
         let hw_chunk = hw_input_frames(48_000);
         let input = vec![0.1f32; hw_chunk];
         let mut saw_pair = false;
         for _ in 0..50 {
-            for (vad, model) in signal.feed(&input) {
+            for pair in signal.feed(&input) {
                 saw_pair = true;
+                let (vad, model) = roles(&pair);
                 assert!(
-                    std::sync::Arc::ptr_eq(&vad, &model),
-                    "direct pair must share one Arc allocation"
+                    std::ptr::eq(vad.as_ptr(), model.as_ptr()),
+                    "direct pair must share one allocation"
                 );
             }
         }

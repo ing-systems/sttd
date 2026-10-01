@@ -189,14 +189,26 @@ pub(crate) fn fold_polish_diacritic(c: char) -> char {
 
 /// Lowercase, fold Polish diacritics, turn punctuation into spaces and
 /// collapse whitespace.
+///
+/// One pass, one allocation: every non-alphanumeric char becomes a space
+/// and a run of them collapses to a single separator, which is exactly what
+/// `split_whitespace().join(" ")` produced.
 pub(crate) fn normalize_transcript(text: &str) -> String {
-    let normalized: String = text
-        .to_lowercase()
-        .chars()
-        .map(fold_polish_diacritic)
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect();
-    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+    let lowered = text.to_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut gap = false;
+    for c in lowered.chars().map(fold_polish_diacritic) {
+        if c.is_alphanumeric() {
+            if gap && !out.is_empty() {
+                out.push(' ');
+            }
+            gap = false;
+            out.push(c);
+        } else {
+            gap = true;
+        }
+    }
+    out
 }
 
 /// Whether `text` is a repetition-loop decode: 6+ words with at most
@@ -252,6 +264,45 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// `levenshtein` with a ceiling: the true distance when it is at most
+/// `max_distance`, `max_distance + 1` otherwise.
+///
+/// Capping keeps every caller's "closest match" ranking exact while making a
+/// hopeless pair cheap. An edit distance is never smaller than the length
+/// gap, so a pair that fails that test is answered without allocating; once
+/// a DP row's minimum exceeds the ceiling the whole pair is hopeless too (any
+/// alignment crosses that row, so the row minimum lower-bounds the final
+/// distance).
+pub(crate) fn levenshtein_capped(a: &str, b: &str, max_distance: usize) -> usize {
+    let over = max_distance + 1;
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > max_distance {
+        return over;
+    }
+    if a.is_empty() || b.is_empty() {
+        return a.len().max(b.len()).min(over);
+    }
+    // Reuse two rows instead of allocating one per `a` char.
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        let mut row_min = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            let cell = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+            cur[j + 1] = cell;
+            row_min = row_min.min(cell);
+        }
+        if row_min > max_distance {
+            return over;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()].min(over)
+}
+
 /// Whether `text` is a known hallucination on silence/noise: exact
 /// match after normalization, or (for lines of at least
 /// `HALLUCINATION_FUZZ_MIN_LEN` chars) within `HALLUCINATION_FUZZ_MAX_DIST`
@@ -292,6 +343,75 @@ mod tests {
 
     fn default_gate() -> GateConfig {
         GateConfig::new(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY)
+    }
+
+    #[test]
+    fn normalize_collapses_punctuation_and_case() {
+        assert_eq!(normalize_transcript("  Dzień,   DOBRY!  "), "dzien dobry");
+        // Only Polish diacritics fold (`fold_polish_diacritic`).
+        assert_eq!(normalize_transcript("ŻÓŁĆ/żółć"), "zolc zolc");
+        assert_eq!(normalize_transcript("..."), "");
+        assert_eq!(normalize_transcript(""), "");
+    }
+
+    /// The form `normalize_transcript` replaced: fold into a string, then
+    /// re-join the whitespace-separated words.
+    fn reference_normalize(text: &str) -> String {
+        let normalized: String = text
+            .to_lowercase()
+            .chars()
+            .map(fold_polish_diacritic)
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect();
+        normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn normalize_matches_the_reference_form() {
+        for case in [
+            "",
+            " ",
+            ".",
+            "Dzień dobry",
+            "  ŻÓŁĆ   gęślą jaźń!  ",
+            "a...b",
+            "--x--",
+            "tab\tand\nnewline",
+            "Ünïcödé 123",
+            "naïve café",
+            "mixed CASE, with (punctuation)!",
+        ] {
+            assert_eq!(
+                normalize_transcript(case),
+                reference_normalize(case),
+                "case={case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capped_levenshtein_agrees_with_the_uncapped_dp() {
+        let pairs = [
+            ("", ""),
+            ("", "abc"),
+            ("abc", ""),
+            ("paracetamol", "paracetamoll"),
+            ("barrer", "barret"),
+            ("zolc", "żółć"),
+            ("日本語", "日本"),
+        ];
+        for (a, b) in pairs {
+            let full = levenshtein(a, b);
+            for max in 0..=4 {
+                let capped = levenshtein_capped(a, b, max);
+                assert_eq!(
+                    capped,
+                    if full <= max { full } else { max + 1 },
+                    "a={a:?} b={b:?} max={max}"
+                );
+                assert_eq!(capped <= max, full <= max, "a={a:?} b={b:?} max={max}");
+            }
+        }
     }
 
     #[test]

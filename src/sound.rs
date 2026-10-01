@@ -34,12 +34,6 @@ const READY_GAP_MS: u64 = 50;
 /// the detached cue thread.
 pub(crate) const CUE_QUIET_MS: u64 = 500;
 
-/// One cue tone: sine frequency + duration.
-struct Note {
-    freq_hz: f32,
-    duration_ms: u64,
-}
-
 /// Synthesize one sine tone at `sample_rate`: `freq_hz` for `duration_ms`,
 /// with short linear fades at both ends to avoid clicks. Pure over its
 /// inputs so tests don't touch audio hardware.
@@ -80,7 +74,7 @@ pub(crate) fn sequence_buffer(notes: &[(f32, u64)], gap_ms: u64, sample_rate: u3
     };
     for (i, &(freq, dur)) in notes.iter().enumerate() {
         if i > 0 {
-            out.extend(std::iter::repeat(0.0f32).take(gap));
+            out.extend(std::iter::repeat_n(0.0f32, gap));
         }
         out.extend(tone_buffer(freq, dur, sample_rate));
     }
@@ -89,41 +83,26 @@ pub(crate) fn sequence_buffer(notes: &[(f32, u64)], gap_ms: u64, sample_rate: u3
 
 /// Paused ack: single low beep (440 Hz, 150 ms).
 pub(crate) fn play_paused() {
-    play_sequence(&[Note {
-        freq_hz: 440.0,
-        duration_ms: 150,
-    }]);
+    play_sequence(&[(440.0, 150)]);
 }
 
 /// Resumed ack: single mid blip (660 Hz, 100 ms). Fires on signal receipt,
 /// before any reload — `play_ready` follows when transcription can resume.
 pub(crate) fn play_resumed() {
-    play_sequence(&[Note {
-        freq_hz: 660.0,
-        duration_ms: 100,
-    }]);
+    play_sequence(&[(660.0, 100)]);
 }
 
 /// Ready jingle: rising two-tone (660 Hz / 880 Hz) = "speak now". Played on
 /// first load (when unpaused), on reload after a long pause, and on
 /// short-pause resume where the model never unloaded.
 pub(crate) fn play_ready() {
-    play_sequence(&[
-        Note {
-            freq_hz: 660.0,
-            duration_ms: 100,
-        },
-        Note {
-            freq_hz: 880.0,
-            duration_ms: 150,
-        },
-    ]);
+    play_sequence(&[(660.0, 100), (880.0, 150)]);
 }
 
-/// Render `notes` for the default output rate and play them on a detached
-/// thread. Returns immediately; device failures log and never propagate.
-fn play_sequence(notes: &[Note]) {
-    let spec: Vec<(f32, u64)> = notes.iter().map(|n| (n.freq_hz, n.duration_ms)).collect();
+/// Play `notes` (`(freq_hz, duration_ms)` per tone) on a detached thread.
+/// Returns immediately; device failures log and never propagate.
+fn play_sequence(notes: &[(f32, u64)]) {
+    let spec = notes.to_vec();
     std::thread::Builder::new()
         .name("sound-cue".into())
         .spawn(move || play_blocking(&spec))

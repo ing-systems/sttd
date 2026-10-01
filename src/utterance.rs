@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use crate::config::{
     EARLY_SPLIT_QUIET_FRAMES, EARLY_SPLIT_QUIET_RMS, EARLY_SPLIT_SAMPLES,
     EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, INTERIM_SPLIT_SAMPLES, INTERIM_SPLIT_SILENCE_FRAMES,
@@ -8,6 +6,14 @@ use crate::config::{
     SILENCE_FRAMES_THRESHOLD, STRONG_RMS_FACTOR, TAIL_MAX_SAMPLES, TAIL_MIN_SAMPLES,
 };
 use crate::gate::GateConfig;
+use crate::noise::frame_rms;
+
+/// Pre-roll ring capacity in samples: `RING_FRAMES` of 16 kHz audio (300 ms).
+/// A fixed array + head index, not a growable `VecDeque`: the ring never
+/// changes size, so the hot path (`record_preroll`, every frame) writes into
+/// preallocated storage instead of a deque that shifts its whole live tail on
+/// every `pop_front`.
+const PREROLL_CAPACITY: usize = RING_FRAMES * FRAME_16K;
 
 /// What the acoustics observed about an utterance, independent of what the model
 /// made of it: how many frames the VAD judged to be speech, and how loud that
@@ -74,8 +80,14 @@ pub(crate) enum FrameAction {
 /// never touch it, and `Default` carries the compiled-in default so existing
 /// struct literals keep behaving.
 pub(crate) struct UtteranceBuffer {
-    /// Rolling ~300 ms of recent model-branch audio (see the struct doc).
-    preroll: VecDeque<f32>,
+    /// Rolling ~300 ms of recent model-branch audio (see the struct doc): a
+    /// fixed ring where `preroll[..preroll_len]` are live, oldest first, and
+    /// the oldest sample sits at `preroll_head`.
+    preroll: [f32; PREROLL_CAPACITY],
+    /// Live samples in `preroll` (`<= PREROLL_CAPACITY`).
+    preroll_len: usize,
+    /// Index of the oldest live sample; wraps once the ring is full.
+    preroll_head: usize,
     /// Model-branch audio (16 kHz), from the moment the utterance opens.
     buf: Vec<f32>,
     /// Consecutive non-speech frames since the last speech frame, once the
@@ -118,7 +130,9 @@ pub(crate) struct UtteranceBuffer {
 impl Default for UtteranceBuffer {
     fn default() -> Self {
         Self {
-            preroll: VecDeque::new(),
+            preroll: [0.0; PREROLL_CAPACITY],
+            preroll_len: 0,
+            preroll_head: 0,
             buf: Vec::new(),
             silence_frames: 0,
             hangover_frames: SILENCE_FRAMES_THRESHOLD,
@@ -136,10 +150,7 @@ impl Default for UtteranceBuffer {
 
 impl UtteranceBuffer {
     pub(crate) fn new() -> Self {
-        Self {
-            preroll: VecDeque::with_capacity(RING_FRAMES * FRAME_16K),
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Override the silence hangover (in 10 ms frames, see
@@ -180,30 +191,34 @@ impl UtteranceBuffer {
     /// that don't care about the AGC distinction.
     #[allow(dead_code)]
     pub(crate) fn push_frame(&mut self, frame: &[f32], is_speech: bool) -> FrameAction {
-        let evidence_rms = frame_rms(frame);
-        self.push_frame_evidenced(frame, is_speech, evidence_rms)
+        let rms = frame_rms(frame);
+        self.push_frame_evidenced(frame, is_speech, rms, rms)
     }
 
     /// Same as `push_frame`, but scores acoustic evidence
     /// (`speech_energy_sum_sq`/`speech_frame_rms`, hence `Evidence.rms`)
-    /// from `evidence_rms` instead of `frame`'s own RMS. `frame` is still
-    /// what gets appended to the buffered utterance (and sent to the model) and
-    /// still drives the quiet-run/early-split RMS check below — only the
-    /// acoustic-evidence accounting is redirected.
+    /// from `evidence_rms` instead of `frame`'s own RMS, and takes the
+    /// quiet-run/early-split loudness as `frame_rms` instead of measuring
+    /// `frame` itself. `frame` is still what gets appended to the buffered
+    /// utterance (and sent to the model) — only the two loudness
+    /// measurements are redirected.
     ///
-    /// `FrameProcessor::process_frame` passes the *pre-AGC* model-frame RMS
-    /// (`Agc::process_pair`'s return value) here, so evidence describes what
-    /// the microphone actually heard rather than what the shared-gain AGC did
-    /// to it afterward: `Agc` can amplify quiet-but-real speech up to 8x
-    /// toward `--target-rms`, which used to amplify the evidence RMS
-    /// regardless of how quiet the speech actually was.
+    /// `FrameProcessor` passes the *pre-AGC* model-frame RMS
+    /// (`Agc::process_pair`'s return value) as `evidence_rms`, so evidence
+    /// describes what the microphone actually heard rather than what the
+    /// shared-gain AGC did to it afterward: `Agc` can amplify quiet-but-real
+    /// speech up to 8x toward `--target-rms`, which used to amplify the
+    /// evidence RMS regardless of how quiet the speech actually was. It passes
+    /// the *post-AGC* RMS as `frame_rms`, because the quiet run and the
+    /// early-split gate judge the audio that actually reaches the model.
     pub(crate) fn push_frame_evidenced(
         &mut self,
         frame: &[f32],
         is_speech: bool,
         evidence_rms: f32,
+        frame_rms: f32,
     ) -> FrameAction {
-        let action = self.absorb(frame, is_speech, evidence_rms);
+        let action = self.absorb(frame, is_speech, evidence_rms, frame_rms);
         self.record_preroll(frame);
         action
     }
@@ -221,103 +236,122 @@ impl UtteranceBuffer {
         }
     }
 
-    fn absorb(&mut self, frame: &[f32], is_speech: bool, evidence_rms: f32) -> FrameAction {
-        // Frame loudness (of the buffered/transmitted signal) drives the
-        // low-energy early split (any frame while open); `evidence_rms`
-        // (possibly a different, pre-AGC value) drives the acoustic evidence
-        // accounting below instead.
-        let frame_rms = frame_rms(frame);
+    /// Buffer one frame against the current VAD verdict. Both arms share the
+    /// same three-step shape — account for the frame, append it, then decide
+    /// whether the accumulated utterance has reached a split point — but not
+    /// the same rules, so they stay in separate functions.
+    fn absorb(
+        &mut self,
+        frame: &[f32],
+        is_speech: bool,
+        evidence_rms: f32,
+        frame_rms: f32,
+    ) -> FrameAction {
         if is_speech {
-            self.onset_run += 1;
-            self.speech_frames += 1;
-            // `evidence_rms^2 * len` is exactly the sum of squared samples a
-            // frame at that RMS would have (RMS is defined as
-            // sqrt(sum_sq/len)), so this stays an exact accumulator (not an
-            // approximation) whenever `evidence_rms == frame_rms(frame)`,
-            // i.e. for every `push_frame` (test/default) call.
-            self.speech_energy_sum_sq += (evidence_rms as f64).powi(2) * frame.len() as f64;
-            self.speech_sample_count += frame.len();
-            self.speech_frame_rms.push(evidence_rms);
+            self.absorb_speech(frame, evidence_rms, frame_rms)
+        } else {
+            self.absorb_silence(frame, frame_rms)
+        }
+    }
 
-            if self.buf.is_empty() {
-                if self.onset_run < ONSET_SPEECH_FRAMES {
-                    return FrameAction::Continue;
-                }
-                // Adaptive pre-roll: prepend the run-up, but trim leading
-                // silence down to a safety margin when the onset is loud
-                // (see `preroll_trim_skip`). A quiet onset keeps the full
-                // ring, as before.
-                let skip = self.preroll_trim_skip(frame);
-                if skip > 0 {
-                    log::debug!(
-                        "preroll trim: {} -> {} samples",
-                        self.preroll.len(),
-                        self.preroll.len() - skip
-                    );
-                }
-                self.buf.extend(self.preroll.iter().skip(skip).copied());
+    /// Speech frame: extend the onset run, accumulate acoustic evidence from
+    /// `evidence_rms` (pre-AGC), prepend the trimmed pre-roll when this frame
+    /// opens the utterance, then test the hard cap and the quiet dip.
+    fn absorb_speech(&mut self, frame: &[f32], evidence_rms: f32, frame_rms: f32) -> FrameAction {
+        self.onset_run += 1;
+        self.speech_frames += 1;
+        // `evidence_rms^2 * len` is exactly the sum of squared samples a
+        // frame at that RMS would have (RMS is defined as
+        // sqrt(sum_sq/len)), so this stays an exact accumulator (not an
+        // approximation) whenever `evidence_rms == frame_rms`,
+        // i.e. for every `push_frame` (test/default) call.
+        self.speech_energy_sum_sq += (evidence_rms as f64).powi(2) * frame.len() as f64;
+        self.speech_sample_count += frame.len();
+        self.speech_frame_rms.push(evidence_rms);
+
+        if self.buf.is_empty() {
+            if self.onset_run < ONSET_SPEECH_FRAMES {
+                return FrameAction::Continue;
             }
-            self.buf.extend_from_slice(frame);
-            self.samples_at_last_speech = self.buf.len();
-            self.silence_frames = 0;
-            if self.buf.len() >= MAX_UTTERANCE_SAMPLES {
-                self.quiet_run = 0;
+            // Adaptive pre-roll: prepend the run-up, but trim leading
+            // silence down to a safety margin when the onset is loud
+            // (see `preroll_trim_skip`). A quiet onset keeps the full
+            // ring, as before.
+            let skip = self.preroll_trim_skip(frame);
+            if skip > 0 {
+                log::debug!(
+                    "preroll trim: {} -> {} samples",
+                    self.preroll_len,
+                    self.preroll_len - skip
+                );
+            }
+            self.extend_from_preroll(skip);
+        }
+        self.buf.extend_from_slice(frame);
+        self.samples_at_last_speech = self.buf.len();
+        self.silence_frames = 0;
+        if self.buf.len() >= MAX_UTTERANCE_SAMPLES {
+            self.quiet_run = 0;
+            self.pending_split = true;
+            FrameAction::Flush
+        } else if self.buf.len() >= EARLY_SPLIT_SAMPLES && frame_rms < EARLY_SPLIT_QUIET_RMS {
+            // Word-boundary dip inside a long utterance: count it even
+            // though the VAD latch still says speech (see the
+            // non-speech arm below for the shared flush). Must not reset
+            // to 0 first, or a run of quiet-but-VAD-flagged frames could
+            // never accumulate past 1.
+            self.note_quiet(frame_rms);
+            if self.quiet_run >= EARLY_SPLIT_QUIET_FRAMES {
                 self.pending_split = true;
                 FrameAction::Flush
-            } else if self.buf.len() >= EARLY_SPLIT_SAMPLES && frame_rms < EARLY_SPLIT_QUIET_RMS {
-                // Word-boundary dip inside a long utterance: count it even
-                // though the VAD latch still says speech (see the
-                // non-speech arm below for the shared flush). Must not reset
-                // to 0 first, or a run of quiet-but-VAD-flagged frames could
-                // never accumulate past 1.
-                self.note_quiet(frame_rms);
-                if self.quiet_run >= EARLY_SPLIT_QUIET_FRAMES {
-                    self.pending_split = true;
-                    FrameAction::Flush
-                } else {
-                    FrameAction::Continue
-                }
             } else {
-                // Speech frame loud enough that it isn't part of a quiet run.
-                self.quiet_run = 0;
                 FrameAction::Continue
             }
         } else {
-            self.onset_run = 0;
-            if self.buf.is_empty() {
-                self.speech_frames = 0;
-                self.speech_energy_sum_sq = 0.0;
-                self.speech_sample_count = 0;
-                self.speech_frame_rms.clear();
-                return FrameAction::Continue;
-            }
-            self.buf.extend_from_slice(frame);
-            self.silence_frames += 1;
-            self.note_quiet(frame_rms);
-            if self.silence_frames > self.hangover_frames {
-                self.pending_split = false;
-                FrameAction::Flush
-            } else if self.buf.len() >= EARLY_SPLIT_SAMPLES
-                && (self.silence_frames >= EARLY_SPLIT_SILENCE_FRAMES
-                    || self.quiet_run >= EARLY_SPLIT_QUIET_FRAMES)
-            {
-                // Near the 30 s cap with a real pause — or a 50 ms
-                // energy dip — in progress: cut here (in quiet) instead of
-                // riding into the hard cap and cutting mid-word. `close`
-                // still trims to last speech + adaptive tail.
-                self.pending_split = true;
-                FrameAction::Flush
-            } else if self.buf.len() >= INTERIM_SPLIT_SAMPLES
-                && self.silence_frames >= INTERIM_SPLIT_SILENCE_FRAMES
-            {
-                // Long monologue with a 300 ms pause in progress: emit the
-                // prefix now instead of growing one 30 s block. The
-                // continuation starts fresh (pre-roll spans the boundary).
-                self.pending_split = true;
-                FrameAction::Flush
-            } else {
-                FrameAction::Continue
-            }
+            // Speech frame loud enough that it isn't part of a quiet run.
+            self.quiet_run = 0;
+            FrameAction::Continue
+        }
+    }
+
+    /// Non-speech frame: reset the onset run, append in-utterance padding
+    /// (never spliced out), then test the hangover close and the two
+    /// pause-driven splits.
+    fn absorb_silence(&mut self, frame: &[f32], frame_rms: f32) -> FrameAction {
+        self.onset_run = 0;
+        if self.buf.is_empty() {
+            self.speech_frames = 0;
+            self.speech_energy_sum_sq = 0.0;
+            self.speech_sample_count = 0;
+            self.speech_frame_rms.clear();
+            return FrameAction::Continue;
+        }
+        self.buf.extend_from_slice(frame);
+        self.silence_frames += 1;
+        self.note_quiet(frame_rms);
+        if self.silence_frames > self.hangover_frames {
+            self.pending_split = false;
+            FrameAction::Flush
+        } else if self.buf.len() >= EARLY_SPLIT_SAMPLES
+            && (self.silence_frames >= EARLY_SPLIT_SILENCE_FRAMES
+                || self.quiet_run >= EARLY_SPLIT_QUIET_FRAMES)
+        {
+            // Near the 30 s cap with a real pause — or a 50 ms
+            // energy dip — in progress: cut here (in quiet) instead of
+            // riding into the hard cap and cutting mid-word. `close`
+            // still trims to last speech + adaptive tail.
+            self.pending_split = true;
+            FrameAction::Flush
+        } else if self.buf.len() >= INTERIM_SPLIT_SAMPLES
+            && self.silence_frames >= INTERIM_SPLIT_SILENCE_FRAMES
+        {
+            // Long monologue with a 300 ms pause in progress: emit the
+            // prefix now instead of growing one 30 s block. The
+            // continuation starts fresh (pre-roll spans the boundary).
+            self.pending_split = true;
+            FrameAction::Flush
+        } else {
+            FrameAction::Continue
         }
     }
 
@@ -336,55 +370,76 @@ impl UtteranceBuffer {
     /// the ring ever isn't frame-aligned) is always kept, as is the onset
     /// tail itself — it scores far above its own fractional threshold.
     fn preroll_trim_skip(&self, current: &[f32]) -> usize {
-        let n = self.preroll.len();
+        let n = self.preroll_len;
         if n <= PREROLL_SAFETY_FRAMES * FRAME_16K {
             return 0;
         }
         // Onset-burst RMS: the tail of the ring (the earlier onset frames,
         // already recorded) plus the current frame that opens the utterance.
         let tail_samples = ((ONSET_SPEECH_FRAMES as usize).saturating_sub(1) * FRAME_16K).min(n);
-        let mut sum_sq = 0.0f64;
-        let mut count = 0usize;
-        for i in (n - tail_samples)..n {
-            let s = self.preroll[i] as f64;
-            sum_sq += s * s;
-            count += 1;
-        }
+        let mut sum_sq = self.preroll_sum_sq(n - tail_samples, tail_samples);
         for &s in current {
             let s = s as f64;
             sum_sq += s * s;
-            count += 1;
         }
+        let count = tail_samples + current.len();
         if count == 0 {
             return 0;
         }
         let onset_rms = (sum_sq / count as f64).sqrt() as f32;
         let threshold = (onset_rms * PREROLL_TRIM_FACTOR).max(PREROLL_TRIM_FLOOR);
-        let n_frames = n / FRAME_16K;
-        let mut first_hit: Option<usize> = None;
-        for f in 0..n_frames {
-            let mut frame_sum_sq = 0.0f64;
-            for i in (f * FRAME_16K)..((f + 1) * FRAME_16K) {
-                let s = self.preroll[i] as f64;
-                frame_sum_sq += s * s;
-            }
+        for f in 0..(n / FRAME_16K) {
+            let frame_sum_sq = self.preroll_sum_sq(f * FRAME_16K, FRAME_16K);
             if (frame_sum_sq / FRAME_16K as f64).sqrt() as f32 >= threshold {
-                first_hit = Some(f);
-                break;
+                return (f.saturating_sub(PREROLL_SAFETY_FRAMES) * FRAME_16K).min(n);
             }
         }
-        match first_hit {
-            Some(first) => (first.saturating_sub(PREROLL_SAFETY_FRAMES) * FRAME_16K).min(n),
-            None => 0,
+        0
+    }
+
+    /// Sum of squared samples over `count` ring samples starting at the
+    /// `start`-th oldest, in `f64` like `frame_rms`. Walks the ring with a
+    /// wrapping index instead of a modulo per sample.
+    fn preroll_sum_sq(&self, start: usize, count: usize) -> f64 {
+        let mut idx = self.preroll_head + start;
+        let mut sum_sq = 0.0f64;
+        for _ in 0..count {
+            if idx >= PREROLL_CAPACITY {
+                idx -= PREROLL_CAPACITY;
+            }
+            let s = self.preroll[idx] as f64;
+            sum_sq += s * s;
+            idx += 1;
+        }
+        sum_sq
+    }
+
+    /// Append the ring's live samples to `buf`, dropping its leading `skip`
+    /// samples (see `preroll_trim_skip`). The ring is contiguous apart from at
+    /// most one wrap, so this copies at most two runs.
+    fn extend_from_preroll(&mut self, skip: usize) {
+        let live = self.preroll_len - skip;
+        let start = (self.preroll_head + skip) % PREROLL_CAPACITY;
+        let first = (PREROLL_CAPACITY - start).min(live);
+        self.buf
+            .extend_from_slice(&self.preroll[start..start + first]);
+        if live > first {
+            self.buf.extend_from_slice(&self.preroll[..live - first]);
         }
     }
 
     /// Record `frame` as recent audio, so it can be prepended as pre-roll if an
-    /// utterance opens in the next `RING_FRAMES` frames.
+    /// utterance opens in the next `RING_FRAMES` frames. Once the ring is
+    /// full each new sample overwrites the oldest one, so the live window
+    /// always spans the last `PREROLL_CAPACITY` samples.
     fn record_preroll(&mut self, frame: &[f32]) {
-        self.preroll.extend(frame.iter().copied());
-        while self.preroll.len() > RING_FRAMES * FRAME_16K {
-            self.preroll.pop_front();
+        for &s in frame {
+            self.preroll[(self.preroll_head + self.preroll_len) % PREROLL_CAPACITY] = s;
+            if self.preroll_len == PREROLL_CAPACITY {
+                self.preroll_head = (self.preroll_head + 1) % PREROLL_CAPACITY;
+            } else {
+                self.preroll_len += 1;
+            }
         }
     }
 
@@ -499,20 +554,13 @@ impl UtteranceBuffer {
 
     /// Discard everything for a pause transition: like `reset`, but also
     /// drops `preroll` so the first utterance after resume can't prepend
-    /// pre-pause audio.
+    /// pre-pause audio. Rewinding the ring's length and head is enough: the
+    /// samples stay in the array but are no longer reachable.
     pub(crate) fn discard(&mut self) {
         self.reset();
-        self.preroll.clear();
+        self.preroll_len = 0;
+        self.preroll_head = 0;
     }
-}
-
-/// RMS of one 10 ms frame (linear, not dB). Empty frame is silence.
-fn frame_rms(frame: &[f32]) -> f32 {
-    if frame.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f64 = frame.iter().map(|&s| (s as f64) * (s as f64)).sum();
-    (sum_sq / frame.len() as f64).sqrt() as f32
 }
 
 /// Energy-weighted speech share: each VAD-flagged frame contributes
@@ -838,12 +886,13 @@ mod tests {
         let mut buffer = UtteranceBuffer::new();
         let quiet_evidence_rms = 0.004; // just above DEFAULT_MIN_SPEECH_RMS
         let agc_gained_frame = vec![0.04f32; FRAME_16K]; // AGC's --target-rms
+        let gained_rms = frame_rms(&agc_gained_frame);
         for _ in 0..25 {
-            buffer.push_frame_evidenced(&agc_gained_frame, true, quiet_evidence_rms);
+            buffer.push_frame_evidenced(&agc_gained_frame, true, quiet_evidence_rms, gained_rms);
         }
         let silence = vec![0.0f32; FRAME_16K];
         for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
-            buffer.push_frame_evidenced(&silence, false, 0.0);
+            buffer.push_frame_evidenced(&silence, false, 0.0, 0.0);
         }
         let utterance = buffer
             .close(&gate_for(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY))

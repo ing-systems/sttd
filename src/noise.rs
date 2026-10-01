@@ -34,6 +34,26 @@ pub(crate) const VAD_HYSTERESIS: f32 = 0.1;
 /// break regardless of how `--vad-threshold` is configured.
 pub(crate) const EXIT_THRESHOLD_FLOOR: f32 = 0.02;
 
+// ---------------------------------------------------------------------------
+// Frame measurement: one definition of frame loudness for the whole pipeline.
+// ---------------------------------------------------------------------------
+//
+// `agc` (envelope follower, pre-gain evidence), `utterance` (quiet run, early
+// split, weighted density) and this module's floor estimator all read frame
+// loudness, and their thresholds are only comparable because they all measure
+// the same way. It lived in three copies (one per module) until they shared
+// this one. Accumulation is in `f64` — a 160-sample `f32` sum loses ~7 digits
+// of precision — and the result is narrowed once, at the end.
+
+/// RMS of one frame, linear (not dB). An empty frame is silence.
+pub(crate) fn frame_rms(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = frame.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    (sum_sq / frame.len() as f64).sqrt() as f32
+}
+
 /// Slow background RMS estimate. Warm across pause, frozen across speech.
 #[derive(Debug, Clone)]
 pub(crate) struct NoiseTracker {
@@ -56,20 +76,17 @@ impl NoiseTracker {
         self.floor = floor.clamp(0.0001, 0.05);
     }
 
-    /// RMS of one 16 kHz frame.
-    pub(crate) fn frame_rms(frame_16k: &[f32]) -> f32 {
-        if frame_16k.is_empty() {
-            return 0.0;
-        }
-        let sum_sq: f64 = frame_16k.iter().map(|&s| (s as f64) * (s as f64)).sum();
-        (sum_sq / frame_16k.len() as f64).sqrt() as f32
+    /// Update from a background frame, measured here. Test-only: production
+    /// (`SpeechDetector::verdict`) passes the RMS it already has.
+    #[cfg(test)]
+    pub(crate) fn update_background(&mut self, frame_16k: &[f32]) {
+        self.update_background_rms(frame_rms(frame_16k))
     }
 
-    /// Update from a background frame (pause, or live non-speech). Asymmetric:
-    /// drops fast (new quiet room trusted quickly), rises slow (a loud burst
-    /// must persist before it lifts the threshold).
-    pub(crate) fn update_background(&mut self, frame_16k: &[f32]) {
-        let rms = Self::frame_rms(frame_16k);
+    /// Update from a background frame's own RMS: the caller already measured the
+    /// frame (the VAD gets its RMS from the pipeline), so measuring it again
+    /// here would scan the same 160 samples twice.
+    pub(crate) fn update_background_rms(&mut self, rms: f32) {
         if rms < self.floor {
             // 4x faster down: leaving a noisy room adapts in ~0.5 s.
             let a = (NOISE_EMA_ALPHA * 4.0).min(1.0);
@@ -189,7 +206,7 @@ mod tests {
 
     #[test]
     fn empty_frame_is_silence() {
-        assert_eq!(NoiseTracker::frame_rms(&[]), 0.0);
+        assert_eq!(frame_rms(&[]), 0.0);
         let mut n = NoiseTracker::new();
         n.update_background(&[]);
         assert!(n.floor() < 0.001);

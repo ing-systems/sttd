@@ -47,11 +47,23 @@ pub(crate) const POSTCORR_CONF_THRESHOLD: f32 = 0.45;
 /// Joined length at which the bigram pass may absorb 3 edits.
 const POSTCORR_BIGRAM_LONG_LEN: usize = 12;
 
+/// Fold Polish diacritics and lowercase (the dictionary's lookup key form).
 fn normalize_word(word: &str) -> String {
-    word.chars()
-        .map(crate::gate::fold_polish_diacritic)
-        .collect::<String>()
-        .to_lowercase()
+    let mut out = String::with_capacity(word.len());
+    normalize_word_into(word, &mut out);
+    out
+}
+
+/// Same normalization as `normalize_word`, written into a caller-owned
+/// buffer so per-word passes reuse one allocation instead of one per word.
+fn normalize_word_into(word: &str, out: &mut String) {
+    out.clear();
+    for c in word.chars() {
+        // Fold then lowercase in one pass. Same result as folding the whole
+        // word and lowercasing it, for every script but Greek (where
+        // `str::to_lowercase` alone special-cases a word-final sigma).
+        out.extend(crate::gate::fold_polish_diacritic(c).to_lowercase());
+    }
 }
 
 /// Load a `--dictionary` file: UTF-8, one phrase per line, trimmed, empties
@@ -123,15 +135,21 @@ where
 /// segmentation of the restore pass.
 pub(crate) fn confidence_map(word_confidences: &[(String, f32)]) -> HashMap<String, f32> {
     let mut map: HashMap<String, f32> = HashMap::new();
+    // One reusable key buffer: a word already in the map (the common case for
+    // a repeated term) is then looked up without allocating a key.
+    let mut key = String::new();
     for (word, conf) in word_confidences {
         for fragment in word.split(|c: char| !c.is_alphanumeric()) {
-            let key = normalize_word(fragment);
+            normalize_word_into(fragment, &mut key);
             if key.is_empty() {
                 continue;
             }
-            map.entry(key)
-                .and_modify(|c| *c = c.max(*conf))
-                .or_insert(*conf);
+            match map.get_mut(key.as_str()) {
+                Some(slot) => *slot = slot.max(*conf),
+                None => {
+                    map.insert(key.clone(), *conf);
+                }
+            }
         }
     }
     map
@@ -156,11 +174,7 @@ pub(crate) fn restore_dictionary_casing_gated(
     if dictionary.is_empty() {
         return text.to_string();
     }
-    let fuzzy_enabled = dictionary.len() <= POSTCORR_MAX_DICT_WORDS;
-    let normalized: HashMap<String, &String> = dictionary
-        .iter()
-        .map(|key| (normalize_word(key), key))
-        .collect();
+    let mut post = Post::new(dictionary, confidences);
 
     let segments: Vec<(&str, &str)> = text
         .split_inclusive(|c: char| !c.is_alphanumeric())
@@ -179,14 +193,10 @@ pub(crate) fn restore_dictionary_casing_gated(
     let mut i = 0;
     while i < segments.len() {
         let (word, trailing) = segments[i];
-        if let Some(canonical) =
-            best_dictionary_match(word, &normalized, confidences, fuzzy_enabled)
-        {
+        if let Some(canonical) = post.best_match(word) {
             out.push_str(canonical);
             out.push_str(trailing);
-        } else if let Some(canonical) =
-            bigram_match(&segments, i, &normalized, confidences, fuzzy_enabled)
-        {
+        } else if let Some(canonical) = post.bigram_match(word, trailing, segments.get(i + 1)) {
             out.push_str(canonical);
             out.push_str(segments[i + 1].1);
             i += 2;
@@ -208,96 +218,150 @@ fn max_distance_for(len: usize) -> usize {
     }
 }
 
-fn best_dictionary_match<'a>(
-    word: &str,
-    normalized: &HashMap<String, &'a String>,
-    confidences: Option<&HashMap<String, f32>>,
+/// Everything one correction pass needs, built once per utterance: the
+/// normalized dictionary index, the optional confidence gate, and whether
+/// this dictionary size still gets fuzzy correction. The per-word passes
+/// below share it instead of each rebuilding the index.
+struct Post<'a> {
+    /// Normalized entry -> canonical entry as written in the file (the
+    /// exact restore arm).
+    index: HashMap<String, &'a String>,
+    confidences: Option<&'a HashMap<String, f32>>,
     fuzzy_enabled: bool,
-) -> Option<&'a String> {
-    let target = normalize_word(word);
-    if target.is_empty() {
-        return None;
-    }
-    if let Some(canonical) = normalized.get(&target) {
-        return Some(canonical);
-    }
-    if !fuzzy_enabled {
-        return None;
-    }
-    let target_len = target.chars().count();
-    if target_len < POSTCORR_MIN_LEN {
-        return None;
-    }
-    if let Some(map) = confidences {
-        if let Some(&conf) = map.get(&target) {
-            if conf >= POSTCORR_CONF_THRESHOLD {
-                return None;
-            }
-        }
-    }
-    fuzzy_match(&target, normalized, max_distance_for(target_len))
+    /// Reusable normalized-key buffers, so matching a word never allocates
+    /// (only the emitted output does).
+    first: String,
+    second: String,
+    joined: String,
 }
 
-fn bigram_match<'a>(
-    segments: &[(&str, &str)],
-    i: usize,
-    normalized: &HashMap<String, &'a String>,
-    confidences: Option<&HashMap<String, f32>>,
-    fuzzy_enabled: bool,
-) -> Option<&'a String> {
-    let (first, separator) = segments[i];
-    let &(second, _) = segments.get(i + 1)?;
-    if first.is_empty() || second.is_empty() || !matches!(separator, " " | "-") {
-        return None;
+impl<'a> Post<'a> {
+    fn new(dictionary: &'a [String], confidences: Option<&'a HashMap<String, f32>>) -> Self {
+        Self {
+            index: dictionary
+                .iter()
+                .map(|key| (normalize_word(key), key))
+                .collect(),
+            confidences,
+            fuzzy_enabled: dictionary.len() <= POSTCORR_MAX_DICT_WORDS,
+            first: String::new(),
+            second: String::new(),
+            joined: String::new(),
+        }
     }
-    let joined = format!("{}{}", normalize_word(first), normalize_word(second));
-    if let Some(canonical) = normalized.get(&joined) {
-        return Some(canonical);
-    }
-    if !fuzzy_enabled
-        || joined.chars().count() < POSTCORR_LONG_LEN
-        || best_dictionary_match(second, normalized, confidences, fuzzy_enabled).is_some()
-    {
-        return None;
-    }
-    if let Some(map) = confidences {
-        let fragments_conf = [normalize_word(first), normalize_word(second)]
-            .iter()
-            .filter_map(|key| map.get(key))
-            .fold(0.0f32, |acc, &conf| acc.max(conf));
-        if fragments_conf >= POSTCORR_CONF_THRESHOLD {
+
+    /// Best canonical entry for one raw word: an exact normalized hit first,
+    /// then a strictly-best fuzzy hit (short words and confident words never
+    /// reach the fuzzy arm).
+    fn best_match(&mut self, word: &str) -> Option<&'a String> {
+        normalize_word_into(word, &mut self.first);
+        let target = self.first.as_str();
+        if target.is_empty() {
             return None;
         }
+        if let Some(canonical) = self.index.get(target) {
+            return Some(canonical);
+        }
+        if !self.fuzzy_enabled {
+            return None;
+        }
+        let target_len = target.chars().count();
+        if target_len < POSTCORR_MIN_LEN || self.is_confident(target) {
+            return None;
+        }
+        self.fuzzy_match(target, max_distance_for(target_len))
     }
-    let max_distance = if joined.chars().count() >= POSTCORR_BIGRAM_LONG_LEN {
-        3
-    } else {
-        max_distance_for(joined.chars().count())
-    };
-    fuzzy_match(&joined, normalized, max_distance)
-}
 
-fn fuzzy_match<'a>(
-    target: &str,
-    normalized: &HashMap<String, &'a String>,
-    max_distance: usize,
-) -> Option<&'a String> {
-    let mut best: Option<(usize, &String)> = None;
-    let mut tied = false;
-    for (key, canonical) in normalized {
-        let dist = crate::gate::levenshtein(target, key);
-        match best {
-            Some((best_dist, _)) if dist > best_dist => {}
-            Some((best_dist, _)) if dist == best_dist => tied = true,
-            _ => {
-                best = Some((dist, canonical));
-                tied = false;
+    /// Bigram join repair `app image` -> `AppImage` (TDT segmentation), with
+    /// `separator` the text between the two raw fragments (only a space or a
+    /// hyphen joins). Returns `None` when the pair cannot be repaired; the
+    /// caller then handles each fragment on its own.
+    fn bigram_match(
+        &mut self,
+        first: &str,
+        separator: &str,
+        second: Option<&(&str, &str)>,
+    ) -> Option<&'a String> {
+        let &(second, _) = second?;
+        if first.is_empty() || second.is_empty() || !matches!(separator, " " | "-") {
+            return None;
+        }
+        normalize_word_into(first, &mut self.first);
+        normalize_word_into(second, &mut self.second);
+        self.joined.clear();
+        self.joined.push_str(&self.first);
+        self.joined.push_str(&self.second);
+        if let Some(canonical) = self.index.get(self.joined.as_str()) {
+            return Some(canonical);
+        }
+        // Pure predicates below, so they are checked in the order that keeps
+        // the shared buffers alive (`best_match` reuses `first`).
+        let joined_len = self.joined.chars().count();
+        if !self.fuzzy_enabled || joined_len < POSTCORR_LONG_LEN {
+            return None;
+        }
+        if self.fragments_confident() {
+            return None;
+        }
+        let max_distance = if joined_len >= POSTCORR_BIGRAM_LONG_LEN {
+            3
+        } else {
+            max_distance_for(joined_len)
+        };
+        if self.best_match(second).is_some() {
+            return None;
+        }
+        self.fuzzy_match(self.joined.as_str(), max_distance)
+    }
+
+    /// Whether the model was confident about this word (Phase B: a confident
+    /// occurrence is never fuzzy-corrected).
+    fn is_confident(&self, word: &str) -> bool {
+        self.confidences
+            .and_then(|map| map.get(word))
+            .is_some_and(|&conf| conf >= POSTCORR_CONF_THRESHOLD)
+    }
+
+    /// Whether either fragment of the current bigram is confident: the
+    /// highest confidence the engine reported for the two words.
+    fn fragments_confident(&self) -> bool {
+        let conf = [self.first.as_str(), self.second.as_str()]
+            .iter()
+            .filter_map(|key| self.confidences.and_then(|map| map.get(*key)))
+            .fold(0.0f32, |acc, &conf| acc.max(conf));
+        conf >= POSTCORR_CONF_THRESHOLD
+    }
+
+    /// Closest entry within `max_distance` edits, or `None`. A tie leaves the
+    /// word untouched.
+    ///
+    /// The length gap lower-bounds an edit distance, so the gap check throws
+    /// out most of the dictionary before the DP runs, and the capped DP
+    /// returns `max_distance + 1` for whatever is left without finishing it.
+    /// Both keep the ranking exact: every entry within range survives, and
+    /// the over-range ones can neither win nor tie.
+    fn fuzzy_match(&self, target: &str, max_distance: usize) -> Option<&'a String> {
+        let target_len = target.chars().count();
+        let mut best: Option<(usize, &'a String)> = None;
+        let mut tied = false;
+        for (key, canonical) in &self.index {
+            if key.chars().count().abs_diff(target_len) > max_distance {
+                continue;
+            }
+            let dist = crate::gate::levenshtein_capped(target, key, max_distance);
+            match best {
+                Some((best_dist, _)) if dist > best_dist => {}
+                Some((best_dist, _)) if dist == best_dist => tied = true,
+                _ => {
+                    best = Some((dist, canonical));
+                    tied = false;
+                }
             }
         }
-    }
-    match best {
-        Some((dist, canonical)) if !tied && dist <= max_distance => Some(canonical),
-        _ => None,
+        match best {
+            Some((dist, canonical)) if !tied && dist <= max_distance => Some(canonical),
+            _ => None,
+        }
     }
 }
 
@@ -372,6 +436,85 @@ mod tests {
             correct_transcription("dostepne jako app image.", &d, None),
             "dostepne jako AppImage."
         );
+    }
+
+    #[test]
+    fn bigram_fuzzy_join_repairs_one_edit() {
+        let d = dict(&["Application"]);
+        // Joined form "applicatio" is 10 chars: inside the fuzzy window (8+
+        // chars, two edits) and one edit from the entry.
+        assert_eq!(
+            correct_transcription("uzywam ap plicatio", &d, None),
+            "uzywam Application"
+        );
+        // Two edits are inside the window for a 10-char join.
+        assert_eq!(
+            correct_transcription("uzywam ap plicati", &d, None),
+            "uzywam Application"
+        );
+        // Three edits are not.
+        assert_eq!(
+            correct_transcription("uzywam ap plicat", &d, None),
+            "uzywam ap plicat"
+        );
+        // A join under 8 chars never fuzzy-corrects.
+        let d = dict(&["AppImage"]);
+        assert_eq!(correct_transcription("ap imag", &d, None), "ap imag");
+    }
+
+    #[test]
+    fn bigram_join_respects_the_confidence_gate() {
+        let d = dict(&["Application"]);
+        // One confident fragment blocks the fuzzy join.
+        let mut confidences: HashMap<String, f32> = HashMap::new();
+        confidences.insert("plicatio".to_string(), POSTCORR_CONF_THRESHOLD);
+        assert_eq!(
+            correct_transcription("uzywam ap plicatio", &d, Some(&confidences)),
+            "uzywam ap plicatio"
+        );
+        // The other fragment confident: same outcome.
+        let mut confidences: HashMap<String, f32> = HashMap::new();
+        confidences.insert("ap".to_string(), 0.9);
+        assert_eq!(
+            correct_transcription("uzywam ap plicatio", &d, Some(&confidences)),
+            "uzywam ap plicatio"
+        );
+        // Neither confident: repair runs.
+        let confidences: HashMap<String, f32> = HashMap::new();
+        assert_eq!(
+            correct_transcription("uzywam ap plicatio", &d, Some(&confidences)),
+            "uzywam Application"
+        );
+    }
+
+    #[test]
+    fn confident_word_is_never_fuzzy_corrected() {
+        let d = dict(&["paracetamol"]);
+        let mut confidences: HashMap<String, f32> = HashMap::new();
+        confidences.insert("paracetamoll".to_string(), POSTCORR_CONF_THRESHOLD);
+        assert_eq!(
+            correct_transcription("paracetamoll", &d, Some(&confidences)),
+            "paracetamoll"
+        );
+        // Just under the threshold still corrects.
+        let mut confidences: HashMap<String, f32> = HashMap::new();
+        confidences.insert("paracetamoll".to_string(), POSTCORR_CONF_THRESHOLD - 0.01);
+        assert_eq!(
+            correct_transcription("paracetamoll", &d, Some(&confidences)),
+            "paracetamol"
+        );
+    }
+
+    #[test]
+    fn confidence_map_keeps_the_max_per_word() {
+        let map = confidence_map(&[
+            ("Dzień".to_string(), 0.4),
+            ("dzień, dobry".to_string(), 0.9),
+            ("  ".to_string(), 0.99),
+        ]);
+        assert_eq!(map.get("dzien"), Some(&0.9));
+        assert_eq!(map.get("dobry"), Some(&0.9));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]

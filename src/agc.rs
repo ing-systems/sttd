@@ -14,7 +14,8 @@
 // normalized — the RMS/density gates then see rescued quiet speech, as
 // intended.
 
-use crate::config::{AGC_ATTACK_MS, AGC_RELEASE_MS, SAMPLE_RATE};
+use crate::config::{AGC_ATTACK_MS, AGC_RELEASE_MS, FRAME_16K, SAMPLE_RATE};
+use crate::noise::frame_rms;
 
 /// Below this frame RMS the frame never adapts (activation threshold, ~-50 dBFS).
 pub(crate) const AGC_MIN_RMS: f32 = crate::config::DEFAULT_MIN_SPEECH_RMS;
@@ -23,8 +24,13 @@ pub(crate) const AGC_MIN_RMS: f32 = crate::config::DEFAULT_MIN_SPEECH_RMS;
 pub(crate) struct Agc {
     target: f32,
     max_gain: f32,
-    attack_coef: f32,
-    release_coef: f32,
+    /// Per-frame smoothing coefficients: the continuous time constants
+    /// (`AGC_ATTACK_MS`/`AGC_RELEASE_MS` at `SAMPLE_RATE`) raised to the power
+    /// of one frame. Precomputed once in `new` because every frame is the same
+    /// fixed `FRAME_16K` samples, so the two `powf` calls used to run per frame
+    /// for a constant.
+    frame_attack: f32,
+    frame_release: f32,
     envelope: f32,
     cur_gain: f32,
 }
@@ -34,67 +40,67 @@ impl Agc {
         let sr = SAMPLE_RATE as f32;
         let attack_coef = (-1.0 / (AGC_ATTACK_MS * 0.001 * sr)).exp();
         let release_coef = (-1.0 / (AGC_RELEASE_MS * 0.001 * sr)).exp();
+        let frame_len = FRAME_16K as f32;
         Self {
             target: target.max(0.0),
             max_gain: max_gain.max(1.0),
-            attack_coef,
-            release_coef,
+            frame_attack: attack_coef.powf(frame_len),
+            frame_release: release_coef.powf(frame_len),
             envelope: target.max(1e-6),
             cur_gain: 1.0,
         }
     }
 
-    /// Current applied gain (for logging/tests).
-    #[allow(dead_code)]
+    /// Current applied gain (test-only reader; production never asks).
+    #[cfg(test)]
     pub(crate) fn gain(&self) -> f32 {
         self.cur_gain
     }
 
-    /// Process one 10 ms frame in place (single-branch helper; production uses
-    /// `process_pair`). When `speech` is false the frame passes untouched and
-    /// nothing adapts — never on silence.
-    #[allow(dead_code)]
-    pub(crate) fn process(&mut self, frame: &mut [f32], speech: bool) {
-        if !speech || self.target <= 0.0 {
-            return;
+    /// Advance the envelope and the shared gain from `rms` (the model frame's
+    /// RMS before any gain is applied). Returns `None` when the frame must
+    /// pass through untouched: silence (gated off), a disabled target, or a
+    /// frame below the activation threshold. Never adapts on silence.
+    fn adapt(&mut self, rms: f32, prev_speech: bool) -> Option<f32> {
+        if !prev_speech || self.target <= 0.0 {
+            return None;
         }
-        let rms = frame_rms(frame);
         if rms < AGC_MIN_RMS || !rms.is_finite() {
-            return;
+            return None;
         }
-        let n = frame.len().max(1) as f32;
-        let frame_attack = self.attack_coef.powf(n);
-        let frame_release = self.release_coef.powf(n);
         // Envelope follower: fast attack on rise, slow release on fall.
         if rms > self.envelope {
-            self.envelope = frame_attack * self.envelope + (1.0 - frame_attack) * rms;
+            self.envelope = self.frame_attack * self.envelope + (1.0 - self.frame_attack) * rms;
         } else {
-            self.envelope = frame_release * self.envelope + (1.0 - frame_release) * rms;
+            self.envelope = self.frame_release * self.envelope + (1.0 - self.frame_release) * rms;
         }
         let desired = (self.target / self.envelope.max(1e-6)).clamp(1.0, self.max_gain);
         // Smooth gain toward desired with the same time constants to avoid clicks.
         // Rising gain (louder output) uses release (slow); falling uses attack (fast).
         let (frame_coef, goal) = if desired > self.cur_gain {
-            (frame_release, desired)
+            (self.frame_release, desired)
         } else {
-            (frame_attack, desired)
+            (self.frame_attack, desired)
         };
-        self.cur_gain = frame_coef * self.cur_gain + (1.0 - frame_coef) * goal;
-        self.cur_gain = self.cur_gain.clamp(1.0, self.max_gain);
-        // Clip safety: never push peak past 0.99.
-        let peak = frame.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        if peak > 0.0 {
-            let max_for_clip = 0.99 / peak;
-            let applied = self.cur_gain.min(max_for_clip).max(1.0);
-            // Don't let a single hot sample collapse the loop state; only limit
-            // this frame's application.
-            for s in frame.iter_mut() {
+        self.cur_gain =
+            (frame_coef * self.cur_gain + (1.0 - frame_coef) * goal).clamp(1.0, self.max_gain);
+        Some(self.cur_gain)
+    }
+
+    /// Scale one buffer by `gain`, limited so its peak stays below 0.99.
+    /// `peak` is the caller's already-measured peak of this buffer. A single
+    /// hot sample only limits this frame's application; the loop state keeps
+    /// the smoother gain.
+    fn apply_gain(buf: &mut [f32], gain: f32, peak: f32) {
+        let applied = if peak > 0.0 {
+            gain.min(0.99 / peak).max(1.0)
+        } else {
+            gain
+        };
+        if applied > 1.0 {
+            for s in buf.iter_mut() {
                 *s *= applied;
             }
-            return;
-        }
-        for s in frame.iter_mut() {
-            *s *= self.cur_gain;
         }
     }
 
@@ -116,41 +122,29 @@ impl Agc {
         model: &mut [f32],
         prev_speech: bool,
     ) -> f32 {
+        debug_assert_eq!(model.len(), FRAME_16K, "frames are fixed size");
         let rms = frame_rms(model);
-        if !prev_speech || self.target <= 0.0 {
-            return rms;
-        }
-        if rms < AGC_MIN_RMS || !rms.is_finite() {
-            return rms;
-        }
-        let n = model.len().max(1) as f32;
-        let frame_attack = self.attack_coef.powf(n);
-        let frame_release = self.release_coef.powf(n);
-        if rms > self.envelope {
-            self.envelope = frame_attack * self.envelope + (1.0 - frame_attack) * rms;
-        } else {
-            self.envelope = frame_release * self.envelope + (1.0 - frame_release) * rms;
-        }
-        let desired = (self.target / self.envelope.max(1e-6)).clamp(1.0, self.max_gain);
-        let (frame_coef, goal) = if desired > self.cur_gain {
-            (frame_release, desired)
-        } else {
-            (frame_attack, desired)
-        };
-        self.cur_gain = (frame_coef * self.cur_gain + (1.0 - frame_coef) * goal)
-            .clamp(1.0, self.max_gain);
-        for buf in [vad, model] {
-            let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-            let applied = if peak > 0.0 {
-                self.cur_gain.min(0.99 / peak).max(1.0)
-            } else {
-                self.cur_gain
-            };
-            if applied > 1.0 {
-                for s in buf.iter_mut() {
-                    *s *= applied;
-                }
+        if let Some(gain) = self.adapt(rms, prev_speech) {
+            for buf in [vad, model] {
+                let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+                Self::apply_gain(buf, gain, peak);
             }
+        }
+        rms
+    }
+
+    /// Same as `process_pair`, for the default `Direct` topology where one
+    /// allocation serves both roles: the gain is measured and applied once,
+    /// and the caller reads the same samples for the VAD verdict and for the
+    /// utterance buffer. Applying the pair's per-buffer gain twice to one
+    /// buffer would be a double gain, so the shared path scales once.
+    pub(crate) fn process_shared(&mut self, frame: &mut [f32], prev_speech: bool) -> f32 {
+        debug_assert_eq!(frame.len(), FRAME_16K, "frames are fixed size");
+        let rms = frame_rms(frame);
+        if let Some(gain) = self.adapt(rms, prev_speech) {
+            // Clip safety: never push peak past 0.99.
+            let peak = frame.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            Self::apply_gain(frame, gain, peak);
         }
         rms
     }
@@ -162,43 +156,43 @@ impl Agc {
     }
 }
 
-fn frame_rms(frame: &[f32]) -> f32 {
-    if frame.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f64 = frame.iter().map(|&s| (s as f64) * (s as f64)).sum();
-    (sum_sq / frame.len() as f64).sqrt() as f32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::FRAME_16K;
 
+    /// Feed one speech-gated frame pair with the same content on both
+    /// branches (the default `Direct` topology) and hand both buffers back
+    /// for inspection.
+    fn adapt_pair(agc: &mut Agc, level: f32, speech: bool) -> (Vec<f32>, Vec<f32>) {
+        let mut vad = vec![level; FRAME_16K];
+        let mut model = vec![level; FRAME_16K];
+        agc.process_pair(&mut vad, &mut model, speech);
+        (vad, model)
+    }
+
     #[test]
     fn silence_never_adapts_or_amplifies() {
         let mut agc = Agc::new(0.04, 8.0);
-        let mut silence = vec![0.0005f32; FRAME_16K];
-        let before = silence.clone();
+        let silence = vec![0.0005f32; FRAME_16K];
         for _ in 0..50 {
-            agc.process(&mut silence, false);
+            let (vad, model) = adapt_pair(&mut agc, 0.0005, false);
+            assert_eq!(vad, silence);
+            assert_eq!(model, silence);
         }
         assert_eq!(agc.gain(), 1.0);
-        assert_eq!(silence, before);
         // Even speech-gated, sub-threshold frames never adapt.
-        let mut quiet = vec![0.0005f32; FRAME_16K];
-        agc.process(&mut quiet, true);
+        adapt_pair(&mut agc, 0.0005, true);
         assert_eq!(agc.gain(), 1.0);
     }
 
     #[test]
     fn speech_converges_toward_target() {
         let mut agc = Agc::new(0.04, 8.0);
-        let frame = vec![0.01f32; FRAME_16K];
         for _ in 0..200 {
-            agc.process(&mut frame.clone(), true);
-            // Recompute fresh frame each time to avoid compounding; gain state
-            // is what we assert.
+            // Fresh frame each time to avoid compounding; gain state is what we
+            // assert.
+            adapt_pair(&mut agc, 0.01, true);
         }
         assert!(
             agc.gain() > 1.5,
@@ -211,19 +205,18 @@ mod tests {
     #[test]
     fn loud_speech_stays_at_unity() {
         let mut agc = Agc::new(0.04, 8.0);
-        let mut loud = vec![0.2f32; FRAME_16K];
-        let before = loud.clone();
-        agc.process(&mut loud, true);
+        let loud = vec![0.2f32; FRAME_16K];
+        let (vad, model) = adapt_pair(&mut agc, 0.2, true);
         assert_eq!(agc.gain(), 1.0);
-        assert_eq!(loud, before);
+        assert_eq!(vad, loud);
+        assert_eq!(model, loud);
     }
 
     #[test]
     fn reset_returns_to_unity() {
         let mut agc = Agc::new(0.04, 8.0);
-        let frame = vec![0.01f32; FRAME_16K];
         for _ in 0..50 {
-            agc.process(&mut frame.clone(), true);
+            adapt_pair(&mut agc, 0.01, true);
         }
         assert!(agc.gain() > 1.0);
         agc.reset();

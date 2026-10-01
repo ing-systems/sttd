@@ -64,7 +64,7 @@ pub(crate) trait SpeechModel {
 }
 
 /// Load the model `ModelRef` names. Called once per load/reload cycle by
-/// `asr_init_and_run`.
+/// `AsrWorker::load_once`.
 pub(crate) fn load_model(model: &ModelRef, opts: &AsrOptions) -> Result<Box<dyn SpeechModel>> {
     Ok(Box::new(crate::parakeet::ParakeetModel::load(&model.dir, opts)?))
 }
@@ -230,22 +230,37 @@ fn asr_loop(
     sound_enabled: bool,
     autopause_enabled: bool,
 ) -> Result<()> {
-    // `asr_init_and_run` signals the *first* load outcome via `ready`
-    // itself (later reloads only log); an `Err` return here therefore always
-    // means initial init failed, and re-sending is a harmless duplicate.
-    match asr_init_and_run(
+    let mut worker = AsrWorker {
         rx,
-        model,
+        model_ref: model,
         opts,
-        &ready,
+        ready: &ready,
         emitter,
         paused,
         running,
         auto_unload,
-        auto_unload_after_secs,
+        unload_after: Duration::from_secs(auto_unload_after_secs),
         sound_enabled,
         autopause_enabled,
-    ) {
+        // Resolved once here, not per utterance: the gate thresholds, the
+        // dictionary and the cleaning policy are fixed for the session.
+        gate: opts.gate.clone(),
+        dictionary: opts.dictionary.clone(),
+        remove_hesitations: opts.remove_hesitations,
+        // Observability only: a broken metrics path must never take down
+        // transcription, so open errors warn once and disable the log.
+        metrics: open_metrics_log(opts.metrics_path.as_deref()),
+        first_load: true,
+        utterance_no: 0,
+        prev_emit_text: String::new(),
+        stash: Vec::new(),
+        was_paused: false,
+        last_unpaused: Instant::now(),
+    };
+    // `AsrWorker::load_once` signals the *first* load outcome via `ready`
+    // itself (later reloads only log); an `Err` return here therefore always
+    // means initial init failed, and re-sending is a harmless duplicate.
+    match worker.run() {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = ready.send(Err(e.to_string()));
@@ -324,259 +339,255 @@ fn fire_autopause(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn asr_init_and_run(
-    rx: &mut Consumer<Utterance>,
-    model_ref: &ModelRef,
-    opts: &AsrOptions,
-    ready: &std::sync::mpsc::Sender<Result<(), String>>,
-    emitter: &mut impl Emitter,
-    paused: &Arc<AtomicBool>,
-    running: &Arc<AtomicBool>,
+/// Outcome of one `load_once` attempt.
+enum Loaded {
+    Model(Box<dyn SpeechModel>),
+    /// A reload failed and was already logged; the outer loop retries.
+    Retry,
+}
+
+/// The ASR worker's own state, so the loop reads as its phases (load, replay,
+/// transcribe, unload, wait) instead of one long function. Everything here is
+/// worker-thread local; the only shared state is the `paused` and `running`
+/// flags.
+struct AsrWorker<'a> {
+    rx: &'a mut Consumer<Utterance>,
+    model_ref: &'a ModelRef,
+    opts: &'a AsrOptions,
+    ready: &'a std::sync::mpsc::Sender<Result<(), String>>,
+    emitter: &'a mut dyn Emitter,
+    paused: &'a Arc<AtomicBool>,
+    running: &'a Arc<AtomicBool>,
     auto_unload: bool,
-    auto_unload_after_secs: u64,
+    /// `--auto-unload-after` as a duration.
+    unload_after: Duration,
     sound_enabled: bool,
     autopause_enabled: bool,
-) -> Result<()> {
-    let shed_stale = opts.shed_stale;
-    let gate = opts.gate.clone();
-    let dictionary = opts.dictionary.clone();
-    let remove_hesitations = opts.remove_hesitations;
-    let unload_after = Duration::from_secs(auto_unload_after_secs);
-    // Observability only: a broken metrics path must never take down
-    // transcription, so open errors warn once and disable the log.
-    let mut metrics = open_metrics_log(opts.metrics_path.as_deref());
+    /// Resolved once from `opts` at startup, then fixed.
+    gate: GateConfig,
+    dictionary: Vec<String>,
+    remove_hesitations: bool,
+    /// `--metrics` JSONL writer, disabled on any open/write error.
+    metrics: Option<std::io::BufWriter<std::fs::File>>,
+    first_load: bool,
+    /// Tag counter, owned here so numbering stays monotonic across reloads.
+    utterance_no: u64,
+    /// Previous emission's final text for split-seam dedup (see
+    /// `remove_split_overlap`): only emits update it, drops never do, and it
+    /// survives reloads so a split prefix is not lost to an unload racing
+    /// the continuation.
+    prev_emit_text: String,
+    /// Utterances that arrive while the model is unloaded (resume raced the
+    /// reload, or shutdown raced it): replayed in order after the next load.
+    /// In practice this stays empty while paused, since the main loop
+    /// discards audio instead of sending utterances.
+    stash: Vec<Utterance>,
+    /// Pause flag as of the last check, and when the model was last loaded
+    /// unpaused (the auto-unload clock). Both are per-load state, reset by
+    /// `load_once`.
+    was_paused: bool,
+    last_unpaused: Instant,
+}
 
-    let mut first_load = true;
-    let mut utterance_no: u64 = 0;
-    // Previous emission's final text for split-seam dedup (see
-    // `remove_split_overlap`): only emits update it, drops never do, and it
-    // survives reloads so a split prefix is not lost to an unload racing
-    // the continuation.
-    let mut prev_emit_text = String::new();
-    // Utterances that arrive while the model is unloaded (resume raced the
-    // reload, or shutdown raced it): replayed in order after the next load.
-    // In practice this stays empty while paused, since the main loop
-    // discards audio instead of sending utterances.
-    let mut stash: Vec<Utterance> = Vec::new();
+impl AsrWorker<'_> {
+    /// Outer loop: one loaded model per iteration. The model is created and
+    /// dropped inside the iteration (no self-referential struct), so unload
+    /// is a plain scope exit that frees VRAM, and reload is the next
+    /// iteration. All load/unload runs on this one thread, synchronously, so
+    /// fast pause/resume toggles collapse to whatever the flag reads at the
+    /// poll interval — a second load can never start mid-load.
+    fn run(&mut self) -> Result<()> {
+        loop {
+            let mut model = match self.load_once() {
+                Ok(Loaded::Model(m)) => m,
+                Ok(Loaded::Retry) => continue,
+                Err(e) => return Err(e),
+            };
+            // `true` = the producer is gone, so shut down.
+            if self.run_loaded(model.as_mut()) {
+                return Ok(());
+            }
+            let engine_name = model.engine_name();
+            // Scope exit frees VRAM (Parakeet: ORT sessions).
+            drop(model);
+            log::info!("{engine_name} model unloaded (paused, VRAM freed)");
+            if self.wait_unloaded(engine_name) {
+                return Ok(());
+            }
+        }
+    }
 
-    // Outer loop owns one loaded model per iteration. `model` is created and
-    // dropped inside the iteration (no self-referential struct), so unload
-    // is a plain scope exit that frees VRAM, and reload is the next
-    // iteration. All load/unload runs on this one thread, synchronously, so
-    // fast pause/resume toggles collapse to whatever the flag reads at the
-    // 1 s tick — a second load can never start mid-load.
-    loop {
-        let mut model = match load_model(model_ref, opts) {
+    /// Load one model instance and announce it (full summary on the first
+    /// load, the short line on every reload).
+    ///
+    /// A failed *first* load is fatal — captures would go into a dead queue,
+    /// so the error goes out on `ready` and ends the worker. A failed reload
+    /// only warns and retries, so a transient disk error does not kill a
+    /// running session. Also resets the per-load state: the auto-unload
+    /// clock and the pause-edge tracker.
+    fn load_once(&mut self) -> Result<Loaded> {
+        let model = match load_model(self.model_ref, self.opts) {
             Ok(m) => m,
             Err(e) => {
-                if first_load {
+                if self.first_load {
                     // Fail fast: captures would go into a dead queue.
                     // `asr_loop` re-sends as well (harmless duplicate).
-                    let _ = ready.send(Err(format!("{e:#}")));
+                    let _ = self.ready.send(Err(format!("{e:#}")));
                     return Err(e);
                 }
                 log::warn!("model reload failed: {e:?}; retrying in 5s");
                 std::thread::sleep(Duration::from_secs(5));
-                continue;
+                return Ok(Loaded::Retry);
             }
         };
-
-        if first_load {
+        if self.first_load {
             log::info!("{}", model.describe());
             // Init succeeded: signal ready so the main thread knows captures
             // aren't going into a dead queue. Emission policy (dump dir,
             // clipboard, paste, stdout) already resolved on the main thread
             // inside `SystemEmitter::new`, before spawn.
-            let _ = ready.send(Ok(()));
-            first_load = false;
+            let _ = self.ready.send(Ok(()));
+            self.first_load = false;
         } else {
             log::info!("{}", model.describe_reload());
         }
         // Ready jingle ("speak now") only when actually unpaused: a first
         // load that finishes while `--start-paused` (or a reload that races
         // a re-pause) stays silent, and the resume edge below cues later.
-        if sound_enabled && !paused.load(Ordering::Relaxed) {
+        if self.sound_enabled && !self.paused.load(Ordering::Relaxed) {
             crate::sound::play_ready();
         }
         // A pause that raced the (tens of seconds) load gets a full fresh
         // timeout rather than an instant unload.
-        let mut last_unpaused = Instant::now();
-        // Tracks the pause flag across 1 s ticks so a short-pause resume
-        // (model never unloaded) still gets its ready jingle: the reload
-        // path above only covers the long-pause case.
-        let mut was_paused = paused.load(Ordering::Relaxed);
+        self.last_unpaused = Instant::now();
+        // Tracks the pause flag across ticks so a short-pause resume (model
+        // never unloaded) still gets its ready jingle: the reload path above
+        // only covers the long-pause case.
+        self.was_paused = self.paused.load(Ordering::Relaxed);
+        Ok(Loaded::Model(model))
+    }
 
-        // Full-pipeline hold: while paused the stash holds — nothing
-        // transcribes until resume.
-        let mut stash_iter = std::mem::take(&mut stash).into_iter();
+    /// Full-pipeline hold: transcribe what was stashed while the model was
+    /// unloaded, in order, before the live loop starts.
+    ///
+    /// A re-pause mid-replay drops the rest of the stash outright, same as
+    /// the live queue's pause-edge drain (`should_drain_on_pause`): stale
+    /// audio from before an arbitrary-length pause must not silently wait for
+    /// a future resume and then transcribe (and with --copy/--paste enabled,
+    /// be typed into whatever window has focus).
+    fn replay_stash(&mut self, model: &mut dyn SpeechModel) {
+        let mut stash_iter = std::mem::take(&mut self.stash).into_iter();
         for utterance in stash_iter.by_ref() {
-            if paused.load(Ordering::Relaxed) {
-                // Re-paused mid-replay: stop here: the remainder is handled
+            if self.paused.load(Ordering::Relaxed) {
+                // Re-paused mid-replay: stop here: the remainder is dropped
                 // below.
                 break;
             }
             if utterance.pcm.is_empty() {
                 continue;
             }
-            utterance_no += 1;
-            let emitted = transcribe_and_emit(
-                model.as_mut(),
-                &utterance,
-                utterance_no,
-                &gate,
-                running,
-                emitter,
-                &mut metrics,
-                &dictionary,
-                remove_hesitations,
-                &mut prev_emit_text,
-            );
-            fire_autopause(
-                autopause_enabled,
-                emitted,
-                paused,
-                &mut was_paused,
-                utterance_no,
-                sound_enabled,
-            );
+            self.transcribe(model, utterance);
         }
-        // A re-pause mid-replay drops the rest of the stash outright, same
-        // as the live queue's pause-edge drain (`should_drain_on_pause`):
-        // stale audio from before an arbitrary-length pause shouldn't
-        // silently wait for a future resume and then transcribe/auto-paste.
-        // (This also fixes what used to be a plain bug: `break` after
-        // re-stashing only the current entry discarded every entry still in
-        // the iterator, unlogged.)
-        let dropped_stash = stash_iter.count();
-        if dropped_stash > 0 {
-            log::warn!(
-                "dropping {dropped_stash} stashed utterance(s) (re-paused during reload replay)"
-            );
+        let dropped = stash_iter.count();
+        if dropped > 0 {
+            log::warn!("dropping {dropped} stashed utterance(s) (re-paused during reload replay)");
         }
+    }
 
-        // Loaded loop: transcribe until the pause-idle timeout asks for an
-        // unload (`false`), or the producer is gone (`true` = shut down).
-        // `rtrb` has no blocking recv: poll with a short sleep so idle CPU
-        // stays negligible while pause/unload checks run every ~20 ms
-        // instead of the old 1 s tick.
-        let disconnected = loop {
+    /// One utterance through inference, gate and emission, then the
+    /// single-shot autopause. A drop or a failed inference never fires the
+    /// pause, so noise cannot steal the shot.
+    fn transcribe(&mut self, model: &mut dyn SpeechModel, utterance: Utterance) {
+        self.utterance_no += 1;
+        let emitted = transcribe_and_emit(
+            model,
+            &utterance,
+            self.utterance_no,
+            &self.gate,
+            self.running,
+            &mut *self.emitter,
+            &mut self.metrics,
+            &self.dictionary,
+            self.remove_hesitations,
+            &mut self.prev_emit_text,
+        );
+        fire_autopause(
+            self.autopause_enabled,
+            emitted,
+            self.paused,
+            &mut self.was_paused,
+            self.utterance_no,
+            self.sound_enabled,
+        );
+    }
+
+    /// Loaded loop: replay the stash, then transcribe until the pause-idle
+    /// timeout asks for an unload (`false`), or the producer is gone
+    /// (`true` = shut down).
+    ///
+    /// `rtrb` has no blocking recv: poll with a short sleep so idle CPU
+    /// stays negligible while pause/unload checks run every ~20 ms
+    /// instead of an old 1 s tick.
+    fn run_loaded(&mut self, model: &mut dyn SpeechModel) -> bool {
+        self.replay_stash(model);
+        loop {
             // Full hold: while paused, idle without popping so queued
             // utterances wait for resume instead of transcribing through pause.
-            if paused.load(Ordering::Relaxed) {
-                if should_drain_on_pause(was_paused, true) {
+            if self.paused.load(Ordering::Relaxed) {
+                if should_drain_on_pause(self.was_paused, true) {
                     // Pause edge: drop whatever is already queued. Without
                     // this, utterances closed just before the pause was
                     // noticed survive it and transcribe (and, with --copy/
-                    // --paste enabled, get typed into whatever window
-                    // has focus) on resume — possibly minutes later.
-                    // Consistent with the shutdown-while-paused drain a few
-                    // lines below, and with `hold_pipeline`'s own discard
-                    // semantics on the capture side of this same edge.
-                    let n = drain_queue(rx);
+                    // --paste enabled, get typed into whatever window has
+                    // focus) on resume — possibly minutes later. Consistent
+                    // with the shutdown-while-paused drain a few lines below,
+                    // and with `hold_pipeline`'s own discard semantics on the
+                    // capture side of this same edge.
+                    let n = drain_queue(self.rx);
                     if n > 0 {
                         log::warn!("dropping {n} queued utterance(s) (paused)");
                     }
                 }
                 std::thread::sleep(Duration::from_millis(50));
-                was_paused = true;
-                if should_unload(auto_unload, true, last_unpaused.elapsed(), unload_after) {
-                    log::info!(
-                        "paused {}s, unloading {} model to free VRAM...",
-                        unload_after.as_secs(),
-                        model.engine_name()
-                    );
-                    break false;
+                self.was_paused = true;
+                if self.should_unload_now(true) {
+                    self.log_unload(model);
+                    return false;
                 }
-                if rx.is_abandoned() {
+                if self.rx.is_abandoned() {
                     // Shutdown while paused with a held queue: drop it (paused
                     // shutdown has nothing worth flushing) and exit.
-                    let n = drain_queue(rx);
+                    let n = drain_queue(self.rx);
                     if n > 0 {
                         log::warn!("dropping {n} queued utterance(s) (shut down while paused)");
                     }
-                    break true;
+                    return true;
                 }
                 continue;
             }
-            match rx.pop() {
+            match self.rx.pop() {
                 Ok(utterance) => {
-                    last_unpaused = Instant::now();
-                    if sound_enabled && was_paused {
-                        crate::sound::play_ready();
-                    }
-                    was_paused = false;
+                    self.last_unpaused = Instant::now();
+                    self.ack_resume();
                     if utterance.pcm.is_empty() {
                         continue;
                     }
                     // Backlogged GPU: shed the weakest utterances (lowest
                     // density, then lowest rms) so the transcripts that
                     // follow are the best evidence, not minutes-late noise.
-                    // Survivors transcribe in arrival order (see
-                    // `shed_survivors`).
-                    let backlog = if shed_stale && rx.slots() > ASR_SHED_KEEP {
-                        let mut backlog = vec![utterance];
-                        while let Ok(u) = rx.pop() {
-                            backlog.push(u);
-                        }
-                        let scores: Vec<(f32, f32)> = backlog
-                            .iter()
-                            .map(|u| (u.evidence.density(), u.evidence.rms))
-                            .collect();
-                        let keep = shed_survivors(&scores, ASR_SHED_KEEP);
-                        let shed = backlog.len() - keep.len();
-                        if shed > 0 {
-                            log::warn!(
-                                "shed {shed} low-quality utterance(s): {} outruns real time \
-                                 (kept {keep} best of {total})",
-                                model.engine_name(),
-                                keep = keep.len(),
-                                total = backlog.len(),
-                            );
-                        }
-                        let mut survivors = Vec::with_capacity(keep.len());
-                        for (i, u) in backlog.into_iter().enumerate() {
-                            if keep.contains(&i) {
-                                survivors.push(u);
-                            }
-                        }
-                        survivors
-                    } else {
-                        vec![utterance]
-                    };
-                    for utterance in backlog {
+                    for utterance in self.take_backlog(utterance, model.engine_name()) {
                         if utterance.pcm.is_empty() {
                             continue;
                         }
-                        utterance_no += 1;
-                        let emitted = transcribe_and_emit(
-                            model.as_mut(),
-                            &utterance,
-                            utterance_no,
-                            &gate,
-                            running,
-                            emitter,
-                            &mut metrics,
-                            &dictionary,
-                            remove_hesitations,
-                            &mut prev_emit_text,
-                        );
-                        fire_autopause(
-                            autopause_enabled,
-                            emitted,
-                            paused,
-                            &mut was_paused,
-                            utterance_no,
-                            sound_enabled,
-                        );
+                        self.transcribe(model, utterance);
                     }
                 }
                 Err(_) => {
-                    if rx.is_abandoned() {
-                        break true;
+                    if self.rx.is_abandoned() {
+                        return true;
                     }
                     std::thread::sleep(Duration::from_millis(20));
-                    let now_paused = paused.load(Ordering::Relaxed);
+                    let now_paused = self.paused.load(Ordering::Relaxed);
                     // Only clear `was_paused` here (mirroring the `Ok` arm
                     // above); never set it true. The top-of-loop paused
                     // branch is the sole place a false->true transition runs
@@ -586,59 +597,109 @@ fn asr_init_and_run(
                     // pause flag flip before the top-of-loop branch does),
                     // silently skipping the drain for that transition.
                     if !now_paused {
-                        last_unpaused = Instant::now();
-                        if sound_enabled && was_paused {
-                            crate::sound::play_ready();
-                        }
-                        was_paused = false;
+                        self.last_unpaused = Instant::now();
+                        self.ack_resume();
                     }
-                    if should_unload(auto_unload, now_paused, last_unpaused.elapsed(), unload_after)
-                    {
-                        log::info!(
-                            "paused {}s, unloading {} model to free VRAM...",
-                            unload_after.as_secs(),
-                            model.engine_name()
-                        );
-                        break false;
+                    if self.should_unload_now(now_paused) {
+                        self.log_unload(model);
+                        return false;
                     }
                 }
             }
-        };
-        if disconnected {
-            return Ok(());
         }
-        let engine_name = model.engine_name();
-        // Scope exit frees VRAM (Parakeet: ORT sessions).
-        drop(model);
-        log::info!("{engine_name} model unloaded (paused, VRAM freed)");
+    }
 
-        // Unloaded wait: never transcribe here, just stash late arrivals and
-        // reload eagerly the moment resume is seen — before the next
-        // utterance, so the first post-resume speech doesn't pay load
-        // latency twice. Abandoned + empty means shutdown while unloaded:
-        // drop the stash (paused shutdown has nothing worth flushing) and
-        // exit so the join doesn't hang.
+    /// Unloaded wait: never transcribe here, just stash late arrivals and
+    /// reload eagerly the moment resume is seen — before the next utterance,
+    /// so the first post-resume speech does not pay load latency twice.
+    /// Returns `true` once the producer is gone, so the caller exits:
+    /// abandoned + empty means shutdown while unloaded, and the stash is
+    /// dropped (paused shutdown has nothing worth flushing) so the join
+    /// does not hang.
+    fn wait_unloaded(&mut self, engine_name: &str) -> bool {
         loop {
-            match rx.pop() {
-                Ok(utterance) => stash.push(utterance),
+            match self.rx.pop() {
+                Ok(utterance) => self.stash.push(utterance),
                 Err(_) => {
-                    if rx.is_abandoned() {
-                        if !stash.is_empty() {
+                    if self.rx.is_abandoned() {
+                        if !self.stash.is_empty() {
                             log::warn!(
                                 "dropping {} queued utterance(s) (shut down while model unloaded)",
-                                stash.len()
+                                self.stash.len()
                             );
                         }
-                        return Ok(());
+                        return true;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
-            if !paused.load(Ordering::Relaxed) {
+            if !self.paused.load(Ordering::Relaxed) {
                 log::info!("resumed, reloading {engine_name} model...");
-                break;
+                return false;
             }
         }
+    }
+
+    /// Auto-unload decision for this tick. `should_unload` itself stays a
+    /// pure function so its edge cases are testable without a worker.
+    fn should_unload_now(&self, now_paused: bool) -> bool {
+        should_unload(
+            self.auto_unload,
+            now_paused,
+            self.last_unpaused.elapsed(),
+            self.unload_after,
+        )
+    }
+
+    fn log_unload(&self, model: &dyn SpeechModel) {
+        log::info!(
+            "paused {}s, unloading {} model to free VRAM...",
+            self.unload_after.as_secs(),
+            model.engine_name()
+        );
+    }
+
+    /// Ready jingle on the resume edge: a short-pause resume (model never
+    /// unloaded) has no reload path to cue it.
+    fn ack_resume(&mut self) {
+        if self.sound_enabled && self.was_paused {
+            crate::sound::play_ready();
+        }
+        self.was_paused = false;
+    }
+
+    /// What to transcribe for this arrival: just it, or the whole drained
+    /// queue with the weakest shed first (see `shed_survivors`). Survivors
+    /// stay in arrival order.
+    fn take_backlog(&mut self, first: Utterance, engine_name: &str) -> Vec<Utterance> {
+        if !self.opts.shed_stale || self.rx.slots() <= ASR_SHED_KEEP {
+            return vec![first];
+        }
+        let mut backlog = vec![first];
+        while let Ok(u) = self.rx.pop() {
+            backlog.push(u);
+        }
+        let scores: Vec<(f32, f32)> = backlog
+            .iter()
+            .map(|u| (u.evidence.density(), u.evidence.rms))
+            .collect();
+        let keep = shed_survivors(&scores, ASR_SHED_KEEP);
+        let shed = backlog.len() - keep.len();
+        if shed > 0 {
+            log::warn!(
+                "shed {shed} low-quality utterance(s): {engine_name} outruns real time \
+                 (kept {keep} best of {total})",
+                keep = keep.len(),
+                total = backlog.len(),
+            );
+        }
+        let mut survivors = Vec::with_capacity(keep.len());
+        for (i, u) in backlog.into_iter().enumerate() {
+            if keep.contains(&i) {
+                survivors.push(u);
+            }
+        }
+        survivors
     }
 }
 
@@ -799,6 +860,40 @@ fn write_metrics_row(
     }
 }
 
+/// Post-gate transcript polish, in the one order that matters: dictionary
+/// first (casing restore plus strict fuzzy repair), then `clean` (collapse
+/// 3+ repeats, optionally strip fillers).
+///
+/// Only an `Emit` verdict reaches here, so a near-miss dictionary key cannot
+/// resurrect boilerplate, and cleaning can only shorten what the gate
+/// accepted. `confidences` gates the fuzzy dictionary step (see
+/// `dictionary`); it is `None` when the engine reported no per-word scores.
+/// Returns the polished text — empty (or all whitespace) means cleaning
+/// removed everything and the caller must turn the verdict into
+/// `DropEmpty` rather than emit empty text.
+fn polish_transcript(
+    tag: &str,
+    text: &str,
+    dictionary: &[String],
+    confidences: Option<&std::collections::HashMap<String, f32>>,
+    remove_hesitations: bool,
+) -> String {
+    let corrected: std::borrow::Cow<'_, str> = if dictionary.is_empty() {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        let corrected = crate::dictionary::correct_transcription(text, dictionary, confidences);
+        if corrected != text {
+            log::debug!("{tag}: dictionary {text:?} -> {corrected:?}");
+        }
+        std::borrow::Cow::Owned(corrected)
+    };
+    let cleaned = crate::clean::clean_transcription(&corrected, remove_hesitations);
+    if cleaned != corrected {
+        log::debug!("{tag}: clean {corrected:?} -> {cleaned:?}");
+    }
+    cleaned
+}
+
 /// One utterance through conditioning, inference, gate and emission. Tag
 /// numbering is owned by the caller so it stays monotonic across reloads.
 /// Returns whether the transcript was actually emitted (vs dropped or
@@ -811,7 +906,7 @@ fn transcribe_and_emit(
     utterance_no: u64,
     gate: &GateConfig,
     running: &Arc<AtomicBool>,
-    emitter: &mut impl Emitter,
+    emitter: &mut dyn Emitter,
     metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
     dictionary: &[String],
     remove_hesitations: bool,
@@ -848,49 +943,53 @@ fn transcribe_and_emit(
     }
     match result {
         Ok(t) => {
-            let raw_trimmed = t.text.trim();
             // Split-seam dedup before the gate: a continuation re-decodes the
             // boundary words, so strip the overlap vs the previous emission.
-            let deduped = if utterance.split_continuation && !prev_emit_text.is_empty() {
-                let d = remove_split_overlap(prev_emit_text, raw_trimmed);
-                if d.len() != raw_trimmed.len() {
-                    log::debug!("{tag}: split-seam dedup stripped {} chars", raw_trimmed.len() - d.len());
-                }
-                d
-            } else {
-                raw_trimmed.to_string()
-            };
-            let deduped_trimmed = deduped.trim();
-            let mut verdict = gate.decide_transcript(deduped_trimmed);
+            // Borrowed unless the dedup actually changed something.
+            let raw_trimmed = t.text.trim();
+            let deduped: std::borrow::Cow<'_, str> =
+                if utterance.split_continuation && !prev_emit_text.is_empty() {
+                    let stripped = remove_split_overlap(prev_emit_text, raw_trimmed);
+                    if stripped.len() != raw_trimmed.len() {
+                        log::debug!(
+                            "{tag}: split-seam dedup stripped {} chars",
+                            raw_trimmed.len() - stripped.len()
+                        );
+                    }
+                    std::borrow::Cow::Owned(stripped)
+                } else {
+                    std::borrow::Cow::Borrowed(raw_trimmed)
+                };
+            let deduped = deduped.trim();
+            let mut verdict = gate.decide_transcript(deduped);
             let mut emitted = matches!(verdict, crate::gate::TranscriptVerdict::Emit);
-            // Post-gate dictionary polish only: drops stay drops, so a
-            // near-miss key cannot resurrect boilerplate. Per-word
-            // confidences gate the fuzzy step (see `dictionary`).
-            let mut final_text = if emitted && !dictionary.is_empty() {
-                let confidences = crate::dictionary::confidence_map(&t.word_confidences);
-                let gated = (!t.word_confidences.is_empty()).then_some(&confidences);
-                let corrected =
-                    crate::dictionary::correct_transcription(deduped_trimmed, dictionary, gated);
-                if corrected != deduped_trimmed {
-                    log::debug!("{tag}: dictionary {deduped_trimmed:?} -> {corrected:?}");
-                }
-                corrected
+            // Per-word confidences gate the fuzzy dictionary step. Built only
+            // when they can be used: no dictionary, or no per-word scores from
+            // the engine, means the ungated form.
+            let confidences = if emitted && !dictionary.is_empty() {
+                (!t.word_confidences.is_empty())
+                    .then(|| crate::dictionary::confidence_map(&t.word_confidences))
             } else {
-                deduped_trimmed.to_string()
+                None
             };
-            // Post-gate cleaning: collapse 3+ repeats to 2, optionally strip
-            // fillers. Gate ran first, so pathological loops already dropped.
-            if emitted {
-                let cleaned = crate::clean::clean_transcription(&final_text, remove_hesitations);
-                if cleaned != final_text {
-                    log::debug!("{tag}: clean {final_text:?} -> {cleaned:?}");
-                }
-                final_text = cleaned;
-                if final_text.trim().is_empty() {
-                    verdict = crate::gate::TranscriptVerdict::DropEmpty;
-                    emitted = false;
-                    final_text.clear();
-                }
+            let mut final_text = if emitted {
+                polish_transcript(
+                    &tag,
+                    deduped,
+                    dictionary,
+                    confidences.as_ref(),
+                    remove_hesitations,
+                )
+            } else {
+                deduped.to_string()
+            };
+            if emitted && final_text.trim().is_empty() {
+                // Cleaning removed everything (hesitations only with the flag
+                // on): drop instead of emitting empty text, which would
+                // clobber the clipboard.
+                verdict = crate::gate::TranscriptVerdict::DropEmpty;
+                emitted = false;
+                final_text.clear();
             }
             let final_trimmed = final_text.trim();
             if emitted {
@@ -963,21 +1062,32 @@ pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Pad sub-second audio with quiet dithered noise instead of exact digital
-/// silence: a long run of true zero is a hallucination trigger for the mel
-/// front-end, and a poor input for short-utterance handling in general.
-pub(crate) fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(min_samples.max(pcm_16k.len()));
-    out.extend_from_slice(pcm_16k);
-    // xorshift32: cheap, deterministic, no extra dependency.
-    let mut seed: u32 = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_add(1);
-    while out.len() < min_samples {
+/// One deterministic dither stream: `count` samples at `+-1e-4` from an
+/// xorshift32 generator (cheap, no extra dependency).
+///
+/// Both padding sites below share this stream, not their seed: the seed is
+/// derived from the input length by each caller, so its padding stays stable
+/// per input shape.
+fn dither_samples(seed: u32, count: usize) -> impl Iterator<Item = f32> {
+    let mut seed = seed;
+    (0..count).map(move |_| {
         seed ^= seed << 13;
         seed ^= seed >> 17;
         seed ^= seed << 5;
-        let n = (seed as f32 / u32::MAX as f32 - 0.5) * 2e-4; // +-1e-4
-        out.push(n);
-    }
+        (seed as f32 / u32::MAX as f32 - 0.5) * 2e-4 // +-1e-4
+    })
+}
+
+/// Pad sub-second audio with quiet dithered noise instead of exact digital
+/// silence: a long run of true zero is a hallucination trigger for the mel
+/// front-end, and a poor input for short-utterance handling in general.
+/// Grows the input to `min_samples`; longer input is returned unchanged.
+pub(crate) fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
+    let missing = min_samples.saturating_sub(pcm_16k.len());
+    let mut out = Vec::with_capacity(min_samples.max(pcm_16k.len()));
+    out.extend_from_slice(pcm_16k);
+    let seed = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_add(1);
+    out.extend(dither_samples(seed, missing));
     out
 }
 
@@ -994,13 +1104,8 @@ pub(crate) fn pad_trailing_with_dither(pcm_16k: &[f32], pad_samples: usize) -> V
     }
     let mut out = Vec::with_capacity(pcm_16k.len() + pad_samples);
     out.extend_from_slice(pcm_16k);
-    let mut seed: u32 = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_mul(0x85EB_CA6B);
-    for _ in 0..pad_samples {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        out.push((seed as f32 / u32::MAX as f32 - 0.5) * 2e-4); // +-1e-4
-    }
+    let seed = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_mul(0x85EB_CA6B);
+    out.extend(dither_samples(seed, pad_samples));
     out
 }
 
@@ -1019,15 +1124,23 @@ pub(crate) fn remove_split_overlap(prev: &str, cur: &str) -> String {
     let max_overlap = MERGE_WINDOW_WORDS
         .min(prev_words.len())
         .min(cur_words.len());
+    // Normalize each word once instead of inside the window loop: the loop
+    // looks at up to `MERGE_WINDOW_WORDS` windows of up to
+    // `MERGE_WINDOW_WORDS` words, which re-normalized the same words over and
+    // over. The comparison (and therefore the result) is unchanged.
+    let normalized = |words: &[&str]| -> Vec<String> {
+        words
+            .iter()
+            .map(|w| crate::gate::normalize_transcript(w))
+            .collect()
+    };
+    let prev_norm = normalized(&prev_words);
+    let cur_norm = normalized(&cur_words);
     let mut matched = 0;
     for len in (1..=max_overlap).rev() {
-        let prev_tail = &prev_words[prev_words.len() - len..];
-        let cur_head = &cur_words[..len];
-        let tails_match = prev_tail
-            .iter()
-            .zip(cur_head.iter())
-            .all(|(a, b)| crate::gate::normalize_transcript(a) == crate::gate::normalize_transcript(b));
-        if tails_match {
+        let prev_tail = &prev_norm[prev_norm.len() - len..];
+        let cur_head = &cur_norm[..len];
+        if prev_tail == cur_head {
             matched = len;
             break;
         }
@@ -1401,6 +1514,36 @@ mod tests {
     }
 
     #[test]
+    fn polish_applies_dictionary_then_clean_then_empty_check() {
+        let dict = vec!["Kubernetes".to_string()];
+        // Casing restore first, then the 3+ repeat collapse sees the
+        // canonical form (not the raw one).
+        assert_eq!(
+            polish_transcript(
+                "utt_000001",
+                "kubernetes kubernetes kubernetes",
+                &dict,
+                None,
+                false
+            ),
+            "Kubernetes Kubernetes"
+        );
+        // Filler stripping only when asked; whitespace is normalized either way.
+        assert_eq!(
+            polish_transcript("utt_000002", "  yyy   dzień  dobry ", &[], None, true),
+            "dzień dobry"
+        );
+        assert_eq!(
+            polish_transcript("utt_000003", "  yyy   dzień  dobry ", &[], None, false),
+            "yyy dzień dobry"
+        );
+        // Cleaning can empty the transcript: the caller turns that into
+        // DropEmpty, so this must not fall back to the input.
+        assert_eq!(polish_transcript("utt_000004", "yyy eee", &[], None, true), "");
+        assert_eq!(polish_transcript("utt_000005", "", &[], None, false), "");
+    }
+
+    #[test]
     fn trailing_pad_appends_dither_and_preserves_start() {
         use crate::config::INFERENCE_PAD_SAMPLES;
         let pcm = vec![0.5f32; 1_600];
@@ -1416,6 +1559,22 @@ mod tests {
         assert!(pad_trailing_with_dither(&[], 4000).is_empty());
         let pcm = vec![0.1f32; 100];
         assert_eq!(pad_trailing_with_dither(&pcm, 0), pcm);
+    }
+
+    #[test]
+    fn min_pad_grows_short_audio_only_and_stays_deterministic() {
+        use crate::config::PARAKEET_MIN_SAMPLES;
+        let short = vec![0.25f32; 1_600];
+        let padded = pad_with_dither(&short, PARAKEET_MIN_SAMPLES);
+        assert_eq!(padded.len(), PARAKEET_MIN_SAMPLES);
+        assert_eq!(&padded[..short.len()], &short[..]);
+        assert!(padded[short.len()..].iter().all(|&s| s.abs() <= 1e-4));
+        assert!(padded[short.len()..].iter().any(|&s| s != 0.0));
+        // Same input, same dither stream.
+        assert_eq!(pad_with_dither(&short, PARAKEET_MIN_SAMPLES), padded);
+        // Already long enough: untouched, no pad added.
+        let long = vec![0.25f32; PARAKEET_MIN_SAMPLES + 10];
+        assert_eq!(pad_with_dither(&long, PARAKEET_MIN_SAMPLES), long);
     }
 
     #[test]

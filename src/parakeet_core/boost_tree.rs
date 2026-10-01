@@ -145,14 +145,29 @@ impl BoostTree {
 
     /// Fusion score for every reachable token from `state`, following the
     /// backoff chain to the root while accumulating `backoff_w`. The deepest
-    /// state wins for a given token (first seen along the chain).
+    /// state wins for a given token (first seen along the chain). Allocates a
+    /// fresh vector, so the decode loop uses `bias_into` instead.
+    #[cfg(test)]
     pub fn bias(&self, state: NodeId) -> Vec<BiasCandidate> {
-        let mut result: HashMap<i32, BiasCandidate> = HashMap::new();
+        let mut result = Vec::new();
+        self.bias_into(state, &mut result);
+        result
+    }
+
+    /// Same as `bias`, but writes into the caller's buffer and reuses its
+    /// allocation. Candidate sets are small (the dictionary's live first
+    /// tokens), so a linear scan for an already-seen token beats a `HashMap`
+    /// per decode step.
+    pub fn bias_into(&self, state: NodeId, result: &mut Vec<BiasCandidate>) {
+        result.clear();
         let mut acc = 0.0;
         let mut cur = state;
         loop {
             for (&token, &child) in &self.nodes[cur].children {
-                result.entry(token).or_insert_with(|| BiasCandidate {
+                if result.iter().any(|c| c.token == token) {
+                    continue;
+                }
+                result.push(BiasCandidate {
                     token,
                     score: acc + self.nodes[child].token_score,
                     depth: self.nodes[child].depth,
@@ -164,7 +179,6 @@ impl BoostTree {
             acc += self.nodes[cur].backoff_w;
             cur = self.nodes[cur].fail;
         }
-        result.into_values().collect()
     }
 
     /// Next state after emitting `token`: the child reached along the backoff
@@ -277,6 +291,41 @@ mod tests {
         assert_ne!(first, ROOT);
         let second = tree.advance(first, 20);
         assert!(tree.nodes[second].is_end);
+    }
+
+    #[test]
+    fn bias_into_reuses_buffer_and_matches_bias() {
+        let tree = BoostTree::new(&[vec![10, 20], vec![50], vec![60, 70, 80]]);
+        let first = tree.advance(ROOT, 10);
+        let mut buffer = Vec::new();
+        tree.bias_into(first, &mut buffer);
+        let from_bias = tree.bias(first);
+        assert_eq!(buffer.len(), from_bias.len());
+        for cand in &from_bias {
+            let got = buffer.iter().find(|c| c.token == cand.token).unwrap();
+            assert!(approx(got.score, cand.score));
+            assert_eq!(got.depth, cand.depth);
+        }
+        // A second call into the same buffer replaces the old contents.
+        tree.bias_into(first, &mut buffer);
+        assert_eq!(buffer.len(), from_bias.len());
+    }
+
+    #[test]
+    fn bias_into_yields_one_candidate_per_token() {
+        // Tokens 10 and 50 are reachable from both the deep state and the root;
+        // the deepest score must win, exactly once per token.
+        let tree = BoostTree::new(&[vec![10, 20], vec![10, 50], vec![10], vec![50]]);
+        let first = tree.advance(ROOT, 10);
+        let bias = tree.bias(first);
+        let mut seen: Vec<i32> = bias.iter().map(|c| c.token).collect();
+        seen.sort_unstable();
+        let unique = {
+            let mut copy = seen.clone();
+            copy.dedup();
+            copy
+        };
+        assert_eq!(seen, unique);
     }
 
     #[test]
