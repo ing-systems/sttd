@@ -5,3 +5,14 @@
 /packaging/pkg/
 /packaging/*.pkg.tar.*
 /packaging/*.log
+# eval harness + local audio corpora (tools/eval.py, tools/dump2corpus.py, --dump-dir)
+/eval-out/
+/corpus/
+/dumps/
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
