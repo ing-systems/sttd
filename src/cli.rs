@@ -4,13 +4,15 @@ use clap::Parser;
 
 use crate::config::{
     parse_bool, parse_fraction, parse_hangover_ms, parse_linear_rms, parse_threads,
-    DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_HANGOVER_MS, DEFAULT_MIN_DENSITY,
-    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS, DEFAULT_USE_GPU,
-    DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
+    system_language, DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_HANGOVER_MS,
+    DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS,
+    DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
-use crate::whisper_core::types::{parse_audio_ctx, Language, DEFAULT_WINDOW_FRAMES};
+use crate::whisper_core::types::{
+    parse_audio_ctx, parse_language, Language, DEFAULT_WINDOW_FRAMES,
+};
 
 /// How `--paste` inserts text via `ydotool` (Wayland only).
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -103,18 +105,20 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_THREADS", default_value_t = 0, value_parser = parse_threads, value_name = "N", help_heading = "Model")]
     pub(crate) threads: i32,
 
-    /// Decoding language for Whisper models; Parakeet auto-detects and ignores
-    /// it. `auto` detects per utterance and costs nothing extra (the prompt run
-    /// already produces the language distribution).
+    /// Language to decode in, as any code Whisper supports (`pl`, `en`, `de`,
+    /// `yue`, ...); Parakeet auto-detects and ignores it. `auto` detects per
+    /// utterance and costs nothing extra (the prompt run already produces the
+    /// language distribution). Unset: the system locale's language, or `auto`
+    /// where the locale names none. A code the model has no token for fails the
+    /// load.
     #[arg(
         long,
         env = "STTD_LANGUAGE",
-        value_enum,
-        ignore_case = true,
-        default_value_t = Language::Polish,
+        value_parser = parse_language,
+        value_name = "CODE",
         help_heading = "Model"
     )]
-    pub(crate) language: Language,
+    pub(crate) language: Option<Language>,
 
     /// Floor of the dynamic Whisper encoder window, in mel frames (100 = 1 s
     /// of 16 kHz audio). The window is the audio rounded up to a whole second
@@ -424,6 +428,18 @@ impl Cli {
             .clone()
             .unwrap_or_else(crate::daemon::default_log_file)
     }
+
+    /// Language to decode in: `--language`/`STTD_LANGUAGE` when set, else the
+    /// system locale's language.
+    ///
+    /// The unset case resolves to `Language::System`, not `Language::Explicit`,
+    /// and that is the whole point of reading the locale here rather than
+    /// defaulting the field: a model that cannot decode the locale's language
+    /// then warns and detects, where an explicit `--language` fails the load
+    /// (see `Language::resolve`).
+    pub(crate) fn language(&self) -> Language {
+        self.language.clone().unwrap_or_else(system_language)
+    }
 }
 
 /// Pure precedence helper (see `Cli::model_input`), split out for tests.
@@ -467,6 +483,7 @@ mod tests {
         assert_eq!(cli.channel, ChannelSel::Mix);
         assert_eq!(cli.threads, 0);
         assert_eq!(cli.gpu, DEFAULT_USE_GPU);
+        assert_eq!(cli.language, None, "--language has no fixed default");
         assert_eq!(cli.min_rms, DEFAULT_MIN_SPEECH_RMS);
         assert_eq!(cli.min_density, DEFAULT_MIN_DENSITY);
         assert_eq!(cli.target_rms, DEFAULT_TARGET_RMS);

@@ -40,8 +40,8 @@ use ort::value::TensorRef;
 use tokenizers::Tokenizer;
 
 use super::types::{
-    window_frames, KvCache, Language, MelConfig, WhisperError, WhisperModel, BEGIN_SUPPRESS_TOKENS,
-    LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
+    window_frames, DecodingLanguage, KvCache, Language, MelConfig, WhisperError, WhisperModel,
+    BEGIN_SUPPRESS_TOKENS, LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
 };
 use crate::decode::{argmax_index, softmax_prob, word_confidences as group_words};
 
@@ -157,6 +157,10 @@ impl WhisperModel {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| WhisperError::Tokenizer(format!("{}: {e}", tokenizer_path.display())))?;
         verify_token_ids(&tokenizer)?;
+        // A code the model has no token for fails here rather than at the first
+        // utterance: an explicit `--language` is a promise about the language of
+        // the output, and decoding in some other one would not be it.
+        let language = language.resolve(&tokenizer)?;
 
         let frontend = super::frontend::Frontend::new(MelConfig::large_v3_turbo());
         Ok(Self {
@@ -213,9 +217,17 @@ impl WhisperModel {
         // first position's logits, which this very call produces, so detection
         // is free unless the fallback guess was wrong — then the prompt is
         // re-run once with what was detected.
-        let mut lang_token = self.language.prompt_token();
+        //
+        // That fallback is the first language token, `<|en|>`, which is also
+        // what `detect_language` returns for a flat distribution. So the no-
+        // signal case costs nothing extra, and a wrong guess only ever happens
+        // when detection had real signal to disagree with.
+        let mut lang_token = match self.language {
+            DecodingLanguage::Fixed { token, .. } => token,
+            DecodingLanguage::Auto => LANG_TOKEN_FIRST as i64,
+        };
         let mut prompt = self.run_prompt(&hidden, lang_token)?;
-        if self.language == Language::Auto {
+        if self.language == DecodingLanguage::Auto {
             if let Some(detected) = detect_language(&prompt.language) {
                 if detected != lang_token {
                     log::debug!("whisper detected language id {detected}, re-running the prompt");
@@ -569,10 +581,10 @@ mod tests {
             50364,
             "<|notimestamps|>"
         );
-        assert_eq!(super::super::types::TOK_LANG_PL, 50269, "<|pl|>");
-        assert_eq!(super::super::types::TOK_LANG_EN, 50259, "<|en|>");
         // Languages run <|en|>..<|yue|> inclusive, and `<|translate|>` (50359)
         // must sit outside the range or auto-detection could pick a task token.
+        // No language id inside the range is compiled in: `--language` reads it
+        // out of `tokenizer.json` instead.
         assert_eq!(LANG_TOKEN_FIRST, 50259);
         assert_eq!(super::super::types::LANG_TOKEN_LAST, 50358);
         assert_eq!(LANG_TOKEN_COUNT, 100);
@@ -600,24 +612,31 @@ mod tests {
 
     #[test]
     fn prompt_is_sot_lang_task_notimestamps() {
+        // The token id is whatever the model resolved `--language` to, so a
+        // prompt is built from a bare id: 50269 is `<|pl|>` in this export and
+        // 50259 is `<|en|>`, but neither is compiled in anywhere.
         assert_eq!(
-            build_prompt(Language::Polish.prompt_token()),
-            [TOK_SOT, 50269, TOK_TRANSCRIBE, 50364]
+            build_prompt(50_269),
+            [TOK_SOT, 50_269, TOK_TRANSCRIBE, 50_364],
+            "a resolved language token goes in unchanged"
         );
-        assert_eq!(
-            build_prompt(Language::English.prompt_token()),
-            [TOK_SOT, 50259, TOK_TRANSCRIBE, 50364]
-        );
-        // Auto builds the Polish prompt as a fallback; detection supplies the
-        // token id for the re-run.
-        assert_eq!(
-            build_prompt(Language::Auto.prompt_token()),
-            build_prompt(Language::Polish.prompt_token())
-        );
+        // A detected language id goes in the same way.
         assert_eq!(
             build_prompt(50_259),
-            [TOK_SOT, 50_259, TOK_TRANSCRIBE, 50364],
-            "a detected language id goes in unchanged"
+            [TOK_SOT, 50_259, TOK_TRANSCRIBE, 50_364]
+        );
+    }
+
+    /// `Auto` builds its prompt on the first language token, which is also what
+    /// `detect_language` returns for a flat distribution — so the no-signal case
+    /// does not pay for a second prompt run, and a re-run happens only when
+    /// detection had real signal to disagree with.
+    #[test]
+    fn auto_falls_back_to_the_first_language_token() {
+        assert_eq!(
+            build_prompt(LANG_TOKEN_FIRST as i64),
+            build_prompt(50_259),
+            "LANG_TOKEN_FIRST is <|en|>"
         );
     }
 

@@ -993,8 +993,11 @@ fn ignored_model_flags(cli: &Cli, model: &ModelRef) -> Vec<&'static str> {
     if cli.gpu {
         flags.push("--gpu");
     }
-    if model.kind == EngineKind::Parakeet && cli.language != Language::default() {
+    if model.kind == EngineKind::Parakeet && cli.language.is_some() {
         // Parakeet auto-detects per utterance, so a fixed language cannot apply.
+        // Any explicit flag counts, including one that matches the default the
+        // system locale would have supplied: the user typed it, so it is worth
+        // saying that it does nothing here.
         flags.push("--language");
     }
     if cli.audio_ctx != DEFAULT_WINDOW_FRAMES && model.kind == EngineKind::Parakeet {
@@ -1020,7 +1023,7 @@ fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
         EngineKind::Parakeet => {
             log::info!("Parakeet auto-detects the spoken language per utterance")
         }
-        EngineKind::Whisper => match cli.language {
+        EngineKind::Whisper => match cli.language() {
             Language::Auto => {
                 log::info!("Whisper detects the spoken language per utterance (--language auto)")
             }
@@ -1038,7 +1041,7 @@ fn asr_options(cli: &Cli, shed_stale: bool, dictionary: crate::asr::LiveDictiona
         gate: AcousticConfig::from_cli(cli).gate,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
-        language: cli.language,
+        language: cli.language(),
         metrics_path: cli.metrics.clone(),
         shed_stale,
         audio_ctx: cli.audio_ctx,
@@ -1330,7 +1333,8 @@ mod tests {
         // `auto` is a deviation from the default for Whisper's log line but a
         // Parakeet user who set it explicitly should still be told.
         let auto = Cli::try_parse_from(["sttd", "--language", "auto"]).expect("flags must parse");
-        assert_eq!(auto.language, Language::Auto);
+        assert_eq!(auto.language, Some(Language::Auto));
+        assert_eq!(auto.language(), Language::Auto);
         assert_eq!(
             ignored_model_flags(&auto, &parakeet),
             vec!["--language"],
@@ -1357,22 +1361,44 @@ mod tests {
         assert!(ignored_model_flags(&plain, &parakeet).is_empty());
     }
 
+    /// Every code Whisper accepts goes through, and the unset default is the
+    /// system locale's language rather than a fixed one. sttd keeps no list of
+    /// languages: the model decides at load time which codes it has.
     #[test]
-    fn language_flag_defaults_to_polish_and_parses_every_value() {
-        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
-        assert_eq!(cli.language, Language::Polish);
+    fn language_flag_defaults_to_the_system_locale_and_takes_any_code() {
+        let plain = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert_eq!(plain.language, None, "unset, not defaulted to a code");
+        assert_eq!(
+            plain.language(),
+            crate::config::system_language(),
+            "unset resolves through the locale"
+        );
+
         for (value, expected) in [
-            ("pl", Language::Polish),
-            ("en", Language::English),
+            ("pl", Language::Explicit("pl".to_string())),
+            ("en", Language::Explicit("en".to_string())),
+            ("de", Language::Explicit("de".to_string())),
+            ("yue", Language::Explicit("yue".to_string())),
+            ("DE", Language::Explicit("de".to_string())),
             ("auto", Language::Auto),
-            ("PL", Language::Polish),
             ("Auto", Language::Auto),
+            (" pl ", Language::Explicit("pl".to_string())),
         ] {
             let cli = Cli::try_parse_from(["sttd", "--language", value])
                 .unwrap_or_else(|e| panic!("--language {value} must parse: {e}"));
-            assert_eq!(cli.language, expected, "value={value}");
+            assert_eq!(cli.language, Some(expected.clone()), "value={value:?}");
+            assert_eq!(cli.language(), expected, "value={value:?}");
         }
-        assert!(Cli::try_parse_from(["sttd", "--language", "de"]).is_err());
+
+        // A locale name, a word, a digit and an over-long code are not language
+        // codes, so they are refused before a model is ever loaded. Which codes
+        // the model *does* have is its own business, checked at load.
+        for bad in ["x", "pl_PL", "english", "p1", "abcd", "", "en-US"] {
+            assert!(
+                Cli::try_parse_from(["sttd", "--language", bad]).is_err(),
+                "must reject {bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -1385,7 +1411,7 @@ mod tests {
         .1;
         assert_eq!(
             asr_options(&cli, true, dictionary).language,
-            Language::English
+            Language::Explicit("en".to_string())
         );
     }
 

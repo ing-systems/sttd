@@ -64,7 +64,7 @@ Whisper weights come from `huggingface.co/onnx-community/whisper-large-v3-turbo`
 | --- | --- | --- |
 | Window | grows with the utterance | fixed 30 s; follows the audio (15 s at least, `--audio-ctx`) |
 | Inference cost | scales with speech length | one full encoder pass per utterance, whatever its length (about 2x less with the dynamic window) |
-| Language | auto-detects per utterance | `--language` (`pl` default, `en`, `auto`) |
+| Language | auto-detects per utterance | `--language` (any Whisper code; defaults to the system locale's language, or `auto`) |
 | Dictionary phrase boosting | yes (logit-level) | no; the post-gate correction still applies |
 | Per-word confidences | yes | yes |
 
@@ -208,7 +208,7 @@ Key tunables:
 | Flag / Env | Default | Effect |
 | --- | --- | --- |
 | `--model` / `STTD_MODEL` | `parakeet` | Catalog spec or model directory path. |
-| `--language` / `STTD_LANGUAGE` | `pl` | `pl`, `en`, or `auto` (per-utterance detection). Whisper only; Parakeet auto-detects and warns that the flag is ignored. |
+| `--language` / `STTD_LANGUAGE` | system locale language | Any language code Whisper supports (`pl`, `en`, `de`, `yue`, ...), or `auto` (per-utterance detection). Unset: the system locale's language (`LC_ALL`, `LC_MESSAGES` or `LANG`), or `auto` where that names none. A code the model has no token for fails the load; a system locale the model cannot decode warns and detects instead. Whisper only; Parakeet auto-detects and warns that the flag is ignored. |
 | `--audio-ctx` / `STTD_AUDIO_CTX` | `1500` | Floor of that window, in mel frames (100 = 1 s), even, `100..=3000`. Whisper only; Parakeet sizes its own window and reports the flag as ignored. See *Live streaming*. |
 | `--device` / `STTD_DEVICE` | unset | Case-insensitive substring match on input device. |
 | `--channel` / `STTD_CHANNEL` | `mix` | `mix`, `auto` (loudest), or channel index `N`. |

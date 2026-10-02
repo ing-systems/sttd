@@ -52,16 +52,21 @@ impl WhisperModel {
             log::warn!("--gpu is set but Whisper runs on CPU in this build; running on CPU");
         }
         let intra_threads = opts.n_threads.max(1) as usize;
-        let language = opts.language;
         log::info!("loading whisper model ({})...", dir.display());
         let inner = with_loading_ticker("whisper model", || {
             // Streaming always asks for the length-free encoder: the export is
             // patched in memory (see `dyn_encoder`) and the window follows the
             // audio. If the patch does not apply the fixed export is loaded
             // instead, with a warning, and `dynamic_window` ends up false.
-            CoreModel::new(dir, language, intra_threads, true, opts.audio_ctx)
-                .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))
-                .context("failed to load whisper model")
+            CoreModel::new(
+                dir,
+                opts.language.clone(),
+                intra_threads,
+                true,
+                opts.audio_ctx,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))
+            .context("failed to load whisper model")
         })?;
         let window = if inner.dynamic_window {
             // The floor is `--audio-ctx`; with the fixed encoder the floor does
@@ -70,9 +75,13 @@ impl WhisperModel {
         } else {
             "fixed 30s".to_string()
         };
+        // The *resolved* language, not the requested one: a system locale
+        // language the model cannot decode falls back to detection
+        // (`Language::resolve`), and the ready line must say what will actually
+        // happen.
         let ready_line = format!(
             "whisper ready (model={}, lang={}, threads={}, gpu=false, window={window})",
-            opts.model_spec, language, opts.n_threads
+            opts.model_spec, inner.language, opts.n_threads
         );
         log::info!("{}", ready_line);
         Ok(Self { inner, ready_line })
@@ -128,9 +137,7 @@ impl SpeechModel for WhisperModel {
 #[cfg(test)]
 mod tests {
     use crate::config::MAX_UTTERANCE_SAMPLES;
-    use crate::whisper_core::types::{
-        window_frames, Language, MelConfig, DEFAULT_WINDOW_FRAMES, TOK_LANG_EN, TOK_LANG_PL,
-    };
+    use crate::whisper_core::types::{window_frames, MelConfig, DEFAULT_WINDOW_FRAMES};
 
     #[test]
     fn the_fixed_window_is_thirty_seconds() {
@@ -156,26 +163,5 @@ mod tests {
         assert_eq!(ran(2 * 16_000), 15 * 16_000);
         // Never more than the export's window.
         assert_eq!(ran(40 * 16_000), 30 * 16_000);
-    }
-
-    /// The compiled-in prompt tokens must be the exported ones: Whisper has no
-    /// per-engine vocabulary lookup for these (see
-    /// `whisper_core::types`), so a wrong id decodes garbage.
-    #[test]
-    fn language_prompt_tokens_are_the_exported_ones() {
-        assert_eq!(Language::Polish.prompt_token(), TOK_LANG_PL);
-        assert_eq!(Language::English.prompt_token(), TOK_LANG_EN);
-        assert_eq!(
-            Language::Auto.prompt_token(),
-            TOK_LANG_PL,
-            "auto falls back to pl"
-        );
-        assert_eq!(Language::Polish.as_str(), "pl");
-        assert_eq!(Language::English.as_str(), "en");
-        assert_eq!(Language::Auto.as_str(), "auto");
-        assert_eq!(Language::English.to_string(), "en");
-        // The default is what `--language` resolves to when unset, and sttd is
-        // a Polish speech-to-text tool, so it must be Polish.
-        assert_eq!(Language::default(), Language::Polish);
     }
 }

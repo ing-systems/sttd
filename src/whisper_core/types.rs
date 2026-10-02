@@ -128,19 +128,18 @@ pub const TOK_TRANSCRIBE: i64 = 50360;
 /// them (emission is text only), and leaving them in produces transcripts
 /// full of `<|3.20|>` markers.
 pub const TOK_NOTIMESTAMPS: i64 = 50364;
-/// `<|pl|>`, the Polish decoding language.
-pub const TOK_LANG_PL: i64 = 50269;
-/// `<|en|>`, the English decoding language.
-pub const TOK_LANG_EN: i64 = 50259;
-
-/// `<|yue|>`, the last language token before `<|translate|>` (50359).
-const TOK_LANG_YUE: i64 = 50358;
 
 /// Inclusive id range of the 100 language tokens, `<|en|>` (50259) through
-/// `<|yue|>` (50358). `--language auto` takes its argmax over exactly this
-/// slice of the first position's logits.
-pub const LANG_TOKEN_FIRST: usize = TOK_LANG_EN as usize;
-pub const LANG_TOKEN_LAST: usize = TOK_LANG_YUE as usize;
+/// `<|yue|>` (50358, the last before `<|translate|>`). `--language auto` takes
+/// its argmax over exactly this slice of the first position's logits.
+///
+/// Only the two bounds are compiled in, because detection has to slice the
+/// logits by id. No language id inside the range is: `--language` resolves a
+/// code to a token by asking `tokenizer.json` (`Language::resolve`), so sttd
+/// holds no list of the languages Whisper supports and `--help` need not grow
+/// one either.
+pub const LANG_TOKEN_FIRST: usize = 50259;
+pub const LANG_TOKEN_LAST: usize = 50358;
 /// How many ids that range holds, i.e. its width. `--language auto` reads
 /// exactly this many logits out of the prompt's first position, so the rest of
 /// the vocabulary never has to be copied out of the ONNX output.
@@ -168,6 +167,8 @@ pub enum WhisperError {
     MissingAsset(String),
     #[error("tokenizer unavailable: {0}")]
     Tokenizer(String),
+    #[error("this whisper model cannot decode {code:?}: no such language token in its tokenizer")]
+    UnknownLanguage { code: String },
     #[error(
         "token ids do not match tokenizer.json (expected \
          sot={sot} transcribe={transcribe} notimestamps={notimestamps}, \
@@ -347,49 +348,126 @@ impl KvCache {
     }
 }
 
-/// Decoding language for one inference. Chosen once at startup (see
-/// `cli::Language`), not per utterance.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+/// Parse `--language`/`STTD_LANGUAGE`: a Whisper language code (`pl`, `en`,
+/// `de`, `yue`) or `auto`.
+///
+/// The code is not checked against a list of languages here, because sttd holds
+/// none: whether the model has a token for it is decided at load time against
+/// the model's own `tokenizer.json` (`Language::resolve`), the only place that
+/// knows. What this does reject is input that cannot be a language code at all
+/// — a locale name, a word, a digit — so that mistake becomes a message instead
+/// of a load that fails later.
+pub fn parse_language(s: &str) -> Result<Language, String> {
+    if s.trim().eq_ignore_ascii_case("auto") {
+        return Ok(Language::Auto);
+    }
+    let code = s.trim().to_ascii_lowercase();
+    let malformed =
+        || format!("expected a Whisper language code (pl, en, de, yue, ...) or `auto`, got {s:?}");
+    if !(2..=3).contains(&code.len()) || !code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(malformed());
+    }
+    Ok(Language::Explicit(code))
+}
+
+/// The language Whisper is told to decode in, as requested. Chosen once at
+/// startup and fixed for the process's lifetime.
+///
+/// The origin is kept beside the code, not just the code, because the two are
+/// treated differently when the model turns out not to have a token for them:
+/// an explicit `--language` fails the load, and the system locale's language
+/// falls back to `Auto` (see `resolve`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Language {
-    /// Force Polish decoding (`<|pl|>` in the prompt). The default, matching
-    /// the project: sttd transcribes Polish.
-    #[default]
-    #[value(name = "pl")]
-    Polish,
-    /// Force English decoding (`<|en|>` in the prompt).
-    #[value(name = "en")]
-    English,
+    /// An explicit code from `--language` / `STTD_LANGUAGE`. The model must
+    /// have a token for it.
+    Explicit(String),
+    /// The system locale's language, used when `--language` is unset. Soft: a
+    /// model with no token for it falls back to `Auto` with a warning, because
+    /// the user did not ask for this code.
+    System(String),
     /// Detect per utterance from the prompt's first-token logits.
-    #[value(name = "auto")]
     Auto,
 }
 
-impl Language {
-    /// The language token that goes into the prompt. For `Auto` this is the
-    /// fallback the prompt is built with; the detection pass below overrides
-    /// it (see `resolve_language`), so a wrong guess costs one re-run of the
-    /// prompt and nothing more.
-    pub const fn prompt_token(self) -> i64 {
-        match self {
-            Self::Polish => TOK_LANG_PL,
-            Self::English => TOK_LANG_EN,
-            Self::Auto => TOK_LANG_PL,
-        }
-    }
+/// What a `Language` resolves to against a loaded model's tokenizer: one fixed
+/// language token id, or per-utterance detection.
+///
+/// `Fixed` keeps the code next to the id because the id alone cannot be logged
+/// or compared — it is a position in a vocabulary, not a language.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodingLanguage {
+    Fixed { code: String, token: i64 },
+    Auto,
+}
 
-    /// Stable short spelling for log lines.
-    pub const fn as_str(self) -> &'static str {
+/// The language token for `code` in this model's vocabulary, or `None` when it
+/// has none.
+///
+/// The lookup is the token named `<|code|>` in the tokenizer's added tokens,
+/// which is where a Whisper export keeps all 100 language tokens
+/// (`tokenizer.json` lists them under `added_tokens`, not in `model.vocab`).
+/// Reading them out of the same file that decodes the output is what lets sttd
+/// take any language the model has, with no list of them written down here.
+fn language_token(code: &str, tokenizer: &Tokenizer) -> Option<i64> {
+    tokenizer
+        .token_to_id(&format!("<|{code}|>"))
+        .map(|id| id as i64)
+}
+
+impl Language {
+    /// Resolve against the tokenizer that will decode the output.
+    ///
+    /// `Explicit` fails on a code the model has no token for: the user named
+    /// that code, and starting anyway would produce a transcript in some other
+    /// language, which is worse than refusing. `System` only warns, because
+    /// nobody chose that code — it is what the machine happens to be set to, and
+    /// detecting per utterance beats not starting at all.
+    pub fn resolve(&self, tokenizer: &Tokenizer) -> Result<DecodingLanguage, WhisperError> {
         match self {
-            Self::Polish => "pl",
-            Self::English => "en",
-            Self::Auto => "auto",
+            Self::Auto => Ok(DecodingLanguage::Auto),
+            Self::Explicit(code) => language_token(code, tokenizer).map_or_else(
+                || Err(WhisperError::UnknownLanguage { code: code.clone() }),
+                |token| {
+                    Ok(DecodingLanguage::Fixed {
+                        code: code.clone(),
+                        token,
+                    })
+                },
+            ),
+            Self::System(code) => Ok(language_token(code, tokenizer).map_or_else(
+                || {
+                    log::warn!(
+                        "this whisper model cannot decode the system locale language \
+                         {code:?}; detecting the spoken language per utterance instead \
+                         (pass --language CODE to choose one)"
+                    );
+                    DecodingLanguage::Auto
+                },
+                |token| DecodingLanguage::Fixed {
+                    code: code.clone(),
+                    token,
+                },
+            )),
         }
     }
 }
 
 impl std::fmt::Display for Language {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Self::Explicit(code) | Self::System(code) => f.write_str(code),
+            Self::Auto => f.write_str("auto"),
+        }
+    }
+}
+
+impl std::fmt::Display for DecodingLanguage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed { code, .. } => f.write_str(code),
+            Self::Auto => f.write_str("auto"),
+        }
     }
 }
 
@@ -400,9 +478,10 @@ pub struct WhisperModel {
     /// Runs each following token off the cache.
     pub decoder_with_past: Session,
     pub tokenizer: Tokenizer,
-    /// What `--language` selected. Fixed for the process's lifetime; `Auto`
-    /// resolves per utterance from the prompt's first-position logits.
-    pub language: Language,
+    /// What `--language` resolved to against this model's tokenizer. Fixed for
+    /// the process's lifetime; `Auto` resolves per utterance from the prompt's
+    /// first-position logits.
+    pub language: DecodingLanguage,
     /// Owns the encoder's input buffer (see `Frontend::extract`).
     pub frontend: Frontend,
     /// Whether the encoder is the patched, length-free one (streaming, and the
@@ -418,6 +497,140 @@ pub struct WhisperModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The downloaded model's own `tokenizer.json`, when present. Resolving a
+    /// `--language` code is a lookup in this file, and no hand-written token list
+    /// can stand in for the real vocabulary — a code that resolves against a
+    /// stand-in would still be wrong against a re-tokenized export. Skipped when
+    /// the weights are not downloaded, so `cargo test` stays runnable on a clean
+    /// checkout.
+    fn downloaded_tokenizer() -> Option<Tokenizer> {
+        let path = crate::model_store::catalog_dir(crate::config::WHISPER_DEFAULT_SPEC)
+            .join("tokenizer.json");
+        if !path.exists() {
+            eprintln!("skipping: {} not downloaded", path.display());
+            return None;
+        }
+        Tokenizer::from_file(&path).ok()
+    }
+
+    /// The parser takes a code and lowercases it; it must not decide which codes
+    /// exist, because sttd holds no list of them.
+    #[test]
+    fn the_language_parser_accepts_codes_and_auto_only() {
+        for code in ["pl", "en", "de", "yue", "haw", "DE", " pl "] {
+            assert_eq!(
+                parse_language(code),
+                Ok(Language::Explicit(code.trim().to_ascii_lowercase())),
+                "code={code:?}"
+            );
+        }
+        assert_eq!(parse_language("auto"), Ok(Language::Auto));
+        assert_eq!(parse_language("Auto"), Ok(Language::Auto));
+        for bad in ["", "x", "abcd", "pl_PL", "en-US", "p1", "english", "12"] {
+            assert!(parse_language(bad).is_err(), "must reject {bad:?}");
+        }
+        // The message must not list the languages either: it cannot, because it
+        // does not know them.
+        let err = parse_language("pl_PL").expect_err("a locale is not a code");
+        assert!(!err.contains("polski"), "must not enumerate languages");
+    }
+
+    /// A code is worth nothing until the model's own tokenizer says so. This is
+    /// what replaces a compiled-in `<|pl|>` id: the id comes out of the file
+    /// that will decode the output, so any language the export has works and a
+    /// re-tokenized export cannot go stale.
+    #[test]
+    fn a_language_code_resolves_to_the_exported_token_id() {
+        let Some(tokenizer) = downloaded_tokenizer() else {
+            return;
+        };
+        // `WhisperError` wraps ORT and ndarray errors, so it is compared by
+        // message rather than by value.
+        let resolved = |language: Language| language.resolve(&tokenizer).map_err(|e| e.to_string());
+        // Ids read out of the export itself: `<|en|>` and `<|yue|>` bound the
+        // language range, `<|de|>` is the third token in it, `<|pl|>` the
+        // eleventh.
+        for (id, content) in [
+            (LANG_TOKEN_FIRST, "<|en|>"),
+            (50_261, "<|de|>"),
+            (50_269, "<|pl|>"),
+            (LANG_TOKEN_LAST, "<|yue|>"),
+        ] {
+            assert_eq!(tokenizer.token_to_id(content), Some(id as u32), "{content}");
+            let code = content
+                .strip_prefix("<|")
+                .and_then(|rest| rest.strip_suffix("|>"))
+                .expect("a language token is <|code|>")
+                .to_string();
+            assert_eq!(
+                resolved(Language::Explicit(code.clone())),
+                Ok(DecodingLanguage::Fixed {
+                    code,
+                    token: id as i64
+                }),
+                "{content}"
+            );
+            assert!(
+                (LANG_TOKEN_FIRST..=LANG_TOKEN_LAST).contains(&id),
+                "{content} must be inside the range auto-detection reads"
+            );
+        }
+        // The system locale reaches the same token, through the same lookup.
+        assert_eq!(
+            resolved(Language::System("de".to_string())),
+            resolved(Language::Explicit("de".to_string()))
+        );
+    }
+
+    /// The two origins differ in exactly one way, and that difference is the
+    /// reason `Language` carries one. An explicit code fails the load, because the
+    /// user named it; a locale code only warns, because nobody did.
+    #[test]
+    fn an_explicit_code_fails_but_an_unsupported_locale_falls_back() {
+        let Some(tokenizer) = downloaded_tokenizer() else {
+            return;
+        };
+        let resolved = |language: Language| language.resolve(&tokenizer).map_err(|e| e.to_string());
+        // A code no Whisper export has.
+        let unknown = "zzz";
+        assert_eq!(
+            tokenizer.token_to_id(&format!("<|{unknown}|>")),
+            None,
+            "premise: this model has no such token"
+        );
+        assert_eq!(
+            resolved(Language::Explicit(unknown.to_string())),
+            Err(format!(
+                "this whisper model cannot decode {unknown:?}: no such language \
+                 token in its tokenizer"
+            )),
+            "the error must name the code, and must not list the others"
+        );
+        assert_eq!(
+            resolved(Language::System(unknown.to_string())),
+            Ok(DecodingLanguage::Auto),
+            "an unsupported locale detects instead of refusing to load"
+        );
+        assert_eq!(resolved(Language::Auto), Ok(DecodingLanguage::Auto));
+    }
+
+    /// Both enums log as the code a user would type, never as a raw id.
+    #[test]
+    fn languages_log_as_codes() {
+        assert_eq!(Language::Explicit("de".to_string()).to_string(), "de");
+        assert_eq!(Language::System("pl".to_string()).to_string(), "pl");
+        assert_eq!(Language::Auto.to_string(), "auto");
+        assert_eq!(
+            DecodingLanguage::Fixed {
+                code: "yue".to_string(),
+                token: 50_358,
+            }
+            .to_string(),
+            "yue"
+        );
+        assert_eq!(DecodingLanguage::Auto.to_string(), "auto");
+    }
 
     #[test]
     fn fixed_encoder_always_gets_the_full_window() {

@@ -2,6 +2,8 @@
 // Constants / config
 // ---------------------------------------------------------------------------
 
+use crate::whisper_core::types::Language;
+
 /// Sample rate required by the VAD branch's denoiser (DeepFilterNet3,
 /// opt-in via `STTD_DENOISER=deepfilter` with the `denoise` Cargo feature;
 /// see `denoise`). Only the denoised VAD path uses this rate — the default
@@ -213,6 +215,66 @@ pub(crate) const DEFAULT_THREADS: i32 = 8;
 /// Whether to load the model onto the GPU (`use_gpu`). Default false.
 /// Override with `STTD_GPU=1` / `--gpu` for GPU machines.
 pub(crate) const DEFAULT_USE_GPU: bool = false;
+
+/// Locale variables that name the user's language, in POSIX precedence order
+/// for the message language: `LC_ALL` overrides everything, `LC_MESSAGES` is
+/// the category that governs program messages, and `LANG` is the fallback.
+const LOCALE_VARS: [&str; 3] = ["LC_ALL", "LC_MESSAGES", "LANG"];
+
+/// The language Whisper decodes in when `--language` is unset: the system
+/// locale's language, or `Auto` when the locale names no language.
+///
+/// `Auto` is the right answer for `C` and `POSIX` — what a machine with no
+/// locale configured reports — and it is what a user wants anyway when their
+/// locale says nothing. `Language::System` rather than `Language::Explicit` so
+/// that a model which cannot decode the code warns and detects instead of
+/// refusing to load (see `Language::resolve`).
+///
+/// The `LANGUAGE` variable (the gettext `pl:en` preference list) is not read:
+/// it only exists on GNOME sessions, and it overrides the variables above for
+/// message catalogs, which is a precedence rule worth a lot of thought for a
+/// default that only reaches Whisper.
+pub(crate) fn system_language() -> Language {
+    language_from_locale(|var| std::env::var(var).ok())
+}
+
+/// The locale part of `system_language`, over an injected variable lookup.
+///
+/// Injected so the rules are testable against fixed variables: `std::env` is
+/// process-global, and mutating it from one test would race every other test in
+/// the binary.
+fn language_from_locale(get: impl Fn(&str) -> Option<String>) -> Language {
+    LOCALE_VARS
+        .iter()
+        // An empty variable is a variable that is not set, as far as the C
+        // library is concerned, so it must not shadow the one below it.
+        .find_map(|var| get(var).filter(|value| !value.trim().is_empty()))
+        .as_deref()
+        .and_then(locale_code)
+        .map_or(Language::Auto, Language::System)
+}
+
+/// The primary language subtag of a locale name: `pl_PL.UTF-8` -> `pl`,
+/// `zh_TW` -> `zh`.
+///
+/// `None` when that subtag is not a 2-3 letter code, which is what rules out
+/// `C`, `C.UTF-8` and `POSIX` (one and five letters) without a special case
+/// each. The code is *not* checked against the languages Whisper supports: that
+/// is the model's business, decided at load time against its own tokenizer
+/// (`Language::resolve`).
+fn locale_code(locale: &str) -> Option<String> {
+    let code = locale
+        .trim()
+        .split(['_', '-', '.', '@'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if (2..=3).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        Some(code)
+    } else {
+        None
+    }
+}
 
 /// Directory every catalog spec resolves into — one fixed value per binary,
 /// chosen at **compile time** from `STTD_MODELS_DIR` (see `build.rs`), default
@@ -552,6 +614,71 @@ mod tests {
         assert!(parse_threads("bogus").is_err());
         assert_eq!(DEFAULT_THREADS, 8);
         assert!(!DEFAULT_USE_GPU);
+    }
+
+    /// The system locale becomes `--language`'s default. A locale that names no
+    /// language (`C`, `POSIX`, unset) must become `Auto`, not a guess.
+    #[test]
+    fn the_default_language_comes_from_the_locale() {
+        let of = |vars: &[(&str, &str)]| {
+            language_from_locale(|var| {
+                vars.iter()
+                    .find(|(name, _)| *name == var)
+                    .map(|(_, value)| (*value).to_string())
+            })
+        };
+        let system = |code: &str| Language::System(code.to_string());
+
+        // Only the primary subtag survives; the territory and encoding are not
+        // languages.
+        assert_eq!(of(&[("LANG", "pl_PL.UTF-8")]), system("pl"));
+        assert_eq!(of(&[("LANG", "en_US.UTF-8")]), system("en"));
+        assert_eq!(of(&[("LANG", "zh_TW")]), system("zh"), "hyphens too");
+        assert_eq!(of(&[("LANG", "de_DE@euro")]), system("de"));
+        assert_eq!(of(&[("LANG", "pt_BR")]), system("pt"));
+        assert_eq!(of(&[("LANG", "yue")]), system("yue"));
+        // POSIX precedence for the message language.
+        assert_eq!(
+            of(&[("LANG", "en_US"), ("LC_MESSAGES", "pl_PL")]),
+            system("pl")
+        );
+        assert_eq!(
+            of(&[
+                ("LANG", "en_US"),
+                ("LC_ALL", "de_DE"),
+                ("LC_MESSAGES", "pl_PL")
+            ]),
+            system("de"),
+            "LC_ALL overrides the category, which overrides LANG"
+        );
+        assert_eq!(
+            of(&[("LANG", "en_US"), ("LC_ALL", "")]),
+            system("en"),
+            "an empty variable is a variable that is not set"
+        );
+
+        // Nothing that names no language: detect instead of guessing. `C` and
+        // `POSIX` need no special case — one and five letters both fail the
+        // 2-3 letter code rule.
+        for locale in ["C", "C.UTF-8", "POSIX", "", "   ", "1"] {
+            assert_eq!(
+                of(&[("LANG", locale)]),
+                Language::Auto,
+                "locale={locale:?} must not become a code"
+            );
+        }
+        assert_eq!(of(&[]), Language::Auto, "no variable set at all");
+        // An empty trailing modifier is harmless: the code was already read.
+        assert_eq!(of(&[("LANG", "en_US.UTF-8@")]), system("en"));
+        // A set variable that names no language is an answer, not a reason to
+        // try the next one: `LC_MESSAGES=C` is a deliberate "no language", and
+        // reading `LANG` instead would override it.
+        for vars in [
+            &[("LANG", "pl_PL"), ("LC_ALL", "C")][..],
+            &[("LANG", "pl_PL"), ("LC_MESSAGES", "C")][..],
+        ] {
+            assert_eq!(of(vars), Language::Auto, "vars={vars:?}");
+        }
     }
 
     #[test]

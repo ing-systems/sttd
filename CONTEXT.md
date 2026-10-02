@@ -106,8 +106,13 @@ _Avoid_: model name, model id
 
 **Decoding language**:
 The language Whisper is told to decode in, fixed into its prompt as a language
-token for the process's lifetime — `pl` unless `--language` says otherwise,
-with `auto` detecting per utterance from the prompt's own first-token logits.
+token for the process's lifetime. Any code Whisper supports (`pl`, `en`, `de`,
+`yue`, ...), taken from `--language` or from the system locale when that is
+unset, with `auto` detecting per utterance from the prompt's own first-token
+logits. The code is resolved to a token id against the model's own tokenizer at
+load time, so sttd holds no list of languages: an explicit code the model cannot
+decode fails the load, while a system locale it cannot decode warns and detects
+instead.
 Parakeet has no such thing: it detects the language itself, every utterance.
 _Avoid_: language detection (that is what Parakeet does, and what `--language
 auto` asks Whisper for), locale
