@@ -91,7 +91,7 @@ impl SpeechDetector {
 
     /// Current noise floor (for logging/tuning, and for carrying the warm
     /// estimate across a device rebuild — see `set_floor`).
-    pub(crate) fn noise_floor(&self) -> f32 {
+    pub(crate) const fn noise_floor(&self) -> f32 {
         self.noise.floor()
     }
 
@@ -99,7 +99,7 @@ impl SpeechDetector {
     /// `SpeechDetector`, so `reset()`'s "keep the floor" guarantee doesn't
     /// apply — the caller must carry it across explicitly via this setter).
     /// Clamped the same as `NoiseTracker::update_background`.
-    pub(crate) fn set_floor(&mut self, floor: f32) {
+    pub(crate) const fn set_floor(&mut self, floor: f32) {
         self.noise.set_floor(floor);
     }
 

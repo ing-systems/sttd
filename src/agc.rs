@@ -53,7 +53,7 @@ impl Agc {
 
     /// Current applied gain (test-only reader; production never asks).
     #[cfg(test)]
-    pub(crate) fn gain(&self) -> f32 {
+    pub(crate) const fn gain(&self) -> f32 {
         self.cur_gain
     }
 
@@ -150,7 +150,7 @@ impl Agc {
     }
 
     /// Reset to unity gain + target envelope for pause/discard transitions.
-    pub(crate) fn reset(&mut self) {
+    pub(crate) const fn reset(&mut self) {
         self.envelope = self.target.max(1e-6);
         self.cur_gain = 1.0;
     }

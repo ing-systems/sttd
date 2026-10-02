@@ -1134,7 +1134,7 @@ struct AcousticConfig {
 }
 
 impl AcousticConfig {
-    fn from_cli(cli: &Cli) -> Self {
+    const fn from_cli(cli: &Cli) -> Self {
         Self {
             denoiser: cli.denoiser,
             vad_threshold: cli.vad_threshold,

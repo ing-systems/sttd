@@ -39,7 +39,7 @@ pub struct PreprocessorConfig {
 }
 
 impl PreprocessorConfig {
-    pub fn tdt_0_6b() -> Self {
+    pub const fn tdt_0_6b() -> Self {
         Self {
             feature_size: 128,
             hop_length: 160,

@@ -415,7 +415,7 @@ pub(crate) fn should_unload(
 /// single-shot resume fires only on an actually emitted transcript, never
 /// on a drop or a failed inference, so noise can't steal the shot.
 /// Pure over its inputs for tests.
-pub(crate) fn should_autopause(autopause_enabled: bool, emitted: bool) -> bool {
+pub(crate) const fn should_autopause(autopause_enabled: bool, emitted: bool) -> bool {
     autopause_enabled && emitted
 }
 
@@ -430,7 +430,7 @@ pub(crate) fn should_autopause(autopause_enabled: bool, emitted: bool) -> bool {
 /// stale content into whatever window has focus, possibly minutes later.
 /// Firing only on the edge (not on every paused tick) means a long pause
 /// drains once, not on a busy-loop.
-pub(crate) fn should_drain_on_pause(was_paused: bool, now_paused: bool) -> bool {
+pub(crate) const fn should_drain_on_pause(was_paused: bool, now_paused: bool) -> bool {
     now_paused && !was_paused
 }
 
@@ -928,7 +928,7 @@ fn open_metrics_log(path: Option<&std::path::Path>) -> Option<std::io::BufWriter
 
 /// Machine-readable verdict for the `--metrics` log (human-readable
 /// `DROPPED(...)` strings stay in the dump dir via `dump_reason`).
-pub(crate) fn verdict_slug(verdict: crate::gate::TranscriptVerdict) -> &'static str {
+pub(crate) const fn verdict_slug(verdict: crate::gate::TranscriptVerdict) -> &'static str {
     match verdict {
         crate::gate::TranscriptVerdict::Emit => "emit",
         crate::gate::TranscriptVerdict::DropEmpty => "drop:empty",

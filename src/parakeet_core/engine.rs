@@ -86,7 +86,7 @@ fn degressive_alpha(word_count: usize) -> f32 {
     (BOOST_ALPHA_MAX - (word_count as f32 / 5.0).log10()).clamp(BOOST_ALPHA_MIN, BOOST_ALPHA_MAX)
 }
 
-fn top_k_for_depth(depth: usize) -> usize {
+const fn top_k_for_depth(depth: usize) -> usize {
     if depth >= BOOST_DEEP_DEPTH {
         BOOST_TOP_K_DEEP
     } else {

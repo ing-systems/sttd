@@ -168,7 +168,7 @@ impl UtteranceBuffer {
     }
 
     /// Whether an utterance has opened and is still accumulating.
-    pub(crate) fn is_open(&self) -> bool {
+    pub(crate) const fn is_open(&self) -> bool {
         !self.buf.is_empty()
     }
 

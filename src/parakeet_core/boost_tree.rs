@@ -196,7 +196,7 @@ impl BoostTree {
         }
     }
 
-    pub fn root(&self) -> NodeId {
+    pub const fn root(&self) -> NodeId {
         ROOT
     }
 }

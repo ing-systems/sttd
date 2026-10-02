@@ -18,6 +18,9 @@ use std::borrow::Cow;
 
 /// Index of the highest logit, with ties going to the lowest id. Returns 0 on
 /// an empty slice.
+///
+/// `#[inline]`: one call per generated token in both engines.
+#[inline]
 pub(crate) fn argmax_index(logits: &[f32]) -> usize {
     let mut best = 0;
     let mut best_val = f32::NEG_INFINITY;
@@ -34,6 +37,9 @@ pub(crate) fn argmax_index(logits: &[f32]) -> usize {
 /// trick. Out-of-range ids score 0 rather than panicking: a wrong id here
 /// means a broken export, and the confidence then reads as "no confidence"
 /// for the dictionary gate instead of taking the process down.
+///
+/// `#[inline]`: one call per generated token in both engines.
+#[inline]
 pub(crate) fn softmax_prob(logits: &[f32], token: usize) -> f32 {
     let Some(&target) = logits.get(token) else {
         return 0.0;

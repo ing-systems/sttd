@@ -332,7 +332,7 @@ impl Language {
     /// fallback the prompt is built with; the detection pass below overrides
     /// it (see `resolve_language`), so a wrong guess costs one re-run of the
     /// prompt and nothing more.
-    pub fn prompt_token(self) -> i64 {
+    pub const fn prompt_token(self) -> i64 {
         match self {
             Self::Polish => TOK_LANG_PL,
             Self::English => TOK_LANG_EN,
@@ -341,7 +341,7 @@ impl Language {
     }
 
     /// Stable short spelling for log lines.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Polish => "pl",
             Self::English => "en",

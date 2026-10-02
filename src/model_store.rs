@@ -31,7 +31,7 @@ pub(crate) fn catalog_dir(spec: &str) -> PathBuf {
 
 impl EngineKind {
     /// Short name for log lines and the `--list-models` table heading.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Parakeet => "parakeet",
             Self::Whisper => "whisper",
@@ -42,7 +42,7 @@ impl EngineKind {
     /// Note the deliberate naming difference between the two exports:
     /// Parakeet's graphs use hyphens (`encoder-model.int8.onnx`), Whisper's
     /// underscores (`encoder_model_int8.onnx`).
-    fn marker_file(self) -> &'static str {
+    const fn marker_file(self) -> &'static str {
         match self {
             Self::Parakeet => "decoder_joint-model.int8.onnx",
             Self::Whisper => "decoder_with_past_model_int8.onnx",
@@ -51,7 +51,7 @@ impl EngineKind {
 
     /// Every file a directory of this kind must hold. Used both to validate a
     /// user-supplied directory and to describe the expected layout in errors.
-    fn required_files(self) -> &'static [&'static str] {
+    const fn required_files(self) -> &'static [&'static str] {
         match self {
             Self::Parakeet => &[
                 "encoder-model.int8.onnx",

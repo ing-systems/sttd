@@ -224,7 +224,7 @@ pub(crate) fn restore_dictionary_casing_gated(
     out
 }
 
-fn max_distance_for(len: usize) -> usize {
+const fn max_distance_for(len: usize) -> usize {
     if len >= POSTCORR_LONG_LEN {
         2
     } else {

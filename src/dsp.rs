@@ -13,6 +13,10 @@ use resampler::{Attenuation, Latency, ResamplerFir};
 ///
 /// `conv` scales one raw sample to f32, so f32, i16 and u16 device data share
 /// this one path (see `i16_to_f32`, `u16_to_f32`).
+///
+/// `#[inline]` because the capture callback calls this once per sample (see
+/// `capture::build_for_format`), and the binary ships without LTO.
+#[inline]
 pub(crate) fn mono_mix_frame<T, C>(
     frame: &[T],
     channels: usize,

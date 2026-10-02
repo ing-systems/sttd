@@ -79,7 +79,7 @@ fn encoder_hidden_states(
 /// `language_token` is a token id, not a `Language`: for `Auto` the caller
 /// passes the fallback and, once the first prompt run has reported what it
 /// detected, the id that was actually detected (see `transcribe_samples`).
-pub(crate) fn build_prompt(language_token: i64) -> [i64; PROMPT_LEN] {
+pub(crate) const fn build_prompt(language_token: i64) -> [i64; PROMPT_LEN] {
     [
         TOK_SOT,
         language_token,

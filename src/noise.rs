@@ -46,6 +46,10 @@ pub(crate) const EXIT_THRESHOLD_FLOOR: f32 = 0.02;
 // of precision — and the result is narrowed once, at the end.
 
 /// RMS of one frame, linear (not dB). An empty frame is silence.
+///
+/// `#[inline]`: the per-frame loudness measure, called two or three times per
+/// 10 ms frame from `frame`, `utterance` and `agc`.
+#[inline]
 pub(crate) fn frame_rms(frame: &[f32]) -> f32 {
     if frame.is_empty() {
         return 0.0;
@@ -61,18 +65,18 @@ pub(crate) struct NoiseTracker {
 }
 
 impl NoiseTracker {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self { floor: 0.001 }
     }
 
     /// Current floor estimate (linear RMS, not dB).
-    pub(crate) fn floor(&self) -> f32 {
+    pub(crate) const fn floor(&self) -> f32 {
         self.floor
     }
 
     /// Adopt a floor learned elsewhere (see `SpeechDetector::set_floor`),
     /// clamped the same as `update_background`.
-    pub(crate) fn set_floor(&mut self, floor: f32) {
+    pub(crate) const fn set_floor(&mut self, floor: f32) {
         self.floor = floor.clamp(0.0001, 0.05);
     }
 

@@ -485,7 +485,7 @@ pub(crate) fn parse_hangover_ms(s: &str) -> Result<u64, String> {
 
 /// Whole 10 ms frames in `ms` of hangover. Exact: the parser only accepts
 /// multiples of 10.
-pub(crate) fn hangover_frames(ms: u64) -> u32 {
+pub(crate) const fn hangover_frames(ms: u64) -> u32 {
     (ms / 10) as u32
 }
 

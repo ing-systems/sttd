@@ -68,7 +68,7 @@ impl FrameProcessor {
     /// Turn on partial snapshots for `--stream`. Builder-style, like
     /// `UtteranceBuffer::with_hangover_frames`, so the constructor and the
     /// tests keep their signature.
-    pub(crate) fn with_streaming(mut self, stream: bool) -> Self {
+    pub(crate) const fn with_streaming(mut self, stream: bool) -> Self {
         self.stream = stream;
         self
     }
@@ -84,7 +84,7 @@ impl FrameProcessor {
     }
 
     /// The raw hw-rate chunk size every call to `process_frame` must be fed.
-    pub(crate) fn required_input_frames(&self) -> usize {
+    pub(crate) const fn required_input_frames(&self) -> usize {
         self.hw_input_frames
     }
 
@@ -99,14 +99,14 @@ impl FrameProcessor {
     /// see `adopt_noise_floor`; a rebuild constructs a brand new
     /// `FrameProcessor`, so `discard_pending`'s "floor preserved" guarantee
     /// doesn't apply across that boundary on its own).
-    pub(crate) fn noise_floor(&self) -> f32 {
+    pub(crate) const fn noise_floor(&self) -> f32 {
         self.vad.noise_floor()
     }
 
     /// Whether an utterance is currently buffered (opened, not yet closed).
     /// The beep-leak guard (`main::cue_guard`) skips its discard when speech
     /// is in flight so a cue never cuts real audio.
-    pub(crate) fn has_open_utterance(&self) -> bool {
+    pub(crate) const fn has_open_utterance(&self) -> bool {
         self.utterance.is_open()
     }
 
@@ -115,7 +115,7 @@ impl FrameProcessor {
     /// default (0.001), running the VAD at the un-lifted base threshold for
     /// the ~2 s the EMA needs to relearn a noisy room — exactly the window
     /// where false triggers turn into hallucinated utterances.
-    pub(crate) fn adopt_noise_floor(&mut self, floor: f32) {
+    pub(crate) const fn adopt_noise_floor(&mut self, floor: f32) {
         self.vad.set_floor(floor);
     }
 

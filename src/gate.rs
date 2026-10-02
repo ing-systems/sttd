@@ -28,7 +28,7 @@ pub(crate) struct GateConfig {
 }
 
 impl GateConfig {
-    pub(crate) fn new(min_speech_rms: f32, min_density: f32) -> Self {
+    pub(crate) const fn new(min_speech_rms: f32, min_density: f32) -> Self {
         Self {
             min_speech_rms,
             min_density,
@@ -173,7 +173,7 @@ impl TranscriptVerdict {
 
 /// Fold a single Polish diacritic to its ASCII base letter; every other char is
 /// returned unchanged.
-pub(crate) fn fold_polish_diacritic(c: char) -> char {
+pub(crate) const fn fold_polish_diacritic(c: char) -> char {
     match c {
         'ą' => 'a',
         'ć' => 'c',
