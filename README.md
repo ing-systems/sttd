@@ -40,7 +40,7 @@ See `src/main.rs:1-51` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdic
 ## Requirements
 
 - Linux x86_64, Rust stable, `alsa-lib`.
-- ~640 MiB disk for the default `int8` model, ~2.4 GiB for `fp32`.
+- ~638 MiB disk for the default `int8` model.
 - Optional: `wl-clipboard` (`wl-copy`) for `--copy`, `ydotool` + `ydotoold` for `--paste` (Wayland only), PipeWire/WirePlumber for capture, Python 3 stdlib for `tools/`.
 
 ## Models
@@ -49,11 +49,10 @@ Catalog (`src/config.rs:253-277`):
 
 | Spec | Size | Contents |
 | --- | --- | --- |
-| `parakeet` (alias for `int8`) | 640 MiB | encoder int8 + decoder_joint int8 + vocab + tokenizer |
-| `parakeet-tdt-0.6b-v3-int8` | 640 MiB | same as above |
-| `parakeet-tdt-0.6b-v3-fp32` | 2.4 GiB | encoder fp32 + data + decoder + vocab + tokenizer |
+| `parakeet` (alias for `int8`) | 638 MiB | encoder int8 + decoder_joint int8 + vocab + tokenizer |
+| `parakeet-ultra-int8` | 638 MiB | same as above |
 
-Weights come from `huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx` and `huggingface.co/nvidia/parakeet-tdt-0.6b-v3` (tokenizer only).
+Weights come from `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx` (ONNX weights from its `int8/` folder, `vocab.txt` from the repo root) and `huggingface.co/nvidia/parakeet-tdt-0.6b-v3` (tokenizer only). The ultra export keeps the base architecture and tokenizer, so the Rust mel frontend and dictionary phrase-boosting are unchanged.
 
 Resolution (`src/config.rs:210-221`, `src/model_store.rs`):
 

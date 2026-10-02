@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{
     parakeet_entry_for_spec, valid_model_specs, DEFAULT_MODELS_DIR, PARAKEET_BASE_URL,
-    PARAKEET_TOKENIZER_URL,
+    PARAKEET_TOKENIZER_URL, PARAKEET_VOCAB_URL,
 };
 
 /// Which ASR model a resolved `--model` value maps to, and where its
@@ -117,14 +117,21 @@ fn install_hint(dir: &Path) -> String {
 }
 
 /// Download URL for one Parakeet asset filename (e.g.
-/// `encoder-model.int8.onnx`). `tokenizer.json` lives in the upstream
-/// NVIDIA checkpoint, everything else in the ONNX export (see
-/// `PARAKEET_BASE_URL` / `PARAKEET_TOKENIZER_URL`).
+/// `encoder-model.int8.onnx`). Three sources, because the upstream
+/// repository is not one flat file list: the ONNX weights sit in its `int8/`
+/// folder (`PARAKEET_BASE_URL`), `vocab.txt` at its root
+/// (`PARAKEET_VOCAB_URL`), and `tokenizer.json` is absent from it entirely,
+/// so it comes from the upstream NVIDIA checkpoint
+/// (`PARAKEET_TOKENIZER_URL`).
+///
+/// The destination is always the flat `<models_dir>/<spec>/<file_name>`, so
+/// the repository layout never leaks into the engine's expectations.
 pub(crate) fn parakeet_asset_url(file_name: &str) -> String {
-    if file_name == "tokenizer.json" {
-        return PARAKEET_TOKENIZER_URL.to_string();
+    match file_name {
+        "tokenizer.json" => PARAKEET_TOKENIZER_URL.to_string(),
+        "vocab.txt" => format!("{PARAKEET_VOCAB_URL}{file_name}"),
+        _ => format!("{PARAKEET_BASE_URL}{file_name}"),
     }
-    format!("{PARAKEET_BASE_URL}{file_name}")
 }
 
 /// One-line download progress for stderr, e.g.
@@ -162,8 +169,8 @@ pub(crate) fn format_download_progress(downloaded: u64, total: Option<u64>) -> S
 
 /// Note: no resume support — an interrupted download restarts from zero on
 /// the next `ensure_available` call (`.part` is recreated with
-/// `File::create` every attempt). Same gap for Parakeet's 2.4 GiB
-/// `encoder-model.onnx.data`; not fixed here.
+/// `File::create` every attempt). This bites on the 619 MiB encoder; not
+/// fixed here.
 fn download(url: &str, dest: &Path) -> Result<()> {
     let tmp = dest.with_extension("part");
     let resp = ureq::get(url)
@@ -232,37 +239,51 @@ mod tests {
     fn default_model_is_parakeet() {
         let resolved =
             resolve_model(crate::config::DEFAULT_MODEL_SPEC).expect("default spec must resolve");
-        assert_eq!(resolved.dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"));
+        assert_eq!(resolved.dir, PathBuf::from("models/parakeet-ultra-int8"));
         assert!(resolved.assets.contains(&"vocab.txt"));
     }
 
     #[test]
     fn parakeet_specs_and_alias_resolve_to_model_dir() {
-        for spec in ["parakeet-tdt-0.6b-v3-int8", "parakeet"] {
+        for spec in ["parakeet-ultra-int8", "parakeet"] {
             let resolved = resolve_model(spec).expect("parakeet spec must resolve");
-            assert_eq!(resolved.dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"));
+            assert_eq!(resolved.dir, PathBuf::from("models/parakeet-ultra-int8"));
             assert!(resolved.assets.contains(&"vocab.txt"));
             assert!(resolved.assets.iter().any(|f| f.contains("int8")));
         }
         let resolved =
             resolve_model(PARAKEET_DEFAULT_SPEC).expect("default parakeet spec must resolve");
-        assert_eq!(resolved.dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"));
+        assert_eq!(resolved.dir, PathBuf::from("models/parakeet-ultra-int8"));
         assert_eq!(resolved.assets.len(), 4);
     }
 
     #[test]
-    fn parakeet_fp32_spec_resolves_with_external_data_file() {
-        let resolved =
-            resolve_model("parakeet-tdt-0.6b-v3-fp32").expect("fp32 spec must resolve");
-        assert_eq!(resolved.dir, PathBuf::from("models/parakeet-tdt-0.6b-v3-fp32"));
-        assert!(resolved.assets.contains(&"encoder-model.onnx.data"));
+    fn parakeet_asset_urls_derive_from_base_url() {
+        // The ONNX weights live in the repository's `int8/` folder.
+        for file in ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx"] {
+            assert_eq!(
+                parakeet_asset_url(file),
+                format!("{PARAKEET_BASE_URL}{file}")
+            );
+            assert!(
+                PARAKEET_BASE_URL.ends_with("/int8/"),
+                "base={PARAKEET_BASE_URL}"
+            );
+        }
     }
 
     #[test]
-    fn parakeet_asset_urls_derive_from_base_url() {
-        for file in ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "vocab.txt"] {
-            assert_eq!(parakeet_asset_url(file), format!("{PARAKEET_BASE_URL}{file}"));
-        }
+    fn parakeet_vocab_url_points_at_the_repository_root() {
+        // `vocab.txt` sits next to `config.json` at the repo root, not in
+        // `int8/` — so it must not come from `PARAKEET_BASE_URL`.
+        use crate::config::PARAKEET_VOCAB_URL;
+        let url = parakeet_asset_url("vocab.txt");
+        assert_eq!(url, format!("{PARAKEET_VOCAB_URL}vocab.txt"));
+        assert_ne!(url, parakeet_asset_url("encoder-model.int8.onnx"));
+        assert!(
+            !PARAKEET_VOCAB_URL.ends_with("/int8/"),
+            "base={PARAKEET_VOCAB_URL}"
+        );
     }
 
     #[test]
@@ -307,9 +328,9 @@ mod tests {
     fn install_hint_names_the_directory_and_the_way_out() {
         // The raw EACCES from a root-owned /usr/share/sttd/models must not be
         // the whole story: name the directory, then the three ways forward.
-        let hint = install_hint(Path::new("/usr/share/sttd/models/parakeet-tdt-0.6b-v3-fp32"));
+        let hint = install_hint(Path::new("/usr/share/sttd/models/parakeet-ultra-int8"));
         assert!(
-            hint.contains("/usr/share/sttd/models/parakeet-tdt-0.6b-v3-fp32"),
+            hint.contains("/usr/share/sttd/models/parakeet-ultra-int8"),
             "hint={hint}"
         );
         for way_out in ["sttd package", "sudo", "--model"] {

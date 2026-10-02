@@ -231,54 +231,47 @@ pub(crate) fn valid_model_specs() -> String {
         .join(", ")
 }
 
-/// Parakeet-TDT-0.6B-v3 weights, published as loose ONNX files (no archive)
-/// rather than a single `.bin`: the engine loads from a directory containing
-/// an encoder, a decoder_joint, `vocab.txt` and `tokenizer.json`
+/// Parakeet-TDT-0.6B-v3 "ultra" weights, published as loose ONNX files (no
+/// archive) rather than a single `.bin`: the engine loads from a directory
+/// containing an encoder, a decoder_joint, `vocab.txt` and `tokenizer.json`
 /// (phrase-boosting; without it transcription works but boosting stays off).
-/// The ONNX weights come from the istupakov export; `tokenizer.json` comes
-/// from the upstream NVIDIA checkpoint (the export has none). Mel features
-/// are computed in Rust (`parakeet_core::frontend`), so no `nemo128.onnx` and
-/// no `config.json`/`preprocessor_config.json` are needed.
+/// Mel features are computed in Rust (`parakeet_core::frontend`), so no
+/// `nemo128.onnx` and no `config.json`/`preprocessor_config.json` are needed.
+/// The export keeps the base architecture and tokenizer (128 mel features,
+/// subsampling 8, a `vocab.txt` byte-identical to the base checkpoint), so
+/// the Rust frontend and the `PreprocessorConfig::tdt_0_6b` recipe still
+/// apply unchanged.
 pub(crate) const PARAKEET_BASE_URL: &str =
-    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/";
+    "https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx/resolve/main/int8/";
+/// Same repository, one level up: the export keeps `vocab.txt` at the repo
+/// root next to `config.json` and `nemo128.onnx`, not inside `int8/`.
+pub(crate) const PARAKEET_VOCAB_URL: &str =
+    "https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx/resolve/main/";
 /// Upstream NVIDIA checkpoint, source of `tokenizer.json` (absent from the
-/// ONNX export above).
+/// ultra export, which drops the SentencePiece files).
 pub(crate) const PARAKEET_TOKENIZER_URL: &str =
     "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/tokenizer.json";
 
 /// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
-/// int8 is the default variant (`PARAKEET_DEFAULT_SPEC`); fp32 is offered
-/// for accuracy-sensitive use. Filenames match what the engine looks for,
-/// so no renaming after download.
-pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[
-    (
-        "parakeet-tdt-0.6b-v3-int8",
-        "parakeet-tdt-0.6b-v3-int8",
-        &[
-            "encoder-model.int8.onnx",
-            "decoder_joint-model.int8.onnx",
-            "vocab.txt",
-            "tokenizer.json",
-        ],
-        "640 MiB",
-    ),
-    (
-        "parakeet-tdt-0.6b-v3-fp32",
-        "parakeet-tdt-0.6b-v3-fp32",
-        &[
-            "encoder-model.onnx",
-            "encoder-model.onnx.data",
-            "decoder_joint-model.onnx",
-            "vocab.txt",
-            "tokenizer.json",
-        ],
-        "2.4 GiB",
-    ),
-];
+/// The int8 export is the default variant (`PARAKEET_DEFAULT_SPEC`). Its
+/// filenames match what the engine looks for, so no renaming after download,
+/// even though the repository stores them under an `int8/` folder (see
+/// `model_store::parakeet_asset_url`).
+pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[(
+    "parakeet-ultra-int8",
+    "parakeet-ultra-int8",
+    &[
+        "encoder-model.int8.onnx",
+        "decoder_joint-model.int8.onnx",
+        "vocab.txt",
+        "tokenizer.json",
+    ],
+    "638 MiB",
+)];
 
 /// Short alias for `--model parakeet`, resolving to the int8 variant (see
 /// `PARAKEET_CATALOG`).
-pub(crate) const PARAKEET_DEFAULT_SPEC: &str = "parakeet-tdt-0.6b-v3-int8";
+pub(crate) const PARAKEET_DEFAULT_SPEC: &str = "parakeet-ultra-int8";
 
 /// Look up a `PARAKEET_CATALOG` entry by spec, accepting the `parakeet`
 /// alias for the default (int8) variant.
@@ -512,7 +505,7 @@ mod tests {
 
     #[test]
     fn parakeet_catalog_entries_are_self_consistent() {
-        assert_eq!(PARAKEET_CATALOG.len(), 2);
+        assert_eq!(PARAKEET_CATALOG.len(), 1);
         for (spec, dir, files, _size) in PARAKEET_CATALOG {
             assert_eq!(*dir, *spec, "dir must equal spec for {spec}");
             assert!(!files.is_empty(), "{spec} must list at least one file");
@@ -526,7 +519,7 @@ mod tests {
 
     #[test]
     fn parakeet_alias_resolves_to_int8_default() {
-        assert_eq!(PARAKEET_DEFAULT_SPEC, "parakeet-tdt-0.6b-v3-int8");
+        assert_eq!(PARAKEET_DEFAULT_SPEC, "parakeet-ultra-int8");
         let default_entry =
             parakeet_entry_for_spec(PARAKEET_DEFAULT_SPEC).expect("default spec must resolve");
         let alias_entry = parakeet_entry_for_spec("parakeet").expect("alias must resolve");

@@ -83,7 +83,7 @@ package() {
   # The bundled default model: catalog specs resolve to a single directory
   # baked in at build time (STTD_MODELS_DIR above -> src/config.rs), so this
   # is what makes `sttd --model parakeet` work offline from any directory.
-  local m=parakeet-tdt-0.6b-v3-int8
+  local m=parakeet-ultra-int8
   local d="$pkgdir/usr/share/sttd/models/$m"
   install -Dm644 "models/$m/encoder-model.int8.onnx" "$d/encoder-model.int8.onnx"
   install -Dm644 "models/$m/decoder_joint-model.int8.onnx" "$d/decoder_joint-model.int8.onnx"

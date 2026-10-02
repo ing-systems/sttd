@@ -1086,12 +1086,12 @@ mod tests {
     #[test]
     fn parakeet_selection_matches_spec_and_alias() {
         assert_eq!(
-            selected_parakeet_spec_for_input("parakeet-tdt-0.6b-v3-int8"),
-            Some("parakeet-tdt-0.6b-v3-int8")
+            selected_parakeet_spec_for_input("parakeet-ultra-int8"),
+            Some("parakeet-ultra-int8")
         );
         assert_eq!(
             selected_parakeet_spec_for_input("parakeet"),
-            Some("parakeet-tdt-0.6b-v3-int8")
+            Some("parakeet-ultra-int8")
         );
         assert_eq!(selected_parakeet_spec_for_input("small"), None);
         assert_eq!(selected_parakeet_spec_for_input(""), None);
@@ -1100,7 +1100,7 @@ mod tests {
     #[test]
     fn parakeet_models_table_aligns_columns_and_marks_rows() {
         let installed = vec![false; PARAKEET_CATALOG.len()];
-        let table = format_parakeet_models(Some("parakeet-tdt-0.6b-v3-int8"), &installed);
+        let table = format_parakeet_models(Some("parakeet-ultra-int8"), &installed);
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), PARAKEET_CATALOG.len() + 1);
         assert!(lines[0].contains("SPEC"));
@@ -1108,7 +1108,7 @@ mod tests {
         assert!(lines[0].contains("SIZE"));
         let int8_row = lines
             .iter()
-            .find(|l| l.contains("parakeet-tdt-0.6b-v3-int8"))
+            .find(|l| l.contains("parakeet-ultra-int8"))
             .expect("int8 row must exist");
         assert!(int8_row.starts_with("* "), "row={int8_row:?}");
     }
@@ -1135,7 +1135,7 @@ mod tests {
     fn validate_parakeet_flags_accepts_plain_cli() {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         let model = ModelRef {
-            dir: std::path::PathBuf::from("models/parakeet-tdt-0.6b-v3-int8"),
+            dir: std::path::PathBuf::from("models/parakeet-ultra-int8"),
             assets: &[],
         };
         assert!(validate_parakeet_model_flags(&cli, &model).is_ok());

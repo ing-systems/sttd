@@ -86,7 +86,7 @@ _Avoid_: model (bare, when the engine — as opposed to the weights — is meant
 
 **Model spec**:
 A `--model` value that names a catalog entry rather than a filesystem path —
-`parakeet` or `parakeet-tdt-0.6b-v3-int8`. Resolved into the models
+`parakeet` or `parakeet-ultra-int8`. Resolved into the models
 directory baked into the binary at build time (`STTD_MODELS_DIR`, default
 `models`; the Arch package uses `/usr/share/sttd/models`) and, for a catalog
 spec, downloaded if missing; an existing directory passes through untouched
