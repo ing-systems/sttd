@@ -258,7 +258,8 @@ mod tests {
         if frames <= 1 {
             // Not enough frames for a per-feature mean/variance.
             let time = out.nrows();
-            return Array3::from_shape_vec((1, features, time), out.into_raw_vec()).unwrap();
+            return Array3::from_shape_vec((1, features, time), out.into_raw_vec_and_offset().0)
+                .unwrap();
         }
         for feat_idx in 0..features {
             let mut column = out.column_mut(feat_idx);
@@ -271,7 +272,7 @@ mod tests {
             }
         }
         let time = out.nrows();
-        Array3::from_shape_vec((1, features, time), out.into_raw_vec()).unwrap()
+        Array3::from_shape_vec((1, features, time), out.into_raw_vec_and_offset().0).unwrap()
     }
 
     #[test]

@@ -69,7 +69,9 @@ Whisper weights come from `huggingface.co/onnx-community/whisper-large-v3-turbo`
 | Dictionary phrase boosting | yes (logit-level) | no; the post-gate correction still applies |
 | Per-word confidences | yes | yes |
 
-Whisper's encoder takes a **fixed** 30 s window: its `input_features` axes are constants in the ONNX graph, not symbolic. A two-second utterance therefore costs the same encoder pass as a thirty-second one, and `--metrics` reports RTF against that window rather than the utterance. Measured on a 16-core Ryzen 9 9950X, that is ~1.2 s per utterance (rtf 0.04) against Parakeet's 64 ms on the same audio — usable for `--file` work and slow dictation, not for live streaming. The single-graph `decoder_model_merged` is deliberately not used: it re-runs cross-attention over all 1500 encoder frames per generated token, so the prompt decoder plus the cached-token decoder are shipped instead.
+Whisper's encoder takes a **fixed** 30 s window: its `input_features` axes are constants in the ONNX graph, not symbolic. A two-second utterance therefore costs the same encoder pass as a thirty-second one, and `--metrics` reports RTF against that window rather than the utterance. Measured on a 16-core Ryzen 9 9950X, that is ~1.1 s per utterance (rtf 0.04) against Parakeet's 64 ms on the same audio — usable for `--file` work and slow dictation, not for live streaming. The single-graph `decoder_model_merged` is deliberately not used: it re-runs cross-attention over all 1500 encoder frames per generated token, so the prompt decoder plus the cached-token decoder are shipped instead.
+
+Roughly 97 % of Whisper's inference time is inside ONNX Runtime's own kernels (GEMM, quantized GEMM, attention softmax), and about 80 % of it is the one encoder pass — the graph pins that window, so no shorter window can be fed. Each generated token adds ~8 ms on top. ORT session settings were measured against this (memory pattern, denormals-as-zero, fewer threads for the per-token session) and none of them moved the total; see the table on `init_session` in `src/whisper_core/engine.rs`.
 
 Both engines run on CPU. `--gpu` is accepted and warned about for both.
 
@@ -108,9 +110,9 @@ cargo test
 cargo test --release --frozen
 ```
 
-No clippy/rustfmt config. No CI config. Tests live inline (`#[cfg(test)]`, 312 tests).
+No clippy/rustfmt config. No CI config. Tests live inline (`#[cfg(test)]`, 316 tests).
 
-Four Whisper tests read the downloaded model's `tokenizer.json` and skip themselves when it is absent, so they cover the byte-level BPE handling on a machine that has the weights and leave `cargo test` runnable on a clean checkout.
+Five Whisper tests read the downloaded model's `tokenizer.json` and skip themselves when it is absent, so they cover the byte-level BPE handling and the compiled prompt token ids on a machine that has the weights, and leave `cargo test` runnable on a clean checkout.
 
 ## Use
 
@@ -317,6 +319,7 @@ src/parakeet_core/   ONNX engine, mel frontend, booster
 src/whisper.rs       SpeechModel impl (Whisper), decoding language
 src/whisper_core/    ONNX engine, log-mel frontend, KV-cached decode
 src/mel.rs           Slaney mel filterbank, shared by both frontends
+src/decode.rs        argmax/softmax/word confidences, shared by both engines
 src/gate.rs          acoustic/transcript verdicts
 src/emit.rs          stdout/clipboard/paste/dump/last-text
 src/dictionary.rs    custom vocabulary

@@ -29,6 +29,7 @@
 // already drops runaway output, so the extra machinery would buy nothing here.
 // ---------------------------------------------------------------------------
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use ndarray17::{Array2, ArrayD};
@@ -39,9 +40,13 @@ use ort::value::TensorRef;
 use tokenizers::Tokenizer;
 
 use super::types::{
-    Language, KvCache, MelConfig, WhisperError, WhisperModel, BEGIN_SUPPRESS_TOKENS,
-    LANG_TOKEN_FIRST, LANG_TOKEN_LAST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
+    KvCache, Language, MelConfig, WhisperError, WhisperModel, BEGIN_SUPPRESS_TOKENS,
+    LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
 };
+use crate::decode::{argmax_index, softmax_prob, word_confidences as group_words};
+
+/// Tokens in one prompt: start-of-transcript, language, task, no-timestamps.
+const PROMPT_LEN: usize = 4;
 
 /// `last_hidden_state` is `[1, encoder_seq, d_model]`, and the export pins the
 /// encoder length (1500 = 3000 mel frames / 2) but leaves `d_model` symbolic.
@@ -56,45 +61,14 @@ fn encoder_hidden_states(
         .to_owned())
 }
 
-/// Argmax over `logits`, with ties going to the lowest id. Returns the
-/// position in `logits` of the winning token.
-pub(crate) fn argmax_index(logits: &[f32]) -> usize {
-    let mut best = 0;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best = i;
-        }
-    }
-    best
-}
-
-/// Softmax probability of one token over `logits`, via the max-subtraction
-/// trick. Out-of-range ids score 0 rather than panicking: a wrong id here
-/// means a broken export, and the confidence then reads as "no confidence"
-/// for the dictionary gate instead of taking the process down.
-pub(crate) fn token_probability(logits: &[f32], token: usize) -> f32 {
-    let Some(&target) = logits.get(token) else {
-        return 0.0;
-    };
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
-    if sum > 0.0 {
-        ((target - max).exp() / sum).clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
-}
-
 /// The prompt for one inference: start-of-transcript, a language token, the
 /// transcribe task, and no timestamps.
 ///
 /// `language_token` is a token id, not a `Language`: for `Auto` the caller
 /// passes the fallback and, once the first prompt run has reported what it
 /// detected, the id that was actually detected (see `transcribe_samples`).
-pub(crate) fn build_prompt(language_token: i64) -> Vec<i64> {
-    vec![
+pub(crate) fn build_prompt(language_token: i64) -> [i64; PROMPT_LEN] {
+    [
         TOK_SOT,
         language_token,
         TOK_TRANSCRIBE,
@@ -103,7 +77,9 @@ pub(crate) fn build_prompt(language_token: i64) -> Vec<i64> {
 }
 
 /// Language id chosen by `Auto`, from the first position's logits over the
-/// language-token range.
+/// language-token range. `language_logits` is that range only — the caller
+/// slices it out of the prompt's position-0 row rather than handing over all
+/// 51866 vocabulary logits to have 100 of them read.
 ///
 /// `None` only when there is no usable slice (too few logits, or a non-finite
 /// value in range), in which case the caller's fallback language stands. A
@@ -112,21 +88,33 @@ pub(crate) fn build_prompt(language_token: i64) -> Vec<i64> {
 /// pass to land on `<|en|>`. Rejecting ties outright would leave the fallback
 /// (`<|pl|>`) in charge, and neither answer is better — the transcript gate
 /// decides whether anything is emitted.
-pub(crate) fn detect_language(logits: &[f32]) -> Option<i64> {
-    let slice = logits.get(LANG_TOKEN_FIRST..=LANG_TOKEN_LAST)?;
+pub(crate) fn detect_language(language_logits: &[f32]) -> Option<i64> {
+    let slice = language_logits.get(..LANG_TOKEN_COUNT)?;
     if !slice.iter().all(|v| v.is_finite()) {
         return None;
     }
-    let win = LANG_TOKEN_FIRST + argmax_index(slice);
-    Some(win as i64)
+    Some((LANG_TOKEN_FIRST + argmax_index(slice)) as i64)
 }
 
 /// Mask `token` out of the winning set on the first generated step
-/// (`begin_suppress_tokens`). Applied by setting the logit below every
-/// competing logit rather than by skipping the id, so a step whose argmax is
-/// exactly the suppressed token still lands on the runner-up.
+/// (`begin_suppress_tokens`). The decode does not skip the id outright: it
+/// takes the best logit that is *not* suppressed, so a step whose argmax is
+/// exactly a suppressed token still lands on the runner-up.
 fn is_suppressed(token: usize) -> bool {
     BEGIN_SUPPRESS_TOKENS.contains(&token)
+}
+
+/// The highest-scoring id that is not suppressed, ties going to the lowest id.
+/// `None` when every id is suppressed, in which case the caller keeps its
+/// argmax: there is nothing better to decode.
+fn best_unsuppressed(logits: &[f32]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        if !is_suppressed(i) && best.is_none_or(|b| v > logits[b]) {
+            best = Some(i);
+        }
+    }
+    best
 }
 
 impl WhisperModel {
@@ -144,18 +132,20 @@ impl WhisperModel {
         let decoder_with_past = init_session(dir, "decoder_with_past_model_int8.onnx", threads)?;
 
         let tokenizer_path = dir.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-            WhisperError::Tokenizer(format!("{}: {e}", tokenizer_path.display()))
-        })?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| WhisperError::Tokenizer(format!("{}: {e}", tokenizer_path.display())))?;
         verify_token_ids(&tokenizer)?;
 
+        let frontend = super::frontend::Frontend::new(MelConfig::large_v3_turbo());
+        let features = frontend.feature_buffer();
         Ok(Self {
             encoder,
             decoder,
             decoder_with_past,
             tokenizer,
             language,
-            frontend: super::frontend::Frontend::new(MelConfig::large_v3_turbo()),
+            frontend,
+            features,
         })
     }
 
@@ -171,28 +161,29 @@ impl WhisperModel {
         pcm: &[f32],
         max_tokens: usize,
     ) -> Result<TranscriptionResult, WhisperError> {
-        let mel = self.frontend.extract(pcm)?;
-        let hidden = self.run_encoder(&mel)?;
+        let hidden = self.run_encoder(pcm)?;
 
         // Prompt run. For `--language auto` the language distribution is the
         // first position's logits, which this very call produces, so detection
         // is free unless the fallback guess was wrong — then the prompt is
         // re-run once with what was detected.
         let mut lang_token = self.language.prompt_token();
-        let mut first = self.run_prompt(&hidden, lang_token)?;
+        let mut prompt = self.run_prompt(&hidden, lang_token)?;
         if self.language == Language::Auto {
-            if let Some(detected) = detect_language(&first.first) {
+            if let Some(detected) = detect_language(&prompt.language) {
                 if detected != lang_token {
                     log::debug!("whisper detected language id {detected}, re-running the prompt");
                     lang_token = detected;
-                    first = self.run_prompt(&hidden, lang_token)?;
+                    prompt = self.run_prompt(&hidden, lang_token)?;
                 }
             }
             log::debug!("whisper decoded with language token id {lang_token}");
         }
-        // `first` has served its purpose (language detection); the decode
-        // starts from the last prompt position.
-        let PromptRun { mut cache, next, .. } = first;
+        // The prompt's first position has served its purpose (language
+        // detection); the decode starts from its last position.
+        let PromptRun {
+            mut cache, next, ..
+        } = prompt;
 
         let mut logits = next;
         let mut tokens: Vec<u32> = Vec::new();
@@ -202,31 +193,20 @@ impl WhisperModel {
         // The loop runs at most `max_tokens` steps but issues one *fewer*
         // `decoder_with_past_model` call than that: the last token needs no
         // successor logits, since there is no step left to use them in.
-        let mut step = 0;
-        while step < max_tokens {
+        for step in 0..max_tokens {
             let mut next = argmax_index(&logits);
             if step == 0 && is_suppressed(next) {
                 // The winning id is suppressed on the opening step: take the
-                // best one that is not. Sorting the whole vocab is wasteful
-                // here, but it happens at most once per utterance.
-                let mut ranked: Vec<usize> = (0..logits.len()).collect();
-                ranked.sort_unstable_by(|&a, &b| {
-                    logits[b]
-                        .partial_cmp(&logits[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                next = ranked
-                    .into_iter()
-                    .find(|&i| !is_suppressed(i) && i != next)
-                    .unwrap_or(next);
+                // best one that is not. One pass over the vocabulary, not a
+                // sort of it — this is 51866 ids on the hottest path there is.
+                next = best_unsuppressed(&logits).unwrap_or(next);
             }
             if next as i64 == TOK_EOT {
                 break;
             }
             tokens.push(next as u32);
-            probs.push(token_probability(&logits, next));
-            step += 1;
-            if step >= max_tokens {
+            probs.push(softmax_prob(&logits, next));
+            if step + 1 == max_tokens {
                 // Out of budget with the model still talking.
                 truncated = true;
                 break;
@@ -248,14 +228,18 @@ impl WhisperModel {
         })
     }
 
-    fn run_encoder(&mut self, mel: &ndarray17::Array3<f32>) -> Result<ArrayD<f32>, WhisperError> {
+    /// Log-mel features for the utterance, then the encoder over them.
+    ///
+    /// Both buffers belong to the model, so neither is allocated per utterance.
+    fn run_encoder(&mut self, pcm: &[f32]) -> Result<ArrayD<f32>, WhisperError> {
+        self.frontend.extract(pcm, &mut self.features)?;
         debug_assert!(
-            mel.as_slice().is_some(),
+            self.features.as_slice().is_some(),
             "encoder input must be contiguous"
         );
         log::trace!("running whisper encoder...");
         let outputs = self.encoder.run(inputs![
-            "input_features" => TensorRef::from_array_view(mel.view())?,
+            "input_features" => TensorRef::from_array_view(self.features.view())?,
         ])?;
         encoder_hidden_states(&outputs)
     }
@@ -273,7 +257,7 @@ impl WhisperModel {
     ) -> Result<PromptRun, WhisperError> {
         log::trace!("running whisper prompt decoder...");
         let prompt = build_prompt(language_token);
-        let ids = Array2::from_shape_vec((1, prompt.len()), prompt)?;
+        let ids = Array2::from_shape_vec((1, PROMPT_LEN), prompt.to_vec())?;
         let outputs = self.decoder.run(inputs![
             "input_ids" => TensorRef::from_array_view(ids.view())?,
             "encoder_hidden_states" => TensorRef::from_array_view(hidden.view())?,
@@ -284,21 +268,20 @@ impl WhisperModel {
         // first generated token.
         let logits = outputs
             .get("logits")
-            .ok_or(WhisperError::OutputNotFound("logits".to_string()))?
+            .ok_or_else(|| WhisperError::OutputNotFound("logits".to_string()))?
             .try_extract_array::<f32>()?;
-        let positions = logits.shape()[1];
-        let row = |i: usize| -> Vec<f32> {
-            logits
-                .index_axis(ndarray17::Axis(0), 0)
-                .index_axis(ndarray17::Axis(0), i)
-                .iter()
-                .copied()
-                .collect()
-        };
+        let (flat, vocab) = logits_rows(&logits)?;
+        // A vocabulary too small to hold the language range leaves `language`
+        // empty, and `detect_language` reads that as "no answer" — the
+        // caller's fallback language stands.
+        let language = flat
+            .get(LANG_TOKEN_FIRST..LANG_TOKEN_FIRST + LANG_TOKEN_COUNT)
+            .map(<[f32]>::to_vec)
+            .unwrap_or_default();
         Ok(PromptRun {
             cache,
-            first: row(0),
-            next: row(positions - 1),
+            language,
+            next: flat[flat.len() - vocab..].to_vec(),
         })
     }
 
@@ -315,36 +298,58 @@ impl WhisperModel {
         // (`past_key_values.3.encoder.value` and friends), so `inputs!` — which
         // needs literal names — cannot build this. A named map is the same
         // thing `inputs!` produces.
-        let mut named: Vec<(String, ort::session::SessionInputValue<'_>)> = Vec::with_capacity(17);
-        named.push((
-            "input_ids".to_string(),
-            TensorRef::from_array_view(ids.view())?.into(),
-        ));
+        let mut named: Vec<(&str, ort::session::SessionInputValue<'_>)> = Vec::with_capacity(17);
+        named.push(("input_ids", TensorRef::from_array_view(ids.view())?.into()));
         named.extend(cache.named_inputs());
         let outputs = self.decoder_with_past.run(named)?;
         cache.update_decoder(&outputs)?;
+        // `[1, 1, vocab]` for a single token, so the flat data *is* the row.
         let logits = outputs
             .get("logits")
-            .ok_or(WhisperError::OutputNotFound("logits".to_string()))?
+            .ok_or_else(|| WhisperError::OutputNotFound("logits".to_string()))?
             .try_extract_array::<f32>()?;
-        // `[1, 1, vocab]` for a single token.
-        Ok(logits
-            .index_axis(ndarray17::Axis(0), 0)
-            .index_axis(ndarray17::Axis(0), 0)
-            .iter()
-            .copied()
-            .collect())
+        let (flat, _) = logits_rows(&logits)?;
+        Ok(flat.to_vec())
     }
 }
 
+/// The contiguous data of a `[1, positions, vocab]` logits output, with the
+/// row stride.
+///
+/// `ort` hands back a dense ONNX tensor, so each position's logits are one
+/// contiguous `vocab`-long run and callers can slice rows straight off the flat
+/// data. Both halves are checked rather than assumed: an unexpected rank means
+/// the graph is not the one this engine was written against, and every row
+/// slice would be silently wrong.
+fn logits_rows<'a>(
+    logits: &'a ndarray17::ArrayViewD<'a, f32>,
+) -> Result<(&'a [f32], usize), WhisperError> {
+    let shape = logits.shape();
+    let (_, vocab) = match shape {
+        [1, positions, vocab] if *positions > 0 && *vocab > 0 => (*positions, *vocab),
+        other => {
+            return Err(WhisperError::Logits(format!(
+                "expected [1, positions, vocab], got {other:?}"
+            )))
+        }
+    };
+    let flat = logits
+        .as_slice()
+        .ok_or_else(|| WhisperError::Logits("output is not contiguous".to_string()))?;
+    Ok((flat, vocab))
+}
+
 /// What the prompt run leaves behind: the KV cache to feed the cached steps,
-/// and the two logits rows the decode reads — position 0 (the language
-/// distribution) and the last position (the first generated token).
+/// and the two logits the decode reads — the language range of position 0 and
+/// the whole of the last position.
 ///
 /// Fully owned so the caller can keep using the sessions afterwards.
 struct PromptRun {
     cache: KvCache,
-    first: Vec<f32>,
+    /// Position 0's logits over the language tokens only, which is all
+    /// `detect_language` reads.
+    language: Vec<f32>,
+    /// The last position's full row: the first generated token.
     next: Vec<f32>,
 }
 
@@ -360,37 +365,21 @@ pub struct TranscriptionResult {
 
 /// Per-word confidences from the generated token run, in the same shape the
 /// dictionary gate expects from Parakeet (see
-/// `parakeet_core::helpers::word_confidences`): a word opens on a token that
-/// starts with a space, continues on one that does not, and its confidence is
-/// the weakest token probability among the ones carrying alphanumerics.
+/// `parakeet_core::helpers::word_confidences`).
 ///
 /// Whisper's tokens are byte-level BPE, so "starts with a space" is the
 /// decoded piece starting with `' '` — the same test as the Parakeet path,
-/// reached through the tokenizer instead of a vocab table.
+/// reached through the tokenizer instead of a vocab table. The grouping itself
+/// is `crate::decode::word_confidences`.
 pub fn word_confidences(
     tokenizer: &Tokenizer,
     tokens: &[u32],
     probs: &[f32],
 ) -> Vec<(String, f32)> {
-    let mut words: Vec<(String, f32)> = Vec::new();
-    for (&id, &prob) in tokens.iter().zip(probs) {
+    group_words(tokens.iter().zip(probs).map(|(&id, &prob)| {
         let piece = tokenizer.decode(&[id], false).unwrap_or_default();
-        let opens_word = piece.starts_with(' ');
-        let has_content = piece.chars().any(|c| c.is_alphanumeric());
-        if opens_word || words.is_empty() {
-            words.push((
-                piece.trim_start().to_string(),
-                if has_content { prob } else { 1.0 },
-            ));
-        } else if let Some((text, conf)) = words.last_mut() {
-            text.push_str(&piece);
-            if has_content {
-                *conf = conf.min(prob);
-            }
-        }
-    }
-    words.retain(|(text, _)| text.chars().any(|c| c.is_alphanumeric()));
-    words
+        (Cow::Owned(piece), prob)
+    }))
 }
 
 /// Cross-check the compiled-in prompt token ids against `tokenizer.json`.
@@ -400,11 +389,8 @@ pub fn word_confidences(
 /// that will decode the output turns a silent garbage-in-garbage-out failure
 /// into a load-time error naming both sets.
 fn verify_token_ids(tokenizer: &Tokenizer) -> Result<(), WhisperError> {
-    let lookup = |content: &str| -> Option<i64> {
-        tokenizer
-            .token_to_id(content)
-            .map(|id| id as i64)
-    };
+    let lookup =
+        |content: &str| -> Option<i64> { tokenizer.token_to_id(content).map(|id| id as i64) };
     let t_sot = lookup("<|startoftranscript|>");
     let t_transcribe = lookup("<|transcribe|>");
     let t_notimestamps = lookup("<|notimestamps|>");
@@ -436,6 +422,30 @@ fn verify_token_ids(tokenizer: &Tokenizer) -> Result<(), WhisperError> {
 /// uses (Level3 graph optimization, fixed intra/inter thread counts, no memory
 /// pattern, no parallel execution): the two engines then get the same
 /// treatment, and `--threads` means the same thing for both.
+///
+/// Every knob here was measured, and none of them is worth turning. Against a
+/// 30-token utterance on a 16-core 9950X (median of three, `--threads 16`,
+/// transcripts identical in every case), the session settings moved nothing:
+///
+/// | variant                                   | 30-token | 1-token |
+/// |-------------------------------------------|---------:|--------:|
+/// | this configuration                        |   1306 ms | 1077 ms |
+/// | `with_memory_pattern(true)`               |   1305 ms | 1079 ms |
+/// | `set_denormal_as_zero`                    |   1318 ms | 1078 ms |
+/// | `decoder_with_past` at 1 / 2 / 4 threads  | 1323 / 1305 / 1306 ms | — |
+///
+/// That is what the profile says too: 97 % of inference is inside MLAS kernels
+/// (fp32 GEMM ~50 %, int8 GEMM ~18 %, attention softmax ~9 %), so there is no
+/// allocator, no arena and no sync overhead left to remove. Thread count is the
+/// one knob that does move anything, and it is `--threads`: 4.6 s at 1, 2.5 s at
+/// 2, 1.7 s at 4, 1.38 s at 8, 1.30 s at 16 — near-linear to 8, then flat, so
+/// the default of one thread per physical core is already the right pick.
+///
+/// The one real lever left is the encoder's fixed 30 s window (~1.06 s of the
+/// total, whatever the utterance holds), and the export pins it at
+/// `input_features = [batch, 128, 3000]` — no shorter window can be fed, and
+/// `with_dimension_override` would only lie about a shape the graph's own
+/// reshapes depend on.
 fn init_session(dir: &Path, file: &str, intra_threads: usize) -> Result<Session, WhisperError> {
     let path = dir.join(file);
     if !path.exists() {
@@ -464,15 +474,19 @@ mod tests {
         assert_eq!(TOK_SOT, 50258, "<|startoftranscript|>");
         assert_eq!(TOK_EOT, 50257, "<|endoftext|>");
         assert_eq!(TOK_TRANSCRIBE, 50360, "<|transcribe|>");
-        assert_eq!(super::super::types::TOK_NOTIMESTAMPS, 50364, "<|notimestamps|>");
+        assert_eq!(
+            super::super::types::TOK_NOTIMESTAMPS,
+            50364,
+            "<|notimestamps|>"
+        );
         assert_eq!(super::super::types::TOK_LANG_PL, 50269, "<|pl|>");
         assert_eq!(super::super::types::TOK_LANG_EN, 50259, "<|en|>");
         // Languages run <|en|>..<|yue|> inclusive, and `<|translate|>` (50359)
         // must sit outside the range or auto-detection could pick a task token.
         assert_eq!(LANG_TOKEN_FIRST, 50259);
-        assert_eq!(LANG_TOKEN_LAST, 50358);
-        assert_eq!(LANG_TOKEN_LAST - LANG_TOKEN_FIRST + 1, 100);
-        assert!((LANG_TOKEN_LAST as i64) < TOK_TRANSCRIBE);
+        assert_eq!(super::super::types::LANG_TOKEN_LAST, 50358);
+        assert_eq!(LANG_TOKEN_COUNT, 100);
+        assert!((super::super::types::LANG_TOKEN_LAST as i64) < TOK_TRANSCRIBE);
         assert!(BEGIN_SUPPRESS_TOKENS == [220, 50256]);
     }
 
@@ -480,11 +494,11 @@ mod tests {
     fn prompt_is_sot_lang_task_notimestamps() {
         assert_eq!(
             build_prompt(Language::Polish.prompt_token()),
-            vec![TOK_SOT, 50269, TOK_TRANSCRIBE, 50364]
+            [TOK_SOT, 50269, TOK_TRANSCRIBE, 50364]
         );
         assert_eq!(
             build_prompt(Language::English.prompt_token()),
-            vec![TOK_SOT, 50259, TOK_TRANSCRIBE, 50364]
+            [TOK_SOT, 50259, TOK_TRANSCRIBE, 50364]
         );
         // Auto builds the Polish prompt as a fallback; detection supplies the
         // token id for the re-run.
@@ -494,62 +508,37 @@ mod tests {
         );
         assert_eq!(
             build_prompt(50_259),
-            vec![TOK_SOT, 50_259, TOK_TRANSCRIBE, 50364],
+            [TOK_SOT, 50_259, TOK_TRANSCRIBE, 50364],
             "a detected language id goes in unchanged"
         );
     }
 
-    #[test]
-    fn argmax_picks_the_highest_logit_and_the_lowest_id_on_a_tie() {
-        assert_eq!(argmax_index(&[0.0, 1.0, 2.0]), 2);
-        assert_eq!(argmax_index(&[2.0, 1.0, 2.0]), 0, "ties go to the lowest id");
-        assert_eq!(argmax_index(&[f32::NEG_INFINITY; 4]), 0);
-        assert_eq!(argmax_index(&[]), 0, "empty logits must not panic");
-    }
-
-    #[test]
-    fn token_probability_is_the_softmax_share() {
-        // Two equal logits: each is half the mass.
-        let p = token_probability(&[0.0, 0.0], 0);
-        assert!((p - 0.5).abs() < 1e-6, "p={p}");
-        // A logit 20 above the rest is essentially all the mass.
-        assert!(token_probability(&[20.0, 0.0], 0) > 0.999);
-        assert!(token_probability(&[20.0, 0.0], 1) < 1e-6);
-        // Out of range and empty are 0, not a panic.
-        assert_eq!(token_probability(&[1.0], 5), 0.0);
-        assert_eq!(token_probability(&[], 0), 0.0);
-        // Sum to 1 across the vocab.
-        let logits = [1.0, 2.0, 3.0, 0.5];
-        let total: f32 = (0..logits.len())
-            .map(|i| token_probability(&logits, i))
-            .sum();
-        assert!((total - 1.0).abs() < 1e-5, "total={total}");
-    }
-
+    /// `detect_language` is handed the language range only — 100 ids, not the
+    /// 51866-strong row it is cut from — so the test feeds it exactly that.
     #[test]
     fn language_detection_reads_the_language_token_range_only() {
-        // 51866 logits, with Polish (50269) winning.
-        let mut logits = vec![0.0f32; 51_866];
-        logits[50_269] = 10.0;
-        // Something huge outside the language range must be ignored.
-        logits[40_000] = 100.0;
-        logits[50_360] = 50.0;
-        assert_eq!(detect_language(&logits), Some(50_269));
+        let mut range = vec![0.0f32; LANG_TOKEN_COUNT];
+        range[50_269 - LANG_TOKEN_FIRST] = 10.0;
+        assert_eq!(detect_language(&range), Some(50_269));
         // English wins instead.
-        logits[50_269] = 0.0;
-        logits[50_259] = 10.0;
-        assert_eq!(detect_language(&logits), Some(50_259));
+        range[50_269 - LANG_TOKEN_FIRST] = 0.0;
+        range[50_259 - LANG_TOKEN_FIRST] = 10.0;
+        assert_eq!(detect_language(&range), Some(50_259));
         // A flat distribution is a tie, and `argmax_index` breaks ties toward
         // the lowest id: the first language token wins, and the prompt is not
         // re-run. That is a real outcome for a silent or noise-only window, and
         // falling back to `<|en|>` is the right way to spend one extra pass.
-        let flat = vec![0.0f32; 51_866];
-        assert_eq!(detect_language(&flat), Some(LANG_TOKEN_FIRST as i64));
-        // Short or non-finite logits must not panic or invent a language.
+        assert_eq!(
+            detect_language(&vec![0.0f32; LANG_TOKEN_COUNT]),
+            Some(LANG_TOKEN_FIRST as i64)
+        );
+        // A range too short to be the language block (a vocabulary that does
+        // not hold 100 of them) or a non-finite value inside it must not panic
+        // or invent a language.
         assert_eq!(detect_language(&[]), None);
-        assert_eq!(detect_language(&[0.0; 100]), None);
-        let mut nan = vec![0.0f32; 51_866];
-        nan[50_300] = f32::NAN;
+        assert_eq!(detect_language(&vec![0.0f32; 99]), None);
+        let mut nan = vec![0.0f32; LANG_TOKEN_COUNT];
+        nan[50_300 - LANG_TOKEN_FIRST] = f32::NAN;
         assert_eq!(detect_language(&nan), None);
     }
 
@@ -559,6 +548,26 @@ mod tests {
         assert!(is_suppressed(50_256));
         assert!(!is_suppressed(0));
         assert!(!is_suppressed(50_257), "EOT must never be suppressed");
+    }
+
+    /// The opening step must not open on a suppressed id, and the fallback is
+    /// the best *allowed* one, not merely the second-best overall — so a row
+    /// where both suppressed ids outrank everything must still land on the
+    /// best ordinary token.
+    #[test]
+    fn best_unsuppressed_skips_every_suppressed_id() {
+        let mut vocab = vec![0.0f32; 51_866];
+        vocab[220] = 9.0;
+        vocab[50_256] = 8.0;
+        vocab[4242] = 1.0;
+        assert_eq!(argmax_index(&vocab), 220, "premise: a suppressed id wins");
+        assert_eq!(best_unsuppressed(&vocab), Some(4242));
+        // A flat row breaks the tie toward the lowest unsuppressed id.
+        assert_eq!(best_unsuppressed(&[0.0; 4]), Some(0));
+        // A lone suppressed id leaves the rest of the row as the candidates.
+        assert_eq!(best_unsuppressed(&[0.0, 5.0]), Some(1));
+        // An empty row has nothing to offer; the caller keeps its own argmax.
+        assert_eq!(best_unsuppressed(&[]), None);
     }
 
     /// The downloaded model's own `tokenizer.json`, when present. The word
@@ -665,12 +674,11 @@ mod tests {
         let run = |prob: f32| {
             let words = word_confidences(&tokenizer, &ids, &vec![prob; ids.len()]);
             let map = crate::dictionary::confidence_map(&words);
-            let corrected = crate::dictionary::correct_transcription(
+            crate::dictionary::correct_transcription(
                 "test transkrypcji mowy",
                 &dictionary,
                 Some(&map),
-            );
-            corrected
+            )
         };
         let threshold = crate::dictionary::POSTCORR_CONF_THRESHOLD;
         let confident = run(threshold);
@@ -692,7 +700,6 @@ mod tests {
     /// A decode that emits only punctuation or spaces must produce no words:
     /// the dictionary gate looks words up by name, and an empty or whitespace
     /// entry would never match anything.
-    #[test]
     #[test]
     fn word_confidences_drop_punctuation_only_entries() {
         let Some(tokenizer) = downloaded_tokenizer() else {

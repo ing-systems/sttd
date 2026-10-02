@@ -97,6 +97,7 @@ use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
 mod parakeet_core;
 mod parakeet;
 mod mel;
+mod decode;
 mod whisper;
 mod whisper_core;
 use whisper_core::types::Language;

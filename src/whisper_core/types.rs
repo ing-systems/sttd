@@ -8,7 +8,7 @@
 // graphs rather than assumed.
 // ---------------------------------------------------------------------------
 
-use ndarray17::ArrayD;
+use ndarray17::{Array3, ArrayD};
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
@@ -80,6 +80,10 @@ const TOK_LANG_YUE: i64 = 50358;
 /// slice of the first position's logits.
 pub const LANG_TOKEN_FIRST: usize = TOK_LANG_EN as usize;
 pub const LANG_TOKEN_LAST: usize = TOK_LANG_YUE as usize;
+/// How many ids that range holds, i.e. its width. `--language auto` reads
+/// exactly this many logits out of the prompt's first position, so the rest of
+/// the vocabulary never has to be copied out of the ONNX output.
+pub const LANG_TOKEN_COUNT: usize = LANG_TOKEN_LAST - LANG_TOKEN_FIRST + 1;
 
 /// `begin_suppress_tokens` from the export's `config.json`: ids 220 (`'Ġ'`,
 /// a lone space) and 50256 (`''`, the empty token). Applied to the first
@@ -88,20 +92,17 @@ pub const LANG_TOKEN_LAST: usize = TOK_LANG_YUE as usize;
 pub const BEGIN_SUPPRESS_TOKENS: [usize; 2] = [220, 50256];
 
 #[derive(thiserror::Error, Debug)]
-#[allow(dead_code)]
 pub enum WhisperError {
     #[error("ORT error: {0}")]
     Ort(#[from] ort::Error),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
     #[error("ndarray shape error: {0}")]
     Shape(#[from] ndarray17::ShapeError),
     #[error("audio frontend error: {0}")]
     Frontend(String),
-    #[error("Model input not found: {0}")]
-    InputNotFound(String),
     #[error("Model output not found: {0}")]
     OutputNotFound(String),
+    #[error("whisper logits output is unusable: {0}")]
+    Logits(String),
     #[error("model directory is missing a Whisper file: {0}")]
     MissingAsset(String),
     #[error("tokenizer unavailable: {0}")]
@@ -131,6 +132,51 @@ impl From<ort::Error<ort::session::builder::SessionBuilder>> for WhisperError {
     }
 }
 
+/// The output name a `past_key_values.N.*` input is returned under: the same
+/// string without the `past_` prefix (`present.N.decoder.key`).
+fn present_name(input_name: &str) -> String {
+    input_name.replacen("past_key_values.", "present.", 1)
+}
+
+/// Which half of the cache a slot reads: `Decoder` is self-attention (grows
+/// every step), `Encoder` is cross-attention (fixed after the prompt). The
+/// names are the export's own, so they format straight into an input or output
+/// name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Half {
+    Decoder,
+    Encoder,
+}
+
+impl Half {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Decoder => "decoder",
+            Self::Encoder => "encoder",
+        }
+    }
+}
+
+/// The 16 cache slots as `(layer, half, key_or_value)`, in the order the export
+/// declares them: per layer, decoder key/value then encoder key/value.
+///
+/// The input names and the tensors under them are both derived from this one
+/// list, so a name and its tensor cannot drift apart — the failure mode being a
+/// cross-attention cache fed to a self-attention slot, which the shapes allow
+/// and only the transcript reveals.
+fn input_slots() -> impl Iterator<Item = (usize, Half, &'static str)> {
+    (0..DECODER_LAYERS).flat_map(|layer| {
+        [
+            (Half::Decoder, "key"),
+            (Half::Decoder, "value"),
+            (Half::Encoder, "key"),
+            (Half::Encoder, "value"),
+        ]
+        .into_iter()
+        .map(move |(half, kv)| (layer, half, kv))
+    })
+}
+
 /// Self-attention (grows every step) and cross-attention (fixed after the
 /// prompt) key/value tensors, one pair per decoder layer.
 ///
@@ -141,93 +187,100 @@ impl From<ort::Error<ort::session::builder::SessionBuilder>> for WhisperError {
 /// from `decoder_model` and then handed back unchanged on every step — drop it
 /// and the cached steps have no encoder keys to attend to.
 pub struct KvCache {
-    /// `[1, heads, seq, head_dim]` per layer, self-attention.
-    decoder: Vec<ArrayD<f32>>,
-    /// `[1, heads, encoder_seq, head_dim]` per layer, cross-attention.
-    encoder: Vec<ArrayD<f32>>,
+    /// The 16 cached tensors in `input_slots` order: per layer, decoder
+    /// key/value (self-attention, `[1, heads, seq, head_dim]`) then encoder
+    /// key/value (cross-attention, `[1, heads, encoder_seq, head_dim]`).
+    ///
+    /// One flat list rather than two, because the slot order is what both the
+    /// input names and the tensor lookup are derived from; splitting them into
+    /// a decoder and an encoder vector is what let the two orders drift.
+    tensors: Vec<ArrayD<f32>>,
+    /// The `past_key_values.N.{decoder,encoder}.{key,value}` input names, in
+    /// the same order as `tensors`. Built once at capture: they never change,
+    /// and the cached steps feed them once per token.
+    input_names: Vec<String>,
 }
 
 impl KvCache {
-    /// Capture both halves from a `decoder_model` run's outputs.
-    ///
-    /// Within each half, layers are stored key-then-value: index `2 * layer`
-    /// is the key and `2 * layer + 1` the value, which is the order the export
-    /// declares the inputs in.
+    /// Capture both halves from a `decoder_model` run's outputs, keyed by the
+    /// slots `input_slots` enumerates.
     pub fn capture(outputs: &ort::session::SessionOutputs<'_>) -> Result<Self, WhisperError> {
-        let take = |name: String| -> Result<ArrayD<f32>, WhisperError> {
-            Ok(outputs
-                .get(name.as_str())
-                .ok_or(WhisperError::OutputNotFound(name.clone()))?
-                // The output tensor is owned by the session's output borrow,
-                // so the cache needs its own copy to outlive this call. The
-                // self-attn half is 4 x 20 x seq x 64 floats; the encoder half
-                // (4 x 20 x 1500 x 64) is copied once per utterance and then
-                // reused as read-only input on every step.
-                .try_extract_array::<f32>()?
-                .to_owned())
-        };
-        let mut decoder = Vec::with_capacity(DECODER_LAYERS * 2);
-        let mut encoder = Vec::with_capacity(DECODER_LAYERS * 2);
-        for layer in 0..DECODER_LAYERS {
-            decoder.push(take(format!("present.{layer}.decoder.key"))?);
-            decoder.push(take(format!("present.{layer}.decoder.value"))?);
-            encoder.push(take(format!("present.{layer}.encoder.key"))?);
-            encoder.push(take(format!("present.{layer}.encoder.value"))?);
+        let mut tensors = Vec::with_capacity(DECODER_LAYERS * 4);
+        let mut input_names = Vec::with_capacity(DECODER_LAYERS * 4);
+        for (layer, half, kv) in input_slots() {
+            input_names.push(format!("past_key_values.{layer}.{}.{kv}", half.as_str()));
+            let name = present_name(input_names.last().expect("just pushed"));
+            tensors.push(
+                outputs
+                    .get(name.as_str())
+                    .ok_or(WhisperError::OutputNotFound(name.clone()))?
+                    // The output tensor is owned by the session's output borrow,
+                    // so the cache needs its own copy to outlive this call. The
+                    // self-attn half is 4 x 20 x seq x 64 floats; the encoder
+                    // half (4 x 20 x 1500 x 64) is copied once per utterance and
+                    // then reused as read-only input on every step.
+                    .try_extract_array::<f32>()?
+                    .to_owned(),
+            );
         }
-        Ok(Self { decoder, encoder })
+        debug_assert_eq!(tensors.len(), input_names.len());
+        Ok(Self {
+            tensors,
+            input_names,
+        })
     }
 
-    /// `past_key_values.N.{decoder,encoder}.{key,value}` in the order the
-    /// export declares them: decoder key/value then encoder key/value, layer
-    /// by layer.
+    /// The 16 `past_key_values.N.{decoder,encoder}.{key,value}` inputs, named
+    /// and ordered the way the export declares them: decoder key/value then
+    /// encoder key/value, layer by layer.
     ///
-    /// Returned as `(name, view)` pairs borrowing `self`, so the 16 input
-    /// tensors are views of one cache with no per-step copy.
-    /// The 16 `past_key_values.N.{decoder,encoder}.{key,value}` inputs, in the
-    /// order the export declares them (layer by layer, decoder key/value then
-    /// encoder key/value).
-    ///
-    /// Returned as owned name/value pairs the caller splices into a single
-    /// `SessionInputs`: `ort`'s `inputs!` macro needs its names as literals, so
-    /// 16 dynamically-named tensors cannot go through it.
+    /// Borrowed `(name, view)` pairs over one cache, so the 16 tensors are
+    /// views with no per-step copy, and the names are the ones built once in
+    /// `capture` rather than re-formatted per step. Returned as `&str` pairs
+    /// because `ort` takes `Cow<str>`: `inputs!` cannot build these (it needs
+    /// literal names) but a named map is the same thing `inputs!` produces,
+    /// and `&str` costs no allocation.
     pub fn named_inputs<'a>(
         &'a self,
-    ) -> Vec<(String, ort::session::SessionInputValue<'a>)> {
-        let mut out = Vec::with_capacity(DECODER_LAYERS * 4);
-        for layer in 0..DECODER_LAYERS {
-            for (role, halves) in [("decoder", &self.decoder), ("encoder", &self.encoder)] {
-                for (offset, half) in ["key", "value"].into_iter().enumerate() {
-                    let name = format!("past_key_values.{layer}.{role}.{half}");
-                    // The cache holds tensors ORT itself produced, so a
-                    // failure here would be an ORT bug rather than bad caller
-                    // data; `expect` keeps the hot path free of an error arm.
-                    let view = ort::value::TensorRef::from_array_view(
-                        halves[layer * 2 + offset].view(),
-                    )
-                    .expect("KV cache tensor must be convertible");
-                    out.push((name, view.into()));
-                }
-            }
-        }
-        out
+    ) -> impl Iterator<Item = (&'a str, ort::session::SessionInputValue<'a>)> {
+        self.input_names
+            .iter()
+            .zip(self.views())
+            .map(|(name, view)| {
+                (
+                    name.as_str(),
+                    // The cache holds tensors ORT itself produced, so a failure here
+                    // would be an ORT bug rather than bad caller data; `expect`
+                    // keeps the hot path free of an error arm.
+                    ort::value::TensorRef::from_array_view(view)
+                        .expect("KV cache tensor must be convertible")
+                        .into(),
+                )
+            })
     }
 
-    /// Replace the self-attention half from a `decoder_with_past_model` run,
-    /// leaving the cross-attention half alone (see the type comment).
+    /// Every cached tensor as a view, in slot order.
+    fn views(&self) -> impl Iterator<Item = ndarray17::ArrayViewD<'_, f32>> {
+        self.tensors.iter().map(|t| t.view())
+    }
+
+    /// Replace the self-attention slots from a `decoder_with_past_model` run,
+    /// leaving the cross-attention slots alone (see the type comment).
     pub fn update_decoder(
         &mut self,
         outputs: &ort::session::SessionOutputs<'_>,
     ) -> Result<(), WhisperError> {
-        for layer in 0..DECODER_LAYERS {
-            for (offset, half) in ["key", "value"].into_iter().enumerate() {
-                let name = format!("present.{layer}.decoder.{half}");
-                let value = outputs
-                    .get(name.as_str())
-                    .ok_or(WhisperError::OutputNotFound(name.clone()))?
-                    .try_extract_array::<f32>()?
-                    .to_owned();
-                self.decoder[layer * 2 + offset] = value;
+        for (index, (_, half, _)) in input_slots().enumerate() {
+            if half != Half::Decoder {
+                continue;
             }
+            let name = present_name(&self.input_names[index]);
+            let value = outputs
+                .get(name.as_str())
+                .ok_or(WhisperError::OutputNotFound(name.clone()))?
+                .try_extract_array::<f32>()?
+                .to_owned();
+            self.tensors[index] = value;
         }
         Ok(())
     }
@@ -290,4 +343,59 @@ pub struct WhisperModel {
     /// resolves per utterance from the prompt's first-position logits.
     pub language: Language,
     pub frontend: Frontend,
+    /// The encoder's `[1, n_mels, n_frames]` input, filled by the frontend for
+    /// every utterance and kept for the process's lifetime: the window is
+    /// pinned, so the buffer never changes shape.
+    pub features: Array3<f32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 16 cache input names, in the order `decoder_with_past_model`
+    /// declares them, and the output name each is captured from.
+    ///
+    /// Pinned here because nothing else can: `capture` and `named_inputs` are
+    /// only exercised by a loaded session, and getting the order wrong feeds
+    /// each layer's cross-attention tensors to its self-attention slot — same
+    /// shapes, so no error, just a transcript that quietly falls apart.
+    #[test]
+    fn cache_slots_are_named_and_captured_in_the_export_order() {
+        let slots: Vec<(usize, Half, &str)> = input_slots().collect();
+        assert_eq!(slots.len(), DECODER_LAYERS * 4);
+        let names: Vec<String> = slots
+            .iter()
+            .map(|&(layer, half, kv)| format!("past_key_values.{layer}.{}.{kv}", half.as_str()))
+            .collect();
+        assert_eq!(names[0], "past_key_values.0.decoder.key");
+        assert_eq!(names[1], "past_key_values.0.decoder.value");
+        assert_eq!(names[2], "past_key_values.0.encoder.key");
+        assert_eq!(names[3], "past_key_values.0.encoder.value");
+        assert_eq!(names[15], "past_key_values.3.encoder.value");
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "no slot may repeat: {unique:?}");
+        // Each input is returned under the same name without `past_`, which is
+        // what `capture` reads the prompt's outputs by.
+        for (name, &(layer, half, kv)) in names.iter().zip(&slots) {
+            assert_eq!(
+                present_name(name),
+                format!("present.{layer}.{}.{kv}", half.as_str())
+            );
+        }
+        // Self-attention is the first two slots of every layer, which is what
+        // `update_decoder` walks when it replaces them.
+        assert_eq!(DECODER_LAYERS * 4, slots.len());
+        for layer in 0..DECODER_LAYERS {
+            let base = layer * 4;
+            let halves: Vec<Half> = slots[base..base + 4].iter().map(|s| s.1).collect();
+            assert_eq!(
+                halves,
+                [Half::Decoder, Half::Decoder, Half::Encoder, Half::Encoder],
+                "layer {layer}"
+            );
+        }
+    }
 }

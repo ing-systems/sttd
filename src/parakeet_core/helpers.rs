@@ -9,6 +9,8 @@
 // spellings (`zolc` for `żółć`), not just French.
 // ---------------------------------------------------------------------------
 
+use std::borrow::Cow;
+
 use tokenizers::Tokenizer;
 
 use super::types::TimestampedResult;
@@ -108,24 +110,17 @@ pub fn load_tokenizer(tokenizer_path: Option<&std::path::Path>) -> Option<Tokeni
     }
 }
 
-/// Per-word confidence: the minimum token probability (weakest link), with
-/// punctuation-only tokens excluded from the minimum.
+/// Per-word confidence over `result`'s decoded tokens: the minimum token
+/// probability (weakest link), with punctuation-only tokens excluded from the
+/// minimum. The grouping itself lives in `crate::decode::word_confidences`,
+/// shared with Whisper; the pieces here are Parakeet's vocab strings, where
+/// Whisper's are byte-level BPE pieces.
 pub fn word_confidences(result: &TimestampedResult) -> Vec<(String, f32)> {
-    let mut words: Vec<(String, f32)> = Vec::new();
-    for (token, &prob) in result.tokens.iter().zip(result.probs.iter()) {
-        let has_content = token.chars().any(|c| c.is_alphanumeric());
-        if token.starts_with(' ') || words.is_empty() {
-            words.push((
-                token.trim_start().to_string(),
-                if has_content { prob } else { 1.0 },
-            ));
-        } else if let Some((text, conf)) = words.last_mut() {
-            text.push_str(token);
-            if has_content {
-                *conf = conf.min(prob);
-            }
-        }
-    }
-    words.retain(|(text, _)| text.chars().any(|c| c.is_alphanumeric()));
-    words
+    crate::decode::word_confidences(
+        result
+            .tokens
+            .iter()
+            .zip(result.probs.iter())
+            .map(|(token, &prob)| (Cow::Borrowed(token.as_str()), prob)),
+    )
 }

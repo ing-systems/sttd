@@ -63,8 +63,6 @@ pub struct Frontend {
     fft_scratch: Vec<Complex<f32>>,
     /// Power spectrogram scratch: `[n_fft / 2 + 1, n_frames]`.
     spectrogram: Array2<f32>,
-    /// Feature scratch: `[1, n_mels, n_frames]` in encoder layout.
-    features: Array3<f32>,
 }
 
 impl Frontend {
@@ -76,7 +74,6 @@ impl Frontend {
         let freq_bins = config.n_fft / 2 + 1;
         let window = periodic_hann(config.win_length);
         let frame = vec![0.0; config.n_fft];
-        let features = Array3::zeros((1, config.n_mels, config.n_frames));
         Self {
             config,
             mel_basis,
@@ -87,18 +84,37 @@ impl Frontend {
             padded: Vec::new(),
             frame,
             spectrogram: Array2::zeros((freq_bins, config.n_frames)),
-            features,
         }
     }
 
+    /// The `[1, n_mels, n_frames]` destination `extract` fills: the encoder's
+    /// input shape, which this frontend's window pins for every utterance
+    /// whatever the audio length. Allocate it once and reuse it.
+    pub fn feature_buffer(&self) -> Array3<f32> {
+        Array3::zeros((1, self.config.n_mels, self.config.n_frames))
+    }
+
     /// Raw 16 kHz mono samples -> `[1, 128, 3000]` log-mel features in the
-    /// layout the encoder expects.
+    /// layout the encoder expects, written into `features`.
+    ///
+    /// The destination is the caller's so it survives the call: the engine holds
+    /// one buffer for the process's lifetime, instead of allocating and zeroing
+    /// 1.5 MB of features per utterance to hand ownership over.
     ///
     /// Audio longer than the window is truncated to it and logged: an
     /// utterance is capped at 30 s upstream (`MAX_UTTERANCE_SAMPLES`), so this
     /// only bites when trailing dither padding pushes it over, and what is cut
     /// is pad rather than speech.
-    pub fn extract(&mut self, audio: &[f32]) -> Result<Array3<f32>, WhisperError> {
+    pub fn extract(
+        &mut self,
+        audio: &[f32],
+        features: &mut Array3<f32>,
+    ) -> Result<(), WhisperError> {
+        debug_assert_eq!(
+            features.dim(),
+            (1, self.config.n_mels, self.config.n_frames)
+        );
+        debug_assert!(features.is_standard_layout(), "ort rejects a strided tensor");
         if audio.len() > self.config.n_samples {
             log::debug!(
                 "whisper window is {} samples, truncating {} ({} samples dropped)",
@@ -109,8 +125,8 @@ impl Frontend {
         }
         self.pad_and_reflect(audio);
         self.stft()?;
-        self.log_mel();
-        Ok(std::mem::take(&mut self.features))
+        self.log_mel(features);
+        Ok(())
     }
 
     /// Zero-pad (or truncate) to the window length, then reflect-pad by
@@ -142,48 +158,51 @@ impl Frontend {
 
     /// Power spectrogram of the padded signal into `self.spectrogram`.
     ///
-    /// The centre pad makes this `n_samples / hop + 1` frames — 3001 for the
-    /// 30 s window — of which the last is dropped, exactly as
-    /// `stft[..., :-1]` does in the reference. That is what makes the encoder's
-    /// 3000-frame input line up.
-    fn stft(&mut self) -> Result<usize, WhisperError> {
+    /// The centre pad makes this `n_samples / hop` frames — 3000 for the 30 s
+    /// window, which is exactly the encoder's `input_features` frame count, so
+    /// the buffers are sized once in `new` and never resized.
+    fn stft(&mut self) -> Result<(), WhisperError> {
         let n_fft = self.config.n_fft;
         let hop_length = self.config.hop_length;
         let win_length = self.config.win_length;
-        let num_frames = (self.padded.len() - n_fft) / hop_length;
         let freq_bins = n_fft / 2 + 1;
-        if self.spectrogram.shape() != [freq_bins, num_frames] {
-            self.spectrogram = Array2::zeros((freq_bins, num_frames));
-        }
+        let num_frames = (self.padded.len() - n_fft) / hop_length;
+        debug_assert_eq!(self.spectrogram.shape(), [freq_bins, num_frames]);
+        // Whisper's analysis window fills the FFT buffer exactly (`win_length
+        // == n_fft == 400`) and every frame has `n_fft` samples available, so
+        // there is no unwritten tail to clear and the old
+        // `win_length.min(..)` bound was always `win_length`. A shorter
+        // analysis window would leave one, which is all this flag guards.
+        let needs_tail_clear = win_length < n_fft;
 
-        for frame_idx in 0..num_frames {
+        for (frame_idx, mut column) in self.spectrogram.axis_iter_mut(Axis(1)).enumerate() {
             let start = frame_idx * hop_length;
-            self.frame.fill(0.0);
-            for i in 0..win_length.min(self.padded.len() - start) {
-                self.frame[i] = self.padded[start + i] * self.window[i];
+            if needs_tail_clear {
+                self.frame.fill(0.0);
+            }
+            for (dst, (&sample, &taper)) in self.frame[..win_length]
+                .iter_mut()
+                .zip(self.padded[start..].iter().zip(&self.window))
+            {
+                *dst = sample * taper;
             }
             self.fft_plan
                 .process_with_scratch(&mut self.frame, &mut self.fft_out, &mut self.fft_scratch)
                 .map_err(|e| WhisperError::Frontend(format!("FFT failed: {e}")))?;
-            for k in 0..freq_bins {
-                self.spectrogram[[k, frame_idx]] = self.fft_out[k].norm_sqr();
+            for (bin, value) in column.iter_mut().zip(&self.fft_out) {
+                *bin = value.norm_sqr();
             }
         }
-        Ok(num_frames)
+        Ok(())
     }
 
     /// Mel projection, `log10` with the window-relative clamp, and the affine
-    /// map into the encoder's input range, all into `self.features`.
-    fn log_mel(&mut self) {
-        let num_features = self.config.n_mels;
-        let time_steps = self.spectrogram.shape()[1];
-        if self.features.shape() != [1, num_features, time_steps] {
-            self.features = Array3::zeros((1, num_features, time_steps));
-        }
-        // C <- 1 * mel_basis * spectrogram + 0 * C: writes into the cached
+    /// map into the encoder's input range, all into `features`.
+    fn log_mel(&mut self, features: &mut Array3<f32>) {
+        // C <- 1 * mel_basis * spectrogram + 0 * C: writes into the caller's
         // feature buffer instead of allocating per utterance.
-        let mut features = self.features.view_mut();
-        let mut mel = features.index_axis_mut(Axis(0), 0);
+        let mut view = features.view_mut();
+        let mut mel = view.index_axis_mut(Axis(0), 0);
         general_mat_mul(
             1.0,
             &self.mel_basis.view(),
@@ -194,12 +213,9 @@ impl Frontend {
         // `log_spec.max()` is over the whole window, so a silent utterance
         // scales its own noise floor up to full range rather than collapsing
         // to a constant — the model was trained on windows like this.
-        let peak = self
-            .features
-            .iter()
-            .fold(LOG_FLOOR, |acc, &v| acc.max(v));
+        let peak = features.iter().fold(LOG_FLOOR, |acc, &v| acc.max(v));
         let floor = (peak.max(LOG_FLOOR)).log10() - DYNAMIC_RANGE_DB;
-        for value in self.features.iter_mut() {
+        for value in features.iter_mut() {
             *value = ((*value).max(LOG_FLOOR).log10()).max(floor);
             *value = (*value + LOG_OFFSET) / LOG_SCALE;
         }
@@ -229,6 +245,15 @@ mod tests {
             .collect()
     }
 
+    /// One `extract` into a fresh buffer, which is what the engine does not do
+    /// (it reuses one) but is what these checks want to look at.
+    fn features(audio: &[f32]) -> Array3<f32> {
+        let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
+        let mut out = frontend.feature_buffer();
+        frontend.extract(audio, &mut out).unwrap();
+        out
+    }
+
     /// Straightforward reimplementation of `log_mel_spectrogram` with no
     /// cached buffers and no reuse: pad to the window, reflect-pad, windowed
     /// rFFT, drop the last frame, mel, clamp, scale. The optimized `extract`
@@ -243,9 +268,9 @@ mod tests {
         // own zero padding.
         let mut signal = vec![0.0f32; half + c.n_samples + half];
         signal[half..half + len].copy_from_slice(&audio[..len]);
-        for i in 0..half {
-            let src = c.n_samples - 1 - i;
-            signal[i] = if src < len { audio[src] } else { 0.0 };
+        let left = &mut signal[..half];
+        for (dst, i) in left.iter_mut().zip((c.n_samples - half..c.n_samples).rev()) {
+            *dst = if i < len { audio[i] } else { 0.0 };
         }
         assert_eq!(signal.len(), c.n_samples + 2 * half);
 
@@ -279,7 +304,8 @@ mod tests {
             *v = ((*v).max(LOG_FLOOR).log10()).max(floor);
             *v = (*v + LOG_OFFSET) / LOG_SCALE;
         }
-        Array3::from_shape_vec((1, c.n_mels, mel.shape()[1]), mel.into_raw_vec()).unwrap()
+        Array3::from_shape_vec((1, c.n_mels, mel.shape()[1]), mel.into_raw_vec_and_offset().0)
+            .unwrap()
     }
 
     #[test]
@@ -287,8 +313,7 @@ mod tests {
         // Short enough to exercise zero padding, long enough for real content.
         for len in [8_000, 96_000, 480_000] {
             let audio = tone(len);
-            let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
-            let got = frontend.extract(&audio).unwrap();
+            let got = features(&audio);
             let want = reference(&audio);
             assert_eq!(got.shape(), want.shape(), "len={len}");
             for (g, w) in got.iter().zip(want.iter()) {
@@ -302,9 +327,8 @@ mod tests {
     /// that makes per-utterance cost independent of utterance length.
     #[test]
     fn output_is_always_the_fixed_encoder_window() {
-        let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
         for len in [0, 1_600, 48_000, 480_000, 960_000] {
-            let features = frontend.extract(&tone(len)).unwrap();
+            let features = features(&tone(len));
             assert_eq!(features.shape(), &[1, 128, 3000], "len={len}");
             assert!(
                 features.is_standard_layout(),
@@ -319,8 +343,7 @@ mod tests {
     /// out to hold nothing), and NaN there would poison the encoder.
     #[test]
     fn silence_yields_finite_features() {
-        let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
-        let features = frontend.extract(&[]).unwrap();
+        let features = features(&[]);
         assert_eq!(features.shape(), &[1, 128, 3000]);
         assert!(
             features.iter().all(|v| v.is_finite()),
@@ -334,10 +357,9 @@ mod tests {
     /// range, while pure digital silence sits at the floor.
     #[test]
     fn quiet_audio_is_scaled_relative_to_its_own_maximum() {
-        let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
         let quiet: Vec<f32> = tone(96_000).iter().map(|s| s * 1e-4).collect();
-        let quiet_feats = frontend.extract(&quiet).unwrap();
-        let silence_feats = frontend.extract(&[]).unwrap();
+        let quiet_feats = features(&quiet);
+        let silence_feats = features(&[]);
         let peak = |a: &Array3<f32>| a.iter().copied().fold(f32::MIN, f32::max);
         assert!(
             peak(&quiet_feats) > peak(&silence_feats),
@@ -353,17 +375,21 @@ mod tests {
         }
     }
 
-    /// `extract` hands its buffer out and allocates a fresh one, so a second
-    /// call must not alias the first result.
+    /// `extract` fills the caller's buffer and keeps every other one, so the
+    /// same audio must produce the same features on the second pass — a buffer
+    /// that had to be reallocated or re-zeroed per call would show up here as
+    /// stale values from the utterance in between.
     #[test]
-    fn extract_reuses_buffers_without_aliasing_previous_results() {
+    fn extract_refills_the_callers_buffer_every_call() {
         let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
-        let first = frontend.extract(&tone(96_000)).unwrap();
-        let _second = frontend.extract(&tone(48_000)).unwrap();
-        let third = frontend.extract(&tone(96_000)).unwrap();
-        assert_eq!(first.shape(), third.shape());
-        for (a, c) in first.iter().zip(third.iter()) {
-            assert!((a - c).abs() < 1e-6);
+        let mut out = frontend.feature_buffer();
+        frontend.extract(&tone(96_000), &mut out).unwrap();
+        let first = out.clone();
+        frontend.extract(&tone(48_000), &mut out).unwrap();
+        frontend.extract(&tone(96_000), &mut out).unwrap();
+        assert_eq!(first.shape(), out.shape());
+        for (a, b) in first.iter().zip(out.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}: buffer was not fully rewritten");
         }
     }
 

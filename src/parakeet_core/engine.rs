@@ -29,6 +29,7 @@ use super::frontend::{Frontend, PreprocessorConfig};
 use super::helpers::{load_tokenizer, tokenize_word_to_ids, word_confidences, word_variants};
 use super::transcription_engine::TranscriptionResult;
 use super::types::{DecoderState, ParakeetError, ParakeetModel, TimestampedResult};
+use crate::decode::{argmax_index, softmax_prob};
 
 /// Tokens, frame timestamps and raw-logit probabilities of one decoded
 /// sequence, kept index-aligned by the decode loops.
@@ -137,20 +138,6 @@ fn select_kth_largest(buf: &mut [f32], k: usize) -> &f32 {
 static DECODE_SPACE_RE: Lazy<Result<Regex, regex::Error>> =
     Lazy::new(|| Regex::new(r"\A\s|\s\B|(\s)\b"));
 
-fn softmax_prob(logits: &[f32], token: usize) -> f32 {
-    let target = match logits.get(token) {
-        Some(&l) => l,
-        None => return 0.0,
-    };
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
-    if sum > 0.0 {
-        ((target - max).exp() / sum).clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
-}
-
 /// Encoder output `[1, time, features]` -> decoder layout `[1, features, time]`,
 /// owned and in standard (row-major) layout.
 ///
@@ -167,6 +154,10 @@ fn to_decoder_layout(encoder_output: &ArrayViewD<f32>) -> ArrayD<f32> {
         .into_owned()
 }
 
+/// Index of the maximum value, taking the blank id when the row is empty.
+/// Unlike `crate::decode::argmax_index` this lets the *last* maximum win a
+/// tie: TDT's joint pads its vocabulary with the blank id, so the highest
+/// index is as valid a winner as the lowest.
 fn argmax_token(logits: &[f32], blank_idx: i32) -> i32 {
     logits
         .iter()
@@ -174,19 +165,6 @@ fn argmax_token(logits: &[f32], blank_idx: i32) -> i32 {
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(idx, _)| idx as i32)
         .unwrap_or(blank_idx)
-}
-
-/// Index of the maximum value (first on ties). Returns 0 on an empty slice.
-fn argmax_index(logits: &[f32]) -> usize {
-    let mut best = 0;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best = i;
-        }
-    }
-    best
 }
 
 impl Drop for ParakeetModel {
@@ -512,12 +490,8 @@ impl ParakeetModel {
         // Reshape on the view (free), then take ownership of the two state
         // arrays once. They are 2 x 1 x 640 floats, so this copy is small
         // next to the per-step inference itself.
-        let state1_3d = state1
-            .into_dimensionality::<ndarray17::Ix3>()?
-            .to_owned();
-        let state2_3d = state2
-            .into_dimensionality::<ndarray17::Ix3>()?
-            .to_owned();
+        let state1_3d = state1.into_dimensionality::<ndarray17::Ix3>()?.to_owned();
+        let state2_3d = state2.into_dimensionality::<ndarray17::Ix3>()?.to_owned();
 
         Ok((logits.to_owned(), (state1_3d, state2_3d)))
     }
@@ -870,8 +844,8 @@ mod tests {
 
     #[test]
     fn decoder_layout_keeps_the_encoder_values() {
-        let encoder_output = Array::from_shape_vec((1, 3, 4), (0..12).map(|v| v as f32).collect())
-            .unwrap();
+        let encoder_output =
+            Array::from_shape_vec((1, 3, 4), (0..12).map(|v| v as f32).collect()).unwrap();
         let decoder = to_decoder_layout(&encoder_output.view().into_dyn());
         for t in 0..3 {
             for f in 0..4 {
