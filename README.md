@@ -45,14 +45,15 @@ See `src/main.rs:1-51` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdic
 
 ## Models
 
-Catalog (`src/config.rs:253-277`):
+Catalog (`src/config.rs:285-305`):
 
 | Spec | Size | Contents |
 | --- | --- | --- |
 | `parakeet` (alias for `int8`) | 638 MiB | encoder int8 + decoder_joint int8 + vocab + tokenizer |
 | `parakeet-ultra-int8` | 638 MiB | same as above |
+| `parakeet-redux-int8` | 640 MiB | same as above |
 
-Weights come from `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx` (ONNX weights from its `int8/` folder, `vocab.txt` from the repo root) and `huggingface.co/nvidia/parakeet-tdt-0.6b-v3` (tokenizer only). The ultra export keeps the base architecture and tokenizer, so the Rust mel frontend and dictionary phrase-boosting are unchanged.
+Weights come from `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx` and `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-redux-onnx` (ONNX weights from each repo's `int8/` folder, `vocab.txt` from its repo root) and `huggingface.co/nvidia/parakeet-tdt-0.6b-v3` (tokenizer only). Both exports keep the base architecture and tokenizer, so the Rust mel frontend and dictionary phrase-boosting are unchanged.
 
 Resolution (`src/config.rs:210-221`, `src/model_store.rs`):
 

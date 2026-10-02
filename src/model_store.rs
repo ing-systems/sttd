@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::{
-    parakeet_entry_for_spec, valid_model_specs, DEFAULT_MODELS_DIR, PARAKEET_BASE_URL,
-    PARAKEET_TOKENIZER_URL, PARAKEET_VOCAB_URL,
+    parakeet_entry_for_spec, parakeet_source_for_spec, valid_model_specs, DEFAULT_MODELS_DIR,
+    PARAKEET_TOKENIZER_URL,
 };
 
 /// Which ASR model a resolved `--model` value maps to, and where its
@@ -70,7 +70,9 @@ pub(crate) fn ensure_available(model: &ModelRef) -> Result<()> {
 
 /// Parakeet: downloads any of `assets` missing from `dir`. An empty
 /// `assets` (user-supplied directory) is only validated, never fetched —
-/// see `resolve_model`.
+/// see `resolve_model`. For a catalog entry the directory name equals the
+/// spec, which selects the download source; for a user-supplied directory
+/// `assets` is empty and the spec is never used.
 fn ensure_parakeet_available(dir: &Path, assets: &'static [&'static str]) -> Result<()> {
     if assets.is_empty() {
         if !dir.is_dir() {
@@ -89,12 +91,16 @@ fn ensure_parakeet_available(dir: &Path, assets: &'static [&'static str]) -> Res
         return Ok(());
     }
     std::fs::create_dir_all(dir).with_context(|| install_hint(dir))?;
+    let spec = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     for file in assets {
         let dest = dir.join(file);
         if dest.exists() {
             continue;
         }
-        let url = parakeet_asset_url(file);
+        let url = parakeet_asset_url(&spec, file);
         log::info!("model not found at {}, downloading {url}...", dest.display());
         download(&url, &dest)
             .with_context(|| format!("{file}: {}", install_hint(dir)))?;
@@ -117,20 +123,29 @@ fn install_hint(dir: &Path) -> String {
 }
 
 /// Download URL for one Parakeet asset filename (e.g.
-/// `encoder-model.int8.onnx`). Three sources, because the upstream
-/// repository is not one flat file list: the ONNX weights sit in its `int8/`
-/// folder (`PARAKEET_BASE_URL`), `vocab.txt` at its root
-/// (`PARAKEET_VOCAB_URL`), and `tokenizer.json` is absent from it entirely,
-/// so it comes from the upstream NVIDIA checkpoint
-/// (`PARAKEET_TOKENIZER_URL`).
+/// `encoder-model.int8.onnx`) of catalog `spec`. Three sources per spec,
+/// because the export repository is not one flat file list: the ONNX weights
+/// sit in its `int8/` folder, `vocab.txt` at its root, and `tokenizer.json` is
+/// absent from it entirely, so it comes from the upstream NVIDIA checkpoint
+/// (`PARAKEET_TOKENIZER_URL`, shared by both specs — see
+/// `PARAKEET_SOURCES`).
 ///
 /// The destination is always the flat `<models_dir>/<spec>/<file_name>`, so
 /// the repository layout never leaks into the engine's expectations.
-pub(crate) fn parakeet_asset_url(file_name: &str) -> String {
+///
+/// # Panics
+///
+/// Panics if `spec` has no `PARAKEET_SOURCES` row. Every catalog spec has one
+/// (asserted in `config`'s tests); the empty `assets` path in
+/// `ensure_parakeet_available` — a user-supplied directory whose name need
+/// not be a spec — never reaches this function.
+pub(crate) fn parakeet_asset_url(spec: &str, file_name: &str) -> String {
+    let (root, folder) = parakeet_source_for_spec(spec)
+        .unwrap_or_else(|| panic!("no PARAKEET_SOURCES row for parakeet spec {spec:?}"));
     match file_name {
         "tokenizer.json" => PARAKEET_TOKENIZER_URL.to_string(),
-        "vocab.txt" => format!("{PARAKEET_VOCAB_URL}{file_name}"),
-        _ => format!("{PARAKEET_BASE_URL}{file_name}"),
+        "vocab.txt" => format!("{root}{file_name}"),
+        _ => format!("{root}{folder}{file_name}"),
     }
 }
 
@@ -233,7 +248,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{PARAKEET_BASE_URL, PARAKEET_DEFAULT_SPEC};
+    use crate::config::{PARAKEET_CATALOG, PARAKEET_DEFAULT_SPEC};
 
     #[test]
     fn default_model_is_parakeet() {
@@ -245,9 +260,13 @@ mod tests {
 
     #[test]
     fn parakeet_specs_and_alias_resolve_to_model_dir() {
-        for spec in ["parakeet-ultra-int8", "parakeet"] {
+        for (spec, dir) in [
+            ("parakeet-ultra-int8", "models/parakeet-ultra-int8"),
+            ("parakeet", "models/parakeet-ultra-int8"),
+            ("parakeet-redux-int8", "models/parakeet-redux-int8"),
+        ] {
             let resolved = resolve_model(spec).expect("parakeet spec must resolve");
-            assert_eq!(resolved.dir, PathBuf::from("models/parakeet-ultra-int8"));
+            assert_eq!(resolved.dir, PathBuf::from(dir));
             assert!(resolved.assets.contains(&"vocab.txt"));
             assert!(resolved.assets.iter().any(|f| f.contains("int8")));
         }
@@ -255,41 +274,66 @@ mod tests {
             resolve_model(PARAKEET_DEFAULT_SPEC).expect("default parakeet spec must resolve");
         assert_eq!(resolved.dir, PathBuf::from("models/parakeet-ultra-int8"));
         assert_eq!(resolved.assets.len(), 4);
+        let redux = resolve_model("parakeet-redux-int8").expect("redux spec must resolve");
+        assert_eq!(redux.dir, PathBuf::from("models/parakeet-redux-int8"));
+        assert_eq!(redux.assets.len(), 4);
+        assert_eq!(
+            redux.assets, resolved.assets,
+            "both exports must ship the same asset set"
+        );
     }
 
     #[test]
-    fn parakeet_asset_urls_derive_from_base_url() {
-        // The ONNX weights live in the repository's `int8/` folder.
-        for file in ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx"] {
-            assert_eq!(
-                parakeet_asset_url(file),
-                format!("{PARAKEET_BASE_URL}{file}")
-            );
-            assert!(
-                PARAKEET_BASE_URL.ends_with("/int8/"),
-                "base={PARAKEET_BASE_URL}"
-            );
+    fn parakeet_asset_urls_derive_from_each_spec_source() {
+        // Each export lives in its own repository, and the ONNX weights sit
+        // in that repository's `int8/` folder.
+        let mut encoders = Vec::new();
+        for (spec, _dir, _files, _size) in PARAKEET_CATALOG {
+            let (root, folder) =
+                parakeet_source_for_spec(spec).expect("catalog spec must have a source row");
+            assert_eq!(folder, "int8/", "{spec} folder");
+            for file in ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx"] {
+                let url = parakeet_asset_url(spec, file);
+                assert_eq!(url, format!("{root}{folder}{file}"), "{spec} {file}");
+                let from_own_repo = url.starts_with(root);
+                assert!(from_own_repo, "{spec} url must use its own repo: {url}");
+                assert!(url.contains("/int8/"), "{spec} url missing /int8/: {url}");
+                if file.starts_with("encoder") {
+                    encoders.push(url);
+                }
+            }
         }
+        assert_eq!(encoders.len(), 2, "one encoder URL per catalog spec");
+        assert_ne!(encoders[0], encoders[1], "specs must not share a repo");
     }
 
     #[test]
     fn parakeet_vocab_url_points_at_the_repository_root() {
         // `vocab.txt` sits next to `config.json` at the repo root, not in
-        // `int8/` — so it must not come from `PARAKEET_BASE_URL`.
-        use crate::config::PARAKEET_VOCAB_URL;
-        let url = parakeet_asset_url("vocab.txt");
-        assert_eq!(url, format!("{PARAKEET_VOCAB_URL}vocab.txt"));
-        assert_ne!(url, parakeet_asset_url("encoder-model.int8.onnx"));
-        assert!(
-            !PARAKEET_VOCAB_URL.ends_with("/int8/"),
-            "base={PARAKEET_VOCAB_URL}"
-        );
+        // `int8/` — so it must not come from the weights folder.
+        for (spec, _dir, _files, _size) in PARAKEET_CATALOG {
+            let (root, folder) =
+                parakeet_source_for_spec(spec).expect("catalog spec must have a source row");
+            let url = parakeet_asset_url(spec, "vocab.txt");
+            assert_eq!(url, format!("{root}vocab.txt"), "{spec}");
+            assert!(
+                !url.contains(folder),
+                "{spec} vocab must not be under {folder}: {url}"
+            );
+            assert_ne!(url, parakeet_asset_url(spec, "encoder-model.int8.onnx"));
+        }
     }
 
     #[test]
     fn parakeet_tokenizer_url_points_upstream() {
         use crate::config::PARAKEET_TOKENIZER_URL;
-        assert_eq!(parakeet_asset_url("tokenizer.json"), PARAKEET_TOKENIZER_URL);
+        for (spec, ..) in PARAKEET_CATALOG {
+            assert_eq!(
+                parakeet_asset_url(spec, "tokenizer.json"),
+                PARAKEET_TOKENIZER_URL,
+                "{spec}"
+            );
+        }
         assert!(PARAKEET_TOKENIZER_URL.contains("nvidia/parakeet-tdt-0.6b-v3"));
     }
 
