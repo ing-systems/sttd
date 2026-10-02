@@ -182,7 +182,7 @@ impl std::fmt::Debug for LiveDictionary {
 }
 
 /// Latest-wins hand-off of the open utterance's audio from the capture loop to
-/// the ASR worker, for `--stream` partial transcripts.
+/// the ASR worker, for partial transcripts.
 ///
 /// One slot, not a queue: a partial is stale the moment newer audio exists, so
 /// a model slower than the capture step just skips steps instead of building a
@@ -240,15 +240,12 @@ pub(crate) struct AsrOptions {
     /// Shed oldest-first past `ASR_SHED_KEEP` (microphone mode). File mode
     /// sets false: offline decoding must be lossless.
     pub(crate) shed_stale: bool,
-    /// `--stream`: the engine may use its short-window mode (Whisper) and the
-    /// worker decodes partials from `partials` while the queue is idle.
-    pub(crate) stream: bool,
-    /// `--audio-ctx`: floor of the dynamic Whisper window, in mel frames. Only
-    /// the patched encoder honours it; Parakeet sizes its own window, and a
-    /// fixed (unpatched) Whisper encoder always decodes its full 30 s.
+    /// `--audio-ctx`: floor of the dynamic Whisper window, in mel frames. The
+    /// encoder graph is patched at load, so the window follows the audio;
+    /// Parakeet sizes its own window and ignores this.
     pub(crate) audio_ctx: usize,
     /// Where the capture loop leaves the open utterance for partial decoding.
-    /// Shared with the capture side; empty unless `stream` is on.
+    /// Shared with the capture side.
     pub(crate) partials: PartialSlot,
 }
 
@@ -773,14 +770,9 @@ impl AsrWorker<'_> {
                         return true;
                     }
                     // Idle: decode the open utterance's newest snapshot if one
-                    // is waiting (`--stream`), else nap. Only here, so a closed
-                    // utterance in the queue always goes first.
-                    match self
-                        .opts
-                        .stream
-                        .then(|| self.opts.partials.take())
-                        .flatten()
-                    {
+                    // is waiting, else nap. Only here, so a closed utterance in
+                    // the queue always goes first.
+                    match self.opts.partials.take() {
                         Some(pcm) => self.transcribe_partial(model, &pcm),
                         None => std::thread::sleep(Duration::from_millis(20)),
                     }
@@ -1917,7 +1909,6 @@ mod tests {
             language: crate::whisper_core::types::Language::Polish,
             metrics_path: None,
             shed_stale: false,
-            stream: false,
             audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
             partials: PartialSlot::default(),
             dictionary: empty_live_dictionary(),
@@ -2069,7 +2060,6 @@ mod tests {
     /// `calls` decodes (or 10 s pass), then close the queue and join it.
     /// Returns the worker's final `utterance_no` and its `prev_emit_text`.
     fn run_worker_until(
-        stream: bool,
         queued: Option<Utterance>,
         partial: Option<Vec<f32>>,
         mut model: ScriptedModel,
@@ -2086,7 +2076,6 @@ mod tests {
             language: crate::whisper_core::types::Language::Polish,
             metrics_path: None,
             shed_stale: false,
-            stream,
             audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
             partials: PartialSlot::default(),
             dictionary: empty_live_dictionary(),
@@ -2151,7 +2140,6 @@ mod tests {
     fn a_closed_utterance_goes_before_a_waiting_partial() {
         let (model, inputs) = ScriptedModel::new("dzień dobry");
         let (utterance_no, prev) = run_worker_until(
-            true,
             Some(closed_utterance(8_000)),
             Some(vec![0.1; 20_000]),
             model,
@@ -2177,7 +2165,6 @@ mod tests {
     fn a_partial_alone_is_decoded_but_takes_no_number() {
         let (model, inputs) = ScriptedModel::new("dzień dobry");
         let (utterance_no, prev) = run_worker_until(
-            true,
             None,
             Some(vec![0.1; 16_000]),
             model,
@@ -2188,26 +2175,6 @@ mod tests {
         assert_eq!(inputs.lock().unwrap().len(), 1);
         assert_eq!(utterance_no, 0);
         assert!(prev.is_empty(), "a partial must not feed split-seam dedup");
-    }
-
-    #[test]
-    fn partials_are_ignored_without_stream() {
-        let (model, inputs) = ScriptedModel::new("dzień dobry");
-        run_worker_until(
-            false,
-            None,
-            Some(vec![0.1; 16_000]),
-            model,
-            &inputs,
-            // Nothing is expected, so do not wait for a decode: just give the
-            // loop time to (wrongly) take the partial before the queue closes.
-            0,
-            Duration::from_millis(300),
-        );
-        assert!(
-            inputs.lock().unwrap().is_empty(),
-            "no stream, no partial decode"
-        );
     }
 
     #[test]

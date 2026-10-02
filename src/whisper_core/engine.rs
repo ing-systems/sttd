@@ -133,7 +133,7 @@ impl WhisperModel {
     /// Load the three graphs and the tokenizer from `model_dir` (already
     /// guaranteed to hold them by `model_store::ensure_available`).
     ///
-    /// `dynamic_window` asks for the length-free encoder (`--stream`): the
+    /// `dynamic_window` asks for the length-free encoder (streaming): the
     /// export is patched in memory (see `dyn_encoder`) and the window follows
     /// the audio. If the patch does not apply the fixed export is loaded
     /// instead, with a warning, and `dynamic_window` ends up false.
@@ -493,7 +493,7 @@ fn verify_token_ids(tokenizer: &Tokenizer) -> Result<(), WhisperError> {
 /// total, whatever the utterance holds), and the export pins it at
 /// `input_features = [batch, 128, 3000]` — no shorter window can be fed as it
 /// stands, and `with_dimension_override` would only lie about a shape the
-/// graph's own reshapes depend on. `--stream` pulls that lever by patching the
+/// graph's own reshapes depend on. Streaming pulls that lever by patching the
 /// graph itself (`dyn_encoder`), not by overriding its declared shape.
 fn init_session(dir: &Path, file: &str, intra_threads: usize) -> Result<Session, WhisperError> {
     let path = dir.join(file);

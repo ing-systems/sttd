@@ -294,9 +294,9 @@ fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
 /// at the end, instead of a `drain` per frame (which memmoved the whole
 /// remainder every time).
 ///
-/// With `--stream`, a frame that closed nothing may instead leave a partial
-/// snapshot of the open utterance in `partials` (latest wins), and a close drops
-/// the one waiting: its utterance is now a final in the queue.
+/// A frame that closed nothing may instead leave a partial snapshot of the open
+/// utterance in `partials` (latest wins), and a close drops the one waiting: its
+/// utterance is now a final in the queue.
 fn drain_frames(
     utterance_buffer: &mut Vec<f32>,
     input_frames: usize,
@@ -490,6 +490,14 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // Heavy but pre-capture: resolve/download the model before the stream
     // starts so the callback can't outrun the drain loop.
     let (model, mut asr_tx, asr_rx) = prepare_model(cli)?;
+    match model.kind {
+        EngineKind::Parakeet => log::info!(
+            "streaming: partial transcripts in the log while you speak (Parakeet already sizes its window to the audio)"
+        ),
+        EngineKind::Whisper => log::info!(
+            "streaming: partial transcripts in the log while you speak, encoder window follows the audio"
+        ),
+    }
     let acoustic = AcousticConfig::from_cli(cli);
     let telemetry = StreamTelemetry::default();
 
@@ -559,7 +567,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // Capture is already running above and the drain loop below sheds (counted)
     // while it loads.
     let asr_opts = asr_options(cli, true, live_dict);
-    // The capture loop fills this, the worker drains it (`--stream`).
+    // The capture loop fills this, the worker drains it (partial transcripts).
     let partials = asr_opts.partials.clone();
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
@@ -899,10 +907,13 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     );
 
     let (model, mut asr_tx, asr_rx) = prepare_model(cli)?;
-    if cli.stream {
-        // Offline decoding has no live text to show, so `--stream` only buys
-        // the short encoder window here.
-        log::info!("--stream in file mode: short encoder window only, no partial transcripts");
+    if model.kind == EngineKind::Whisper {
+        // Offline decoding has no live text to show, so streaming buys the
+        // short encoder window here and nothing else.
+        log::info!(
+            "file mode: short encoder window ({} frame floor), no partial transcripts",
+            cli.audio_ctx
+        );
     }
     let mut fp = AcousticConfig::from_cli(cli).make_frame_processor(wav.sample_rate)?;
     let input_frames = fp.required_input_frames();
@@ -986,11 +997,9 @@ fn ignored_model_flags(cli: &Cli, model: &ModelRef) -> Vec<&'static str> {
         // Parakeet auto-detects per utterance, so a fixed language cannot apply.
         flags.push("--language");
     }
-    if cli.audio_ctx != DEFAULT_WINDOW_FRAMES && (model.kind == EngineKind::Parakeet || !cli.stream)
-    {
-        // Parakeet sizes its window itself, and a Whisper encoder that was not
-        // patched (no `--stream`, or a patch that did not apply) always decodes
-        // the export's full 30 s.
+    if cli.audio_ctx != DEFAULT_WINDOW_FRAMES && model.kind == EngineKind::Parakeet {
+        // Parakeet sizes its window itself; a Whisper encoder follows the audio
+        // because the graph is patched when the model loads.
         flags.push("--audio-ctx");
     }
     flags
@@ -1006,16 +1015,6 @@ fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
             model.kind.as_str(),
             ignored.join(", ")
         );
-    }
-    if cli.stream {
-        match model.kind {
-            EngineKind::Parakeet => log::info!(
-                "--stream: partial transcripts in the log (Parakeet already sizes its window to the audio)"
-            ),
-            EngineKind::Whisper => log::info!(
-                "--stream: partial transcripts in the log, encoder window follows the audio"
-            ),
-        }
     }
     match model.kind {
         EngineKind::Parakeet => {
@@ -1042,7 +1041,6 @@ fn asr_options(cli: &Cli, shed_stale: bool, dictionary: crate::asr::LiveDictiona
         language: cli.language,
         metrics_path: cli.metrics.clone(),
         shed_stale,
-        stream: cli.stream,
         audio_ctx: cli.audio_ctx,
         partials: crate::asr::PartialSlot::default(),
         // The live handle, not a `Vec` snapshot: the D-Bus thread swaps the
@@ -1148,8 +1146,6 @@ struct AcousticConfig {
     gate: gate::GateConfig,
     hangover_frames: u32,
     target_rms: f32,
-    /// `--stream`: the frame processor may hand out partial snapshots.
-    stream: bool,
 }
 
 impl AcousticConfig {
@@ -1161,7 +1157,6 @@ impl AcousticConfig {
             gate: gate::GateConfig::new(cli.min_rms, cli.min_density),
             hangover_frames: crate::config::hangover_frames(cli.hangover_ms),
             target_rms: cli.target_rms,
-            stream: cli.stream,
         }
     }
 
@@ -1180,7 +1175,6 @@ impl AcousticConfig {
             self.target_rms,
             crate::config::MAX_GAIN,
         )
-        .map(|fp| fp.with_streaming(self.stream))
     }
 }
 
@@ -1346,24 +1340,19 @@ mod tests {
     }
 
     #[test]
-    fn audio_ctx_is_reported_where_the_window_cannot_follow_the_audio() {
+    fn audio_ctx_is_reported_only_where_the_window_cannot_follow_the_audio() {
         let parakeet = model_ref(EngineKind::Parakeet, "models/parakeet-ultra-int8");
         let whisper = model_ref(EngineKind::Whisper, "models/whisper-large-v3-turbo-int8");
         let cli = Cli::try_parse_from(["sttd", "--audio-ctx", "300"]).expect("must parse");
 
         // Parakeet sizes its own window.
         assert_eq!(ignored_model_flags(&cli, &parakeet), vec!["--audio-ctx"]);
-        // A fixed Whisper encoder (no `--stream`) always decodes 30 s.
-        assert_eq!(ignored_model_flags(&cli, &whisper), vec!["--audio-ctx"]);
+        // Whisper's encoder is patched when the model loads, so the floor applies.
+        assert!(ignored_model_flags(&cli, &whisper).is_empty());
         assert!(validate_model_flags(&cli, &parakeet).is_ok());
 
-        // With `--stream` the encoder is patched, so the floor applies.
-        let streamed =
-            Cli::try_parse_from(["sttd", "--stream", "--audio-ctx", "300"]).expect("must parse");
-        assert!(ignored_model_flags(&streamed, &whisper).is_empty());
-
         // The default is not a setting, so nothing is reported for it.
-        let plain = Cli::try_parse_from(["sttd", "--stream"]).expect("must parse");
+        let plain = Cli::try_parse_from(["sttd"]).expect("must parse");
         assert!(ignored_model_flags(&plain, &whisper).is_empty());
         assert!(ignored_model_flags(&plain, &parakeet).is_empty());
     }
@@ -1401,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn asr_options_carry_stream_and_start_with_an_empty_slot() {
+    fn asr_options_start_with_an_empty_partial_slot() {
         let dictionary = || {
             crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
                 Vec::new(),
@@ -1409,19 +1398,13 @@ mod tests {
             ))
             .1
         };
-        let off = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
-        assert!(!asr_options(&off, true, dictionary()).stream);
-        let on = Cli::try_parse_from(["sttd", "--stream"]).expect("flag must parse");
-        let opts = asr_options(&on, true, dictionary());
-        assert!(opts.stream);
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        let opts = asr_options(&cli, true, dictionary());
         assert!(opts.partials.take().is_none());
         // The capture side holds a clone of the same slot.
         let capture_side = opts.partials.clone();
         capture_side.put(vec![0.0; 4]);
         assert_eq!(opts.partials.take().map(|p| p.len()), Some(4));
-        // And the frame processor is told, from the same flag.
-        assert!(AcousticConfig::from_cli(&on).stream);
-        assert!(!AcousticConfig::from_cli(&off).stream);
     }
 
     #[test]

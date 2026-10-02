@@ -449,8 +449,8 @@ impl UtteranceBuffer {
         }
     }
 
-    /// The open utterance so far, for a partial transcript (`--stream`), or
-    /// `None` when it is not time for one.
+    /// The open utterance so far, for a partial transcript, or `None` when it is
+    /// not time for one.
     ///
     /// Cut like `close` cuts: up to the last speech frame plus the minimum tail,
     /// so a pause inside the utterance does not feed silence to the model, and

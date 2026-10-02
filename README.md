@@ -63,19 +63,19 @@ Whisper weights come from `huggingface.co/onnx-community/whisper-large-v3-turbo`
 
 | | Parakeet-TDT-0.6B-v3 | Whisper large-v3-turbo |
 | --- | --- | --- |
-| Window | grows with the utterance | fixed 30 s; follows the audio (15 s at least, `--audio-ctx`) with `--stream` |
-| Inference cost | scales with speech length | one full encoder pass per utterance, whatever its length (about 2x less with `--stream`) |
+| Window | grows with the utterance | fixed 30 s; follows the audio (15 s at least, `--audio-ctx`) |
+| Inference cost | scales with speech length | one full encoder pass per utterance, whatever its length (about 2x less with the dynamic window) |
 | Language | auto-detects per utterance | `--language` (`pl` default, `en`, `auto`) |
 | Dictionary phrase boosting | yes (logit-level) | no; the post-gate correction still applies |
 | Per-word confidences | yes | yes |
 
-Whisper's encoder takes a **fixed** 30 s window: its `input_features` axes are constants in the ONNX graph, not symbolic. A two-second utterance therefore costs the same encoder pass as a thirty-second one, and `--metrics` reports RTF against that window rather than the utterance. Measured on a 16-core Ryzen 9 9950X, that is ~1.1 s per utterance (rtf 0.04) against Parakeet's 64 ms on the same audio — usable for `--file` work and slow dictation. `--stream` (below) is the way to use it live. The single-graph `decoder_model_merged` is deliberately not used: it re-runs cross-attention over all 1500 encoder frames per generated token, so the prompt decoder plus the cached-token decoder are shipped instead.
+Whisper's encoder takes a **fixed** 30 s window: its `input_features` axes are constants in the ONNX graph, not symbolic. A two-second utterance therefore costs the same encoder pass as a thirty-second one, and `--metrics` reports RTF against that window rather than the utterance. Measured on a 16-core Ryzen 9 9950X, that is ~1.1 s per utterance (rtf 0.04) against Parakeet's 64 ms on the same audio — usable for `--file` work and slow dictation. Live streaming (below) is the way to use it live: it patches the encoder so the window follows the audio. The single-graph `decoder_model_merged` is deliberately not used: it re-runs cross-attention over all 1500 encoder frames per generated token, so the prompt decoder plus the cached-token decoder are shipped instead.
 
-Roughly 97 % of Whisper's inference time is inside ONNX Runtime's own kernels (GEMM, quantized GEMM, attention softmax), and about 80 % of it is the one encoder pass — the exported graph pins that window, so without `--stream` no shorter window can be fed. Each generated token adds ~8 ms on top. ORT session settings were measured against this (memory pattern, denormals-as-zero, fewer threads for the per-token session) and none of them moved the total; see the table on `init_session` in `src/whisper_core/engine.rs`.
+Roughly 97 % of Whisper's inference time is inside ONNX Runtime's own kernels (GEMM, quantized GEMM, attention softmax), and about 80 % of it is the one encoder pass — the exported graph pins that window, so without the in-memory patch no shorter window can be fed. Each generated token adds ~8 ms on top. ORT session settings were measured against this (memory pattern, denormals-as-zero, fewer threads for the per-token session) and none of them moved the total; see the table on `init_session` in `src/whisper_core/engine.rs`.
 
-### Live streaming (`--stream`)
+### Live streaming
 
-`--stream` / `STTD_STREAM` does two things:
+Streaming is always on. It does two things:
 
 1. **Partial transcripts (microphone mode).** While you speak, sttd decodes the still-open utterance about once a second and logs it at `info` level (`utt_000012: partial (3.0 s audio, 303 ms): ...`). The final transcript, the gates, the clipboard and paste are unchanged: only the final reaches them. The worker keeps only the newest snapshot, so a model slower than one step skips steps instead of falling behind, and a closed utterance always goes before a waiting partial (it waits at most one decode). Works with both engines.
 2. **A short Whisper encoder window.** whisper.cpp does this with `audio_ctx`, and so does sttd, as `--audio-ctx`. The exported encoder pins 30 s in two places (128 `Reshape` constants and the 1500-row position table), so sttd patches the graph in memory when it loads (`src/whisper_core/dyn_encoder.rs`; nothing is written to the model directory) and then picks the window per utterance: the audio rounded up to a whole second, plus 1 s, never below the `--audio-ctx` floor (**1500** frames = 15 s by default) and never above 30 s. If the graph does not match what the patch expects, sttd warns and keeps the fixed 30 s window. `--file` gets the short window only (no partials offline).
@@ -84,13 +84,13 @@ Measured on a 16-core Ryzen 9 9950X with three espeak Polish clips (1.4 s, 6 s a
 
 | Encoder window | Per-utterance time | Finals identical to the fixed 30 s run |
 | --- | --- | --- |
-| 30 s (default) | 1.07 - 1.46 s | reference |
-| 15 s (`--stream`) | 0.42 - 0.71 s | 3 of 3 |
+| 30 s (patch failed) | 1.07 - 1.46 s | reference |
+| 15 s (default) | 0.42 - 0.71 s | 3 of 3 |
 | 10 s (tried, not used) | 0.25 - 0.60 s | 1 of 3 (`dziękuję` became `jankruje`) |
 
 A window cut close to the audio is worse than a short one: with no margin a 6 s clip repeated itself and under ~3 s of speech the decode looped, so the floor and the margin are not tuning knobs to shave. With the short window the decode also gets a token budget tied to the audio length (20 + 15 tokens per second, at most 448), which bounds a looping decode.
 
-`--audio-ctx` / `STTD_AUDIO_CTX` moves that floor: it is an even mel-frame count (100 frames = 1 s of 16 kHz audio) in `100..=3000`, and the window is never shorter than it. Lower is cheaper per utterance and worse per word: the 10 s row above is what `--audio-ctx 1000` gives, and `--audio-ctx 100` on a 1.2 s utterance leaves a 3 s window in which the decode loops (the repetition gate then drops the utterance rather than emitting the loop). Whisper only, and only with `--stream`; Parakeet and a fixed 30 s encoder report the flag as ignored.
+`--audio-ctx` / `STTD_AUDIO_CTX` moves that floor: it is an even mel-frame count (100 frames = 1 s of 16 kHz audio) in `100..=3000`, and the window is never shorter than it. Lower is cheaper per utterance and worse per word: the 10 s row above is what `--audio-ctx 1000` gives, and `--audio-ctx 100` on a 1.2 s utterance leaves a 3 s window in which the decode loops (the repetition gate then drops the utterance rather than emitting the loop). Whisper only; Parakeet sizes its own window and reports the flag as ignored.
 
 In a simulated live run (a 24 s file with pauses, streamed through the real VAD and model, 15 s floor) partials came one per second, each 0.41 - 0.69 s to decode, and the three finals matched the fixed-window run. A machine that needs more than a second per decode simply skips steps. Known limit: a partial is cut mid-word, so it can misspell words that the final gets right (`po zągiem` for `pociągiem`).
 
@@ -210,8 +210,7 @@ Key tunables:
 | --- | --- | --- |
 | `--model` / `STTD_MODEL` | `parakeet` | Catalog spec or model directory path. |
 | `--language` / `STTD_LANGUAGE` | `pl` | `pl`, `en`, or `auto` (per-utterance detection). Whisper only; Parakeet auto-detects and warns that the flag is ignored. |
-| `--stream` / `STTD_STREAM` | off | Live mode: partial transcripts in the log while you speak, and (Whisper) an encoder window that follows the audio instead of a fixed 30 s. See *Live streaming*. |
-| `--audio-ctx` / `STTD_AUDIO_CTX` | `1500` | Floor of that window, in mel frames (100 = 1 s), even, `100..=3000`. Whisper with `--stream` only; ignored elsewhere. See *Live streaming*. |
+| `--audio-ctx` / `STTD_AUDIO_CTX` | `1500` | Floor of that window, in mel frames (100 = 1 s), even, `100..=3000`. Whisper only; Parakeet sizes its own window and reports the flag as ignored. See *Live streaming*. |
 | `--device` / `STTD_DEVICE` | unset | Case-insensitive substring match on input device. |
 | `--channel` / `STTD_CHANNEL` | `mix` | `mix`, `auto` (loudest), or channel index `N`. |
 | `--denoiser` / `STTD_DENOISER` | `none` | `none` or `deepfilter` (needs `denoise` feature). VAD branch only. |

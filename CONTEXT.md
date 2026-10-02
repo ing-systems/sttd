@@ -125,11 +125,11 @@ second, never over 30 s and never under a floor of 1500 mel frames = 15 s, which
 _Avoid_: chunk (that is a piece of an utterance, cut by the VAD), clip
 
 **Streaming mode**:
-What `--stream` turns on: **partial transcripts** while an utterance is open and,
-for Whisper, a **padded window** that follows the audio, made possible by
-patching the encoder graph in memory when the model loads. It changes when and how
-fast text appears in the log, never what the final transcript of an utterance goes
-through.
+Always on, with no flag and no off switch: **partial transcripts** while an
+utterance is open and, for Whisper, a **padded window** that follows the audio,
+made possible by patching the encoder graph in memory when the model loads. It
+changes when and how fast text appears in the log, never what the final transcript
+of an utterance goes through.
 _Avoid_: live mode, real-time mode (the whole tool is real-time), sliding window
 (there is no overlap between decodes)
 

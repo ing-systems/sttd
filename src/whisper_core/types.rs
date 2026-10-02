@@ -405,7 +405,7 @@ pub struct WhisperModel {
     pub language: Language,
     /// Owns the encoder's input buffer (see `Frontend::extract`).
     pub frontend: Frontend,
-    /// Whether the encoder is the patched, length-free one (`--stream`, and the
+    /// Whether the encoder is the patched, length-free one (streaming, and the
     /// patch applied), so the window follows the audio. False = the export as
     /// shipped, always the full 30 s window.
     pub dynamic_window: bool,

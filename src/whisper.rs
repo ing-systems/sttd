@@ -12,7 +12,7 @@
 //
 // - the encoder takes a fixed 30 s window, so an utterance's length does not
 //   change the inference cost (~1.2 s per utterance on a 16-core 9950X, against
-//   Parakeet's tens of milliseconds). With `--stream` the encoder is patched in
+//   Parakeet's tens of milliseconds). The encoder is patched in
 //   memory so the window follows the audio (15 s at least by default, set with
 //   `--audio-ctx`; see `whisper_core::types::window_frames`), which cuts a short
 //   utterance to ~0.3 s. Either way `decoded_sample_count` reports the window
@@ -55,7 +55,11 @@ impl WhisperModel {
         let language = opts.language;
         log::info!("loading whisper model ({})...", dir.display());
         let inner = with_loading_ticker("whisper model", || {
-            CoreModel::new(dir, language, intra_threads, opts.stream, opts.audio_ctx)
+            // Streaming always asks for the length-free encoder: the export is
+            // patched in memory (see `dyn_encoder`) and the window follows the
+            // audio. If the patch does not apply the fixed export is loaded
+            // instead, with a warning, and `dynamic_window` ends up false.
+            CoreModel::new(dir, language, intra_threads, true, opts.audio_ctx)
                 .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))
                 .context("failed to load whisper model")
         })?;
@@ -114,7 +118,7 @@ impl SpeechModel for WhisperModel {
     /// The window the encoder ran, not the utterance. The export's encoder
     /// always decodes a fixed 30 s window (its `input_features` shape is
     /// constant), so a 2 s utterance really did cost a full window's encoder
-    /// pass, and RTF should say so. The patched encoder (`--stream`) follows
+    /// pass, and RTF should say so. The patched encoder follows
     /// the audio, and this follows it.
     fn decoded_sample_count(&self, conditioned_len: usize) -> usize {
         self.inner.window_samples(conditioned_len)

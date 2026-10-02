@@ -12,8 +12,8 @@
 //   would re-run cross-attention over all 1500 encoder frames per token.
 // - the encoder takes a *fixed* 30 s window (`input_features` axes 1 and 2
 //   are constants in the graph, not symbolic), so an utterance's length never
-//   changes the encoder cost. `--stream` patches the graph in memory
-//   (`dyn_encoder`) so the window can follow the audio instead.
+//   changes the encoder cost. Streaming patches the graph in memory
+//   (`dyn_encoder`) so the window follows the audio instead.
 // - no phrase boosting. Parakeet's logit-level dictionary boost tree has no
 //   counterpart here; the post-gate dictionary correction in `dictionary`
 //   still applies, and per-word confidences still gate it.

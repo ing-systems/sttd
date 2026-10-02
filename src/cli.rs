@@ -26,6 +26,11 @@ pub(crate) enum PasteMode {
 
 /// Real-time Polish-English speech-to-text.
 ///
+/// Streaming is always on: sttd decodes the open utterance about once a second
+/// and logs the partial text while you speak, and with Whisper the encoder
+/// window follows the audio instead of staying at 30 s (see `--audio-ctx`).
+/// Only the final transcript reaches the gates, the clipboard and the paste.
+///
 /// Precedence for every tunable is: CLI flag > environment variable >
 /// compiled-in default. Env names use the `STTD_*` spellings.
 #[derive(Parser, Debug, Clone)]
@@ -111,30 +116,12 @@ pub(crate) struct Cli {
     )]
     pub(crate) language: Language,
 
-    /// Live-streaming mode. While you speak, sttd decodes the open utterance
-    /// about once a second and logs the partial text (`info`, `partial`); the
-    /// final transcript, gates, clipboard and paste are unchanged. With
-    /// Whisper it also patches the encoder in memory so the window follows the
-    /// audio (15 s at least) instead of always being 30 s: about 2x less
-    /// time per utterance. Microphone mode only for partials; `--file` gets the
-    /// short window alone.
-    #[arg(
-        long,
-        env = "STTD_STREAM",
-        default_value_t = false,
-        value_parser = parse_bool,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        help_heading = "Model"
-    )]
-    pub(crate) stream: bool,
-
     /// Floor of the dynamic Whisper encoder window, in mel frames (100 = 1 s
-    /// of 16 kHz audio). With `--stream` the window is the audio rounded up to
-    /// a whole second plus one more, never under this floor. A lower floor
-    /// costs less per utterance and drifts or loops more; 15 s is the shortest
-    /// window that matched the 30 s transcript on the reference clips.
-    /// Whisper only, and only with `--stream`; Parakeet ignores it.
+    /// of 16 kHz audio). The window is the audio rounded up to a whole second
+    /// plus one more, never under this floor. A lower floor costs less per
+    /// utterance and drifts or loops more; 15 s is the shortest window that
+    /// matched the 30 s transcript on the reference clips. Whisper only;
+    /// Parakeet sizes its own window and ignores it.
     #[arg(
         long,
         env = "STTD_AUDIO_CTX",
@@ -486,7 +473,6 @@ mod tests {
         assert_eq!(cli.vad_threshold, DEFAULT_VAD_THRESHOLD);
         assert_eq!(cli.vad_adapt, DEFAULT_VAD_ADAPT);
         assert!(!cli.copy);
-        assert!(!cli.stream, "streaming is opt-in");
         assert_eq!(
             cli.audio_ctx, DEFAULT_WINDOW_FRAMES,
             "the window floor keeps its 15 s default"
@@ -665,15 +651,6 @@ mod tests {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert!(cli.pid_file_path().ends_with("sttd.pid"));
         assert!(cli.log_file_path().ends_with("sttd.log"));
-    }
-
-    #[test]
-    fn cli_stream_parses_bare_and_with_a_value() {
-        let cli = Cli::try_parse_from(["sttd", "--stream"]).expect("bare flag must parse");
-        assert!(cli.stream);
-        let cli = Cli::try_parse_from(["sttd", "--stream", "off"]).expect("off must parse");
-        assert!(!cli.stream);
-        assert!(Cli::try_parse_from(["sttd", "--stream", "sometimes"]).is_err());
     }
 
     #[test]
