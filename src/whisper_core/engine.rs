@@ -40,8 +40,8 @@ use ort::value::TensorRef;
 use tokenizers::Tokenizer;
 
 use super::types::{
-    window_frames, KvCache, Language, MelConfig, WhisperError, WhisperModel,
-    BEGIN_SUPPRESS_TOKENS, LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
+    window_frames, KvCache, Language, MelConfig, WhisperError, WhisperModel, BEGIN_SUPPRESS_TOKENS,
+    LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
 };
 use crate::decode::{argmax_index, softmax_prob, word_confidences as group_words};
 
@@ -266,7 +266,10 @@ impl WhisperModel {
     /// utterance.
     fn run_encoder(&mut self, pcm: &[f32], n_frames: usize) -> Result<ArrayD<f32>, WhisperError> {
         let features = self.frontend.extract(pcm, n_frames)?;
-        debug_assert!(features.as_slice().is_some(), "encoder input must be contiguous");
+        debug_assert!(
+            features.as_slice().is_some(),
+            "encoder input must be contiguous"
+        );
         log::trace!("running whisper encoder over {n_frames} frames...");
         let outputs = self.encoder.run(inputs![
             "input_features" => TensorRef::from_array_view(features)?,
@@ -566,10 +569,18 @@ mod tests {
     fn token_budget_scales_with_audio_and_respects_the_cap() {
         assert_eq!(token_budget(0, 448), 20);
         assert_eq!(token_budget(16_000, 448), 35);
-        assert_eq!(token_budget(16_001, 448), 50, "a partial second counts whole");
+        assert_eq!(
+            token_budget(16_001, 448),
+            50,
+            "a partial second counts whole"
+        );
         assert_eq!(token_budget(10 * 16_000, 448), 170);
         assert_eq!(token_budget(30 * 16_000, 448), 448, "capped");
-        assert_eq!(token_budget(2 * 16_000, 10), 10, "never above the caller's cap");
+        assert_eq!(
+            token_budget(2 * 16_000, 10),
+            10,
+            "never above the caller's cap"
+        );
     }
 
     #[test]

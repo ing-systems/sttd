@@ -26,8 +26,8 @@
 
 use ndarray17::linalg::general_mat_mul;
 use ndarray17::{Array2, ArrayView3, ArrayViewMut2, Axis};
-use realfft::RealToComplex;
 use realfft::num_complex::Complex;
+use realfft::RealToComplex;
 use std::f32::consts::PI;
 use std::sync::Arc;
 
@@ -72,8 +72,7 @@ pub struct Frontend {
 
 impl Frontend {
     pub fn new(config: MelConfig) -> Self {
-        let mel_basis =
-            create_mel_filterbank(config.n_fft, config.n_mels, config.sampling_rate);
+        let mel_basis = create_mel_filterbank(config.n_fft, config.n_mels, config.sampling_rate);
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let fft_plan = planner.plan_fft_forward(config.n_fft);
         let freq_bins = config.n_fft / 2 + 1;
@@ -319,8 +318,11 @@ mod tests {
             *v = ((*v).max(LOG_FLOOR).log10()).max(floor);
             *v = (*v + LOG_OFFSET) / LOG_SCALE;
         }
-        Array3::from_shape_vec((1, c.n_mels, mel.shape()[1]), mel.into_raw_vec_and_offset().0)
-            .unwrap()
+        Array3::from_shape_vec(
+            (1, c.n_mels, mel.shape()[1]),
+            mel.into_raw_vec_and_offset().0,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -332,7 +334,10 @@ mod tests {
             let want = reference(&audio, 3000);
             assert_eq!(got.shape(), want.shape(), "len={len}");
             for (g, w) in got.iter().zip(want.iter()) {
-                assert!((g - w).abs() < 1e-5, "len={len} feature mismatch: {g} vs {w}");
+                assert!(
+                    (g - w).abs() < 1e-5,
+                    "len={len} feature mismatch: {g} vs {w}"
+                );
             }
         }
     }
@@ -343,7 +348,12 @@ mod tests {
     /// the shorter window only.
     #[test]
     fn extract_matches_the_reference_at_shorter_windows() {
-        for (len, n_frames) in [(8_000, 1000), (96_000, 1000), (96_000, 1500), (160_000, 1000)] {
+        for (len, n_frames) in [
+            (8_000, 1000),
+            (96_000, 1000),
+            (96_000, 1500),
+            (160_000, 1000),
+        ] {
             let audio = tone(len);
             let got = features_in(&audio, n_frames);
             let want = reference(&audio, n_frames);
@@ -420,7 +430,10 @@ mod tests {
         // Both sit inside the affine range the encoder expects.
         for feats in [&quiet_feats, &silence_feats] {
             for v in feats.iter() {
-                assert!((-1.5..=1.0).contains(v), "feature {v} outside the expected range");
+                assert!(
+                    (-1.5..=1.0).contains(v),
+                    "feature {v} outside the expected range"
+                );
             }
         }
     }
@@ -438,7 +451,10 @@ mod tests {
         let again = frontend.extract(&tone(96_000), 1000).unwrap().to_owned();
         assert_eq!(first.shape(), again.shape());
         for (a, b) in first.iter().zip(again.iter()) {
-            assert!((a - b).abs() < 1e-6, "{a} vs {b}: buffer was not fully rewritten");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "{a} vs {b}: buffer was not fully rewritten"
+            );
         }
     }
 

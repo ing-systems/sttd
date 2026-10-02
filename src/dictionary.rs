@@ -565,7 +565,10 @@ mod tests {
 
     #[test]
     fn empty_dictionary_is_noop() {
-        assert_eq!(correct_transcription("Dzien dobry", &[], None), "Dzien dobry");
+        assert_eq!(
+            correct_transcription("Dzien dobry", &[], None),
+            "Dzien dobry"
+        );
     }
 
     #[test]
@@ -603,10 +606,7 @@ mod tests {
             sanitize_entries(["Syntocinon", "syntocinon", "SYNTOCINON"]),
             vec!["Syntocinon".to_string()]
         );
-        assert_eq!(
-            sanitize_entries(["żółć", "zolc"]),
-            vec!["żółć".to_string()]
-        );
+        assert_eq!(sanitize_entries(["żółć", "zolc"]), vec!["żółć".to_string()]);
     }
 
     #[test]

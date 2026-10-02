@@ -19,8 +19,8 @@
 
 use ndarray17::linalg::general_mat_mul;
 use ndarray17::{Array2, Array3, Axis};
-use realfft::RealToComplex;
 use realfft::num_complex::Complex;
+use realfft::RealToComplex;
 use std::f32::consts::PI;
 use std::sync::Arc;
 
@@ -181,11 +181,8 @@ impl Frontend {
         for feat_idx in 0..num_features {
             let mut feature = self.features.index_axis_mut(Axis(1), feat_idx);
             let mean: f32 = feature.iter().sum::<f32>() / num_frames;
-            let variance: f32 = feature
-                .iter()
-                .map(|&x| (x - mean).powi(2))
-                .sum::<f32>()
-                / (num_frames - 1.0);
+            let variance: f32 =
+                feature.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / (num_frames - 1.0);
             let std = variance.sqrt() + 1e-5;
             for value in feature.iter_mut() {
                 *value = (*value - mean) / std;
@@ -264,8 +261,8 @@ mod tests {
         for feat_idx in 0..features {
             let mut column = out.column_mut(feat_idx);
             let mean: f32 = column.iter().sum::<f32>() / frames as f32;
-            let variance: f32 = column.iter().map(|&x| (x - mean).powi(2)).sum::<f32>()
-                / (frames as f32 - 1.0);
+            let variance: f32 =
+                column.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / (frames as f32 - 1.0);
             let std = variance.sqrt() + 1e-5;
             for value in column.iter_mut() {
                 *value = (*value - mean) / std;
@@ -283,10 +280,7 @@ mod tests {
         let want = reference(&audio);
         assert_eq!(got.shape(), want.shape());
         for (g, w) in got.iter().zip(want.iter()) {
-            assert!(
-                (g - w).abs() < 1e-6,
-                "feature mismatch: {g} vs {w}"
-            );
+            assert!((g - w).abs() < 1e-6, "feature mismatch: {g} vs {w}");
         }
     }
 
@@ -339,5 +333,3 @@ mod tests {
         }
     }
 }
-
-

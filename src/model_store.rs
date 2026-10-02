@@ -99,7 +99,10 @@ impl std::fmt::Display for ModelRef {
 pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("empty --model value; expected one of: {}", valid_model_specs());
+        anyhow::bail!(
+            "empty --model value; expected one of: {}",
+            valid_model_specs()
+        );
     }
     if let Some((spec, _, assets, _)) = parakeet_entry_for_spec(trimmed) {
         return Ok(ModelRef {
@@ -114,7 +117,8 @@ pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
             assets,
             kind: EngineKind::Whisper,
         });
-    }    if trimmed.contains('/') || trimmed.contains('\\') {
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
         // A manually-prepared model directory (nothing to download, just
         // validated at load time). Which engine it holds is decided by its
         // files, since the two exports have different names.
@@ -220,9 +224,11 @@ fn ensure_available_for(
             continue;
         }
         let url = asset_url(kind, &spec, file);
-        log::info!("model not found at {}, downloading {url}...", dest.display());
-        download(&url, &dest)
-            .with_context(|| format!("{file}: {}", install_hint(dir)))?;
+        log::info!(
+            "model not found at {}, downloading {url}...",
+            dest.display()
+        );
+        download(&url, &dest).with_context(|| format!("{file}: {}", install_hint(dir)))?;
     }
     Ok(())
 }
@@ -442,7 +448,10 @@ mod tests {
     #[test]
     fn whisper_specs_and_alias_resolve_to_model_dir() {
         for (spec, dir) in [
-            ("whisper-large-v3-turbo-int8", "models/whisper-large-v3-turbo-int8"),
+            (
+                "whisper-large-v3-turbo-int8",
+                "models/whisper-large-v3-turbo-int8",
+            ),
             ("whisper", "models/whisper-large-v3-turbo-int8"),
         ] {
             let resolved = resolve_model(spec).expect("whisper spec must resolve");
@@ -452,7 +461,10 @@ mod tests {
         }
         let resolved =
             resolve_model(WHISPER_DEFAULT_SPEC).expect("default whisper spec must resolve");
-        assert_eq!(resolved.dir, PathBuf::from("models/whisper-large-v3-turbo-int8"));
+        assert_eq!(
+            resolved.dir,
+            PathBuf::from("models/whisper-large-v3-turbo-int8")
+        );
         assert_eq!(resolved.kind, EngineKind::Whisper);
         for graph in [
             "encoder_model_int8.onnx",
@@ -636,7 +648,10 @@ mod tests {
     #[test]
     fn nonexistent_directory_path_is_rejected() {
         let err = resolve_model("models/does-not-exist-dir/model").expect_err("must reject");
-        assert!(err.to_string().contains("not an existing model directory"), "msg={err}");
+        assert!(
+            err.to_string().contains("not an existing model directory"),
+            "msg={err}"
+        );
     }
 
     #[test]

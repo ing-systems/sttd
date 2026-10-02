@@ -74,11 +74,7 @@ impl WhisperModel {
 }
 
 impl SpeechModel for WhisperModel {
-    fn transcribe(
-        &mut self,
-        pcm_16k: &[f32],
-        running: &Arc<AtomicBool>,
-    ) -> Result<Transcript> {
+    fn transcribe(&mut self, pcm_16k: &[f32], running: &Arc<AtomicBool>) -> Result<Transcript> {
         // Same reasoning as the Parakeet path: `ort` has no abort callback and
         // one inference is seconds, not minutes, so a pre-call check is enough.
         if !running.load(Ordering::Relaxed) {
@@ -161,7 +157,11 @@ mod tests {
     fn language_prompt_tokens_are_the_exported_ones() {
         assert_eq!(Language::Polish.prompt_token(), TOK_LANG_PL);
         assert_eq!(Language::English.prompt_token(), TOK_LANG_EN);
-        assert_eq!(Language::Auto.prompt_token(), TOK_LANG_PL, "auto falls back to pl");
+        assert_eq!(
+            Language::Auto.prompt_token(),
+            TOK_LANG_PL,
+            "auto falls back to pl"
+        );
         assert_eq!(Language::Polish.as_str(), "pl");
         assert_eq!(Language::English.as_str(), "en");
         assert_eq!(Language::Auto.as_str(), "auto");

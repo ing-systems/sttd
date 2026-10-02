@@ -100,7 +100,10 @@ impl GateConfig {
 /// Why an utterance never reached the model.
 #[derive(PartialEq, Debug)]
 pub(crate) enum AcousticDrop {
-    TooFewFrames { speech_frames: u32, samples: usize },
+    TooFewFrames {
+        speech_frames: u32,
+        samples: usize,
+    },
     LowDensity {
         speech_frames: u32,
         total_frames: u32,
@@ -121,7 +124,9 @@ impl AcousticDrop {
             Self::TooFewFrames {
                 speech_frames,
                 samples,
-            } => format!("[sttd] dropping utterance ({speech_frames} speech frames, {samples} samples)"),
+            } => format!(
+                "[sttd] dropping utterance ({speech_frames} speech frames, {samples} samples)"
+            ),
             Self::LowDensity {
                 speech_frames,
                 total_frames,
@@ -337,9 +342,7 @@ pub(crate) fn is_hallucination(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, MIN_SPEECH_FRAMES,
-    };
+    use crate::config::{DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, MIN_SPEECH_FRAMES};
 
     fn default_gate() -> GateConfig {
         GateConfig::new(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY)
@@ -437,9 +440,18 @@ mod tests {
     fn acoustic_exempts_long_utterances_from_density() {
         let gate = GateConfig::new(DEFAULT_MIN_SPEECH_RMS, 1.0);
         assert!(gate
-            .check_acoustic(25, 0.08, 0.3, DENSITY_LONG_EXEMPT_SAMPLES + 2_000, 300, 60_000)
+            .check_acoustic(
+                25,
+                0.08,
+                0.3,
+                DENSITY_LONG_EXEMPT_SAMPLES + 2_000,
+                300,
+                60_000
+            )
             .is_ok());
-        assert!(gate.check_acoustic(25, 0.08, 0.3, 20_000, 125, 20_000).is_err());
+        assert!(gate
+            .check_acoustic(25, 0.08, 0.3, 20_000, 125, 20_000)
+            .is_err());
     }
 
     #[test]
@@ -455,19 +467,24 @@ mod tests {
         let v = gate.decide_transcript("Wszelkie prawa zastrzeżone.");
         assert!(matches!(
             v,
-            TranscriptVerdict::Drop { kind: TranscriptDropKind::Hallucination, .. }
+            TranscriptVerdict::Drop {
+                kind: TranscriptDropKind::Hallucination,
+                ..
+            }
         ));
     }
 
     #[test]
     fn transcript_composition_repetition_loop_caught() {
         let gate = default_gate();
-        let v = gate.decide_transcript(
-            "Współpraca w Współpraca w Współpraca w Współpraca w Współpraca.",
-        );
+        let v = gate
+            .decide_transcript("Współpraca w Współpraca w Współpraca w Współpraca w Współpraca.");
         assert!(matches!(
             v,
-            TranscriptVerdict::Drop { kind: TranscriptDropKind::Repetition, .. }
+            TranscriptVerdict::Drop {
+                kind: TranscriptDropKind::Repetition,
+                ..
+            }
         ));
     }
 

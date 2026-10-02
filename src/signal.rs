@@ -20,12 +20,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::config::{FRAME_16K, SAMPLE_RATE};
 #[cfg(feature = "denoise")]
 use crate::config::{DENOISE_RATE, FRAME_48K};
-use crate::denoise::DenoiserKind;
+use crate::config::{FRAME_16K, SAMPLE_RATE};
 #[cfg(feature = "denoise")]
 use crate::denoise::Denoiser;
+use crate::denoise::DenoiserKind;
 use crate::dsp::FirStream;
 use crate::hp::Hp;
 
@@ -130,15 +130,18 @@ impl SignalPath {
                 let resampler = FirStream::new(hw_rate, SAMPLE_RATE, FRAME_16K)
                     .with_context(|| format!("failed to create resampler (hw -> {SAMPLE_RATE})"))?;
                 log::info!("denoiser: none");
-                VadPath::Direct { resampler, hp: Hp::new() }
+                VadPath::Direct {
+                    resampler,
+                    hp: Hp::new(),
+                }
             }
             #[cfg(feature = "denoise")]
             DenoiserKind::DeepFilter => {
                 let resampler_hw48 = FirStream::new(hw_rate, DENOISE_RATE, FRAME_48K)
-                    .with_context(|| format!("failed to create resampler (hw -> {DENOISE_RATE})"))?;
-                log::info!(
-                    "resampler: {hw_rate} -> {DENOISE_RATE} (fir, frame_out={FRAME_48K})"
-                );
+                    .with_context(|| {
+                        format!("failed to create resampler (hw -> {DENOISE_RATE})")
+                    })?;
+                log::info!("resampler: {hw_rate} -> {DENOISE_RATE} (fir, frame_out={FRAME_48K})");
 
                 let resampler_vad = FirStream::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K)
                     .context("failed to create resampler (48k -> 16k, vad branch)")?;

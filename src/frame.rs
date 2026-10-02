@@ -286,12 +286,21 @@ mod tests {
         // NoiseTracker at the default 0.001 floor), so the warm floor must
         // be carried across explicitly rather than assumed preserved.
         let mut fp = processor();
-        assert!((fp.noise_floor() - 0.001).abs() < 1e-6, "fresh floor default");
+        assert!(
+            (fp.noise_floor() - 0.001).abs() < 1e-6,
+            "fresh floor default"
+        );
         fp.adopt_noise_floor(0.02);
-        assert!((fp.noise_floor() - 0.02).abs() < 1e-6, "adopted floor must read back");
+        assert!(
+            (fp.noise_floor() - 0.02).abs() < 1e-6,
+            "adopted floor must read back"
+        );
 
         let mut rebuilt = processor();
-        assert!((rebuilt.noise_floor() - 0.001).abs() < 1e-6, "new instance starts cold");
+        assert!(
+            (rebuilt.noise_floor() - 0.001).abs() < 1e-6,
+            "new instance starts cold"
+        );
         rebuilt.adopt_noise_floor(fp.noise_floor());
         assert!(
             (rebuilt.noise_floor() - 0.02).abs() < 1e-6,

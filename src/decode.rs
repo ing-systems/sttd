@@ -92,7 +92,11 @@ mod tests {
     #[test]
     fn argmax_picks_the_highest_logit_and_the_lowest_id_on_a_tie() {
         assert_eq!(argmax_index(&[0.0, 1.0, 2.0]), 2);
-        assert_eq!(argmax_index(&[2.0, 1.0, 2.0]), 0, "ties go to the lowest id");
+        assert_eq!(
+            argmax_index(&[2.0, 1.0, 2.0]),
+            0,
+            "ties go to the lowest id"
+        );
         assert_eq!(argmax_index(&[f32::NEG_INFINITY; 4]), 0);
         assert_eq!(argmax_index(&[]), 0, "empty logits must not panic");
     }
@@ -110,9 +114,7 @@ mod tests {
         assert_eq!(softmax_prob(&[], 0), 0.0);
         // Sum to 1 across the vocab.
         let logits = [1.0, 2.0, 3.0, 0.5];
-        let total: f32 = (0..logits.len())
-            .map(|i| softmax_prob(&logits, i))
-            .sum();
+        let total: f32 = (0..logits.len()).map(|i| softmax_prob(&logits, i)).sum();
         assert!((total - 1.0).abs() < 1e-5, "total={total}");
     }
 
@@ -168,10 +170,7 @@ mod tests {
         let got = word_confidences(pieces(&[("Dzień", 0.9), (" dobry", 0.4)]).into_iter());
         assert_eq!(
             got,
-            vec![
-                ("Dzień".to_string(), 0.9),
-                ("dobry".to_string(), 0.4),
-            ]
+            vec![("Dzień".to_string(), 0.9), ("dobry".to_string(), 0.4),]
         );
     }
 }

@@ -7,7 +7,7 @@
 // 16 kHz branch with its own state (denoised vs raw must never share a delay
 // line). Replaces the old 60 Hz one-poles in `vad` + `condition_utterance`.
 
-use biquad::{Biquad, Coefficients, DirectForm2Transposed, Q_BUTTERWORTH_F32, Type};
+use biquad::{Biquad, Coefficients, DirectForm2Transposed, Type, Q_BUTTERWORTH_F32};
 
 /// High-pass cutoff (Hz). Removes mains hum/rumble/plosive wind while keeping
 /// Polish speech intact (male F0 ~85 Hz+).

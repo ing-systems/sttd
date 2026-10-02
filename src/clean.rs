@@ -18,8 +18,8 @@
 /// default: the list is stripped whatever the language, so it can delete
 /// real words (Murmure hit German `um` the same way).
 static FILLER_WORDS: &[&str] = &[
-    "yyy", "yyyy", "eee", "euh", "hmm", "hm", "mmm", "uh", "um", "uhm", "umm", "uhh", "uhhh",
-    "eh", "ehh", "ehm", "ah", "ha", "mm", "mh", "mm-hmm",
+    "yyy", "yyyy", "eee", "euh", "hmm", "hm", "mmm", "uh", "um", "uhm", "umm", "uhh", "uhhh", "eh",
+    "ehh", "ehm", "ah", "ha", "mm", "mh", "mm-hmm",
 ];
 
 fn is_filler(word: &str) -> bool {

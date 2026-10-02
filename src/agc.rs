@@ -267,7 +267,11 @@ mod tests {
         let mut model = vec![0.01f32; FRAME_16K];
         let rms = agc.process_pair(&mut vad, &mut model, false); // prev_speech=false
         assert!((rms - 0.01).abs() < 1e-4, "got {rms}");
-        assert_eq!(model, vec![0.01f32; FRAME_16K], "gated-off frame must pass through untouched");
+        assert_eq!(
+            model,
+            vec![0.01f32; FRAME_16K],
+            "gated-off frame must pass through untouched"
+        );
 
         let mut agc_off = Agc::new(0.0, 8.0); // target <= 0 disables entirely
         let mut vad2 = vec![0.01f32; FRAME_16K];

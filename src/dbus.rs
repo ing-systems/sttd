@@ -137,7 +137,10 @@ impl DictionaryState {
             source: Arc::new(RwLock::new(source)),
             dirty: Arc::new(AtomicBool::new(false)),
             on_words_swapped: Arc::new(|words| {
-                log::debug!("dictionary: {} word(s) swapped (no booster attached)", words.len());
+                log::debug!(
+                    "dictionary: {} word(s) swapped (no booster attached)",
+                    words.len()
+                );
             }),
         }
     }
@@ -177,7 +180,9 @@ impl DictionaryState {
     /// unchanged, so the result counts as dirty: the server cannot know that a
     /// caller-supplied list matches the file. Returns the new count.
     pub(crate) fn replace_words(&self, words: Vec<String>) -> u32 {
-        self.swap(crate::dictionary::sanitize_entries(words.iter().map(String::as_str)));
+        self.swap(crate::dictionary::sanitize_entries(
+            words.iter().map(String::as_str),
+        ));
         self.mark_dirty(true);
         self.count()
     }
@@ -284,7 +289,10 @@ impl Daemon {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         self.state.set_paused(true);
-        emitter.state_changed(true).await.map_err(zbus::fdo::Error::ZBus)
+        emitter
+            .state_changed(true)
+            .await
+            .map_err(zbus::fdo::Error::ZBus)
     }
 
     /// Resume transcription. Idempotent. With `--autopause` the ASR lane arms
@@ -294,7 +302,10 @@ impl Daemon {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         self.state.set_paused(false);
-        emitter.state_changed(false).await.map_err(zbus::fdo::Error::ZBus)
+        emitter
+            .state_changed(false)
+            .await
+            .map_err(zbus::fdo::Error::ZBus)
     }
 
     /// Flip the pause state and return the new value.
@@ -315,10 +326,7 @@ impl Daemon {
 
     /// Pause state transition, from D-Bus calls and from signal handlers.
     #[zbus(signal)]
-    async fn state_changed(
-        signal_emitter: &SignalEmitter<'_>,
-        paused: bool,
-    ) -> zbus::Result<()>;
+    async fn state_changed(signal_emitter: &SignalEmitter<'_>, paused: bool) -> zbus::Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +501,10 @@ pub(crate) fn spawn(paused: PauseState, dictionary: DictionaryState) {
                 Err(e) => {
                     let wait = BACKOFF[attempt.min(BACKOFF.len() - 1)];
                     attempt += 1;
-                    log::warn!("dbus: {e}; retrying in {}s (signals unaffected)", wait.as_secs());
+                    log::warn!(
+                        "dbus: {e}; retrying in {}s (signals unaffected)",
+                        wait.as_secs()
+                    );
                     thread::sleep(wait);
                 }
             }
@@ -566,10 +577,8 @@ mod tests {
     /// A dictionary file in the test temp dir, per the `wav.rs` fixture
     /// pattern. The caller removes it.
     fn write_temp_dictionary(name: &str, body: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "sttd-dbus-test-{}-{name}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("sttd-dbus-test-{}-{name}", std::process::id()));
         std::fs::write(&path, body).expect("temp dictionary must be writable");
         path
     }
@@ -596,7 +605,10 @@ mod tests {
         let state = pause_state();
         let flag = state.paused_flag();
         state.set_paused(true);
-        assert!(flag.load(Ordering::Acquire), "the poller must see the change");
+        assert!(
+            flag.load(Ordering::Acquire),
+            "the poller must see the change"
+        );
     }
 
     #[test]
@@ -621,11 +633,14 @@ mod tests {
     fn words_hook_runs_after_the_swap() {
         let seen: Arc<RwLock<Option<Arc<Vec<String>>>>> = Arc::new(RwLock::new(None));
         let sink = Arc::clone(&seen);
-        let state =
-            dictionary_with(&[]).with_words_hook(Arc::new(move |words| *lock_write(&sink) = Some(words)));
+        let state = dictionary_with(&[])
+            .with_words_hook(Arc::new(move |words| *lock_write(&sink) = Some(words)));
         state.replace_words(vec!["Parakeet".to_string()]);
         // The hook observes the already-swapped list.
-        assert_eq!(*lock_read(&seen), Some(Arc::new(vec!["Parakeet".to_string()])));
+        assert_eq!(
+            *lock_read(&seen),
+            Some(Arc::new(vec!["Parakeet".to_string()]))
+        );
     }
 
     #[test]
@@ -711,7 +726,10 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(state.source(), path);
         assert!(!state.is_dirty(), "the list now matches the source");
-        assert_eq!(*state.words(), vec!["AppImage".to_string(), "Syntocinon".to_string()]);
+        assert_eq!(
+            *state.words(),
+            vec!["AppImage".to_string(), "Syntocinon".to_string()]
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -845,7 +863,10 @@ mod tests {
         let daemon_xml = introspect(&conn, DAEMON_PATH);
         assert!(daemon_xml.contains(DAEMON_INTERFACE), "{daemon_xml}");
         for member in ["Pause", "Resume", "Toggle", "Paused", "StateChanged"] {
-            assert!(daemon_xml.contains(member), "pause interface missing {member}");
+            assert!(
+                daemon_xml.contains(member),
+                "pause interface missing {member}"
+            );
         }
         // The dictionary members moved off this interface.
         for gone in ["ReloadDictionary", "SetWords", "GetDictionary"] {
@@ -868,13 +889,19 @@ mod tests {
             "Dirty",
             "DictionaryChanged",
         ] {
-            assert!(dict_xml.contains(member), "dictionary interface missing {member}");
+            assert!(
+                dict_xml.contains(member),
+                "dictionary interface missing {member}"
+            );
         }
 
         // -- pause: the bus call flips the flag the lane polls -------------
-        let reply = call(&conn, DAEMON_PATH, DAEMON_INTERFACE, "Toggle", &())
-            .expect("Toggle must succeed");
-        assert!(reply.body().deserialize::<bool>().expect("Toggle returns b"));
+        let reply =
+            call(&conn, DAEMON_PATH, DAEMON_INTERFACE, "Toggle", &()).expect("Toggle must succeed");
+        assert!(reply
+            .body()
+            .deserialize::<bool>()
+            .expect("Toggle returns b"));
         let paused_reply = conn
             .call_method(
                 Some(SERVICE_NAME),
@@ -910,13 +937,19 @@ mod tests {
         let reply = call(&conn, DICT_PATH, DICT_INTERFACE, "Contains", &("appimage",))
             .expect("Contains must succeed");
         assert!(
-            reply.body().deserialize::<bool>().expect("Contains returns b"),
+            reply
+                .body()
+                .deserialize::<bool>()
+                .expect("Contains returns b"),
             "Contains must match case-insensitively"
         );
         let reply = call(&conn, DICT_PATH, DICT_INTERFACE, "Contains", &("absent",))
             .expect("Contains must succeed");
         assert!(
-            !reply.body().deserialize::<bool>().expect("Contains returns b"),
+            !reply
+                .body()
+                .deserialize::<bool>()
+                .expect("Contains returns b"),
             "Contains must reject an absent word"
         );
 
@@ -936,13 +969,16 @@ mod tests {
         assert_eq!(message, "empty path");
 
         // GetWords reports the four documented fields.
-        let reply = call(&conn, DICT_PATH, DICT_INTERFACE, "GetWords", &())
-            .expect("GetWords must succeed");
+        let reply =
+            call(&conn, DICT_PATH, DICT_INTERFACE, "GetWords", &()).expect("GetWords must succeed");
         let (words, path, count, dirty) = reply
             .body()
             .deserialize::<(Vec<String>, String, u32, bool)>()
             .expect("GetWords returns (as, s, u, b)");
-        assert_eq!(words, vec!["AppImage".to_string(), "Syntocinon".to_string()]);
+        assert_eq!(
+            words,
+            vec!["AppImage".to_string(), "Syntocinon".to_string()]
+        );
         assert_eq!(path, "", "no source was configured");
         assert_eq!(count, 2);
         assert!(dirty);
@@ -977,17 +1013,19 @@ mod tests {
             1,
             "an entry with a digit is rejected"
         );
-        assert!(!conn
-            .call_method(
-                Some(SERVICE_NAME),
-                DICT_PATH,
-                Some(DICT_INTERFACE),
-                "Contains",
-                &("Syntocinon",),
-            )
-            .map(|reply| reply.body().deserialize::<bool>().unwrap_or(false))
-            .unwrap_or(false),
-            "ReplaceWords must drop the old list");
+        assert!(
+            !conn
+                .call_method(
+                    Some(SERVICE_NAME),
+                    DICT_PATH,
+                    Some(DICT_INTERFACE),
+                    "Contains",
+                    &("Syntocinon",),
+                )
+                .map(|reply| reply.body().deserialize::<bool>().unwrap_or(false))
+                .unwrap_or(false),
+            "ReplaceWords must drop the old list"
+        );
 
         // The moved member is gone from the pause interface at runtime.
         assert!(

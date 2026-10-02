@@ -4,9 +4,9 @@ use clap::Parser;
 
 use crate::config::{
     parse_bool, parse_fraction, parse_hangover_ms, parse_linear_rms, parse_threads,
-    DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_HANGOVER_MS,
-    DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS,
-    DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
+    DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_HANGOVER_MS, DEFAULT_MIN_DENSITY,
+    DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS, DEFAULT_USE_GPU,
+    DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
@@ -75,7 +75,12 @@ pub(crate) struct Cli {
     /// Custom vocabulary file for post-gate transcript correction (one phrase
     /// per line, canonical casing preserved; e.g. proper nouns). Applied only
     /// to accepted transcripts, never to drops. Empty/unset = off.
-    #[arg(long, env = "STTD_DICTIONARY", value_name = "PATH", help_heading = "Model")]
+    #[arg(
+        long,
+        env = "STTD_DICTIONARY",
+        value_name = "PATH",
+        help_heading = "Model"
+    )]
     pub(crate) dictionary: Option<PathBuf>,
 
     /// VAD-branch denoiser (`deepfilter` requires the `denoise` Cargo feature).
@@ -603,11 +608,10 @@ mod tests {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert_eq!(cli.paste_mode, PasteMode::CtrlV);
         assert!(!cli.remove_hesitations);
-        let cli = Cli::try_parse_from(["sttd", "--paste-mode", "ctrl-shift-v"])
-            .expect("must parse");
-        assert_eq!(cli.paste_mode, PasteMode::CtrlShiftV);
         let cli =
-            Cli::try_parse_from(["sttd", "--paste-mode", "type"]).expect("must parse");
+            Cli::try_parse_from(["sttd", "--paste-mode", "ctrl-shift-v"]).expect("must parse");
+        assert_eq!(cli.paste_mode, PasteMode::CtrlShiftV);
+        let cli = Cli::try_parse_from(["sttd", "--paste-mode", "type"]).expect("must parse");
         assert_eq!(cli.paste_mode, PasteMode::Type);
         let cli =
             Cli::try_parse_from(["sttd", "--remove-hesitations"]).expect("bare flag must parse");

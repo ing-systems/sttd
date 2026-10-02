@@ -153,7 +153,10 @@ mod tests {
                 exit >= EXIT_THRESHOLD_FLOOR,
                 "base={base}: exit={exit} below floor"
             );
-            assert!(exit > 0.0, "base={base}: exit={exit} must never be exactly 0");
+            assert!(
+                exit > 0.0,
+                "base={base}: exit={exit} must never be exactly 0"
+            );
         }
         // A high base is unaffected by the floor (hysteresis alone clears it).
         assert!(n.exit_threshold(0.5) > EXIT_THRESHOLD_FLOOR + 0.1);

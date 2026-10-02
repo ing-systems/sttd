@@ -67,11 +67,7 @@ impl ParakeetModel {
 }
 
 impl SpeechModel for ParakeetModel {
-    fn transcribe(
-        &mut self,
-        pcm_16k: &[f32],
-        running: &Arc<AtomicBool>,
-    ) -> Result<Transcript> {
+    fn transcribe(&mut self, pcm_16k: &[f32], running: &Arc<AtomicBool>) -> Result<Transcript> {
         // `ort` has no abort callback: a single utterance's inference is
         // hundreds of ms, not minutes, so a pre-call check (rather than
         // aborting mid-inference) is enough to avoid running needless work

@@ -162,16 +162,14 @@ impl SystemEmitter {
             RingBuffer::new(EMIT_QUEUE_CAP);
         let handle = std::thread::Builder::new()
             .name("emit".into())
-            .spawn(move || {
-                loop {
-                    match rx.pop() {
-                        Ok(owned) => worker.handle(owned),
-                        Err(_) => {
-                            if rx.is_abandoned() {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(1));
+            .spawn(move || loop {
+                match rx.pop() {
+                    Ok(owned) => worker.handle(owned),
+                    Err(_) => {
+                        if rx.is_abandoned() {
+                            break;
                         }
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                 }
             })
@@ -301,11 +299,12 @@ impl EmitterWorker {
         };
         match result {
             Ok(()) => {}
-            Err(e) if Self::disable_on_not_found(
-                &mut self.paste_available,
-                &e,
-                YDOTOOL_MISSING_WARN,
-            ) => {}
+            Err(e)
+                if Self::disable_on_not_found(
+                    &mut self.paste_available,
+                    &e,
+                    YDOTOOL_MISSING_WARN,
+                ) => {}
             Err(e) => log::warn!("{tag}: auto-paste failed (is ydotoold running?): {e:?}"),
         }
     }
@@ -417,8 +416,7 @@ fn write_owner_only_text(path: &Path, contents: &str) -> Result<()> {
 /// Murmure's recordings dir. Creation errors propagate (fatal at startup);
 /// a chmod failure only warns — transcription never depends on it.
 fn ensure_owner_only_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -465,7 +463,9 @@ fn prune_dump_dir(dir: &Path) {
 /// matching `.txt` is implied).
 fn dump_stems(dir: &Path) -> Result<Vec<String>> {
     let mut stems = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))? {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))?
+    {
         let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("utt_") && name.ends_with(".wav") {
@@ -555,7 +555,9 @@ pub(crate) fn paste_via_ydotool(mode: crate::cli::PasteMode) -> std::io::Result<
             // No clipboard text available here (one-shot path passes text
             // explicitly via `type_via_ydotool`); without text there is
             // nothing to type.
-            Err(std::io::Error::other("paste-mode=type needs text; nothing to paste"))
+            Err(std::io::Error::other(
+                "paste-mode=type needs text; nothing to paste",
+            ))
         }
     }
 }
@@ -578,20 +580,21 @@ pub(crate) fn type_via_ydotool(text: &str) -> std::io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other(format!("ydotool type exited with {status}")))
+        Err(std::io::Error::other(format!(
+            "ydotool type exited with {status}"
+        )))
     }
 }
 
 fn run_ydotool_key(events: &[&str]) -> std::io::Result<()> {
     use std::process::Command;
-    let status = Command::new("ydotool")
-        .arg("key")
-        .args(events)
-        .status()?;
+    let status = Command::new("ydotool").arg("key").args(events).status()?;
     if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other(format!("ydotool exited with {status}")))
+        Err(std::io::Error::other(format!(
+            "ydotool exited with {status}"
+        )))
     }
 }
 
@@ -730,8 +733,7 @@ mod tests {
     #[test]
     fn confident_transcript_is_emitted_with_copy_and_paste() {
         let evidence = strong_evidence();
-        let verdict =
-            gate().decide_transcript("Dzień dobry");
+        let verdict = gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
         emit(
@@ -756,8 +758,7 @@ mod tests {
     #[test]
     fn stdout_print_is_opt_in() {
         let evidence = strong_evidence();
-        let verdict =
-            gate().decide_transcript("Dzień dobry");
+        let verdict = gate().decide_transcript("Dzień dobry");
         let pcm = vec![0.01f32; 1600];
         let mut emitter = RecordingEmitter::new();
         emit(
@@ -771,8 +772,7 @@ mod tests {
         assert!(emitter.records[0].emitted);
         assert!(!emitter.records[0].printed);
 
-        let verdict =
-            gate().decide_transcript("Dzień dobry");
+        let verdict = gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         emitter.stdout_enabled = true;
         emit(
@@ -804,8 +804,7 @@ mod tests {
     #[test]
     fn paste_only_runs_on_fresh_copy() {
         let evidence = strong_evidence();
-        let verdict =
-            gate().decide_transcript("Dzień dobry");
+        let verdict = gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         emitter.fail_copy = true;
         let pcm = vec![0.01f32; 1600];
@@ -918,13 +917,12 @@ mod tests {
             pcm: &pcm,
             text: "Dzień dobry",
             verdict,
-                        evidence: &evidence,
+            evidence: &evidence,
         });
         let r = &emitter.records[0];
         assert!(r.emitted);
         assert!(r.copied);
     }
-
 
     #[test]
     fn system_emitter_emit_never_blocks_inference() {
@@ -986,7 +984,11 @@ mod tests {
         assert!(stems_to_prune(stems.clone(), 10).is_empty());
         assert_eq!(
             stems_to_prune(stems.clone(), 2),
-            vec!["utt_000000".to_string(), "utt_000001".to_string(), "utt_000002".to_string()]
+            vec![
+                "utt_000000".to_string(),
+                "utt_000001".to_string(),
+                "utt_000002".to_string()
+            ]
         );
         assert!(stems_to_prune(Vec::new(), 2).is_empty());
     }
@@ -1031,7 +1033,7 @@ mod tests {
                     pcm: &pcm,
                     text: "Dzień dobry",
                     verdict: gate().decide_transcript("Dzień dobry"),
-                        evidence: &evidence,
+                    evidence: &evidence,
                 });
             }
             // Drop at scope end flushes the async queue.
@@ -1052,8 +1054,7 @@ mod tests {
     #[test]
     fn empty_emit_never_copies() {
         let evidence = strong_evidence();
-        let verdict =
-            gate().decide_transcript("Dzień dobry");
+        let verdict = gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
         emit(&mut emitter, "utt_000001", &pcm, "   ", verdict, &evidence);

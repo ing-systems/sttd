@@ -393,10 +393,18 @@ mod tests {
         // Floor: anything short gets 15 s, even empty input.
         assert_eq!(w(0), 1500);
         assert_eq!(w(16_000), 1500);
-        assert_eq!(w(13 * 16_000), 1500, "13 s + 1 s margin is still under the floor");
+        assert_eq!(
+            w(13 * 16_000),
+            1500,
+            "13 s + 1 s margin is still under the floor"
+        );
         // Margin: whole seconds of audio plus one more.
         assert_eq!(w(14 * 16_000), 1500);
-        assert_eq!(w(14 * 16_000 + 1), 1600, "a partial second rounds up, then +1 s");
+        assert_eq!(
+            w(14 * 16_000 + 1),
+            1600,
+            "a partial second rounds up, then +1 s"
+        );
         assert_eq!(w(20 * 16_000), 2100);
         // Cap: the export's 30 s, including longer input.
         assert_eq!(w(29 * 16_000), 3000);

@@ -5,9 +5,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use rtrb::Producer;
 
-use crate::dsp::{
-    i16_to_f32, mono_mix_frame, pick_louder_channel, resolve_channel, u16_to_f32,
-};
+use crate::dsp::{i16_to_f32, mono_mix_frame, pick_louder_channel, resolve_channel, u16_to_f32};
 
 /// Capture buffer requested from cpal, in frames. The backend-default size
 /// can silently drop a large share of capture periods, heard as crackling.
@@ -51,28 +49,13 @@ fn supports_fixed_buffer(
     let fixed = fixed_buffer_config(config);
     let ok = match sample_format {
         cpal::SampleFormat::F32 => device
-            .build_input_stream(
-                &fixed,
-                |_: &[f32], _| {},
-                |_: cpal::StreamError| {},
-                None,
-            )
+            .build_input_stream(&fixed, |_: &[f32], _| {}, |_: cpal::StreamError| {}, None)
             .is_ok(),
         cpal::SampleFormat::I16 => device
-            .build_input_stream(
-                &fixed,
-                |_: &[i16], _| {},
-                |_: cpal::StreamError| {},
-                None,
-            )
+            .build_input_stream(&fixed, |_: &[i16], _| {}, |_: cpal::StreamError| {}, None)
             .is_ok(),
         cpal::SampleFormat::U16 => device
-            .build_input_stream(
-                &fixed,
-                |_: &[u16], _| {},
-                |_: cpal::StreamError| {},
-                None,
-            )
+            .build_input_stream(&fixed, |_: &[u16], _| {}, |_: cpal::StreamError| {}, None)
             .is_ok(),
         _ => false,
     };
@@ -110,63 +93,57 @@ pub(crate) fn probe_loudest_channel(
     // Short-lived (hundreds of ms), so a lock per callback is fine — the
     // realtime path never takes it, and never allocates.
     let stream = match sample_format {
-        cpal::SampleFormat::F32 => {
-            build_with_buffer_fallback(config, |cfg| {
-                let collected = Arc::clone(&collected);
-                let err_collected = Arc::clone(&err_collected);
-                device.build_input_stream(
-                    cfg,
-                    move |data: &[f32], _| {
-                        if let Ok(mut v) = collected.lock() {
-                            v.extend_from_slice(data);
-                        }
-                    },
-                    move |err| {
-                        log::warn!("auto-channel probe stream error: {err}");
-                        let _ = err_collected.lock().map(|mut v| v.clear());
-                    },
-                    None,
-                )
-            })?
-        }
-        cpal::SampleFormat::I16 => {
-            build_with_buffer_fallback(config, |cfg| {
-                let collected = Arc::clone(&collected);
-                let err_collected = Arc::clone(&err_collected);
-                device.build_input_stream(
-                    cfg,
-                    move |data: &[i16], _| {
-                        if let Ok(mut v) = collected.lock() {
-                            v.extend(data.iter().map(|&s| s as f32 / 32768.0));
-                        }
-                    },
-                    move |err| {
-                        log::warn!("auto-channel probe stream error: {err}");
-                        let _ = err_collected.lock().map(|mut v| v.clear());
-                    },
-                    None,
-                )
-            })?
-        }
-        cpal::SampleFormat::U16 => {
-            build_with_buffer_fallback(config, |cfg| {
-                let collected = Arc::clone(&collected);
-                let err_collected = Arc::clone(&err_collected);
-                device.build_input_stream(
-                    cfg,
-                    move |data: &[u16], _| {
-                        if let Ok(mut v) = collected.lock() {
-                            v.extend(data.iter().map(|&s| s as f32 / 65535.0 * 2.0 - 1.0));
-                        }
-                    },
-                    move |err| {
-                        log::warn!("auto-channel probe stream error: {err}");
-                        let _ = err_collected.lock().map(|mut v| v.clear());
-                    },
-                    None,
-                )
-            })?
-        }
+        cpal::SampleFormat::F32 => build_with_buffer_fallback(config, |cfg| {
+            let collected = Arc::clone(&collected);
+            let err_collected = Arc::clone(&err_collected);
+            device.build_input_stream(
+                cfg,
+                move |data: &[f32], _| {
+                    if let Ok(mut v) = collected.lock() {
+                        v.extend_from_slice(data);
+                    }
+                },
+                move |err| {
+                    log::warn!("auto-channel probe stream error: {err}");
+                    let _ = err_collected.lock().map(|mut v| v.clear());
+                },
+                None,
+            )
+        })?,
+        cpal::SampleFormat::I16 => build_with_buffer_fallback(config, |cfg| {
+            let collected = Arc::clone(&collected);
+            let err_collected = Arc::clone(&err_collected);
+            device.build_input_stream(
+                cfg,
+                move |data: &[i16], _| {
+                    if let Ok(mut v) = collected.lock() {
+                        v.extend(data.iter().map(|&s| s as f32 / 32768.0));
+                    }
+                },
+                move |err| {
+                    log::warn!("auto-channel probe stream error: {err}");
+                    let _ = err_collected.lock().map(|mut v| v.clear());
+                },
+                None,
+            )
+        })?,
+        cpal::SampleFormat::U16 => build_with_buffer_fallback(config, |cfg| {
+            let collected = Arc::clone(&collected);
+            let err_collected = Arc::clone(&err_collected);
+            device.build_input_stream(
+                cfg,
+                move |data: &[u16], _| {
+                    if let Ok(mut v) = collected.lock() {
+                        v.extend(data.iter().map(|&s| s as f32 / 65535.0 * 2.0 - 1.0));
+                    }
+                },
+                move |err| {
+                    log::warn!("auto-channel probe stream error: {err}");
+                    let _ = err_collected.lock().map(|mut v| v.clear());
+                },
+                None,
+            )
+        })?,
         fmt => anyhow::bail!("unsupported sample format: {fmt:?}"),
     };
     use cpal::traits::StreamTrait;
@@ -407,7 +384,10 @@ pub(crate) fn build_input_stream(
             move |data: &[S], _| {
                 let mut overflowed = false;
                 for frame in data.chunks_exact(channels.max(1)) {
-                    if tx.push(mono_mix_frame(frame, channels, channel, &conv)).is_err() {
+                    if tx
+                        .push(mono_mix_frame(frame, channels, channel, &conv))
+                        .is_err()
+                    {
                         overflowed = true;
                     }
                 }
@@ -559,7 +539,10 @@ mod tests {
             buffer_size: cpal::BufferSize::Default,
         };
         let fixed = fixed_buffer_config(&base);
-        assert_eq!(fixed.buffer_size, cpal::BufferSize::Fixed(CAPTURE_BUFFER_FRAMES));
+        assert_eq!(
+            fixed.buffer_size,
+            cpal::BufferSize::Fixed(CAPTURE_BUFFER_FRAMES)
+        );
         assert_eq!(CAPTURE_BUFFER_FRAMES, 4096);
         assert_eq!(fixed.channels, 2);
         assert_eq!(fixed.sample_rate.0, 48_000);
@@ -577,7 +560,10 @@ mod tests {
         let out = build_with_buffer_fallback(&base, |cfg| {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
-                assert_eq!(cfg.buffer_size, cpal::BufferSize::Fixed(CAPTURE_BUFFER_FRAMES));
+                assert_eq!(
+                    cfg.buffer_size,
+                    cpal::BufferSize::Fixed(CAPTURE_BUFFER_FRAMES)
+                );
                 Err(cpal::BuildStreamError::StreamConfigNotSupported)
             } else {
                 assert_eq!(cfg.buffer_size, cpal::BufferSize::Default);

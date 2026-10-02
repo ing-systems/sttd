@@ -326,7 +326,12 @@ pub(crate) const PARAKEET_DEFAULT_SPEC: &str = "parakeet-ultra-int8";
 /// alias for the default (int8) variant.
 pub(crate) fn parakeet_entry_for_spec(
     spec: &str,
-) -> Option<&'static (&'static str, &'static str, &'static [&'static str], &'static str)> {
+) -> Option<&'static (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+)> {
     let spec = if spec == "parakeet" {
         PARAKEET_DEFAULT_SPEC
     } else {
@@ -393,7 +398,12 @@ pub(crate) const WHISPER_DEFAULT_SPEC: &str = "whisper-large-v3-turbo-int8";
 /// Look up a `WHISPER_CATALOG` entry by spec, accepting the `whisper` alias.
 pub(crate) fn whisper_entry_for_spec(
     spec: &str,
-) -> Option<&'static (&'static str, &'static str, &'static [&'static str], &'static str)> {
+) -> Option<&'static (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+)> {
     let spec = if spec == "whisper" {
         WHISPER_DEFAULT_SPEC
     } else {
@@ -525,7 +535,9 @@ pub(crate) fn parse_linear_rms(s: &str) -> Result<f32, String> {
     if (0.0..=MAX_LINEAR_RMS).contains(&v) {
         Ok(v)
     } else {
-        Err(format!("expected a number 0.0..={MAX_LINEAR_RMS}, got {s:?}"))
+        Err(format!(
+            "expected a number 0.0..={MAX_LINEAR_RMS}, got {s:?}"
+        ))
     }
 }
 
@@ -655,10 +667,10 @@ mod tests {
             parakeet_entry_for_spec(PARAKEET_DEFAULT_SPEC).expect("default spec must resolve");
         let alias_entry = parakeet_entry_for_spec("parakeet").expect("alias must resolve");
         assert_eq!(default_entry.0, alias_entry.0);
-        assert!(default_entry
-            .2
-            .iter()
-            .any(|f| f.contains("int8")), "default variant must be int8");
+        assert!(
+            default_entry.2.iter().any(|f| f.contains("int8")),
+            "default variant must be int8"
+        );
         assert!(parakeet_entry_for_spec("parakeet-bogus").is_none());
     }
 
@@ -712,10 +724,10 @@ mod tests {
             whisper_entry_for_spec(WHISPER_DEFAULT_SPEC).expect("default spec must resolve");
         let alias_entry = whisper_entry_for_spec("whisper").expect("alias must resolve");
         assert_eq!(default_entry.0, alias_entry.0);
-        assert!(alias_entry
-            .2
-            .iter()
-            .any(|f| f.contains("int8")), "default variant must be int8");
+        assert!(
+            alias_entry.2.iter().any(|f| f.contains("int8")),
+            "default variant must be int8"
+        );
         assert!(whisper_entry_for_spec("whisper-bogus").is_none());
     }
 

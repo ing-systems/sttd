@@ -371,13 +371,8 @@ impl FirStream {
         if in_rate == 0 || out_rate == 0 {
             anyhow::bail!("invalid resample rates: {in_rate} -> {out_rate}");
         }
-        let inner = ResamplerFir::new_from_hz(
-            1,
-            in_rate,
-            out_rate,
-            Latency::Sample32,
-            Attenuation::Db90,
-        );
+        let inner =
+            ResamplerFir::new_from_hz(1, in_rate, out_rate, Latency::Sample32, Attenuation::Db90);
         let scratch_out = vec![0.0f32; inner.buffer_size_output().max(frame_out * 4)];
         // Single zero-drain flushes the FIR delay + buffered tail (≈1-2
         // frames). Looping would synthesize indefinite silence: zeros in
@@ -617,7 +612,10 @@ mod tests {
         assert_eq!(mono_mix_frame(&[1.0f32, 3.0], 2, None, |s| s), 2.0);
         assert_eq!(mono_mix_frame(&[1.0f32, 3.0], 2, Some(1), |s| s), 3.0);
         assert_eq!(mono_mix_frame(&[1.0f32, 3.0], 2, Some(7), |s| s), 0.0);
-        assert_eq!(mono_mix_frame(&[16384i16, -16384], 2, None, i16_to_f32), 0.0);
+        assert_eq!(
+            mono_mix_frame(&[16384i16, -16384], 2, None, i16_to_f32),
+            0.0
+        );
         assert_eq!(mono_mix_frame(&[65535u16, 0], 2, Some(1), u16_to_f32), -1.0);
         // Mono input is a verbatim copy regardless of the pick.
         assert_eq!(mono_mix_frame(&[0.5f32], 1, Some(7), |s| s), 0.5);

@@ -77,10 +77,10 @@ mod dictionary;
 mod dsp;
 mod emit;
 use emit::SystemEmitter;
+mod agc;
 mod frame;
 mod gate;
 mod hp;
-mod agc;
 mod noise;
 mod signal;
 mod sound;
@@ -94,10 +94,10 @@ mod model_store;
 use model_store::{ensure_available, resolve_model, EngineKind, ModelRef};
 mod asr;
 use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
-mod parakeet_core;
-mod parakeet;
-mod mel;
 mod decode;
+mod mel;
+mod parakeet;
+mod parakeet_core;
 mod whisper;
 mod whisper_core;
 use whisper_core::types::Language;
@@ -194,7 +194,12 @@ fn print_available_models(cli: &Cli) {
 /// say which engine is meant. Both engines ship as directories, so a bare
 /// basename comparison would be meaningless.
 fn selected_catalog_spec_for_input(
-    catalog: &[(&'static str, &'static str, &'static [&'static str], &'static str)],
+    catalog: &[(
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+    )],
     alias: (&'static str, &'static str),
     input: &str,
 ) -> Option<&'static str> {
@@ -205,14 +210,22 @@ fn selected_catalog_spec_for_input(
     if trimmed == alias.1 {
         return Some(alias.0);
     }
-    catalog.iter().find(|(s, ..)| *s == trimmed).map(|(spec, ..)| *spec)
+    catalog
+        .iter()
+        .find(|(s, ..)| *s == trimmed)
+        .map(|(spec, ..)| *spec)
 }
 
 /// Render one `--list-models` table: `*`/`I` marker scheme over `catalog`
 /// (columns SPEC/DIR/SIZE, since both engines ship as a directory of files
 /// rather than one).
 fn format_catalog_models(
-    catalog: &[(&'static str, &'static str, &'static [&'static str], &'static str)],
+    catalog: &[(
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+    )],
     selected: Option<&str>,
     installed: &[bool],
 ) -> String {
@@ -358,11 +371,7 @@ fn report_backpressure(
 /// worker's post-reload jingle has no signal the main loop can key on, so a
 /// 300 ms tone can still reach an otherwise-idle pipeline there (likely
 /// gate-dropped as non-speech-shaped audio).
-fn cue_guard(
-    fp: &mut FrameProcessor,
-    raw_rx: &mut Consumer<f32>,
-    accumulator: &mut Vec<f32>,
-) {
+fn cue_guard(fp: &mut FrameProcessor, raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
     if fp.has_open_utterance() {
         return;
     }
@@ -1006,20 +1015,16 @@ fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
             log::info!("Parakeet auto-detects the spoken language per utterance")
         }
         EngineKind::Whisper => match cli.language {
-            Language::Auto => log::info!(
-                "Whisper detects the spoken language per utterance (--language auto)"
-            ),
+            Language::Auto => {
+                log::info!("Whisper detects the spoken language per utterance (--language auto)")
+            }
             language => log::info!("Whisper decodes in {language} (--language)"),
         },
     }
     Ok(())
 }
 
-fn asr_options(
-    cli: &Cli,
-    shed_stale: bool,
-    dictionary: crate::asr::LiveDictionary,
-) -> AsrOptions {
+fn asr_options(cli: &Cli, shed_stale: bool, dictionary: crate::asr::LiveDictionary) -> AsrOptions {
     AsrOptions {
         model_spec: cli.model_input(),
         // The transcript gate shares the acoustic thresholds, so both come
@@ -1048,7 +1053,10 @@ fn run_paste_last(cli: &Cli) -> Result<()> {
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let text = text.trim();
     if text.is_empty() {
-        log::warn!("paste-last: no emitted transcription yet ({})", path.display());
+        log::warn!(
+            "paste-last: no emitted transcription yet ({})",
+            path.display()
+        );
         return Ok(());
     }
     if !crate::emit::is_wayland_session_env() {
@@ -1062,9 +1070,8 @@ fn run_paste_last(cli: &Cli) -> Result<()> {
     }
     crate::emit::copy_to_clipboard(text).context("paste-last: wl-copy failed")?;
     log::info!("paste-last: copied {} chars", text.chars().count());
-    crate::emit::paste_via_ydotool(cli.paste_mode).context(
-        "paste-last: ydotool failed (is ydotoold running?)",
-    )?;
+    crate::emit::paste_via_ydotool(cli.paste_mode)
+        .context("paste-last: ydotool failed (is ydotoold running?)")?;
     Ok(())
 }
 
@@ -1078,7 +1085,11 @@ fn load_dictionary_or_warn(cli: &Cli) -> Vec<String> {
     };
     match crate::dictionary::load_dictionary(path) {
         Ok(words) => {
-            log::info!("dictionary: {} entr(y/ies) from {}", words.len(), path.display());
+            log::info!(
+                "dictionary: {} entr(y/ies) from {}",
+                words.len(),
+                path.display()
+            );
             if words.len() > crate::dictionary::POSTCORR_MAX_DICT_WORDS {
                 log::warn!(
                     "dictionary: {} entries, fuzzy correction disabled (over {}); exact casing restore stays on",
@@ -1192,11 +1203,19 @@ mod tests {
             Some("parakeet-ultra-int8")
         );
         assert_eq!(
-            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "whisper-large-v3-turbo-int8"),
+            selected_catalog_spec_for_input(
+                PARAKEET_CATALOG,
+                parakeet,
+                "whisper-large-v3-turbo-int8"
+            ),
             None
         );
         assert_eq!(
-            selected_catalog_spec_for_input(WHISPER_CATALOG, whisper, "whisper-large-v3-turbo-int8"),
+            selected_catalog_spec_for_input(
+                WHISPER_CATALOG,
+                whisper,
+                "whisper-large-v3-turbo-int8"
+            ),
             Some("whisper-large-v3-turbo-int8")
         );
         assert_eq!(

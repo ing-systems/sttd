@@ -26,8 +26,8 @@ use crate::config::{
 };
 use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
-use crate::utterance::Utterance;
 use crate::model_store::ModelRef;
+use crate::utterance::Utterance;
 
 /// Result of one inference: the joined text plus per-word model confidences
 /// when the engine reports them (Parakeet, for the dictionary gate).
@@ -40,11 +40,7 @@ pub(crate) struct Transcript {
 /// only ever sees this trait.
 pub(crate) trait SpeechModel {
     /// Run one inference over already-conditioned 16 kHz mono audio.
-    fn transcribe(
-        &mut self,
-        pcm_16k: &[f32],
-        running: &Arc<AtomicBool>,
-    ) -> Result<Transcript>;
+    fn transcribe(&mut self, pcm_16k: &[f32], running: &Arc<AtomicBool>) -> Result<Transcript>;
 
     /// Rebuild the engine's phrase-boosting automaton from a new dictionary
     /// list. Default is a no-op: an engine without boosting ignores it.
@@ -75,7 +71,8 @@ pub(crate) trait SpeechModel {
 pub(crate) fn load_model(model: &ModelRef, opts: &AsrOptions) -> Result<Box<dyn SpeechModel>> {
     Ok(match model.kind {
         crate::model_store::EngineKind::Parakeet => {
-            Box::new(crate::parakeet::ParakeetModel::load(&model.dir, opts)?) as Box<dyn SpeechModel>
+            Box::new(crate::parakeet::ParakeetModel::load(&model.dir, opts)?)
+                as Box<dyn SpeechModel>
         }
         crate::model_store::EngineKind::Whisper => {
             Box::new(crate::whisper::WhisperModel::load(&model.dir, opts)?) as Box<dyn SpeechModel>
@@ -139,7 +136,9 @@ impl LiveDictionary {
     /// (put it in `AsrOptions::dictionary`). A swap then reaches the worker
     /// twice over the same list: through `words()` for post-correction, and
     /// through the queue for the engine boost.
-    pub(crate) fn new(shared: crate::dbus::DictionaryState) -> (crate::dbus::DictionaryState, Self) {
+    pub(crate) fn new(
+        shared: crate::dbus::DictionaryState,
+    ) -> (crate::dbus::DictionaryState, Self) {
         let boost: Arc<Mutex<Option<Arc<Vec<String>>>>> = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&boost);
         let shared = shared.with_words_hook(Arc::new(move |words| {
@@ -147,10 +146,7 @@ impl LiveDictionary {
             // poisoned value and continue.
             *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(words);
         }));
-        (
-            shared.clone(),
-            Self { shared, boost },
-        )
+        (shared.clone(), Self { shared, boost })
     }
 
     /// Snapshot of the live word list. The caller owns one `Arc` per
@@ -489,7 +485,10 @@ fn deliver_boost_words(
     model: &mut dyn SpeechModel,
 ) -> Option<usize> {
     let words = dictionary.take_boost()?;
-    log::info!("dictionary: {} word(s) active (booster updated)", words.len());
+    log::info!(
+        "dictionary: {} word(s) active (booster updated)",
+        words.len()
+    );
     model.set_boost_words(&words);
     Some(words.len())
 }
@@ -772,7 +771,12 @@ impl AsrWorker<'_> {
                     // Idle: decode the open utterance's newest snapshot if one
                     // is waiting (`--stream`), else nap. Only here, so a closed
                     // utterance in the queue always goes first.
-                    match self.opts.stream.then(|| self.opts.partials.take()).flatten() {
+                    match self
+                        .opts
+                        .stream
+                        .then(|| self.opts.partials.take())
+                        .flatten()
+                    {
                         Some(pcm) => self.transcribe_partial(model, &pcm),
                         None => std::thread::sleep(Duration::from_millis(20)),
                     }
@@ -1068,7 +1072,10 @@ fn partial_line(
     match result {
         Ok(t) => {
             let text = t.text.trim();
-            if !matches!(gate.decide_transcript(text), crate::gate::TranscriptVerdict::Emit) {
+            if !matches!(
+                gate.decide_transcript(text),
+                crate::gate::TranscriptVerdict::Emit
+            ) {
                 return None;
             }
             let audio_sec = pcm.len() as f64 / SAMPLE_RATE as f64;
@@ -1158,9 +1165,7 @@ fn transcribe_and_emit(
     let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let decoded_samples = model.decoded_sample_count(padded.len());
     let (audio_sec, rtf) = infer_rtf(decoded_samples, infer_ms);
-    log::info!(
-        "{tag}: transcribe took {infer_ms:.0} ms ({audio_sec:.1} s audio, rtf={rtf:.2})"
-    );
+    log::info!("{tag}: transcribe took {infer_ms:.0} ms ({audio_sec:.1} s audio, rtf={rtf:.2})");
     if rtf > RTF_WARN_RTF {
         log::warn!(
             "{tag}: inference slower than realtime (rtf={rtf:.2}, {infer_ms:.0} ms for \
@@ -1409,7 +1414,9 @@ mod tests {
         bus.replace_words(vec!["Parakeet".to_string()]);
         assert_eq!(*live.words(), vec!["Parakeet".to_string()]);
         assert_eq!(
-            *live.take_boost().expect("swap must be queued for the booster"),
+            *live
+                .take_boost()
+                .expect("swap must be queued for the booster"),
             vec!["Parakeet".to_string()]
         );
         // One-shot: the engine is rebuilt once, so nothing is left pending.
@@ -1426,7 +1433,9 @@ mod tests {
 
     impl RecordingModel {
         fn new() -> Self {
-            Self { delivered: Vec::new() }
+            Self {
+                delivered: Vec::new(),
+            }
         }
 
         /// The list the booster was last built from, or `None` if the worker
@@ -1587,10 +1596,7 @@ mod tests {
             (TranscriptDropKind::Hallucination, "drop:hallucination"),
             (TranscriptDropKind::Repetition, "drop:repetition"),
         ] {
-            assert_eq!(
-                verdict_slug(TranscriptVerdict::Drop { kind }),
-                slug
-            );
+            assert_eq!(verdict_slug(TranscriptVerdict::Drop { kind }), slug);
         }
     }
 
@@ -1963,7 +1969,11 @@ mod tests {
     }
 
     impl SpeechModel for ScriptedModel {
-        fn transcribe(&mut self, pcm_16k: &[f32], _running: &Arc<AtomicBool>) -> Result<Transcript> {
+        fn transcribe(
+            &mut self,
+            pcm_16k: &[f32],
+            _running: &Arc<AtomicBool>,
+        ) -> Result<Transcript> {
             self.inputs.lock().unwrap().push(pcm_16k.len());
             if self.fail {
                 anyhow::bail!("scripted failure");
@@ -2013,7 +2023,10 @@ mod tests {
         let pcm = vec![0.1f32; 24_000];
         let line = partial_line(&mut model, &pcm, "utt_000007", &default_gate(), &running)
             .expect("a normal transcript is shown");
-        assert!(line.starts_with("utt_000007: partial (1.5 s audio, "), "{line}");
+        assert!(
+            line.starts_with("utt_000007: partial (1.5 s audio, "),
+            "{line}"
+        );
         assert!(line.ends_with("): dzień dobry"), "{line}");
         // Fed like a final: conditioned, plus the trailing pad.
         assert_eq!(*inputs.lock().unwrap(), [24_000 + INFERENCE_PAD_SAMPLES]);
@@ -2143,7 +2156,10 @@ mod tests {
         let seen = inputs.lock().unwrap().clone();
         assert_eq!(
             seen,
-            [8_000 + INFERENCE_PAD_SAMPLES, 20_000 + INFERENCE_PAD_SAMPLES],
+            [
+                8_000 + INFERENCE_PAD_SAMPLES,
+                20_000 + INFERENCE_PAD_SAMPLES
+            ],
             "final first, then the partial"
         );
         // The partial left no trace in the final's bookkeeping.
@@ -2182,7 +2198,10 @@ mod tests {
             0,
             Duration::from_millis(300),
         );
-        assert!(inputs.lock().unwrap().is_empty(), "no stream, no partial decode");
+        assert!(
+            inputs.lock().unwrap().is_empty(),
+            "no stream, no partial decode"
+        );
     }
 
     #[test]
@@ -2211,7 +2230,10 @@ mod tests {
         );
         // Cleaning can empty the transcript: the caller turns that into
         // DropEmpty, so this must not fall back to the input.
-        assert_eq!(polish_transcript("utt_000004", "yyy eee", &[], None, true), "");
+        assert_eq!(
+            polish_transcript("utt_000004", "yyy eee", &[], None, true),
+            ""
+        );
         assert_eq!(polish_transcript("utt_000005", "", &[], None, false), "");
     }
 
@@ -2259,10 +2281,7 @@ mod tests {
             remove_split_overlap("je vais au marché", "au marché acheter du pain"),
             "acheter du pain"
         );
-        assert_eq!(
-            remove_split_overlap("podaj zolc", "żółć proszę"),
-            "proszę"
-        );
+        assert_eq!(remove_split_overlap("podaj zolc", "żółć proszę"), "proszę");
         assert_eq!(
             remove_split_overlap("Dzień dobry świecie", "DZIEŃ DOBRY ŚWIECIE i hej"),
             "i hej"
@@ -2277,16 +2296,16 @@ mod tests {
         );
         assert_eq!(remove_split_overlap("", "bonjour"), "bonjour");
         assert_eq!(remove_split_overlap("bonjour", ""), "");
-        assert_eq!(
-            remove_split_overlap("je vais au marché", "au marché"),
-            ""
-        );
+        assert_eq!(remove_split_overlap("je vais au marché", "au marché"), "");
     }
 
     #[test]
     fn split_overlap_caps_at_window_size() {
         let prev = "zero un deux trois quatre cinq six";
-        assert_eq!(remove_split_overlap(prev, "un deux trois quatre cinq six sept"), "sept");
+        assert_eq!(
+            remove_split_overlap(prev, "un deux trois quatre cinq six sept"),
+            "sept"
+        );
         let long_prev = "un deux trois quatre cinq six sept";
         let long_cur = "un deux trois quatre cinq six sept huit";
         assert_eq!(remove_split_overlap(long_prev, long_cur), long_cur);

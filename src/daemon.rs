@@ -127,7 +127,8 @@ fn send_signal(pid: i32, sig: libc::c_int, name: &str) -> Result<()> {
     if r == 0 {
         return Ok(());
     }
-    Err(std::io::Error::last_os_error()).with_context(|| format!("failed to send {name} to pid {pid}"))
+    Err(std::io::Error::last_os_error())
+        .with_context(|| format!("failed to send {name} to pid {pid}"))
 }
 
 fn wait_for_exit(pid: i32, timeout: std::time::Duration) -> bool {

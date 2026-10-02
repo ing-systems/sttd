@@ -679,13 +679,12 @@ fn mic_level(pcm: &[f32]) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::config::{
-        DEFAULT_MIN_DENSITY,
-        DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES, EARLY_SPLIT_QUIET_FRAMES,
-        EARLY_SPLIT_QUIET_RMS, EARLY_SPLIT_SAMPLES, EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K,
-        INTERIM_SPLIT_SAMPLES,
-        INTERIM_SPLIT_SILENCE_FRAMES, MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES,
-        ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES, RING_FRAMES, SILENCE_FRAMES_THRESHOLD,
-        STRONG_RMS_FACTOR, TAIL_KEEP_SAMPLES, TAIL_MAX_SAMPLES, TAIL_MIN_SAMPLES,
+        DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DENSITY_LONG_EXEMPT_SAMPLES,
+        EARLY_SPLIT_QUIET_FRAMES, EARLY_SPLIT_QUIET_RMS, EARLY_SPLIT_SAMPLES,
+        EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, INTERIM_SPLIT_SAMPLES, INTERIM_SPLIT_SILENCE_FRAMES,
+        MAX_UTTERANCE_SAMPLES, MIN_SPEECH_FRAMES, ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES,
+        RING_FRAMES, SILENCE_FRAMES_THRESHOLD, STRONG_RMS_FACTOR, TAIL_KEEP_SAMPLES,
+        TAIL_MAX_SAMPLES, TAIL_MIN_SAMPLES,
     };
 
     fn gate_for(min_rms: f32, min_density: f32) -> GateConfig {
@@ -1349,7 +1348,9 @@ mod tests {
             buffer.push_frame(&speech, true);
         }
         let end = buffer.samples_at_last_speech;
-        let pcm = buffer.partial_snapshot(DEFAULT_MIN_SPEECH_RMS).expect("due");
+        let pcm = buffer
+            .partial_snapshot(DEFAULT_MIN_SPEECH_RMS)
+            .expect("due");
         assert_eq!(pcm.len(), (end + TAIL_MIN_SAMPLES).min(buffer.buf.len()));
         // And quiet again: nothing new is due while the speaker is silent.
         for _ in 0..100 {

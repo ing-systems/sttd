@@ -77,15 +77,14 @@ pub(crate) fn read_wav_mono_f32_with_channel(path: &Path, sel: ChannelSel) -> Re
     };
     // Shared select/mix with the live capture path (`dsp`), so `--channel`
     // means the same thing for a file as for a microphone.
-    let (samples, picked) = select_channel_and_downmix(sel, &interleaved, channels).with_context(
-        || match sel {
+    let (samples, picked) =
+        select_channel_and_downmix(sel, &interleaved, channels).with_context(|| match sel {
             ChannelSel::Pick(i) => format!(
                 "--channel={i} out of range for {channels}-channel file {}",
                 path.display()
             ),
             _ => format!("failed to select a channel of {}", path.display()),
-        },
-    )?;
+        })?;
     if sel == ChannelSel::Auto {
         if let Some(i) = picked {
             log::info!(

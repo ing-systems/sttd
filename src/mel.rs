@@ -38,7 +38,11 @@ fn mel_to_hz_slaney(mel: f64) -> f64 {
 
 /// Triangular mel filterbank as `[n_mels, n_fft / 2 + 1]`, one row per mel
 /// band, area-normalized (librosa `norm = "slaney"`).
-pub(crate) fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) -> Array2<f32> {
+pub(crate) fn create_mel_filterbank(
+    n_fft: usize,
+    n_mels: usize,
+    sample_rate: usize,
+) -> Array2<f32> {
     let freq_bins = n_fft / 2 + 1;
     let mut filterbank = Array2::<f32>::zeros((n_mels, freq_bins));
 
@@ -87,7 +91,10 @@ mod tests {
             let mut last_peak = 0usize;
             for mel in 0..n_mels {
                 let row: Vec<f32> = (0..freq_bins).map(|k| bank[[mel, k]]).collect();
-                assert!(row.iter().all(|&v| v >= 0.0), "mel {mel} has a negative weight");
+                assert!(
+                    row.iter().all(|&v| v >= 0.0),
+                    "mel {mel} has a negative weight"
+                );
                 let sum: f32 = row.iter().sum();
                 assert!(sum > 0.0, "mel {mel} is an empty band");
                 let peak = row
@@ -170,6 +177,9 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked > 8, "only {checked} shared frequencies; test is too weak");
+        assert!(
+            checked > 8,
+            "only {checked} shared frequencies; test is too weak"
+        );
     }
 }
