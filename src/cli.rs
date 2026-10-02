@@ -61,8 +61,8 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_CHANNEL", value_name = "MIX|AUTO|N", default_value = "mix", value_parser = parse_channel_sel, help_heading = "Input")]
     pub(crate) channel: ChannelSel,
 
-    /// Model spec (e.g. `parakeet`, `parakeet-ultra-int8`, `parakeet-redux-int8`,
-    /// `whisper`, `whisper-large-v3-turbo-int8`) or path to model weights (a
+    /// Model spec (e.g. `parakeet`, `parakeet-ultra-int8`, `whisper`,
+    /// `whisper-large-v3-turbo-int8`) or path to model weights (a
     /// model directory; auto-downloaded if missing).
     #[arg(
         short,

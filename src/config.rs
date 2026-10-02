@@ -248,30 +248,20 @@ pub(crate) fn valid_model_specs() -> String {
 /// Mel features are computed in Rust (`parakeet_core::frontend`), so no
 /// `nemo128.onnx` and no `config.json`/`preprocessor_config.json` are needed.
 ///
-/// Two exports exist, each in its own Hugging Face repository:
-/// `parakeet-ultra-int8` (the default) and `parakeet-redux-int8`, Moondream's
-/// 1.58-bit ternary post-train of `parakeet-tdt-0.6b-v3`. Both keep the base
-/// architecture and tokenizer (128 mel features, subsampling 8, a `vocab.txt`
-/// byte-identical to the base checkpoint), so the Rust frontend and the
-/// `PreprocessorConfig::tdt_0_6b` recipe still apply unchanged.
+/// One export, `parakeet-ultra-int8`, in its own Hugging Face repository. It
+/// keeps the base architecture and tokenizer (128 mel features, subsampling 8, a
+/// `vocab.txt` byte-identical to the base checkpoint), so the Rust frontend and
+/// the `PreprocessorConfig::tdt_0_6b` recipe still apply unchanged.
 ///
-/// `(spec, repo resolve root, weights folder)`. Each export lives in its own
-/// Hugging Face repository, which is not one flat file list: the ONNX weights
-/// sit in its `int8/` folder, `vocab.txt` at its root. `tokenizer.json` is
-/// absent from both exports, so it comes from the upstream NVIDIA checkpoint
-/// (`PARAKEET_TOKENIZER_URL`).
-pub(crate) const PARAKEET_SOURCES: &[(&str, &str, &str)] = &[
-    (
-        "parakeet-ultra-int8",
-        "https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx/resolve/main/",
-        "int8/",
-    ),
-    (
-        "parakeet-redux-int8",
-        "https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-redux-onnx/resolve/main/",
-        "int8/",
-    ),
-];
+/// `(spec, repo resolve root, weights folder)`. The repository is not one flat
+/// file list: the ONNX weights sit in its `int8/` folder, `vocab.txt` at its
+/// root. `tokenizer.json` is absent from the export, so it comes from the
+/// upstream NVIDIA checkpoint (`PARAKEET_TOKENIZER_URL`).
+pub(crate) const PARAKEET_SOURCES: &[(&str, &str, &str)] = &[(
+    "parakeet-ultra-int8",
+    "https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx/resolve/main/",
+    "int8/",
+)];
 /// Download source for a catalog spec: `(repo resolve root, weights folder)`.
 pub(crate) fn parakeet_source_for_spec(spec: &str) -> Option<(&'static str, &'static str)> {
     PARAKEET_SOURCES
@@ -280,18 +270,17 @@ pub(crate) fn parakeet_source_for_spec(spec: &str) -> Option<(&'static str, &'st
         .map(|(_, root, folder)| (*root, *folder))
 }
 
-/// Upstream NVIDIA checkpoint, source of `tokenizer.json` (absent from both
-/// exports, which drop the SentencePiece files).
+/// Upstream NVIDIA checkpoint, source of `tokenizer.json` (absent from the
+/// export, which drops the SentencePiece files).
 pub(crate) const PARAKEET_TOKENIZER_URL: &str =
     "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/tokenizer.json";
 
 /// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
-/// The ultra int8 export is the default variant (`PARAKEET_DEFAULT_SPEC`);
-/// `parakeet-redux-int8` is the ternary post-train. Every spec must have a
-/// matching row in `PARAKEET_SOURCES` (checked by the tests). Filenames match
-/// what the engine looks for, so no renaming after download, even though the
-/// repositories store the ONNX weights under an `int8/` folder (see
-/// `model_store::parakeet_asset_url`).
+/// The ultra int8 export is the default variant (`PARAKEET_DEFAULT_SPEC`).
+/// Every spec must have a matching row in `PARAKEET_SOURCES` (checked by the
+/// tests). Filenames match what the engine looks for, so no renaming after
+/// download, even though the repository stores the ONNX weights under an `int8/`
+/// folder (see `model_store::parakeet_asset_url`).
 pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[
     // `parakeet-ultra-int8` is the default (`PARAKEET_DEFAULT_SPEC`).
     (
@@ -304,17 +293,6 @@ pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[
             "tokenizer.json",
         ],
         "638 MiB",
-    ),
-    (
-        "parakeet-redux-int8",
-        "parakeet-redux-int8",
-        &[
-            "encoder-model.int8.onnx",
-            "decoder_joint-model.int8.onnx",
-            "vocab.txt",
-            "tokenizer.json",
-        ],
-        "640 MiB",
     ),
 ];
 
@@ -639,7 +617,7 @@ mod tests {
 
     #[test]
     fn parakeet_catalog_entries_are_self_consistent() {
-        assert_eq!(PARAKEET_CATALOG.len(), 2);
+        assert_eq!(PARAKEET_CATALOG.len(), 1);
         assert_eq!(PARAKEET_SOURCES.len(), PARAKEET_CATALOG.len());
         for (spec, dir, files, _size) in PARAKEET_CATALOG {
             assert_eq!(*dir, *spec, "dir must equal spec for {spec}");
@@ -654,9 +632,6 @@ mod tests {
                 "{spec} must have a PARAKEET_SOURCES row"
             );
         }
-        // Both exports keep the same asset set and tokenizer recipe.
-        let files = |spec: &str| parakeet_entry_for_spec(spec).map(|e| e.2).unwrap();
-        assert_eq!(files("parakeet-ultra-int8"), files("parakeet-redux-int8"));
         assert!(parakeet_source_for_spec("parakeet-bogus").is_none());
     }
 

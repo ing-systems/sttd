@@ -39,7 +39,7 @@ impl EngineKind {
     }
 
     /// The file that identifies a model directory as this engine's.
-    /// Note the deliberate naming difference between the two exports:
+    /// Note the deliberate naming difference between the two engines:
     /// Parakeet's graphs use hyphens (`encoder-model.int8.onnx`), Whisper's
     /// underscores (`encoder_model_int8.onnx`).
     const fn marker_file(self) -> &'static str {
@@ -121,7 +121,7 @@ pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
     if trimmed.contains('/') || trimmed.contains('\\') {
         // A manually-prepared model directory (nothing to download, just
         // validated at load time). Which engine it holds is decided by its
-        // files, since the two exports have different names.
+        // files, since the two engines have different names.
         let path = PathBuf::from(trimmed);
         if path.is_dir() {
             let kind = detect_engine_kind(&path)?;
@@ -421,7 +421,6 @@ mod tests {
         for (spec, dir) in [
             ("parakeet-ultra-int8", "models/parakeet-ultra-int8"),
             ("parakeet", "models/parakeet-ultra-int8"),
-            ("parakeet-redux-int8", "models/parakeet-redux-int8"),
         ] {
             let resolved = resolve_model(spec).expect("parakeet spec must resolve");
             assert_eq!(resolved.dir, PathBuf::from(dir));
@@ -433,13 +432,6 @@ mod tests {
             resolve_model(PARAKEET_DEFAULT_SPEC).expect("default parakeet spec must resolve");
         assert_eq!(resolved.dir, PathBuf::from("models/parakeet-ultra-int8"));
         assert_eq!(resolved.assets.len(), 4);
-        let redux = resolve_model("parakeet-redux-int8").expect("redux spec must resolve");
-        assert_eq!(redux.dir, PathBuf::from("models/parakeet-redux-int8"));
-        assert_eq!(redux.assets.len(), 4);
-        assert_eq!(
-            redux.assets, resolved.assets,
-            "both exports must ship the same asset set"
-        );
     }
 
     /// A model directory is told apart by its marker file, and the two
@@ -593,9 +585,8 @@ mod tests {
 
     #[test]
     fn parakeet_asset_urls_derive_from_each_spec_source() {
-        // Each export lives in its own repository, and the ONNX weights sit
-        // in that repository's `int8/` folder.
-        let mut encoders = Vec::new();
+        // The export lives in its own repository, and the ONNX weights sit in
+        // that repository's `int8/` folder.
         for (spec, _dir, _files, _size) in PARAKEET_CATALOG {
             let (root, folder) =
                 parakeet_source_for_spec(spec).expect("catalog spec must have a source row");
@@ -606,13 +597,8 @@ mod tests {
                 let from_own_repo = url.starts_with(root);
                 assert!(from_own_repo, "{spec} url must use its own repo: {url}");
                 assert!(url.contains("/int8/"), "{spec} url missing /int8/: {url}");
-                if file.starts_with("encoder") {
-                    encoders.push(url);
-                }
             }
         }
-        assert_eq!(encoders.len(), 2, "one encoder URL per catalog spec");
-        assert_ne!(encoders[0], encoders[1], "specs must not share a repo");
     }
 
     #[test]
@@ -659,7 +645,6 @@ mod tests {
         let specs = valid_model_specs();
         for expected in [
             "parakeet-ultra-int8",
-            "parakeet-redux-int8",
             "parakeet",
             "whisper-large-v3-turbo-int8",
             "whisper",

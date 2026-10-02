@@ -96,7 +96,7 @@ _Avoid_: backend, model kind
 
 **Model spec**:
 A `--model` value that names a catalog entry rather than a filesystem path —
-`parakeet`, `parakeet-ultra-int8`, `parakeet-redux-int8`, `whisper` or
+`parakeet`, `parakeet-ultra-int8`, `whisper` or
 `whisper-large-v3-turbo-int8`. Resolved into the models directory baked into the
 binary at build time (`STTD_MODELS_DIR`, default `models`; the Arch package
 uses `/usr/share/sttd/models`) and, for a catalog spec, downloaded if missing;

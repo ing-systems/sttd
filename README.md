@@ -51,11 +51,10 @@ Two engines ship behind one `--model` flag. Catalog (`src/config.rs`):
 | --- | --- | --- |
 | `parakeet` (alias for `int8`) | 638 MiB | encoder int8 + decoder_joint int8 + vocab + tokenizer |
 | `parakeet-ultra-int8` | 638 MiB | same as above |
-| `parakeet-redux-int8` | 640 MiB | same as above |
 | `whisper` (alias for `int8`) | 1443 MiB | encoder int8 + decoder int8 + decoder_with_past int8 + tokenizer |
 | `whisper-large-v3-turbo-int8` | 1443 MiB | same as above |
 
-Parakeet weights come from `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx` and `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-redux-onnx` (ONNX weights from each repo's `int8/` folder, `vocab.txt` from its repo root) and `huggingface.co/nvidia/parakeet-tdt-0.6b-v3` (tokenizer only). Both exports keep the base architecture and tokenizer, so the Rust mel frontend and dictionary phrase-boosting are unchanged.
+Parakeet weights come from `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx` (ONNX weights from its `int8/` folder, `vocab.txt` from the repo root) and `huggingface.co/nvidia/parakeet-tdt-0.6b-v3` (tokenizer only). The export keeps the base architecture and tokenizer, so the Rust mel frontend and dictionary phrase-boosting are unchanged.
 
 Whisper weights come from `huggingface.co/onnx-community/whisper-large-v3-turbo` (graphs from its `onnx/` folder, `tokenizer.json` from its root).
 
