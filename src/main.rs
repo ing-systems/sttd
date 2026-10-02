@@ -100,7 +100,7 @@ mod parakeet;
 mod parakeet_core;
 mod whisper;
 mod whisper_core;
-use whisper_core::types::Language;
+use whisper_core::types::{Language, DEFAULT_WINDOW_FRAMES};
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -986,6 +986,13 @@ fn ignored_model_flags(cli: &Cli, model: &ModelRef) -> Vec<&'static str> {
         // Parakeet auto-detects per utterance, so a fixed language cannot apply.
         flags.push("--language");
     }
+    if cli.audio_ctx != DEFAULT_WINDOW_FRAMES && (model.kind == EngineKind::Parakeet || !cli.stream)
+    {
+        // Parakeet sizes its window itself, and a Whisper encoder that was not
+        // patched (no `--stream`, or a patch that did not apply) always decodes
+        // the export's full 30 s.
+        flags.push("--audio-ctx");
+    }
     flags
 }
 
@@ -1036,6 +1043,7 @@ fn asr_options(cli: &Cli, shed_stale: bool, dictionary: crate::asr::LiveDictiona
         metrics_path: cli.metrics.clone(),
         shed_stale,
         stream: cli.stream,
+        audio_ctx: cli.audio_ctx,
         partials: crate::asr::PartialSlot::default(),
         // The live handle, not a `Vec` snapshot: the D-Bus thread swaps the
         // word list at runtime and the worker observes it per utterance.
@@ -1335,6 +1343,29 @@ mod tests {
             "explicit --language auto must still be reported under Parakeet"
         );
         assert!(ignored_model_flags(&auto, &whisper).is_empty());
+    }
+
+    #[test]
+    fn audio_ctx_is_reported_where_the_window_cannot_follow_the_audio() {
+        let parakeet = model_ref(EngineKind::Parakeet, "models/parakeet-ultra-int8");
+        let whisper = model_ref(EngineKind::Whisper, "models/whisper-large-v3-turbo-int8");
+        let cli = Cli::try_parse_from(["sttd", "--audio-ctx", "300"]).expect("must parse");
+
+        // Parakeet sizes its own window.
+        assert_eq!(ignored_model_flags(&cli, &parakeet), vec!["--audio-ctx"]);
+        // A fixed Whisper encoder (no `--stream`) always decodes 30 s.
+        assert_eq!(ignored_model_flags(&cli, &whisper), vec!["--audio-ctx"]);
+        assert!(validate_model_flags(&cli, &parakeet).is_ok());
+
+        // With `--stream` the encoder is patched, so the floor applies.
+        let streamed =
+            Cli::try_parse_from(["sttd", "--stream", "--audio-ctx", "300"]).expect("must parse");
+        assert!(ignored_model_flags(&streamed, &whisper).is_empty());
+
+        // The default is not a setting, so nothing is reported for it.
+        let plain = Cli::try_parse_from(["sttd", "--stream"]).expect("must parse");
+        assert!(ignored_model_flags(&plain, &whisper).is_empty());
+        assert!(ignored_model_flags(&plain, &parakeet).is_empty());
     }
 
     #[test]

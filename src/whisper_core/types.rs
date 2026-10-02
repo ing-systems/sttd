@@ -47,29 +47,66 @@ impl MelConfig {
     }
 }
 
-/// Shortest encoder window the dynamic encoder is given, in mel frames
-/// (15 s). Measured on short clips: a window cut close to the audio makes the
+/// Shortest encoder window the dynamic encoder is given by default, in mel
+/// frames (15 s). `--audio-ctx` moves this floor; see `parse_audio_ctx`.
+/// Measured on short clips: a window cut close to the audio makes the
 /// decode loop or return garbage under ~3 s of speech, and the shorter the
 /// window the more words drift. On three espeak Polish clips (1.4 s, 6 s, 10 s)
 /// a 10 s floor changed one word in two of them; 15 s, 20 s and 30 s gave the
 /// 30 s transcript for all three. 15 s is the cheapest of those (see the README).
-pub const MIN_WINDOW_FRAMES: usize = 1500;
+pub const DEFAULT_WINDOW_FRAMES: usize = 1500;
+
+/// Smallest floor `--audio-ctx` accepts, in mel frames (1 s). Below this the
+/// window carries too little context for the decode to be worth running.
+pub const MIN_WINDOW_FRAMES: usize = 100;
+
+/// Largest floor `--audio-ctx` accepts, in mel frames: the export's own 30 s
+/// window. Nothing above it can reach the encoder, whose patched position
+/// table holds 1500 rows (`dyn_encoder`).
+pub const MAX_WINDOW_FRAMES: usize = 3000;
+
+/// Parse `--audio-ctx`/`STTD_AUDIO_CTX`: an even mel-frame count in
+/// `MIN_WINDOW_FRAMES..=MAX_WINDOW_FRAMES`.
+///
+/// Even, because the encoder's stride-2 convolution halves the window and
+/// `window_frames` promises an even result. Both bounds are whole seconds (100
+/// frames = 1 s at 16 kHz, `hop_length` 160), so an accepted value is always a
+/// whole number of seconds.
+pub fn parse_audio_ctx(s: &str) -> Result<usize, String> {
+    let malformed = || {
+        format!(
+            "expected an even number of mel frames (100 = 1 s) in \
+             {MIN_WINDOW_FRAMES}..={MAX_WINDOW_FRAMES}, got {s:?}"
+        )
+    };
+    let v: usize = s.trim().parse().map_err(|_| malformed())?;
+    if !(MIN_WINDOW_FRAMES..=MAX_WINDOW_FRAMES).contains(&v) || !v.is_multiple_of(2) {
+        return Err(malformed());
+    }
+    Ok(v)
+}
 
 /// Encoder window for `audio_samples` of input, in mel frames.
 ///
 /// The fixed export always takes the full window. The dynamic encoder follows
 /// the audio: its length rounded up to a whole second, plus one more second of
 /// margin (a window with no margin repeated itself on a 6 s clip), never below
-/// `MIN_WINDOW_FRAMES` and never above the export's 30 s. The result is a whole
-/// number of seconds, so it is even, as the encoder's stride-2 convolution needs.
-pub fn window_frames(audio_samples: usize, dynamic: bool, config: &MelConfig) -> usize {
+/// `floor` (the `--audio-ctx` value) and never above the export's 30 s. The
+/// result is a whole number of seconds, so it is even, as the encoder's
+/// stride-2 convolution needs.
+pub fn window_frames(
+    audio_samples: usize,
+    dynamic: bool,
+    floor: usize,
+    config: &MelConfig,
+) -> usize {
     if !dynamic {
         return config.n_frames;
     }
     let per_second = config.sampling_rate / config.hop_length;
     let audio_frames = audio_samples.div_ceil(config.hop_length);
     let wanted = audio_frames.div_ceil(per_second) * per_second + per_second;
-    wanted.clamp(MIN_WINDOW_FRAMES, config.n_frames)
+    wanted.clamp(floor, config.n_frames)
 }
 
 /// Decoder layers in large-v3-turbo (4, not the 32 of large-v3). Every KV
@@ -372,6 +409,10 @@ pub struct WhisperModel {
     /// patch applied), so the window follows the audio. False = the export as
     /// shipped, always the full 30 s window.
     pub dynamic_window: bool,
+    /// Floor the dynamic window never goes below (`--audio-ctx`), in mel
+    /// frames. Unused when `dynamic_window` is false: the export's encoder
+    /// decodes its full 30 s whatever this says.
+    pub min_window_frames: usize,
 }
 
 #[cfg(test)]
@@ -382,14 +423,18 @@ mod tests {
     fn fixed_encoder_always_gets_the_full_window() {
         let c = MelConfig::large_v3_turbo();
         for samples in [0, 1, 16_000, 480_000, 960_000] {
-            assert_eq!(window_frames(samples, false, &c), 3000, "samples={samples}");
+            assert_eq!(
+                window_frames(samples, false, DEFAULT_WINDOW_FRAMES, &c),
+                3000,
+                "samples={samples}"
+            );
         }
     }
 
     #[test]
     fn dynamic_window_has_a_floor_a_margin_and_a_cap() {
         let c = MelConfig::large_v3_turbo();
-        let w = |samples| window_frames(samples, true, &c);
+        let w = |samples| window_frames(samples, true, DEFAULT_WINDOW_FRAMES, &c);
         // Floor: anything short gets 15 s, even empty input.
         assert_eq!(w(0), 1500);
         assert_eq!(w(16_000), 1500);
@@ -412,14 +457,55 @@ mod tests {
         assert_eq!(w(45 * 16_000), 3000);
     }
 
+    /// `--audio-ctx` moves the floor and nothing else: the margin and the 30 s
+    /// cap stay where they were.
+    #[test]
+    fn a_configured_floor_replaces_only_the_floor() {
+        let c = MelConfig::large_v3_turbo();
+        let w = |samples, floor| window_frames(samples, true, floor, &c);
+        // 3 s floor: short audio now gets 3 s, not 15 s.
+        assert_eq!(w(0, 300), 300);
+        assert_eq!(w(16_000, 300), 300);
+        assert_eq!(
+            w(2 * 16_000, 300),
+            300,
+            "2 s + 1 s margin is under the floor"
+        );
+        // Margin unchanged above the floor.
+        assert_eq!(w(4 * 16_000, 300), 500, "4 s rounded up, then +1 s");
+        // Cap unchanged, whatever the floor.
+        assert_eq!(w(20 * 16_000, 300), 2100);
+        assert_eq!(w(45 * 16_000, 300), 3000);
+        // The highest accepted floor behaves like the fixed export's window.
+        assert_eq!(w(0, MAX_WINDOW_FRAMES), 3000);
+        // A floor of 1 s: the smallest the parser takes.
+        assert_eq!(w(0, MIN_WINDOW_FRAMES), 100);
+        assert_eq!(w(1, MIN_WINDOW_FRAMES), 200, "1 s of audio + 1 s margin");
+    }
+
+    #[test]
+    fn audio_ctx_parser_takes_even_seconds_only() {
+        assert_eq!(parse_audio_ctx("1500"), Ok(DEFAULT_WINDOW_FRAMES));
+        assert_eq!(parse_audio_ctx(" 300 "), Ok(300));
+        assert_eq!(parse_audio_ctx(&MIN_WINDOW_FRAMES.to_string()), Ok(100));
+        assert_eq!(parse_audio_ctx(&MAX_WINDOW_FRAMES.to_string()), Ok(3000));
+        // Below the 1 s floor, above the export's 30 s, odd, and not a number.
+        for bad in ["0", "99", "3001", "1501", "1500.0", "-2", "bogus", ""] {
+            assert!(parse_audio_ctx(bad).is_err(), "must reject {bad:?}");
+        }
+        // The bounds are whole seconds, so every accepted value is even.
+        assert_eq!(MIN_WINDOW_FRAMES % 100, 0);
+        assert_eq!(MAX_WINDOW_FRAMES % 100, 0);
+    }
+
     #[test]
     fn dynamic_window_is_always_even_and_never_shrinks_with_more_audio() {
         let c = MelConfig::large_v3_turbo();
         let mut last = 0;
         for samples in (0..=31 * 16_000).step_by(1_234) {
-            let frames = window_frames(samples, true, &c);
+            let frames = window_frames(samples, true, DEFAULT_WINDOW_FRAMES, &c);
             assert_eq!(frames % 2, 0, "samples={samples}");
-            assert!((MIN_WINDOW_FRAMES..=c.n_frames).contains(&frames));
+            assert!((DEFAULT_WINDOW_FRAMES..=c.n_frames).contains(&frames));
             assert!(frames >= last, "window shrank at samples={samples}");
             // It always holds the audio (up to the cap).
             assert!(frames * c.hop_length >= samples.min(c.n_frames * c.hop_length));

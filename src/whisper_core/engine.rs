@@ -137,11 +137,15 @@ impl WhisperModel {
     /// export is patched in memory (see `dyn_encoder`) and the window follows
     /// the audio. If the patch does not apply the fixed export is loaded
     /// instead, with a warning, and `dynamic_window` ends up false.
+    ///
+    /// `min_window_frames` is the floor that follow stops at (`--audio-ctx`);
+    /// it is stored but unused unless `dynamic_window` ends up true.
     pub fn new<P: AsRef<Path>>(
         model_dir: P,
         language: Language,
         intra_threads: usize,
         dynamic_window: bool,
+        min_window_frames: usize,
     ) -> Result<Self, WhisperError> {
         let dir = model_dir.as_ref();
         let threads = intra_threads.max(1);
@@ -163,6 +167,7 @@ impl WhisperModel {
             language,
             frontend,
             dynamic_window,
+            min_window_frames,
         })
     }
 
@@ -171,7 +176,12 @@ impl WhisperModel {
     /// follows the audio (`window_frames`), which is what keeps RTF honest.
     pub fn window_samples(&self, audio_samples: usize) -> usize {
         let config = &self.frontend.config;
-        window_frames(audio_samples, self.dynamic_window, config) * config.hop_length
+        window_frames(
+            audio_samples,
+            self.dynamic_window,
+            self.min_window_frames,
+            config,
+        ) * config.hop_length
     }
 
     /// One utterance through the encoder and the greedy decode.
@@ -186,7 +196,12 @@ impl WhisperModel {
         pcm: &[f32],
         max_tokens: usize,
     ) -> Result<TranscriptionResult, WhisperError> {
-        let n_frames = window_frames(pcm.len(), self.dynamic_window, &self.frontend.config);
+        let n_frames = window_frames(
+            pcm.len(),
+            self.dynamic_window,
+            self.min_window_frames,
+            &self.frontend.config,
+        );
         let max_tokens = if self.dynamic_window {
             token_budget(pcm.len(), max_tokens)
         } else {

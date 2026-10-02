@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
-use crate::whisper_core::types::Language;
+use crate::whisper_core::types::{parse_audio_ctx, Language, DEFAULT_WINDOW_FRAMES};
 
 /// How `--paste` inserts text via `ydotool` (Wayland only).
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,6 +128,22 @@ pub(crate) struct Cli {
         help_heading = "Model"
     )]
     pub(crate) stream: bool,
+
+    /// Floor of the dynamic Whisper encoder window, in mel frames (100 = 1 s
+    /// of 16 kHz audio). With `--stream` the window is the audio rounded up to
+    /// a whole second plus one more, never under this floor. A lower floor
+    /// costs less per utterance and drifts or loops more; 15 s is the shortest
+    /// window that matched the 30 s transcript on the reference clips.
+    /// Whisper only, and only with `--stream`; Parakeet ignores it.
+    #[arg(
+        long,
+        env = "STTD_AUDIO_CTX",
+        default_value_t = DEFAULT_WINDOW_FRAMES,
+        value_parser = parse_audio_ctx,
+        value_name = "FRAMES",
+        help_heading = "Model"
+    )]
+    pub(crate) audio_ctx: usize,
 
     /// Load the model onto the GPU (`off`/`0` = CPU-only).
     #[arg(
@@ -471,6 +487,10 @@ mod tests {
         assert_eq!(cli.vad_adapt, DEFAULT_VAD_ADAPT);
         assert!(!cli.copy);
         assert!(!cli.stream, "streaming is opt-in");
+        assert_eq!(
+            cli.audio_ctx, DEFAULT_WINDOW_FRAMES,
+            "the window floor keeps its 15 s default"
+        );
         assert!(!cli.paste);
         assert_eq!(cli.paste_mode, PasteMode::CtrlV);
         assert!(!cli.paste_last);
@@ -654,6 +674,25 @@ mod tests {
         let cli = Cli::try_parse_from(["sttd", "--stream", "off"]).expect("off must parse");
         assert!(!cli.stream);
         assert!(Cli::try_parse_from(["sttd", "--stream", "sometimes"]).is_err());
+    }
+
+    #[test]
+    fn cli_audio_ctx_parses_even_seconds_and_rejects_the_rest() {
+        let cli = Cli::try_parse_from(["sttd", "--audio-ctx", "300"]).expect("must parse");
+        assert_eq!(cli.audio_ctx, 300);
+        // Both bounds, and the default spelled out.
+        for (value, expected) in [("100", 100), ("1500", 1500), ("3000", 3000)] {
+            let cli = Cli::try_parse_from(["sttd", "--audio-ctx", value]).expect("must parse");
+            assert_eq!(cli.audio_ctx, expected, "value={value}");
+        }
+        // Odd (the encoder halves the window), under 1 s, over the export's
+        // 30 s, and not a number.
+        for bad in ["99", "301", "1501", "2999", "0", "3001", "bogus"] {
+            assert!(
+                Cli::try_parse_from(["sttd", "--audio-ctx", bad]).is_err(),
+                "must reject {bad:?}"
+            );
+        }
     }
 
     #[test]

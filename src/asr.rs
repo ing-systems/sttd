@@ -243,6 +243,10 @@ pub(crate) struct AsrOptions {
     /// `--stream`: the engine may use its short-window mode (Whisper) and the
     /// worker decodes partials from `partials` while the queue is idle.
     pub(crate) stream: bool,
+    /// `--audio-ctx`: floor of the dynamic Whisper window, in mel frames. Only
+    /// the patched encoder honours it; Parakeet sizes its own window, and a
+    /// fixed (unpatched) Whisper encoder always decodes its full 30 s.
+    pub(crate) audio_ctx: usize,
     /// Where the capture loop leaves the open utterance for partial decoding.
     /// Shared with the capture side; empty unless `stream` is on.
     pub(crate) partials: PartialSlot,
@@ -1914,6 +1918,7 @@ mod tests {
             metrics_path: None,
             shed_stale: false,
             stream: false,
+            audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
             partials: PartialSlot::default(),
             dictionary: empty_live_dictionary(),
             remove_hesitations: false,
@@ -2082,6 +2087,7 @@ mod tests {
             metrics_path: None,
             shed_stale: false,
             stream,
+            audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
             partials: PartialSlot::default(),
             dictionary: empty_live_dictionary(),
             remove_hesitations: false,

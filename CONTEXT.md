@@ -120,7 +120,8 @@ Whisper's cost per utterance does not scale with how much was said: a two-second
 utterance costs the same encoder pass as a thirty-second one, and the RTF column
 reports against the window rather than the utterance. Under **streaming mode** the
 window is chosen per utterance instead (the audio rounded up to a second, plus a
-second, never under 15 s or over 30 s).
+second, never over 30 s and never under a floor of 1500 mel frames = 15 s, which
+`--audio-ctx` moves).
 _Avoid_: chunk (that is a piece of an utterance, cut by the VAD), clip
 
 **Streaming mode**:
