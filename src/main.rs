@@ -71,6 +71,7 @@ mod capture;
 use capture::*;
 mod clean;
 mod daemon;
+mod dbus;
 mod denoise;
 mod dictionary;
 mod dsp;
@@ -454,9 +455,25 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let mut input_frames = fp.required_input_frames();
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
+    // ---- shared control state (D-Bus, signals, pipeline, ASR worker) ------
+    // One `Shared` serves every control path, so the pause flag and the word
+    // list are the same objects for the D-Bus thread, the signal handlers,
+    // the main loop and the worker. `LiveDictionary::new` attaches the ASR
+    // booster hook and hands back the hooked clone for `dbus::spawn`.
+    let base_shared = crate::dbus::Shared::new(
+        load_dictionary_or_warn(cli),
+        cli.dictionary.clone().unwrap_or_default(),
+    );
+    base_shared.set_paused(cli.start_paused);
+    let (hooked_shared, live_dict) = crate::asr::LiveDictionary::new(base_shared);
+    let paused = hooked_shared.paused_flag();
+    // No service with `--no-dbus`; signals and the pipeline still work.
+    if !cli.no_dbus {
+        crate::dbus::spawn(hooked_shared.clone());
+    }
+
     // ---- capture is running (callback does NOT unwrap) ----------------------
     let running = Arc::new(AtomicBool::new(true));
-    let paused = Arc::new(AtomicBool::new(cli.start_paused));
     if cli.start_paused {
         log::info!("starting paused (SIGUSR2/SIGHUP to resume)");
     } else {
@@ -477,10 +494,10 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // failed install isn't fatal, pause/resume via signals is then simply
     // unavailable.
     {
-        let paused = Arc::clone(&paused);
+        let shared = hooked_shared.clone();
         let running = Arc::clone(&running);
         let sound_enabled = cli.sound;
-        if let Err(e) = install_pause_handlers(paused, running, sound_enabled) {
+        if let Err(e) = install_pause_handlers(shared, running, sound_enabled) {
             log::warn!("{e:?} (signal pause/resume unavailable)");
         }
     }
@@ -491,7 +508,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
-        asr_options(cli, true),
+        asr_options(cli, true, live_dict),
         make_emitter(cli)?,
         Arc::clone(&paused),
         Arc::clone(&running),
@@ -751,7 +768,7 @@ fn install_ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
 /// itself is signaled separately by the ASR thread once transcription
 /// can actually resume.
 fn install_pause_handlers(
-    paused: Arc<AtomicBool>,
+    shared: crate::dbus::Shared,
     running: Arc<AtomicBool>,
     sound_enabled: bool,
 ) -> Result<()> {
@@ -761,32 +778,35 @@ fn install_pause_handlers(
         for sig in signals.forever() {
             match sig {
                 SIGUSR1 => {
-                    paused.store(true, Ordering::Release);
+                    let new_val = shared.set_paused(true);
                     log::info!("paused (SIGUSR1)");
                     if sound_enabled {
                         crate::sound::play_paused();
                     }
+                    crate::dbus::emit_state_changed(new_val);
                 }
                 SIGUSR2 => {
-                    paused.store(false, Ordering::Release);
+                    let new_val = shared.set_paused(false);
                     log::info!("resumed (SIGUSR2)");
                     if sound_enabled {
                         crate::sound::play_resumed();
                     }
+                    crate::dbus::emit_state_changed(new_val);
                 }
                 SIGHUP => {
-                    let was_paused = paused.fetch_xor(true, Ordering::AcqRel);
-                    if was_paused {
-                        log::info!("resumed (SIGHUP toggle)");
-                        if sound_enabled {
-                            crate::sound::play_resumed();
-                        }
-                    } else {
+                    let new_val = shared.toggle_paused();
+                    if new_val {
                         log::info!("paused (SIGHUP toggle)");
                         if sound_enabled {
                             crate::sound::play_paused();
                         }
+                    } else {
+                        log::info!("resumed (SIGHUP toggle)");
+                        if sound_enabled {
+                            crate::sound::play_resumed();
+                        }
                     }
+                    crate::dbus::emit_state_changed(new_val);
                 }
                 SIGTERM => {
                     log::info!("shutting down (SIGTERM)");
@@ -822,10 +842,19 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     let mut fp = AcousticConfig::from_cli(cli).make_frame_processor(wav.sample_rate)?;
     let input_frames = fp.required_input_frames();
 
+    // File mode runs offline with no D-Bus service (see the interview), but
+    // the worker still takes the live handle so `asr_options` has one shape.
+    // The booster hook stays unconsumed: nothing swaps words here.
+    let live_dict = crate::asr::LiveDictionary::new(crate::dbus::Shared::new(
+        load_dictionary_or_warn(cli),
+        cli.dictionary.clone().unwrap_or_default(),
+    ))
+    .1;
+
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
-        asr_options(cli, false),
+        asr_options(cli, false, live_dict),
         make_emitter(cli)?,
         // File mode has no pause signalling; a permanently-clear flag plus
         // disabled auto-unload can never trigger an unload mid-file. Sounds
@@ -905,7 +934,11 @@ fn validate_parakeet_model_flags(cli: &Cli, _model: &ModelRef) -> Result<()> {
     Ok(())
 }
 
-fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
+fn asr_options(
+    cli: &Cli,
+    shed_stale: bool,
+    dictionary: crate::asr::LiveDictionary,
+) -> AsrOptions {
     AsrOptions {
         model_spec: cli.model_input(),
         // The transcript gate shares the acoustic thresholds, so both come
@@ -915,7 +948,9 @@ fn asr_options(cli: &Cli, shed_stale: bool) -> AsrOptions {
         use_gpu: cli.gpu,
         metrics_path: cli.metrics.clone(),
         shed_stale,
-        dictionary: load_dictionary_or_warn(cli),
+        // The live handle, not a `Vec` snapshot: the D-Bus thread swaps the
+        // word list at runtime and the worker observes it per utterance.
+        dictionary,
         remove_hesitations: cli.remove_hesitations,
     }
 }
@@ -1130,7 +1165,12 @@ mod tests {
         assert_eq!(acoustic.hangover_frames, 35);
         assert_eq!(acoustic.target_rms, 0.02);
         // The ASR worker gets the same thresholds, from the same builder.
-        assert_eq!(asr_options(&cli, true).gate.min_density, 0.5);
+        let dictionary = crate::asr::LiveDictionary::new(crate::dbus::Shared::new(
+            Vec::new(),
+            Default::default(),
+        ))
+        .1;
+        assert_eq!(asr_options(&cli, true, dictionary).gate.min_density, 0.5);
     }
 
     #[test]

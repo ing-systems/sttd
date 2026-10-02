@@ -335,6 +335,20 @@ pub(crate) struct Cli {
     )]
     pub(crate) auto_unload_after: u64,
 
+    /// Do not serve the session-bus interface (`org.sttd.Daemon`, object
+    /// `/org/sttd/Daemon`). Signal pause/resume stays available. File mode
+    /// never serves it anyway.
+    #[arg(
+        long,
+        env = "STTD_NO_DBUS",
+        default_value_t = false,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Runtime"
+    )]
+    pub(crate) no_dbus: bool,
+
     /// Play audible cues on pause (low beep), resume (mid blip) and when
     /// transcription is actually ready (rising two-tone) via the default
     /// output device. Best-effort: missing/busy audio only logs.
@@ -425,6 +439,7 @@ mod tests {
         assert!(!cli.stdout);
         assert!(cli.start_paused);
         assert!(!cli.autopause);
+        assert!(!cli.no_dbus);
         assert!(cli.sound);
         assert_eq!(cli.denoiser, DenoiserKind::Bypass);
         assert!(!cli.start);

@@ -187,6 +187,7 @@ Key tunables:
 | `--metrics` / `STTD_METRICS` | unset | Append JSONL per utterance (timing, RTF, evidence, verdict, text). |
 | `--start-paused` / `STTD_START_PAUSED` | on | Start paused; file mode ignores it. |
 | `--autopause` / `STTD_AUTOPAUSE` | off | Pause again after each emission; each resume arms one sentence. |
+| `--no-dbus` / `STTD_NO_DBUS` | off | Skip the session-bus service. Signals and `--stop` keep working. File mode never starts it. |
 | `--auto-unload` / `STTD_AUTO_UNLOAD` | off | Unload model while paused to free VRAM. |
 | `--auto-unload-after` / `STTD_AUTO_UNLOAD_AFTER` | `180` s | Pause duration before unload; `0` = immediate. |
 | `--sound` / `STTD_SOUND` | on | Pause/resume/ready tones on default output. |
@@ -221,6 +222,26 @@ systemctl --user kill -s SIGUSR1 sttd   # pause
 ```
 
 The unit runs foreground (`ExecStart=/usr/bin/sttd --autopause --copy 1 --paste 1`). It starts paused by default. It needs `WAYLAND_DISPLAY` for copy/paste (`systemctl --user import-environment WAYLAND_DISPLAY`).
+
+D-Bus (microphone mode, unless `--no-dbus`): bus name `org.sttd.Daemon`, object path `/org/sttd/Daemon`, interface `org.sttd.Daemon`. A missing session bus is not fatal: the service retries in the background and the signals above keep working. File mode (`--file`) never starts the service.
+
+```sh
+busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Pause
+busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Resume
+busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Toggle
+busctl --user get-property org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Paused
+busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon ReloadDictionary s ""
+busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon ReloadDictionary s /path/to/words.txt
+busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon SetWords as 2 AppImage Syntocinon
+busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon GetDictionary
+busctl --user monitor org.sttd.Daemon
+```
+
+`ReloadDictionary` with an empty path reloads the startup `--dictionary` file. A failed load keeps the previous words and returns `(false, old_count, message)`. `SetWords` sanitizes with the same rules as the file path: entries with digits and entries of more than two words are skipped, duplicates (case/accent-insensitive) are dropped.
+
+Signals: `StateChanged(paused)` on every pause state change (D-Bus call or signal handler), `DictionaryChanged(count, ok, message)` after `ReloadDictionary` and `SetWords`, including a failed reload.
+
+Any process running as the same user can call these methods, so the dictionary is only as trustworthy as the session. Dictionary rules and caps are unchanged from `--dictionary` (see `src/dictionary.rs`): above `POSTCORR_WARN_DICT_WORDS` (50) false positives grow, and at `POSTCORR_MAX_DICT_WORDS` (100) fuzzy correction is off while exact casing restore stays on.
 
 ## Gates
 

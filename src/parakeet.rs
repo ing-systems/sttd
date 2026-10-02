@@ -31,9 +31,9 @@ impl ParakeetModel {
     /// encoder, a decoder_joint and `vocab.txt` by
     /// `model_store::ensure_available`). `tokenizer.json` in the same directory
     /// enables dictionary phrase-boosting; without it transcription works
-    /// but boosting stays off (warned once). The startup dictionary is
-    /// synced here — it is fixed for the process lifetime, and
-    /// `set_boost_words` is a no-op when unchanged.
+    /// but boosting stays off (warned once). The live dictionary is synced
+    /// here (see `SpeechModel::set_boost_words`), so a swap that landed while
+    /// a previous instance was unloaded is already in place.
     pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
         if opts.use_gpu {
             log::warn!("--gpu is set but Parakeet runs on CPU in this build; running on CPU");
@@ -53,7 +53,9 @@ impl ParakeetModel {
                 .map_err(|e| anyhow::anyhow!("failed to load parakeet model: {e}"))
                 .context("failed to load parakeet model")
         })?;
-        inner.set_boost_words(&opts.dictionary);
+        // Snapshot, not a held lock: `opts.dictionary` is the live handle.
+        let startup_words = opts.dictionary.words();
+        inner.set_boost_words(&startup_words);
         Ok(Self {
             inner,
             ready_line: format!(
@@ -96,6 +98,14 @@ impl SpeechModel for ParakeetModel {
             // Per-word confidences gate the dictionary correction.
             word_confidences: result.word_confidences,
         })
+    }
+
+    /// Rebuild the phrase-boosting automaton after a live dictionary swap
+    /// (`SetWords` / `ReloadDictionary`). Called on the worker thread only,
+    /// from `AsrWorker::apply_boost_words`. A no-op when the word set is
+    /// unchanged, so the common case costs nothing.
+    fn set_boost_words(&mut self, words: &[String]) {
+        self.inner.set_boost_words(words);
     }
 
     fn describe(&self) -> String {
