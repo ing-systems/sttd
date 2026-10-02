@@ -456,20 +456,22 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let mut accumulator: Vec<f32> = Vec::with_capacity(hw_rate as usize * 2);
 
     // ---- shared control state (D-Bus, signals, pipeline, ASR worker) ------
-    // One `Shared` serves every control path, so the pause flag and the word
-    // list are the same objects for the D-Bus thread, the signal handlers,
-    // the main loop and the worker. `LiveDictionary::new` attaches the ASR
-    // booster hook and hands back the hooked clone for `dbus::spawn`.
-    let base_shared = crate::dbus::Shared::new(
+    // `PauseState` and `DictionaryState` are separate, one per bus interface.
+    // Each is a cheap clone, so the bus thread, the signal handlers, the main
+    // loop and the worker all observe the same objects.
+    // `LiveDictionary::new` attaches the ASR booster hook and hands back the
+    // hooked clone for `dbus::spawn`.
+    let pause_state = crate::dbus::PauseState::new(cli.start_paused);
+    let dict_state = crate::dbus::DictionaryState::new(
         load_dictionary_or_warn(cli),
         cli.dictionary.clone().unwrap_or_default(),
     );
-    base_shared.set_paused(cli.start_paused);
-    let (hooked_shared, live_dict) = crate::asr::LiveDictionary::new(base_shared);
-    let paused = hooked_shared.paused_flag();
-    // No service with `--no-dbus`; signals and the pipeline still work.
+    let (hooked_dict, live_dict) = crate::asr::LiveDictionary::new(dict_state);
+    let paused = pause_state.paused_flag();
+    // No service with `--no-dbus`; signals and the pipeline still work. One
+    // flag governs both interfaces.
     if !cli.no_dbus {
-        crate::dbus::spawn(hooked_shared.clone());
+        crate::dbus::spawn(pause_state.clone(), hooked_dict.clone());
     }
 
     // ---- capture is running (callback does NOT unwrap) ----------------------
@@ -494,7 +496,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // failed install isn't fatal, pause/resume via signals is then simply
     // unavailable.
     {
-        let shared = hooked_shared.clone();
+        let shared = pause_state.clone();
         let running = Arc::clone(&running);
         let sound_enabled = cli.sound;
         if let Err(e) = install_pause_handlers(shared, running, sound_enabled) {
@@ -768,7 +770,7 @@ fn install_ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
 /// itself is signaled separately by the ASR thread once transcription
 /// can actually resume.
 fn install_pause_handlers(
-    shared: crate::dbus::Shared,
+    pause_state: crate::dbus::PauseState,
     running: Arc<AtomicBool>,
     sound_enabled: bool,
 ) -> Result<()> {
@@ -778,7 +780,7 @@ fn install_pause_handlers(
         for sig in signals.forever() {
             match sig {
                 SIGUSR1 => {
-                    let new_val = shared.set_paused(true);
+                    let new_val = pause_state.set_paused(true);
                     log::info!("paused (SIGUSR1)");
                     if sound_enabled {
                         crate::sound::play_paused();
@@ -786,7 +788,7 @@ fn install_pause_handlers(
                     crate::dbus::emit_state_changed(new_val);
                 }
                 SIGUSR2 => {
-                    let new_val = shared.set_paused(false);
+                    let new_val = pause_state.set_paused(false);
                     log::info!("resumed (SIGUSR2)");
                     if sound_enabled {
                         crate::sound::play_resumed();
@@ -794,7 +796,7 @@ fn install_pause_handlers(
                     crate::dbus::emit_state_changed(new_val);
                 }
                 SIGHUP => {
-                    let new_val = shared.toggle_paused();
+                    let new_val = pause_state.toggle_paused();
                     if new_val {
                         log::info!("paused (SIGHUP toggle)");
                         if sound_enabled {
@@ -845,7 +847,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     // File mode runs offline with no D-Bus service (see the interview), but
     // the worker still takes the live handle so `asr_options` has one shape.
     // The booster hook stays unconsumed: nothing swaps words here.
-    let live_dict = crate::asr::LiveDictionary::new(crate::dbus::Shared::new(
+    let live_dict = crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
         load_dictionary_or_warn(cli),
         cli.dictionary.clone().unwrap_or_default(),
     ))
@@ -1165,7 +1167,7 @@ mod tests {
         assert_eq!(acoustic.hangover_frames, 35);
         assert_eq!(acoustic.target_rms, 0.02);
         // The ASR worker gets the same thresholds, from the same builder.
-        let dictionary = crate::asr::LiveDictionary::new(crate::dbus::Shared::new(
+        let dictionary = crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
             Vec::new(),
             Default::default(),
         ))

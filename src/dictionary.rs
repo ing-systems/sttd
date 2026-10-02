@@ -48,7 +48,14 @@ pub(crate) const POSTCORR_CONF_THRESHOLD: f32 = 0.45;
 const POSTCORR_BIGRAM_LONG_LEN: usize = 12;
 
 /// Fold Polish diacritics and lowercase (the dictionary's lookup key form).
-fn normalize_word(word: &str) -> String {
+///
+/// Lowercasing runs before folding, so an uppercase spelling reaches the same
+/// key as its lowercase form: `żółć`, `ŻÓŁĆ` and `ZOLC` all key to `zolc`.
+///
+/// `pub(crate)` so the bus thread reuses the exact key form that
+/// `sanitize_entries` and `confidence_map` use: a duplicate in `AddWords` and a
+/// miss in `Contains` must agree with the post-correction lookup.
+pub(crate) fn normalize_word(word: &str) -> String {
     let mut out = String::with_capacity(word.len());
     normalize_word_into(word, &mut out);
     out
@@ -59,10 +66,17 @@ fn normalize_word(word: &str) -> String {
 fn normalize_word_into(word: &str, out: &mut String) {
     out.clear();
     for c in word.chars() {
-        // Fold then lowercase in one pass. Same result as folding the whole
-        // word and lowercasing it, for every script but Greek (where
-        // `str::to_lowercase` alone special-cases a word-final sigma).
-        out.extend(crate::gate::fold_polish_diacritic(c).to_lowercase());
+        // Lowercase first, then fold. `fold_polish_diacritic` matches only
+        // lowercase letters, so folding before lowercasing let uppercase Polish
+        // diacritics through: `Ż` survived the fold and became `ż` only
+        // afterwards, so `ŻÓŁĆ` and `żółć` produced different keys.
+        //
+        // Per-char lowercasing keeps the Greek word-final sigma case that
+        // `str::to_lowercase` alone would get wrong, and iterating the result
+        // handles the chars that expand to more than one (`İ`).
+        for lower in c.to_lowercase() {
+            out.push(crate::gate::fold_polish_diacritic(lower));
+        }
     }
 }
 
@@ -368,6 +382,22 @@ impl<'a> Post<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every casing of a Polish word reaches one key, which is what makes
+    /// `sanitize_entries` dedup and the `confidence_map` lookup agree.
+    #[test]
+    fn uppercase_polish_diacritics_fold() {
+        assert_eq!(normalize_word("żółć"), "zolc");
+        assert_eq!(normalize_word("ZOLC"), "zolc");
+        assert_eq!(normalize_word("ŻÓŁĆ"), "zolc");
+    }
+
+    /// A char that lowercases to more than one char must not be dropped.
+    #[test]
+    fn a_multi_char_lowercase_expansion_survives() {
+        // `İ` (U+0130) lowercases to `i` plus a combining dot above.
+        assert_eq!(normalize_word("İ"), "i\u{0307}");
+    }
 
     fn dict(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()

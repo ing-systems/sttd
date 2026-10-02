@@ -101,7 +101,7 @@ impl SpeechModel for ParakeetModel {
     }
 
     /// Rebuild the phrase-boosting automaton after a live dictionary swap
-    /// (`SetWords` / `ReloadDictionary`). Called on the worker thread only,
+    /// (`ReplaceWords` / `LoadFile`). Called on the worker thread only,
     /// from `AsrWorker::apply_boost_words`. A no-op when the word set is
     /// unchanged, so the common case costs nothing.
     fn set_boost_words(&mut self, words: &[String]) {

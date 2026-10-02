@@ -107,16 +107,16 @@ pub(crate) fn with_loading_ticker<T>(label: &str, f: impl FnOnce() -> Result<T>)
     result
 }
 
-/// The ASR side of the live dictionary: a `dbus::Shared` handle for the
+/// The ASR side of the live dictionary: a `dbus::DictionaryState` handle for the
 /// per-utterance word list, plus a one-slot queue the D-Bus hook fills so the
 /// engine boost automaton is rebuilt on the *worker* thread (the engine is
 /// worker-thread local and must never be touched from the bus thread).
 ///
-/// Ownership split: the hooked `dbus::Shared` goes to `dbus::spawn`, this
-/// value goes into `AsrOptions`. Both are cheap clones of the same state, so a
-/// swap on the bus is visible to the next utterance either way.
+/// Ownership split: the hooked `dbus::DictionaryState` goes to `dbus::spawn`,
+/// this value goes into `AsrOptions`. Both are cheap clones of the same state,
+/// so a swap on the bus is visible to the next utterance either way.
 pub(crate) struct LiveDictionary {
-    shared: crate::dbus::Shared,
+    shared: crate::dbus::DictionaryState,
     /// Newest word list reported by the hook, waiting for the worker to apply
     /// it. `None` = nothing pending, so the steady state costs one atomic-free
     /// mutex lock per utterance.
@@ -124,13 +124,13 @@ pub(crate) struct LiveDictionary {
 }
 
 impl LiveDictionary {
-    /// Attach the booster hook to a `dbus::Shared` clone.
+    /// Attach the booster hook to a `dbus::DictionaryState` clone.
     ///
     /// Returns the hooked clone (hand it to `dbus::spawn`) and this value
     /// (put it in `AsrOptions::dictionary`). A swap then reaches the worker
     /// twice over the same list: through `words()` for post-correction, and
     /// through the queue for the engine boost.
-    pub(crate) fn new(shared: crate::dbus::Shared) -> (crate::dbus::Shared, Self) {
+    pub(crate) fn new(shared: crate::dbus::DictionaryState) -> (crate::dbus::DictionaryState, Self) {
         let boost: Arc<Mutex<Option<Arc<Vec<String>>>>> = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&boost);
         let shared = shared.with_words_hook(Arc::new(move |words| {
@@ -422,6 +422,27 @@ enum Loaded {
     Retry,
 }
 
+/// Hand the pending dictionary swap to the engine, and report how many words
+/// the engine received (`None` when no swap was pending).
+///
+/// This is the last hop of the live-dictionary path: a D-Bus mutator on
+/// `DictionaryState` swaps the word list, the booster hook queues it here, and
+/// the worker thread drains it into `SpeechModel::set_boost_words`, which
+/// rebuilds the engine's `BoostTree`. The engine is worker-thread local, so the
+/// queue exists to keep the bus thread from touching it.
+///
+/// Split out of `AsrWorker::apply_boost_words` so a test can drive the
+/// delivery without building a worker.
+fn deliver_boost_words(
+    dictionary: &mut LiveDictionary,
+    model: &mut dyn SpeechModel,
+) -> Option<usize> {
+    let words = dictionary.take_boost()?;
+    log::info!("dictionary: {} word(s) active (booster updated)", words.len());
+    model.set_boost_words(&words);
+    Some(words.len())
+}
+
 /// The ASR worker's own state, so the loop reads as its phases (load, replay,
 /// transcribe, unload, wait) instead of one long function. Everything here is
 /// worker-thread local; the only shared state is the `paused` and `running`
@@ -578,16 +599,13 @@ impl AsrWorker<'_> {
     }
 
     /// Apply a pending dictionary swap to the engine's boost automaton. Called
-    /// before every inference and at every load, so a `SetWords` /
-    /// `ReloadDictionary` takes effect on the next utterance whether the model
+    /// before every inference and at every load, so a `ReplaceWords` /
+    /// `LoadFile` takes effect on the next utterance whether the model
     /// is loaded or was just reloaded. Takes the list out of the queue first,
     /// so a swap racing a long inference is never dropped: the next
     /// `transcribe` picks it up.
     fn apply_boost_words(&mut self, model: &mut dyn SpeechModel) {
-        if let Some(words) = self.dictionary.take_boost() {
-            log::info!("dictionary: {} word(s) active (booster updated)", words.len());
-            model.set_boost_words(&words);
-        }
+        deliver_boost_words(&mut self.dictionary, model);
     }
 
     /// One utterance through inference, gate and emission, then the
@@ -1258,18 +1276,18 @@ mod tests {
 
     /// A live dictionary with no words, for tests that never swap one.
     fn empty_live_dictionary() -> LiveDictionary {
-        LiveDictionary::new(crate::dbus::Shared::new(
+        LiveDictionary::new(crate::dbus::DictionaryState::new(
             Vec::new(),
             std::path::PathBuf::new(),
         ))
         .1
     }
 
-    /// A live dictionary seeded with `words`, plus the `dbus::Shared` a test
-    /// would hand to `dbus::spawn`, so a test can drive `set_words` and see
+    /// A live dictionary seeded with `words`, plus the `dbus::DictionaryState`
+    /// a test would hand to `dbus::spawn`, so a test can drive a swap and see
     /// what the worker would apply.
-    fn live_dictionary_with(words: &[&str]) -> (crate::dbus::Shared, LiveDictionary) {
-        LiveDictionary::new(crate::dbus::Shared::new(
+    fn live_dictionary_with(words: &[&str]) -> (crate::dbus::DictionaryState, LiveDictionary) {
+        LiveDictionary::new(crate::dbus::DictionaryState::new(
             words.iter().map(|w| w.to_string()).collect(),
             std::path::PathBuf::new(),
         ))
@@ -1281,7 +1299,7 @@ mod tests {
         // A swap on the bus thread is visible to the worker in both forms.
         assert_eq!(*live.words(), vec!["AppImage".to_string()]);
         assert!(live.take_boost().is_none(), "no swap yet");
-        bus.set_words(vec!["Parakeet".to_string()]);
+        bus.replace_words(vec!["Parakeet".to_string()]);
         assert_eq!(*live.words(), vec!["Parakeet".to_string()]);
         assert_eq!(
             *live.take_boost().expect("swap must be queued for the booster"),
@@ -1291,12 +1309,152 @@ mod tests {
         assert!(live.take_boost().is_none());
     }
 
+    /// A `SpeechModel` that records what the worker hands the booster. This
+    /// stands in for `ParakeetModel`, whose `set_boost_words` is what rebuilds
+    /// the `BoostTree`.
+    struct RecordingModel {
+        /// Every list the worker delivered, in order.
+        delivered: Vec<Vec<String>>,
+    }
+
+    impl RecordingModel {
+        fn new() -> Self {
+            Self { delivered: Vec::new() }
+        }
+
+        /// The list the booster was last built from, or `None` if the worker
+        /// never delivered one.
+        fn boost_words(&self) -> Option<&[String]> {
+            self.delivered.last().map(Vec::as_slice)
+        }
+    }
+
+    impl SpeechModel for RecordingModel {
+        fn transcribe(
+            &mut self,
+            _pcm_16k: &[f32],
+            _running: &Arc<AtomicBool>,
+        ) -> Result<Transcript> {
+            panic!("these tests never decode audio")
+        }
+
+        fn set_boost_words(&mut self, words: &[String]) {
+            self.delivered.push(words.to_vec());
+        }
+
+        fn describe(&self) -> String {
+            "recording model".to_string()
+        }
+
+        fn describe_reload(&self) -> String {
+            "recording model reloaded".to_string()
+        }
+
+        fn engine_name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn decoded_sample_count(&self, conditioned_len: usize) -> usize {
+            conditioned_len
+        }
+    }
+
+    /// The whole live-dictionary path, from the D-Bus-visible handle to the
+    /// engine's boost list: the bus thread mutates `DictionaryState`, and the
+    /// worker thread hands the result to `set_boost_words`.
+    #[test]
+    fn a_dbus_visible_dictionary_reaches_the_engine_booster() {
+        let (bus, mut live) = live_dictionary_with(&["AppImage"]);
+        let mut model = RecordingModel::new();
+
+        // Nothing has been delivered yet: the initial list reaches the engine
+        // through `ParakeetModel::load`, not through this queue.
+        assert_eq!(
+            deliver_boost_words(&mut live, &mut model),
+            None,
+            "an unswapped dictionary must not queue a rebuild"
+        );
+
+        // ReplaceWords.
+        assert_eq!(bus.replace_words(vec!["Parakeet".to_string()]), 1);
+        assert_eq!(deliver_boost_words(&mut live, &mut model), Some(1));
+        assert_eq!(model.boost_words(), Some(&["Parakeet".to_string()][..]));
+
+        // AddWords: the engine gets the merged list, not just the addition.
+        bus.add_words(vec!["żółć".to_string()]);
+        assert_eq!(deliver_boost_words(&mut live, &mut model), Some(2));
+        assert_eq!(
+            model.boost_words(),
+            Some(&["Parakeet".to_string(), "żółć".to_string()][..])
+        );
+
+        // RemoveWords, matched on the normalized form.
+        bus.remove_words(vec!["PARAKEET".to_string()]);
+        assert_eq!(deliver_boost_words(&mut live, &mut model), Some(1));
+        assert_eq!(model.boost_words(), Some(&["żółć".to_string()][..]));
+
+        // The booster list and the post-correction list are the same list, so
+        // a swap cannot correct one way and boost another.
+        assert_eq!(*model.boost_words().expect("delivered"), *live.words());
+
+        // A no-op mutation queues nothing, so the engine is not rebuilt.
+        bus.add_words(vec!["ZOLC".to_string()]);
+        assert_eq!(
+            deliver_boost_words(&mut live, &mut model),
+            None,
+            "a plain re-case must not queue a rebuild"
+        );
+        assert_eq!(model.delivered.len(), 3);
+    }
+
+    /// An uppercase Polish spelling is the same word, so it must not queue a
+    /// booster rebuild. `normalize_word` lowercases before folding, which is
+    /// what makes this hold.
+    #[test]
+    fn an_uppercase_polish_recase_does_not_queue_a_rebuild() {
+        let (bus, mut live) = live_dictionary_with(&["żółć"]);
+        let mut model = RecordingModel::new();
+
+        let (count, added) = bus.add_words(vec!["ŻÓŁĆ".to_string()]);
+        assert_eq!((count, added), (1, 0), "the uppercase form is folded");
+        assert_eq!(
+            deliver_boost_words(&mut live, &mut model),
+            None,
+            "no rebuild for a pure re-case"
+        );
+        assert_eq!(model.delivered.len(), 0);
+    }
+
+    /// `LoadFile` reaches the engine the same way, and clears the dirty flag
+    /// the caller can read back over the bus.
+    #[test]
+    fn a_loaded_file_reaches_the_engine_booster() {
+        let path = std::env::temp_dir().join(format!("sttd-asr-boost-{}.txt", std::process::id()));
+        std::fs::write(&path, "AppImage\nSyntocinon\n").expect("temp file must be writable");
+        let (bus, mut live) = live_dictionary_with(&[]);
+        let mut model = RecordingModel::new();
+
+        bus.replace_words(vec!["stale".to_string()]);
+        assert!(bus.is_dirty(), "a caller-supplied list diverges");
+        assert_eq!(deliver_boost_words(&mut live, &mut model), Some(1));
+
+        bus.load_file(&path).expect("the temp file must load");
+        assert!(!bus.is_dirty(), "the list now matches the source");
+        assert_eq!(deliver_boost_words(&mut live, &mut model), Some(2));
+        assert_eq!(
+            model.boost_words(),
+            Some(&["AppImage".to_string(), "Syntocinon".to_string()][..])
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn boost_queue_survives_a_reload_after_auto_unload() {
         // Swap while the model is unloaded: the words stay queued, so the next
         // `load_once` applies them (that is the auto-unload path).
         let (bus, live) = live_dictionary_with(&[]);
-        bus.set_words(vec!["zoxide".to_string()]);
+        bus.replace_words(vec!["zoxide".to_string()]);
         let pending = live.take_boost().expect("queued while unloaded");
         // A worker clone sees the same queue slot, so a re-created worker
         // applying after a reload still finds the list.

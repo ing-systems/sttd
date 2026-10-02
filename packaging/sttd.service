@@ -19,15 +19,18 @@ ExecStart=/usr/bin/sttd --autopause --copy 1 --paste 1
 #   systemctl --user kill -s SIGUSR2 sttd   # arm one sentence (--autopause is single-shot)
 #   systemctl --user kill -s SIGHUP  sttd   # toggle pause/run
 #   systemctl --user kill -s SIGUSR1 sttd   # pause
-# Same control surface on the session bus (org.sttd.Daemon, unless --no-dbus).
+# Same control surface on the session bus (org.sttd.Daemon, unless --no-dbus),
+# as two interfaces: org.sttd.Daemon at /org/sttd/Daemon for pause, and
+# org.sttd.Dictionary at /org/sttd/Dictionary for the live word list.
 # Import DBUS_SESSION_BUS_ADDRESS into the user manager first, or run these from
 # a session shell:
 #   busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Pause
 #   busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Resume
 #   busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Toggle
 #   busctl --user get-property org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Paused
-#   busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon ReloadDictionary s ""
-#   busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon SetWords as 2 AppImage Syntocinon
+#   busctl --user call org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary LoadFile s /path/to/words.txt
+#   busctl --user call org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary ReplaceWords as 2 AppImage Syntocinon
+#   busctl --user get-property org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary Count
 #   busctl --user monitor org.sttd.Daemon
 # A missing session bus is not fatal: the service retries in the background and
 # the signals above keep working.
