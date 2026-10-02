@@ -20,7 +20,18 @@ Sweep example (cartesian product, `;` between vars, `,` between values)::
 
     tools/eval.py --corpus corpus/ --output eval-out/ \\
       --sweep "STTD_MIN_CONF=0.4,0.6;STTD_MIN_DENSITY=0.2,0.3" \\
-      --extra-args --model small --language pl
+      --extra-args --model whisper --language pl
+
+Comparing engines over one corpus::
+
+    tools/eval.py --corpus corpus/ --output eval-parakeet/ \\
+      --extra-args --model parakeet
+    tools/eval.py --corpus corpus/ --output eval-whisper/ \\
+      --extra-args --model whisper --language auto
+
+Note that `--model whisper` costs a full 30 s encoder pass per utterance
+whatever its length (the ONNX encoder pins its window), so Whisper's `elapsed_s`
+is not comparable to Parakeet's per-row; compare WER, not time.
 
 Output in `--output`: `results.jsonl` (one row per file per combo) and
 `summary.csv` (one row per combo: count, avg/median/p90 WER, empty rates,

@@ -83,6 +83,12 @@ package() {
   # The bundled default model: catalog specs resolve to a single directory
   # baked in at build time (STTD_MODELS_DIR above -> src/config.rs), so this
   # is what makes `sttd --model parakeet` work offline from any directory.
+  #
+  # Whisper is deliberately NOT bundled: it is 1443 MiB against Parakeet's 638,
+  # and sttd's default is Parakeet. A user who wants
+  # `sttd --model whisper` downloads it on first run into this same directory
+  # (which is root-owned, so that first run needs sudo -- see
+  # model_store::install_hint).
   local m=parakeet-ultra-int8
   local d="$pkgdir/usr/share/sttd/models/$m"
   install -Dm644 "models/$m/encoder-model.int8.onnx" "$d/encoder-model.int8.onnx"

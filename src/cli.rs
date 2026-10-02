@@ -10,6 +10,7 @@ use crate::config::{
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
+use crate::whisper_core::types::Language;
 
 /// How `--paste` inserts text via `ydotool` (Wayland only).
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,9 +56,9 @@ pub(crate) struct Cli {
     #[arg(long, env = "STTD_CHANNEL", value_name = "MIX|AUTO|N", default_value = "mix", value_parser = parse_channel_sel, help_heading = "Input")]
     pub(crate) channel: ChannelSel,
 
-    /// Model spec (e.g. `parakeet`, `parakeet-ultra-int8`, `parakeet-redux-int8`)
-    /// or path to model weights (a Parakeet model directory;
-    /// auto-downloaded if missing).
+    /// Model spec (e.g. `parakeet`, `parakeet-ultra-int8`, `parakeet-redux-int8`,
+    /// `whisper`, `whisper-large-v3-turbo-int8`) or path to model weights (a
+    /// model directory; auto-downloaded if missing).
     #[arg(
         short,
         long,
@@ -91,6 +92,19 @@ pub(crate) struct Cli {
     /// Decoder thread count; `0` = auto (physical cores).
     #[arg(long, env = "STTD_THREADS", default_value_t = 0, value_parser = parse_threads, value_name = "N", help_heading = "Model")]
     pub(crate) threads: i32,
+
+    /// Decoding language for Whisper models; Parakeet auto-detects and ignores
+    /// it. `auto` detects per utterance and costs nothing extra (the prompt run
+    /// already produces the language distribution).
+    #[arg(
+        long,
+        env = "STTD_LANGUAGE",
+        value_enum,
+        ignore_case = true,
+        default_value_t = Language::Polish,
+        help_heading = "Model"
+    )]
+    pub(crate) language: Language,
 
     /// Load the model onto the GPU (`off`/`0` = CPU-only).
     #[arg(
@@ -420,6 +434,7 @@ mod tests {
                     "vocab.txt",
                     "tokenizer.json",
                 ],
+                kind: crate::model_store::EngineKind::Parakeet,
             }
         );
         assert_eq!(cli.hangover_ms, DEFAULT_HANGOVER_MS);

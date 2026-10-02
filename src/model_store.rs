@@ -3,14 +3,75 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::{
-    parakeet_entry_for_spec, parakeet_source_for_spec, valid_model_specs, DEFAULT_MODELS_DIR,
-    PARAKEET_TOKENIZER_URL,
+    parakeet_entry_for_spec, parakeet_source_for_spec, valid_model_specs, whisper_entry_for_spec,
+    whisper_source_for_spec, DEFAULT_MODELS_DIR, PARAKEET_TOKENIZER_URL,
 };
 
+/// Which engine a resolved `--model` value selects. Both engines load from a
+/// directory of files, but the file names differ, so a directory the user
+/// pointed `--model` at directly has to be classified by probing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EngineKind {
+    /// Parakeet-TDT: `encoder-model` + `decoder_joint-model` + `vocab.txt`.
+    Parakeet,
+    /// Whisper large-v3-turbo: `encoder_model` + `decoder_model` +
+    /// `decoder_with_past_model` + `tokenizer.json`.
+    Whisper,
+}
+
+/// The models directory a catalog spec resolves into: the compile-time baked
+/// `DEFAULT_MODELS_DIR` joined with the spec's directory name (which equals the
+/// spec, see `PARAKEET_CATALOG` / `WHISPER_CATALOG`).
+///
+/// One place for that join, so the download path, `--list-models`' installed
+/// check and the tests that reach a downloaded model cannot drift apart.
+pub(crate) fn catalog_dir(spec: &str) -> PathBuf {
+    PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{spec}"))
+}
+
+impl EngineKind {
+    /// Short name for log lines and the `--list-models` table heading.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Parakeet => "parakeet",
+            Self::Whisper => "whisper",
+        }
+    }
+
+    /// The file that identifies a model directory as this engine's.
+    /// Note the deliberate naming difference between the two exports:
+    /// Parakeet's graphs use hyphens (`encoder-model.int8.onnx`), Whisper's
+    /// underscores (`encoder_model_int8.onnx`).
+    fn marker_file(self) -> &'static str {
+        match self {
+            Self::Parakeet => "decoder_joint-model.int8.onnx",
+            Self::Whisper => "decoder_with_past_model_int8.onnx",
+        }
+    }
+
+    /// Every file a directory of this kind must hold. Used both to validate a
+    /// user-supplied directory and to describe the expected layout in errors.
+    fn required_files(self) -> &'static [&'static str] {
+        match self {
+            Self::Parakeet => &[
+                "encoder-model.int8.onnx",
+                "decoder_joint-model.int8.onnx",
+                "vocab.txt",
+            ],
+            Self::Whisper => &[
+                "encoder_model_int8.onnx",
+                "decoder_model_int8.onnx",
+                "decoder_with_past_model_int8.onnx",
+                "tokenizer.json",
+            ],
+        }
+    }
+}
+
 /// Which ASR model a resolved `--model` value maps to, and where its
-/// weights live on disk. Parakeet takes a directory
-/// (encoder + decoder_joint + `vocab.txt` + `tokenizer.json`) — the engine
-/// only accepts a directory, so there is no single-file equivalent.
+/// weights live on disk. Both engines take a directory of files — Parakeet an
+/// encoder plus `decoder_joint`, Whisper an encoder plus two decoders — so
+/// there is no single-file equivalent for either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelRef {
     /// Model directory. `assets` lists the files `ensure_available` must
@@ -18,6 +79,8 @@ pub(crate) struct ModelRef {
     /// at directly (nothing is downloaded, only validated).
     pub(crate) dir: PathBuf,
     pub(crate) assets: &'static [&'static str],
+    /// Which engine opens `dir`. `asr::load_model` dispatches on this.
+    pub(crate) kind: EngineKind,
 }
 
 impl std::fmt::Display for ModelRef {
@@ -30,25 +93,39 @@ impl std::fmt::Display for ModelRef {
 
 /// Resolve a `--model` value to a model location: a directory path
 /// (contains a path separator) passes through untouched, otherwise the
-/// value must be a catalog spec — Parakeet's (a model directory under
-/// `models/`, see `PARAKEET_CATALOG`) — or the `parakeet` alias.
+/// value must be a catalog spec — Parakeet's or Whisper's (a model directory
+/// under `models/`, see `PARAKEET_CATALOG` / `WHISPER_CATALOG`) — or one of
+/// the `parakeet` / `whisper` aliases.
 pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         anyhow::bail!("empty --model value; expected one of: {}", valid_model_specs());
     }
-    if let Some((_, dir, assets, _)) = parakeet_entry_for_spec(trimmed) {
+    if let Some((spec, _, assets, _)) = parakeet_entry_for_spec(trimmed) {
         return Ok(ModelRef {
-            dir: PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{dir}")),
+            dir: catalog_dir(spec),
             assets,
+            kind: EngineKind::Parakeet,
         });
     }
-    if trimmed.contains('/') || trimmed.contains('\\') {
+    if let Some((spec, _, assets, _)) = whisper_entry_for_spec(trimmed) {
+        return Ok(ModelRef {
+            dir: catalog_dir(spec),
+            assets,
+            kind: EngineKind::Whisper,
+        });
+    }    if trimmed.contains('/') || trimmed.contains('\\') {
         // A manually-prepared model directory (nothing to download, just
-        // validated at load time).
+        // validated at load time). Which engine it holds is decided by its
+        // files, since the two exports have different names.
         let path = PathBuf::from(trimmed);
         if path.is_dir() {
-            return Ok(ModelRef { dir: path, assets: &[] });
+            let kind = detect_engine_kind(&path)?;
+            return Ok(ModelRef {
+                dir: path,
+                assets: &[],
+                kind,
+            });
         }
         anyhow::bail!(
             "model path {trimmed:?} is not an existing model directory; \
@@ -62,30 +139,72 @@ pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
     );
 }
 
+/// Classify a user-supplied model directory by probing for each engine's
+/// marker file. Both markers present is ambiguous and rejected rather than
+/// guessed; neither means the directory is not a model at all.
+fn detect_engine_kind(dir: &Path) -> Result<EngineKind> {
+    let parakeet = dir.join(EngineKind::Parakeet.marker_file()).exists();
+    let whisper = dir.join(EngineKind::Whisper.marker_file()).exists();
+    match (parakeet, whisper) {
+        (true, false) => Ok(EngineKind::Parakeet),
+        (false, true) => Ok(EngineKind::Whisper),
+        (true, true) => anyhow::bail!(
+            "{} holds both a Parakeet and a Whisper model directory's files; \
+             point --model at one engine's directory",
+            dir.display()
+        ),
+        (false, false) => anyhow::bail!(
+            "{} is not a valid model directory; a Parakeet one holds {} and a \
+             Whisper one holds {}",
+            dir.display(),
+            EngineKind::Parakeet.required_files().join(", "),
+            EngineKind::Whisper.required_files().join(", ")
+        ),
+    }
+}
+
 /// `model`, guaranteed to exist on return: downloads any missing weights
 /// into place first.
 pub(crate) fn ensure_available(model: &ModelRef) -> Result<()> {
-    ensure_parakeet_available(&model.dir, model.assets)
+    ensure_available_for(&model.dir, model.assets, model.kind)
 }
 
-/// Parakeet: downloads any of `assets` missing from `dir`. An empty
-/// `assets` (user-supplied directory) is only validated, never fetched —
-/// see `resolve_model`. For a catalog entry the directory name equals the
-/// spec, which selects the download source; for a user-supplied directory
-/// `assets` is empty and the spec is never used.
-fn ensure_parakeet_available(dir: &Path, assets: &'static [&'static str]) -> Result<()> {
+/// Downloads any of `assets` missing from `dir`. An empty `assets`
+/// (user-supplied directory) is only validated, never fetched — see
+/// `resolve_model`. For a catalog entry the directory name equals the spec,
+/// which selects the download source; for a user-supplied directory `assets`
+/// is empty and the spec is never used.
+fn ensure_available_for(
+    dir: &Path,
+    assets: &'static [&'static str],
+    kind: EngineKind,
+) -> Result<()> {
     if assets.is_empty() {
+        // Nothing to fetch, so this is the "did the user point --model at a
+        // real model directory" check. Every required file must be there, not
+        // just the marker `resolve_model` probed with: a directory holding an
+        // encoder but no decoder would otherwise fail deep inside the engine
+        // with an opaque ORT error.
         if !dir.is_dir() {
             anyhow::bail!(
-                "Parakeet model directory not found: {} (expected an encoder, a \
-                 decoder_joint and vocab.txt)",
-                dir.display()
+                "{} model directory not found: {} (expected {})",
+                kind.as_str(),
+                dir.display(),
+                kind.required_files().join(", ")
             );
         }
-        if !dir.join("vocab.txt").exists() {
+        let missing: Vec<&str> = kind
+            .required_files()
+            .iter()
+            .copied()
+            .filter(|f| !dir.join(f).exists())
+            .collect();
+        if !missing.is_empty() {
             anyhow::bail!(
-                "{} is missing vocab.txt; not a valid Parakeet model directory",
-                dir.display()
+                "{} is missing {}; not a valid {} model directory",
+                dir.display(),
+                missing.join(", "),
+                kind.as_str()
             );
         }
         return Ok(());
@@ -100,7 +219,7 @@ fn ensure_parakeet_available(dir: &Path, assets: &'static [&'static str]) -> Res
         if dest.exists() {
             continue;
         }
-        let url = parakeet_asset_url(&spec, file);
+        let url = asset_url(kind, &spec, file);
         log::info!("model not found at {}, downloading {url}...", dest.display());
         download(&url, &dest)
             .with_context(|| format!("{file}: {}", install_hint(dir)))?;
@@ -146,6 +265,36 @@ pub(crate) fn parakeet_asset_url(spec: &str, file_name: &str) -> String {
         "tokenizer.json" => PARAKEET_TOKENIZER_URL.to_string(),
         "vocab.txt" => format!("{root}{file_name}"),
         _ => format!("{root}{folder}{file_name}"),
+    }
+}
+
+/// Download URL for one Whisper asset filename (e.g.
+/// `decoder_with_past_model_int8.onnx`) of catalog `spec`. The repository is
+/// not one flat file list: the graphs sit in its `onnx/` folder and
+/// `tokenizer.json` at its root.
+///
+/// # Panics
+///
+/// Panics if `spec` has no `WHISPER_SOURCES` row. Every whisper catalog spec
+/// has one (asserted in `config`'s tests); the empty `assets` path in
+/// `ensure_available_for` never reaches this function.
+pub(crate) fn whisper_asset_url(spec: &str, file_name: &str) -> String {
+    let (root, folder) = whisper_source_for_spec(spec)
+        .unwrap_or_else(|| panic!("no WHISPER_SOURCES row for whisper spec {spec:?}"));
+    if file_name.ends_with(".onnx") {
+        format!("{root}{folder}{file_name}")
+    } else {
+        format!("{root}{file_name}")
+    }
+}
+
+/// Download URL for one asset of `kind`, dispatching to that engine's
+/// repository layout. Panics if `spec` has no source row for `kind` (see
+/// `whisper_asset_url`).
+fn asset_url(kind: EngineKind, spec: &str, file_name: &str) -> String {
+    match kind {
+        EngineKind::Parakeet => parakeet_asset_url(spec, file_name),
+        EngineKind::Whisper => whisper_asset_url(spec, file_name),
     }
 }
 
@@ -248,13 +397,16 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{PARAKEET_CATALOG, PARAKEET_DEFAULT_SPEC};
+    use crate::config::{
+        PARAKEET_CATALOG, PARAKEET_DEFAULT_SPEC, WHISPER_CATALOG, WHISPER_DEFAULT_SPEC,
+    };
 
     #[test]
     fn default_model_is_parakeet() {
         let resolved =
             resolve_model(crate::config::DEFAULT_MODEL_SPEC).expect("default spec must resolve");
         assert_eq!(resolved.dir, PathBuf::from("models/parakeet-ultra-int8"));
+        assert_eq!(resolved.kind, EngineKind::Parakeet);
         assert!(resolved.assets.contains(&"vocab.txt"));
     }
 
@@ -267,6 +419,7 @@ mod tests {
         ] {
             let resolved = resolve_model(spec).expect("parakeet spec must resolve");
             assert_eq!(resolved.dir, PathBuf::from(dir));
+            assert_eq!(resolved.kind, EngineKind::Parakeet);
             assert!(resolved.assets.contains(&"vocab.txt"));
             assert!(resolved.assets.iter().any(|f| f.contains("int8")));
         }
@@ -281,6 +434,149 @@ mod tests {
             redux.assets, resolved.assets,
             "both exports must ship the same asset set"
         );
+    }
+
+    /// A model directory is told apart by its marker file, and the two
+    /// exports spell their graphs differently (hyphens vs underscores), so a
+    /// wrong classification here means loading the wrong engine's names.
+    #[test]
+    fn whisper_specs_and_alias_resolve_to_model_dir() {
+        for (spec, dir) in [
+            ("whisper-large-v3-turbo-int8", "models/whisper-large-v3-turbo-int8"),
+            ("whisper", "models/whisper-large-v3-turbo-int8"),
+        ] {
+            let resolved = resolve_model(spec).expect("whisper spec must resolve");
+            assert_eq!(resolved.dir, PathBuf::from(dir));
+            assert_eq!(resolved.kind, EngineKind::Whisper);
+            assert_eq!(resolved.assets.len(), 4);
+        }
+        let resolved =
+            resolve_model(WHISPER_DEFAULT_SPEC).expect("default whisper spec must resolve");
+        assert_eq!(resolved.dir, PathBuf::from("models/whisper-large-v3-turbo-int8"));
+        assert_eq!(resolved.kind, EngineKind::Whisper);
+        for graph in [
+            "encoder_model_int8.onnx",
+            "decoder_model_int8.onnx",
+            "decoder_with_past_model_int8.onnx",
+        ] {
+            assert!(
+                resolved.assets.contains(&graph),
+                "the decode loop needs {graph}, missing from the asset list"
+            );
+        }
+        assert!(resolved.assets.contains(&"tokenizer.json"));
+    }
+
+    #[test]
+    fn whisper_asset_urls_split_onnx_folder_from_root() {
+        for (spec, _dir, _files, _size) in WHISPER_CATALOG {
+            let (root, folder) =
+                whisper_source_for_spec(spec).expect("catalog spec must have a source row");
+            assert_eq!(folder, "onnx/", "{spec} folder");
+            for graph in [
+                "encoder_model_int8.onnx",
+                "decoder_model_int8.onnx",
+                "decoder_with_past_model_int8.onnx",
+            ] {
+                let url = whisper_asset_url(spec, graph);
+                assert_eq!(url, format!("{root}onnx/{graph}"), "{spec} {graph}");
+                assert!(url.contains("/onnx/"), "{spec} url missing /onnx/: {url}");
+            }
+            // The tokenizer sits at the repository root, not in the folder.
+            let tok = whisper_asset_url(spec, "tokenizer.json");
+            assert_eq!(tok, format!("{root}tokenizer.json"), "{spec}");
+            assert!(!tok.contains("/onnx/"), "{spec} tokenizer url: {tok}");
+            assert!(
+                tok.contains("onnx-community/whisper-large-v3-turbo"),
+                "{spec} tokenizer must come from the whisper repo: {tok}"
+            );
+        }
+    }
+
+    /// Build a throwaway directory holding `files` (empty files are enough:
+    /// classification and validation only test existence).
+    fn temp_model_dir(tag: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sttd-{tag}-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn user_directory_is_classified_by_its_files() {
+        let parakeet = temp_model_dir("parakeet-dir", EngineKind::Parakeet.required_files());
+        let resolved = resolve_model(parakeet.to_str().unwrap()).expect("must resolve");
+        assert_eq!(resolved.kind, EngineKind::Parakeet);
+        assert!(resolved.assets.is_empty(), "a user dir is never fetched");
+        // A resolved directory must then pass validation.
+        ensure_available(&resolved).expect("a complete parakeet dir must validate");
+        std::fs::remove_dir_all(&parakeet).ok();
+
+        let whisper = temp_model_dir("whisper-dir", EngineKind::Whisper.required_files());
+        let resolved = resolve_model(whisper.to_str().unwrap()).expect("must resolve");
+        assert_eq!(resolved.kind, EngineKind::Whisper);
+        assert!(resolved.assets.is_empty(), "a user dir is never fetched");
+        ensure_available(&resolved).expect("a complete whisper dir must validate");
+        std::fs::remove_dir_all(&whisper).ok();
+    }
+
+    #[test]
+    fn ambiguous_or_empty_directory_is_rejected() {
+        // Both marker files present: refuse rather than pick one.
+        let both = temp_model_dir(
+            "both-dir",
+            &[
+                EngineKind::Parakeet.marker_file(),
+                EngineKind::Whisper.marker_file(),
+            ],
+        );
+        let err = resolve_model(both.to_str().unwrap()).expect_err("must reject");
+        assert!(err.to_string().contains("both"), "msg={err}");
+        std::fs::remove_dir_all(&both).ok();
+
+        // No marker file: not a model directory at all, and the error names
+        // the files each engine expects.
+        let empty = temp_model_dir("empty-dir", &["README.md"]);
+        let err = resolve_model(empty.to_str().unwrap()).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("encoder-model.int8.onnx"), "msg={msg}");
+        assert!(msg.contains("encoder_model_int8.onnx"), "msg={msg}");
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// A directory holding a Whisper marker but not the rest: `resolve_model`
+    /// classifies it, then validation must catch the gap *before* the engine
+    /// opens a session, naming what is missing. Without the marker the
+    /// classification itself rejects it (see `ambiguous_or_empty_directory_is_rejected`),
+    /// so the marker is what makes this the interesting case.
+    #[test]
+    fn incomplete_user_directory_fails_validation_with_the_missing_file() {
+        let partial = temp_model_dir(
+            "partial-dir",
+            &[
+                "decoder_with_past_model_int8.onnx",
+                "encoder_model_int8.onnx",
+            ],
+        );
+        let resolved = resolve_model(partial.to_str().unwrap()).expect("classifies as whisper");
+        assert_eq!(resolved.kind, EngineKind::Whisper);
+        let err = ensure_available(&resolved).expect_err("must reject");
+        let msg = err.to_string();
+        // The two graphs it does have must not be reported as missing.
+        assert!(msg.contains("decoder_model_int8.onnx"), "msg={msg}");
+        assert!(msg.contains("tokenizer.json"), "msg={msg}");
+        assert!(!msg.contains("encoder_model_int8.onnx"), "msg={msg}");
+        assert!(msg.contains("whisper"), "msg={msg}");
+        std::fs::remove_dir_all(&partial).ok();
     }
 
     #[test]
@@ -344,19 +640,17 @@ mod tests {
     }
 
     #[test]
-    fn existing_directory_path_resolves_to_parakeet_with_no_assets() {
-        let tmp = std::env::temp_dir().join(format!(
-            "sttd-weights-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let resolved = resolve_model(tmp.to_str().unwrap()).expect("dir path must resolve");
-        assert_eq!(resolved, ModelRef { dir: tmp.clone(), assets: &[] });
-        std::fs::remove_dir_all(&tmp).ok();
+    fn valid_specs_error_names_both_catalogs() {
+        let specs = valid_model_specs();
+        for expected in [
+            "parakeet-ultra-int8",
+            "parakeet-redux-int8",
+            "parakeet",
+            "whisper-large-v3-turbo-int8",
+            "whisper",
+        ] {
+            assert!(specs.contains(expected), "{expected} missing from: {specs}");
+        }
     }
 
     #[test]

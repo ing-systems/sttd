@@ -8,7 +8,9 @@
 //
 // This replaces Murmure's `nemo128.onnx` preprocessor session: same
 // numerical recipe (NeMo `ParakeetFeatureExtractor`: 128 mels, n_fft 512,
-// hop 160, win 400, preemphasis 0.97), one less ONNX file to ship.
+// hop 160, win 400, preemphasis 0.97), one less ONNX file to ship. The mel
+// filterbank itself now lives in `crate::mel`, shared with the Whisper
+// frontend.
 //
 // The window, the padded signal, the FFT input/output/scratch and the
 // spectrogram scratch buffer are built once in `new` and reused by every
@@ -23,6 +25,7 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use super::types::ParakeetError;
+use crate::mel::create_mel_filterbank;
 
 /// NeMo `ParakeetFeatureExtractor` parameters for the TDT 0.6B model.
 #[derive(Debug, Clone)]
@@ -336,57 +339,4 @@ mod tests {
     }
 }
 
-// Slaney mel scale (librosa).
-const F_SP: f64 = 200.0 / 3.0;
-const MIN_LOG_HZ: f64 = 1000.0;
-const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP;
-const LOG_STEP: f64 = 0.06875177742094912;
 
-fn hz_to_mel_slaney(hz: f64) -> f64 {
-    if hz < MIN_LOG_HZ {
-        hz / F_SP
-    } else {
-        MIN_LOG_MEL + (hz / MIN_LOG_HZ).ln() / LOG_STEP
-    }
-}
-
-fn mel_to_hz_slaney(mel: f64) -> f64 {
-    if mel < MIN_LOG_MEL {
-        mel * F_SP
-    } else {
-        MIN_LOG_HZ * ((mel - MIN_LOG_MEL) * LOG_STEP).exp()
-    }
-}
-
-fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) -> Array2<f32> {
-    let freq_bins = n_fft / 2 + 1;
-    let mut filterbank = Array2::<f32>::zeros((n_mels, freq_bins));
-
-    let fmax = sample_rate as f64 / 2.0;
-    let mel_min = hz_to_mel_slaney(0.0);
-    let mel_max = hz_to_mel_slaney(fmax);
-
-    let mel_points: Vec<f64> = (0..=n_mels + 1)
-        .map(|i| mel_to_hz_slaney(mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64))
-        .collect();
-    let fft_freqs: Vec<f64> = (0..freq_bins)
-        .map(|i| i as f64 * sample_rate as f64 / n_fft as f64)
-        .collect();
-    let fdiff: Vec<f64> = mel_points.windows(2).map(|w| w[1] - w[0]).collect();
-
-    for i in 0..n_mels {
-        for (k, &freq) in fft_freqs.iter().enumerate() {
-            let lower = (freq - mel_points[i]) / fdiff[i];
-            let upper = (mel_points[i + 2] - freq) / fdiff[i + 1];
-            filterbank[[i, k]] = 0.0f64.max(lower.min(upper)) as f32;
-        }
-    }
-    // Slaney area normalization.
-    for i in 0..n_mels {
-        let enorm = 2.0 / (mel_points[i + 2] - mel_points[i]);
-        for k in 0..freq_bins {
-            filterbank[[i, k]] *= enorm as f32;
-        }
-    }
-    filterbank
-}

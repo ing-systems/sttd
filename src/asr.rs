@@ -69,9 +69,17 @@ pub(crate) trait SpeechModel {
 }
 
 /// Load the model `ModelRef` names. Called once per load/reload cycle by
-/// `AsrWorker::load_once`.
+/// `AsrWorker::load_once`. Dispatches on the kind `resolve_model` classified,
+/// so the engine choice is settled before any session is opened.
 pub(crate) fn load_model(model: &ModelRef, opts: &AsrOptions) -> Result<Box<dyn SpeechModel>> {
-    Ok(Box::new(crate::parakeet::ParakeetModel::load(&model.dir, opts)?))
+    Ok(match model.kind {
+        crate::model_store::EngineKind::Parakeet => {
+            Box::new(crate::parakeet::ParakeetModel::load(&model.dir, opts)?) as Box<dyn SpeechModel>
+        }
+        crate::model_store::EngineKind::Whisper => {
+            Box::new(crate::whisper::WhisperModel::load(&model.dir, opts)?) as Box<dyn SpeechModel>
+        }
+    })
 }
 
 /// Runs `f` while ticking `"loading {label}... Ns"` once per second on a
@@ -185,6 +193,9 @@ pub(crate) struct AsrOptions {
     pub(crate) gate: GateConfig,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
+    /// Decoding language for the Whisper engine (fixed once at startup). Parakeet
+    /// auto-detects per utterance and ignores this.
+    pub(crate) language: crate::whisper_core::types::Language,
     /// Live custom vocabulary: the post-gate correction list plus the queue
     /// that hands swapped words to the loaded engine (see `LiveDictionary`).
     /// Empty = off. Shared with the D-Bus thread, so it changes at runtime.
@@ -1797,6 +1808,7 @@ mod tests {
             gate: default_gate(),
             n_threads: DEFAULT_THREADS,
             use_gpu: false,
+            language: crate::whisper_core::types::Language::Polish,
             metrics_path: None,
             shed_stale: false,
             dictionary: empty_live_dictionary(),
@@ -1805,6 +1817,7 @@ mod tests {
         let bad = ModelRef {
             dir: std::path::PathBuf::from("/nonexistent/parakeet-bogus"),
             assets: &[],
+            kind: crate::model_store::EngineKind::Parakeet,
         };
         let (handle, ready) = spawn_asr_worker(
             rx,

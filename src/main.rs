@@ -66,7 +66,7 @@ use signal_hook::iterator::Signals;
 mod cli;
 use cli::Cli;
 mod config;
-use config::{parakeet_entry_for_spec, DEFAULT_MODELS_DIR, PARAKEET_CATALOG};
+use config::{DEFAULT_MODELS_DIR, PARAKEET_CATALOG, WHISPER_CATALOG};
 mod capture;
 use capture::*;
 mod clean;
@@ -91,11 +91,15 @@ mod vad;
 mod wav;
 use wav::*;
 mod model_store;
-use model_store::*;
+use model_store::{ensure_available, resolve_model, EngineKind, ModelRef};
 mod asr;
 use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
 mod parakeet_core;
 mod parakeet;
+mod mel;
+mod whisper;
+mod whisper_core;
+use whisper_core::types::Language;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -139,25 +143,39 @@ fn init_logging() {
         .init();
 }
 
-/// Print known models — Parakeet's `PARAKEET_CATALOG` — as an aligned table
-/// with a two-character leading marker: `*` = currently selected (effective
-/// `--model` after CLI > `STTD_MODEL` > compiled-in default),
-/// `I` = installed (weights present on disk). A row can carry both (`*I`).
+/// Print known models — both catalogs — as one aligned table per engine, with
+/// a two-character leading marker: `*` = currently selected (effective
+/// `--model` after CLI > `STTD_MODEL` > compiled-in default), `I` = installed
+/// (weights present on disk). A row can carry both (`*I`).
 fn print_available_models(cli: &Cli) {
     let input = cli.model_input();
 
-    let parakeet_selected = selected_parakeet_spec_for_input(&input);
-    let parakeet_installed: Vec<bool> = PARAKEET_CATALOG
-        .iter()
-        .map(|(_, dir, files, _)| {
-            let base = Path::new(DEFAULT_MODELS_DIR).join(dir);
-            files.iter().all(|f| base.join(f).exists())
-        })
-        .collect();
-    println!("parakeet models:");
-    print!("{}", format_parakeet_models(parakeet_selected, &parakeet_installed));
+    let mut any_selected = false;
+    for (label, catalog, alias) in [
+        (
+            "parakeet",
+            PARAKEET_CATALOG,
+            (crate::config::PARAKEET_DEFAULT_SPEC, "parakeet"),
+        ),
+        (
+            "whisper",
+            WHISPER_CATALOG,
+            (crate::config::WHISPER_DEFAULT_SPEC, "whisper"),
+        ),
+    ] {
+        let selected = selected_catalog_spec_for_input(catalog, alias, &input);
+        let installed: Vec<bool> = catalog
+            .iter()
+            .map(|(_, dir, files, _)| {
+                let base = Path::new(DEFAULT_MODELS_DIR).join(dir);
+                files.iter().all(|f| base.join(f).exists())
+            })
+            .collect();
+        println!("{label} models:");
+        print!("{}", format_catalog_models(catalog, selected, &installed));
+        any_selected |= selected.is_some();
+    }
 
-    let any_selected = parakeet_selected.is_some();
     if !any_selected {
         let trimmed = input.trim();
         if !trimmed.is_empty() {
@@ -166,35 +184,50 @@ fn print_available_models(cli: &Cli) {
     }
 }
 
-/// Map a `--model` input value to the Parakeet catalog spec it selects, if
-/// any (exact spec match, including the `parakeet` alias — see
-/// `parakeet_entry_for_spec`). Parakeet models are directories, and a bare
+/// Map a `--model` input value to the catalog spec it selects in `catalog`, if
+/// any: an exact spec match, or that catalog's short `alias`, which stands for
+/// `alias_spec`.
+///
+/// `alias` has to be passed in rather than looked up, because the two catalogs
+/// use the same alias names for different defaults — the label alone does not
+/// say which engine is meant. Both engines ship as directories, so a bare
 /// basename comparison would be meaningless.
-fn selected_parakeet_spec_for_input(input: &str) -> Option<&'static str> {
+fn selected_catalog_spec_for_input(
+    catalog: &[(&'static str, &'static str, &'static [&'static str], &'static str)],
+    alias: (&'static str, &'static str),
+    input: &str,
+) -> Option<&'static str> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;
     }
-    parakeet_entry_for_spec(trimmed).map(|(spec, ..)| *spec)
+    if trimmed == alias.1 {
+        return Some(alias.0);
+    }
+    catalog.iter().find(|(s, ..)| *s == trimmed).map(|(spec, ..)| *spec)
 }
 
-/// Render the Parakeet `--list-models` table: `*`/`I` marker scheme over
-/// `PARAKEET_CATALOG` (columns SPEC/DIR/SIZE, since Parakeet ships as a
-/// directory of files rather than one).
-fn format_parakeet_models(selected: Option<&str>, installed: &[bool]) -> String {
-    let spec_w = PARAKEET_CATALOG
+/// Render one `--list-models` table: `*`/`I` marker scheme over `catalog`
+/// (columns SPEC/DIR/SIZE, since both engines ship as a directory of files
+/// rather than one).
+fn format_catalog_models(
+    catalog: &[(&'static str, &'static str, &'static [&'static str], &'static str)],
+    selected: Option<&str>,
+    installed: &[bool],
+) -> String {
+    let spec_w = catalog
         .iter()
         .map(|(s, ..)| s.len())
         .max()
         .unwrap_or(0)
         .max("SPEC".len());
-    let dir_w = PARAKEET_CATALOG
+    let dir_w = catalog
         .iter()
         .map(|(_, d, ..)| d.len())
         .max()
         .unwrap_or(0)
         .max("DIR".len());
-    let size_w = PARAKEET_CATALOG
+    let size_w = catalog
         .iter()
         .map(|(_, _, _, s)| s.len())
         .max()
@@ -205,7 +238,7 @@ fn format_parakeet_models(selected: Option<&str>, installed: &[bool]) -> String 
         "   {0:<1$}  {2:<3$}  {4:>5$}\n",
         "SPEC", spec_w, "DIR", dir_w, "SIZE", size_w
     ));
-    for (i, (spec, dir, _files, size)) in PARAKEET_CATALOG.iter().enumerate() {
+    for (i, (spec, dir, _files, size)) in catalog.iter().enumerate() {
         let is_selected = selected == Some(*spec);
         let is_installed = installed.get(i).copied().unwrap_or(false);
         let marker = match (is_selected, is_installed) {
@@ -404,7 +437,7 @@ fn producer_occupied<T>(tx: &Producer<T>, cap: usize) -> usize {
 fn prepare_model(cli: &Cli) -> Result<(ModelRef, Producer<Utterance>, Consumer<Utterance>)> {
     let model = resolve_model_input(cli)?;
     log::info!("model: {model}");
-    validate_parakeet_model_flags(cli, &model)?;
+    validate_model_flags(cli, &model)?;
     let (tx, rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
     Ok((model, tx, rx))
 }
@@ -911,28 +944,43 @@ fn resolve_model_input(cli: &Cli) -> Result<ModelRef> {
     Ok(model)
 }
 
-/// `--gpu` is accepted but ignored (Parakeet runs on CPU in this build,
-/// see `parakeet.rs`): report it so the no-effect is visible instead of
-/// silent. Returns the flag names to warn about.
-fn unsupported_parakeet_flags(cli: &Cli) -> Vec<&'static str> {
+/// Flags the selected engine ignores, so the no-effect is visible instead of
+/// silent. Both engines run on CPU in this build (`--gpu` is accepted but has
+/// no provider behind it); `--language` only means something to Whisper.
+fn ignored_model_flags(cli: &Cli, model: &ModelRef) -> Vec<&'static str> {
     let mut flags = Vec::new();
     if cli.gpu {
-        // Parakeet runs on CPU in this build (see parakeet.rs).
         flags.push("--gpu");
+    }
+    if model.kind == EngineKind::Parakeet && cli.language != Language::default() {
+        // Parakeet auto-detects per utterance, so a fixed language cannot apply.
+        flags.push("--language");
     }
     flags
 }
 
-/// Warn about flags Parakeet ignores, then log the auto-detect note.
-fn validate_parakeet_model_flags(cli: &Cli, _model: &ModelRef) -> Result<()> {
-    let unsupported = unsupported_parakeet_flags(cli);
-    if !unsupported.is_empty() {
+/// Warn about flags the selected engine ignores, then log what that engine
+/// does about the spoken language.
+fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
+    let ignored = ignored_model_flags(cli, model);
+    if !ignored.is_empty() {
         log::warn!(
-            "Parakeet ignores flag(s): {} (no effect with this --model)",
-            unsupported.join(", ")
+            "{} ignores flag(s): {} (no effect with this --model)",
+            model.kind.as_str(),
+            ignored.join(", ")
         );
     }
-    log::info!("Parakeet auto-detects the spoken language per utterance");
+    match model.kind {
+        EngineKind::Parakeet => {
+            log::info!("Parakeet auto-detects the spoken language per utterance")
+        }
+        EngineKind::Whisper => match cli.language {
+            Language::Auto => log::info!(
+                "Whisper detects the spoken language per utterance (--language auto)"
+            ),
+            language => log::info!("Whisper decodes in {language} (--language)"),
+        },
+    }
     Ok(())
 }
 
@@ -948,6 +996,7 @@ fn asr_options(
         gate: AcousticConfig::from_cli(cli).gate,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
+        language: cli.language,
         metrics_path: cli.metrics.clone(),
         shed_stale,
         // The live handle, not a `Vec` snapshot: the D-Bus thread swaps the
@@ -1083,62 +1132,185 @@ impl AcousticConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parakeet_selection_matches_spec_and_alias() {
-        assert_eq!(
-            selected_parakeet_spec_for_input("parakeet-ultra-int8"),
-            Some("parakeet-ultra-int8")
-        );
-        assert_eq!(
-            selected_parakeet_spec_for_input("parakeet"),
-            Some("parakeet-ultra-int8")
-        );
-        assert_eq!(selected_parakeet_spec_for_input("small"), None);
-        assert_eq!(selected_parakeet_spec_for_input(""), None);
-    }
-
-    #[test]
-    fn parakeet_models_table_aligns_columns_and_marks_rows() {
-        let installed = vec![false; PARAKEET_CATALOG.len()];
-        let table = format_parakeet_models(Some("parakeet-ultra-int8"), &installed);
-        let lines: Vec<&str> = table.lines().collect();
-        assert_eq!(lines.len(), PARAKEET_CATALOG.len() + 1);
-        assert!(lines[0].contains("SPEC"));
-        assert!(lines[0].contains("DIR"));
-        assert!(lines[0].contains("SIZE"));
-        let int8_row = lines
-            .iter()
-            .find(|l| l.contains("parakeet-ultra-int8"))
-            .expect("int8 row must exist");
-        assert!(int8_row.starts_with("* "), "row={int8_row:?}");
-    }
-
-    #[test]
-    fn unsupported_parakeet_flags_are_empty_for_plain_cli_without_gpu() {
-        // `--gpu` defaults to false (DEFAULT_USE_GPU), so a plain CLI is
-        // clean; only an explicit `--gpu` warns — see the next test.
-        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
-        assert!(unsupported_parakeet_flags(&cli).is_empty());
-    }
-
-    #[test]
-    fn unsupported_parakeet_flags_flags_explicit_gpu() {
-        let cli = Cli::try_parse_from(["sttd", "--gpu"]).expect("defaults must parse");
-        assert_eq!(unsupported_parakeet_flags(&cli), vec!["--gpu"]);
-    }
-
-
-
-
-
-    #[test]
-    fn validate_parakeet_flags_accepts_plain_cli() {
-        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
-        let model = ModelRef {
-            dir: std::path::PathBuf::from("models/parakeet-ultra-int8"),
+    /// A `ModelRef` for flag-validation tests: `assets` is empty (a
+    /// user-supplied directory), which is all the flag checks look at.
+    fn model_ref(kind: EngineKind, dir: &str) -> ModelRef {
+        ModelRef {
+            dir: std::path::PathBuf::from(dir),
             assets: &[],
+            kind,
+        }
+    }
+
+    /// A spec belongs to exactly one catalog: a Whisper spec must not be
+    /// selectable in the Parakeet table, or the `*` marker would light up in
+    /// both. Each catalog's short alias resolves to its own default, which is
+    /// why the alias is a parameter and not looked up from the table.
+    #[test]
+    fn selection_is_per_catalog_and_exact() {
+        let parakeet = (crate::config::PARAKEET_DEFAULT_SPEC, "parakeet");
+        let whisper = (crate::config::WHISPER_DEFAULT_SPEC, "whisper");
+        assert_eq!(
+            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "parakeet-ultra-int8"),
+            Some("parakeet-ultra-int8")
+        );
+        assert_eq!(
+            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "whisper-large-v3-turbo-int8"),
+            None
+        );
+        assert_eq!(
+            selected_catalog_spec_for_input(WHISPER_CATALOG, whisper, "whisper-large-v3-turbo-int8"),
+            Some("whisper-large-v3-turbo-int8")
+        );
+        assert_eq!(
+            selected_catalog_spec_for_input(WHISPER_CATALOG, whisper, "parakeet-ultra-int8"),
+            None
+        );
+        // Aliases.
+        assert_eq!(
+            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "parakeet"),
+            Some("parakeet-ultra-int8")
+        );
+        assert_eq!(
+            selected_catalog_spec_for_input(WHISPER_CATALOG, whisper, "whisper"),
+            Some("whisper-large-v3-turbo-int8")
+        );
+        // The wrong catalog's alias is not a spec there.
+        assert_eq!(
+            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "whisper"),
+            None
+        );
+        assert_eq!(
+            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "small"),
+            None
+        );
+        assert_eq!(
+            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, ""),
+            None
+        );
+    }
+
+    #[test]
+    fn models_table_aligns_columns_and_marks_rows() {
+        for (catalog, spec) in [
+            (PARAKEET_CATALOG, "parakeet-ultra-int8"),
+            (WHISPER_CATALOG, "whisper-large-v3-turbo-int8"),
+        ] {
+            let installed = vec![false; catalog.len()];
+            let table = format_catalog_models(catalog, Some(spec), &installed);
+            let lines: Vec<&str> = table.lines().collect();
+            assert_eq!(lines.len(), catalog.len() + 1, "{spec}");
+            assert!(lines[0].contains("SPEC"));
+            assert!(lines[0].contains("DIR"));
+            assert!(lines[0].contains("SIZE"));
+            let row = lines
+                .iter()
+                .find(|l| l.contains(spec))
+                .unwrap_or_else(|| panic!("row for {spec} must exist"));
+            // Selected but not installed.
+            assert!(row.starts_with("* "), "{spec} row={row:?}");
+        }
+    }
+
+    #[test]
+    fn models_table_marks_installed_rows_independently_of_selection() {
+        let catalog = WHISPER_CATALOG;
+        let spec = "whisper-large-v3-turbo-int8";
+        let row_with = |selected: Option<&str>, installed: bool| {
+            let table = format_catalog_models(catalog, selected, &[installed]);
+            table
+                .lines()
+                .find(|l| l.contains(spec))
+                .unwrap_or_else(|| panic!("row for {spec} must exist"))
+                .to_string()
         };
-        assert!(validate_parakeet_model_flags(&cli, &model).is_ok());
+        // Installed but not selected, then both markers, then neither. A row
+        // can carry `*` and `I` independently.
+        assert!(row_with(None, true).starts_with("I "));
+        assert!(row_with(Some(spec), true).starts_with("*I"));
+        assert!(row_with(None, false).starts_with("  "));
+    }
+
+    #[test]
+    fn ignored_model_flags_are_empty_for_plain_cli() {
+        // `--gpu` defaults to false and `--language` to the `Language`
+        // default, so a plain CLI is clean for either engine.
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        for (kind, dir) in [
+            (EngineKind::Parakeet, "models/parakeet-ultra-int8"),
+            (EngineKind::Whisper, "models/whisper-large-v3-turbo-int8"),
+        ] {
+            let model = model_ref(kind, dir);
+            assert!(
+                ignored_model_flags(&cli, &model).is_empty(),
+                "{}",
+                kind.as_str()
+            );
+            assert!(validate_model_flags(&cli, &model).is_ok());
+        }
+    }
+
+    #[test]
+    fn gpu_is_ignored_by_both_engines() {
+        let cli = Cli::try_parse_from(["sttd", "--gpu"]).expect("flags must parse");
+        for kind in [EngineKind::Parakeet, EngineKind::Whisper] {
+            let model = model_ref(kind, "models/x");
+            assert_eq!(ignored_model_flags(&cli, &model), vec!["--gpu"]);
+        }
+    }
+
+    /// Parakeet auto-detects per utterance, so a fixed `--language` cannot
+    /// apply and must be reported rather than silently dropped.
+    #[test]
+    fn language_is_ignored_by_parakeet_but_honored_by_whisper() {
+        let cli = Cli::try_parse_from(["sttd", "--language", "en"]).expect("flags must parse");
+        let parakeet = model_ref(EngineKind::Parakeet, "models/parakeet-ultra-int8");
+        let whisper = model_ref(EngineKind::Whisper, "models/whisper-large-v3-turbo-int8");
+        assert_eq!(ignored_model_flags(&cli, &parakeet), vec!["--language"]);
+        assert!(ignored_model_flags(&cli, &whisper).is_empty());
+
+        // `auto` is a deviation from the default for Whisper's log line but a
+        // Parakeet user who set it explicitly should still be told.
+        let auto = Cli::try_parse_from(["sttd", "--language", "auto"]).expect("flags must parse");
+        assert_eq!(auto.language, Language::Auto);
+        assert_eq!(
+            ignored_model_flags(&auto, &parakeet),
+            vec!["--language"],
+            "explicit --language auto must still be reported under Parakeet"
+        );
+        assert!(ignored_model_flags(&auto, &whisper).is_empty());
+    }
+
+    #[test]
+    fn language_flag_defaults_to_polish_and_parses_every_value() {
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert_eq!(cli.language, Language::Polish);
+        for (value, expected) in [
+            ("pl", Language::Polish),
+            ("en", Language::English),
+            ("auto", Language::Auto),
+            ("PL", Language::Polish),
+            ("Auto", Language::Auto),
+        ] {
+            let cli = Cli::try_parse_from(["sttd", "--language", value])
+                .unwrap_or_else(|e| panic!("--language {value} must parse: {e}"));
+            assert_eq!(cli.language, expected, "value={value}");
+        }
+        assert!(Cli::try_parse_from(["sttd", "--language", "de"]).is_err());
+    }
+
+    #[test]
+    fn asr_options_carry_the_language_to_the_worker() {
+        let cli = Cli::try_parse_from(["sttd", "--language", "en"]).expect("flags must parse");
+        let dictionary = crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
+            Vec::new(),
+            Default::default(),
+        ))
+        .1;
+        assert_eq!(
+            asr_options(&cli, true, dictionary).language,
+            Language::English
+        );
     }
 
     #[test]

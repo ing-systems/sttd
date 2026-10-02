@@ -76,22 +76,50 @@ _Avoid_: output, sink, side effects (as a name)
 ### Speech models
 
 **Speech model**:
-The loaded, ready-to-run Parakeet engine an utterance is handed to for
-transcription — chosen once at startup by the model spec and fixed for the
-process's lifetime. Parakeet runs over direct `ort` sessions (Rust mel
-frontend, no `nemo128.onnx`) with dictionary phrase-boosting on its greedy
-decode plus per-word confidences for the dictionary gate.
+The loaded, ready-to-run engine an utterance is handed to for transcription —
+chosen once at startup by the model spec and fixed for the process's lifetime.
+Two engines sit behind the same seam: Parakeet-TDT (direct `ort` sessions, a
+Rust mel frontend, dictionary phrase-boosting on its greedy decode, and per-word
+confidences for the dictionary gate) and Whisper large-v3-turbo (three `ort`
+sessions, a Rust log-mel frontend, and a KV-cached greedy decode with the same
+per-word confidences but no phrase boosting). Parakeet auto-detects the spoken
+language per utterance; Whisper is told which to decode in.
 (Sherpa-onnx support lives on branch `sherpa-onnx`.)
 _Avoid_: model (bare, when the engine — as opposed to the weights — is meant), backend
 
+**Engine**:
+Which of the two speech models a run uses, settled by the model spec (or, for a
+model directory named on the command line, by the files it holds). Everything
+past that point — the worker loop, the gates, the metrics, the emission — is
+engine-agnostic.
+_Avoid_: backend, model kind
+
 **Model spec**:
 A `--model` value that names a catalog entry rather than a filesystem path —
-`parakeet`, `parakeet-ultra-int8` or `parakeet-redux-int8`. Resolved into the
-models directory baked into the binary at build time (`STTD_MODELS_DIR`,
-default `models`; the Arch package uses `/usr/share/sttd/models`) and, for a
-catalog spec, downloaded if missing; an existing directory passes through
-untouched instead.
+`parakeet`, `parakeet-ultra-int8`, `parakeet-redux-int8`, `whisper` or
+`whisper-large-v3-turbo-int8`. Resolved into the models directory baked into the
+binary at build time (`STTD_MODELS_DIR`, default `models`; the Arch package
+uses `/usr/share/sttd/models`) and, for a catalog spec, downloaded if missing;
+an existing directory passes through untouched instead, and the engine is read
+off its files.
 _Avoid_: model name, model id
+
+**Decoding language**:
+The language Whisper is told to decode in, fixed into its prompt as a language
+token for the process's lifetime — `pl` unless `--language` says otherwise,
+with `auto` detecting per utterance from the prompt's own first-token logits.
+Parakeet has no such thing: it detects the language itself, every utterance.
+_Avoid_: language detection (that is what Parakeet does, and what `--language
+auto` asks Whisper for), locale
+
+**Padded window**:
+The fixed 30 s of audio a Whisper utterance is decoded in, padded (and
+truncated) to length before it reaches the encoder, which takes exactly 3000
+mel frames because its input axes are constants in the ONNX graph. This is why
+Whisper's cost per utterance does not scale with how much was said: a two-second
+utterance costs the same encoder pass as a thirty-second one, and the RTF column
+reports against the window rather than the utterance.
+_Avoid_: chunk (that is a piece of an utterance, cut by the VAD), clip
 
 ### Signal paths
 
@@ -110,6 +138,15 @@ adds a 20 ms lookahead ahead of its own output, absorbed by pre-roll
 (300 ms) and silence hangover (800 ms) the same way `earshot`'s own 16 ms
 prediction window is.
 _Avoid_: noise suppression (generic), the denoiser (as if only one exists)
+
+**Speech cache**:
+Whisper's key/value tensors for one utterance: the cross-attention half, which
+depends only on the encoder output and is reused unchanged for every generated
+token, and the self-attention half, which grows by one token per step. Two
+graphs keep this split — one runs the prompt and produces it, the other runs
+each later token off it. Parakeet has no counterpart (it decodes frame by frame
+with no attention cache).
+_Avoid_: KV cache (fine as a term, but the split is the point), hidden state
 
 **Model branch**:
 The signal path that gets transcribed, kept raw and undenoised, because the

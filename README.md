@@ -40,24 +40,42 @@ See `src/main.rs:1-51` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdic
 ## Requirements
 
 - Linux x86_64, Rust stable, `alsa-lib`.
-- ~638 MiB disk for the default `int8` model.
+- ~638 MiB disk for the default Parakeet `int8` model, or ~1443 MiB for Whisper.
 - Optional: `wl-clipboard` (`wl-copy`) for `--copy`, `ydotool` + `ydotoold` for `--paste` (Wayland only), PipeWire/WirePlumber for capture, Python 3 stdlib for `tools/`.
 
 ## Models
 
-Catalog (`src/config.rs:285-305`):
+Two engines ship behind one `--model` flag. Catalog (`src/config.rs`):
 
 | Spec | Size | Contents |
 | --- | --- | --- |
 | `parakeet` (alias for `int8`) | 638 MiB | encoder int8 + decoder_joint int8 + vocab + tokenizer |
 | `parakeet-ultra-int8` | 638 MiB | same as above |
 | `parakeet-redux-int8` | 640 MiB | same as above |
+| `whisper` (alias for `int8`) | 1443 MiB | encoder int8 + decoder int8 + decoder_with_past int8 + tokenizer |
+| `whisper-large-v3-turbo-int8` | 1443 MiB | same as above |
 
-Weights come from `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx` and `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-redux-onnx` (ONNX weights from each repo's `int8/` folder, `vocab.txt` from its repo root) and `huggingface.co/nvidia/parakeet-tdt-0.6b-v3` (tokenizer only). Both exports keep the base architecture and tokenizer, so the Rust mel frontend and dictionary phrase-boosting are unchanged.
+Parakeet weights come from `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx` and `huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-redux-onnx` (ONNX weights from each repo's `int8/` folder, `vocab.txt` from its repo root) and `huggingface.co/nvidia/parakeet-tdt-0.6b-v3` (tokenizer only). Both exports keep the base architecture and tokenizer, so the Rust mel frontend and dictionary phrase-boosting are unchanged.
 
-Resolution (`src/config.rs:210-221`, `src/model_store.rs`):
+Whisper weights come from `huggingface.co/onnx-community/whisper-large-v3-turbo` (graphs from its `onnx/` folder, `tokenizer.json` from its root).
 
-- `--model SPEC|PATH`. A catalog spec resolves into the models directory and downloads if missing. A path to an existing directory passes through untouched.
+### Engines
+
+| | Parakeet-TDT-0.6B-v3 | Whisper large-v3-turbo |
+| --- | --- | --- |
+| Window | grows with the utterance | fixed 30 s, always |
+| Inference cost | scales with speech length | one full encoder pass per utterance, whatever its length |
+| Language | auto-detects per utterance | `--language` (`pl` default, `en`, `auto`) |
+| Dictionary phrase boosting | yes (logit-level) | no; the post-gate correction still applies |
+| Per-word confidences | yes | yes |
+
+Whisper's encoder takes a **fixed** 30 s window: its `input_features` axes are constants in the ONNX graph, not symbolic. A two-second utterance therefore costs the same encoder pass as a thirty-second one, and `--metrics` reports RTF against that window rather than the utterance. Measured on a 16-core Ryzen 9 9950X, that is ~1.2 s per utterance (rtf 0.04) against Parakeet's 64 ms on the same audio — usable for `--file` work and slow dictation, not for live streaming. The single-graph `decoder_model_merged` is deliberately not used: it re-runs cross-attention over all 1500 encoder frames per generated token, so the prompt decoder plus the cached-token decoder are shipped instead.
+
+Both engines run on CPU. `--gpu` is accepted and warned about for both.
+
+Resolution (`src/model_store.rs`):
+
+- `--model SPEC|PATH`. A catalog spec resolves into the models directory and downloads if missing. A path to an existing directory passes through untouched, and which engine it holds is decided by its files (`decoder_joint-model.int8.onnx` vs `decoder_with_past_model_int8.onnx`); a directory with neither, or with both, is rejected.
 - Models directory is baked at compile time from `STTD_MODELS_DIR` (see `build.rs:10-18`). Default is `models` (dev checkout). Packaged builds use `/usr/share/sttd/models`.
 - Setting `STTD_MODELS_DIR` at runtime does nothing. Use `--model <path>` to override.
 
@@ -90,7 +108,9 @@ cargo test
 cargo test --release --frozen
 ```
 
-No clippy/rustfmt config. No CI config. Tests live inline (`#[cfg(test)]`, 267 tests).
+No clippy/rustfmt config. No CI config. Tests live inline (`#[cfg(test)]`, 312 tests).
+
+Four Whisper tests read the downloaded model's `tokenizer.json` and skip themselves when it is absent, so they cover the byte-level BPE handling on a machine that has the weights and leave `cargo test` runnable on a clean checkout.
 
 ## Use
 
@@ -166,11 +186,12 @@ Key tunables:
 | Flag / Env | Default | Effect |
 | --- | --- | --- |
 | `--model` / `STTD_MODEL` | `parakeet` | Catalog spec or model directory path. |
+| `--language` / `STTD_LANGUAGE` | `pl` | `pl`, `en`, or `auto` (per-utterance detection). Whisper only; Parakeet auto-detects and warns that the flag is ignored. |
 | `--device` / `STTD_DEVICE` | unset | Case-insensitive substring match on input device. |
 | `--channel` / `STTD_CHANNEL` | `mix` | `mix`, `auto` (loudest), or channel index `N`. |
 | `--denoiser` / `STTD_DENOISER` | `none` | `none` or `deepfilter` (needs `denoise` feature). VAD branch only. |
 | `--threads` / `STTD_THREADS` | `0` (auto) | Decoder threads; `0` = physical cores. |
-| `--gpu` / `STTD_GPU` | off | Load model on GPU. |
+| `--gpu` / `STTD_GPU` | off | Accepted and warned about: both engines run on CPU in this build. |
 | `--vad-threshold` / `STTD_VAD_THRESHOLD` | `0.5` | Min earshot score for speech. |
 | `--vad-adapt` / `STTD_VAD_ADAPT` | on | Adapt threshold to noise floor with hysteresis. |
 | `--min-rms` / `STTD_MIN_RMS` | `0.003` | Min speech-only RMS to keep utterance. `0` disables. |
@@ -291,8 +312,11 @@ src/vad.rs           earshot 16 ms windows to 10 ms frames
 src/noise.rs         noise floor + hysteresis
 src/utterance.rs     pre-roll, UtteranceBuffer, splits
 src/asr.rs           worker thread, conditioning, metrics
-src/parakeet.rs      SpeechModel impl
+src/parakeet.rs      SpeechModel impl (Parakeet)
 src/parakeet_core/   ONNX engine, mel frontend, booster
+src/whisper.rs       SpeechModel impl (Whisper), decoding language
+src/whisper_core/    ONNX engine, log-mel frontend, KV-cached decode
+src/mel.rs           Slaney mel filterbank, shared by both frontends
 src/gate.rs          acoustic/transcript verdicts
 src/emit.rs          stdout/clipboard/paste/dump/last-text
 src/dictionary.rs    custom vocabulary
