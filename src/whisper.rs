@@ -12,9 +12,12 @@
 //
 // - the encoder takes a fixed 30 s window, so an utterance's length does not
 //   change the inference cost (~1.2 s per utterance on a 16-core 9950X, against
-//   Parakeet's tens of milliseconds). `decoded_sample_count` therefore reports
-//   the window rather than the utterance, which keeps the RTF column and the
-//   `audio_sec` metrics honest;
+//   Parakeet's tens of milliseconds). With `--stream` the encoder is patched in
+//   memory so the window follows the audio (15 s at least, see
+//   `whisper_core::types::window_frames`), which cuts a short utterance to
+//   ~0.3 s. Either way `decoded_sample_count` reports the window rather than
+//   the utterance, which keeps the RTF column and the `audio_sec` metrics
+//   honest;
 // - Whisper needs an explicit language token, unlike Parakeet's per-utterance
 //   auto-detection. `--language` chooses it (see `Language`).
 //
@@ -33,7 +36,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
-use crate::config::{MAX_UTTERANCE_SAMPLES, WHISPER_MAX_NEW_TOKENS};
+use crate::config::WHISPER_MAX_NEW_TOKENS;
 use crate::whisper_core::WhisperModel as CoreModel;
 
 pub(crate) struct WhisperModel {
@@ -52,12 +55,17 @@ impl WhisperModel {
         let language = opts.language;
         log::info!("loading whisper model ({})...", dir.display());
         let inner = with_loading_ticker("whisper model", || {
-            CoreModel::new(dir, language, intra_threads)
+            CoreModel::new(dir, language, intra_threads, opts.stream)
                 .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))
                 .context("failed to load whisper model")
         })?;
+        let window = if inner.dynamic_window {
+            "dynamic"
+        } else {
+            "fixed 30s"
+        };
         let ready_line = format!(
-            "whisper ready (model={}, lang={}, threads={}, gpu=false)",
+            "whisper ready (model={}, lang={}, threads={}, gpu=false, window={window})",
             opts.model_spec, language, opts.n_threads
         );
         log::info!("{}", ready_line);
@@ -105,43 +113,45 @@ impl SpeechModel for WhisperModel {
         "whisper"
     }
 
-    /// Whisper always decodes a fixed 30 s window (the encoder's
-    /// `input_features` shape is constant in the export), so this reports the
-    /// window for every utterance. A 2 s utterance really did cost a full
-    /// window's encoder pass, and RTF should say so.
-    fn decoded_sample_count(&self, _conditioned_len: usize) -> usize {
-        window_samples()
+    /// The window the encoder ran, not the utterance. The export's encoder
+    /// always decodes a fixed 30 s window (its `input_features` shape is
+    /// constant), so a 2 s utterance really did cost a full window's encoder
+    /// pass, and RTF should say so. The patched encoder (`--stream`) follows
+    /// the audio, and this follows it.
+    fn decoded_sample_count(&self, conditioned_len: usize) -> usize {
+        self.inner.window_samples(conditioned_len)
     }
-}
-
-/// Samples the encoder actually decodes for any utterance: the export's fixed
-/// 30 s window.
-///
-/// A free function rather than an inline constant so the tests can assert the
-/// relationship to `MAX_UTTERANCE_SAMPLES` without a loaded session — the
-/// engine is too heavy to build in a unit test.
-fn window_samples() -> usize {
-    MAX_UTTERANCE_SAMPLES
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::whisper_core::types::{Language, TOK_LANG_EN, TOK_LANG_PL};
+    use crate::config::MAX_UTTERANCE_SAMPLES;
+    use crate::whisper_core::types::{
+        window_frames, Language, MelConfig, TOK_LANG_EN, TOK_LANG_PL,
+    };
 
     #[test]
-    fn the_decoded_window_is_thirty_seconds() {
-        // The encoder graph pins the mel frame count, so the window is fixed:
-        // RTF must not be flattered by a short utterance reporting its own
-        // length instead.
-        assert_eq!(window_samples(), MAX_UTTERANCE_SAMPLES);
-        assert_eq!(window_samples(), 30 * 16_000, "30 s at 16 kHz");
+    fn the_fixed_window_is_thirty_seconds() {
+        // The export's encoder graph pins the mel frame count, so the window is
+        // fixed: RTF must not be flattered by a short utterance reporting its
+        // own length instead.
+        let config = MelConfig::large_v3_turbo();
+        let fixed = window_frames(1_600, false, &config) * config.hop_length;
+        assert_eq!(fixed, MAX_UTTERANCE_SAMPLES);
+        assert_eq!(fixed, 30 * 16_000, "30 s at 16 kHz");
         // It must equal the frontend's window, or `audio_sec` would describe
         // audio the model never saw.
-        assert_eq!(
-            window_samples(),
-            crate::whisper_core::types::MelConfig::large_v3_turbo().n_samples
-        );
+        assert_eq!(fixed, config.n_frames * config.hop_length);
+    }
+
+    #[test]
+    fn the_dynamic_window_reports_what_the_encoder_ran() {
+        let config = MelConfig::large_v3_turbo();
+        let ran = |samples| window_frames(samples, true, &config) * config.hop_length;
+        // A short utterance runs the 15 s floor, not 30 s: that is the saving.
+        assert_eq!(ran(2 * 16_000), 15 * 16_000);
+        // Never more than the export's window.
+        assert_eq!(ran(40 * 16_000), 30 * 16_000);
     }
 
     /// The compiled-in prompt tokens must be the exported ones: Whisper has no

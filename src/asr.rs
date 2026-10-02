@@ -2,8 +2,9 @@
 // ASR seam: the worker loop, gates, metrics, conditioning.
 // ---------------------------------------------------------------------------
 //
-// One speech model exists (Parakeet-TDT-0.6B-v3 via direct `ort` sessions,
-// see `parakeet_core`), selected once at startup by `--model`
+// Two speech models exist (Parakeet-TDT-0.6B-v3 and Whisper large-v3-turbo, via
+// direct `ort` sessions, see `parakeet_core` / `whisper_core`), selected once at
+// startup by `--model`
 // (see `model_store::ModelRef`) and fixed for the process's lifetime.
 // This module owns the worker thread and its load/unload/pause/shed loop,
 // the transcript gate call, `--metrics` JSONL, audio conditioning, and the
@@ -184,6 +185,39 @@ impl std::fmt::Debug for LiveDictionary {
     }
 }
 
+/// Latest-wins hand-off of the open utterance's audio from the capture loop to
+/// the ASR worker, for `--stream` partial transcripts.
+///
+/// One slot, not a queue: a partial is stale the moment newer audio exists, so
+/// a model slower than the capture step just skips steps instead of building a
+/// backlog. The capture side `put`s a snapshot and `clear`s the slot when the
+/// utterance closes or the pipeline pauses; the worker `take`s one only when no
+/// closed utterance waits, so a final is never delayed by more than one pass.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct PartialSlot(Arc<Mutex<Option<Vec<f32>>>>);
+
+impl PartialSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<f32>>> {
+        // A poisoned lock holds plain audio: take it and go on.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Store `pcm`, replacing any partial the worker has not taken yet.
+    pub(crate) fn put(&self, pcm: Vec<f32>) {
+        *self.lock() = Some(pcm);
+    }
+
+    /// Take the waiting partial, if any.
+    pub(crate) fn take(&self) -> Option<Vec<f32>> {
+        self.lock().take()
+    }
+
+    /// Drop the waiting partial: its utterance has closed or been discarded.
+    pub(crate) fn clear(&self) {
+        *self.lock() = None;
+    }
+}
+
 /// Tunables the ASR worker needs, resolved once from `Cli`.
 /// Emission policy (`dump_dir`, clipboard, paste) lives with the
 /// `Emitter`, not here.
@@ -210,6 +244,12 @@ pub(crate) struct AsrOptions {
     /// Shed oldest-first past `ASR_SHED_KEEP` (microphone mode). File mode
     /// sets false: offline decoding must be lossless.
     pub(crate) shed_stale: bool,
+    /// `--stream`: the engine may use its short-window mode (Whisper) and the
+    /// worker decodes partials from `partials` while the queue is idle.
+    pub(crate) stream: bool,
+    /// Where the capture loop leaves the open utterance for partial decoding.
+    /// Shared with the capture side; empty unless `stream` is on.
+    pub(crate) partials: PartialSlot,
 }
 
 /// Backlog past which the loaded loop sheds the weakest utterances (see
@@ -651,6 +691,19 @@ impl AsrWorker<'_> {
         );
     }
 
+    /// One partial transcript of the still-open utterance: logged, nothing
+    /// else. It does not take an utterance number, touch the split-seam text,
+    /// reach the emitter or the metrics, or fire autopause — the final
+    /// transcript of the same utterance does all of that when it closes.
+    fn transcribe_partial(&mut self, model: &mut dyn SpeechModel, pcm: &[f32]) {
+        self.apply_boost_words(model);
+        // The number the utterance will get when it closes.
+        let tag = format!("utt_{:06}", self.utterance_no + 1);
+        if let Some(line) = partial_line(model, pcm, &tag, &self.gate, self.running) {
+            log::info!("{line}");
+        }
+    }
+
     /// Loaded loop: replay the stash, then transcribe until the pause-idle
     /// timeout asks for an unload (`false`), or the producer is gone
     /// (`true` = shut down).
@@ -716,7 +769,13 @@ impl AsrWorker<'_> {
                     if self.rx.is_abandoned() {
                         return true;
                     }
-                    std::thread::sleep(Duration::from_millis(20));
+                    // Idle: decode the open utterance's newest snapshot if one
+                    // is waiting (`--stream`), else nap. Only here, so a closed
+                    // utterance in the queue always goes first.
+                    match self.opts.stream.then(|| self.opts.partials.take()).flatten() {
+                        Some(pcm) => self.transcribe_partial(model, &pcm),
+                        None => std::thread::sleep(Duration::from_millis(20)),
+                    }
                     let now_paused = self.paused.load(Ordering::Relaxed);
                     // Only clear `was_paused` here (mirroring the `Ok` arm
                     // above); never set it true. The top-of-loop paused
@@ -987,6 +1046,43 @@ fn write_metrics_row(
     if let Err(e) = w.flush() {
         log::warn!("metrics: flush failed: {e:?} (metrics disabled)");
         *metrics = None;
+    }
+}
+
+/// Decode one partial and return its log line, or `None` when there is nothing
+/// worth showing: an empty or gated transcript (hallucination boilerplate,
+/// a repetition loop) or a failed decode. Conditioned and padded exactly like a
+/// final (`transcribe_and_emit`), so a partial reads the audio the same way.
+fn partial_line(
+    model: &mut dyn SpeechModel,
+    pcm: &[f32],
+    tag: &str,
+    gate: &GateConfig,
+    running: &Arc<AtomicBool>,
+) -> Option<String> {
+    let conditioned = condition_utterance(pcm);
+    let padded = pad_trailing_with_dither(&conditioned, INFERENCE_PAD_SAMPLES);
+    let t0 = Instant::now();
+    let result = model.transcribe(&padded, running);
+    let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    match result {
+        Ok(t) => {
+            let text = t.text.trim();
+            if !matches!(gate.decide_transcript(text), crate::gate::TranscriptVerdict::Emit) {
+                return None;
+            }
+            let audio_sec = pcm.len() as f64 / SAMPLE_RATE as f64;
+            Some(format!(
+                "{tag}: partial ({audio_sec:.1} s audio, {infer_ms:.0} ms): {text}"
+            ))
+        }
+        Err(e) => {
+            // Shutdown skips inference through the pre-call check: not a failure.
+            if running.load(Ordering::Relaxed) {
+                log::warn!("{tag}: partial failed: {e:?}");
+            }
+            None
+        }
     }
 }
 
@@ -1811,6 +1907,8 @@ mod tests {
             language: crate::whisper_core::types::Language::Polish,
             metrics_path: None,
             shed_stale: false,
+            stream: false,
+            partials: PartialSlot::default(),
             dictionary: empty_live_dictionary(),
             remove_hesitations: false,
         };
@@ -1840,6 +1938,251 @@ mod tests {
             Err(e) => panic!("ready channel must send once, got {e:?}"),
         }
         handle.join().expect("worker thread must exit");
+    }
+
+    /// A model that returns a fixed transcript and remembers how long each
+    /// input was, in call order.
+    struct ScriptedModel {
+        text: String,
+        inputs: Arc<Mutex<Vec<usize>>>,
+        fail: bool,
+    }
+
+    impl ScriptedModel {
+        fn new(text: &str) -> (Self, Arc<Mutex<Vec<usize>>>) {
+            let inputs = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    text: text.to_string(),
+                    inputs: Arc::clone(&inputs),
+                    fail: false,
+                },
+                inputs,
+            )
+        }
+    }
+
+    impl SpeechModel for ScriptedModel {
+        fn transcribe(&mut self, pcm_16k: &[f32], _running: &Arc<AtomicBool>) -> Result<Transcript> {
+            self.inputs.lock().unwrap().push(pcm_16k.len());
+            if self.fail {
+                anyhow::bail!("scripted failure");
+            }
+            Ok(Transcript {
+                text: self.text.clone(),
+                word_confidences: Vec::new(),
+            })
+        }
+
+        fn describe(&self) -> String {
+            "scripted".into()
+        }
+
+        fn describe_reload(&self) -> String {
+            "scripted reloaded".into()
+        }
+
+        fn engine_name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn decoded_sample_count(&self, conditioned_len: usize) -> usize {
+            conditioned_len
+        }
+    }
+
+    #[test]
+    fn partial_slot_keeps_only_the_newest_snapshot() {
+        let slot = PartialSlot::default();
+        assert!(slot.take().is_none());
+        slot.put(vec![1.0; 10]);
+        slot.put(vec![2.0; 20]);
+        assert_eq!(slot.take().map(|p| p.len()), Some(20), "latest wins");
+        assert!(slot.take().is_none(), "taking empties the slot");
+        // A clone shares the slot: that is how the capture side reaches the worker.
+        let other = slot.clone();
+        other.put(vec![3.0; 5]);
+        slot.clear();
+        assert!(other.take().is_none(), "clear reaches every handle");
+    }
+
+    #[test]
+    fn partial_line_reports_text_audio_and_the_next_tag() {
+        let (mut model, inputs) = ScriptedModel::new("  dzień dobry  ");
+        let running = Arc::new(AtomicBool::new(true));
+        let pcm = vec![0.1f32; 24_000];
+        let line = partial_line(&mut model, &pcm, "utt_000007", &default_gate(), &running)
+            .expect("a normal transcript is shown");
+        assert!(line.starts_with("utt_000007: partial (1.5 s audio, "), "{line}");
+        assert!(line.ends_with("): dzień dobry"), "{line}");
+        // Fed like a final: conditioned, plus the trailing pad.
+        assert_eq!(*inputs.lock().unwrap(), [24_000 + INFERENCE_PAD_SAMPLES]);
+    }
+
+    #[test]
+    fn partial_line_hides_gated_empty_and_failed_decodes() {
+        let running = Arc::new(AtomicBool::new(true));
+        let pcm = vec![0.1f32; 16_000];
+        for text in ["", "   ", "Dziękuję za uwagę."] {
+            let (mut model, _) = ScriptedModel::new(text);
+            assert!(
+                partial_line(&mut model, &pcm, "utt_000001", &default_gate(), &running).is_none(),
+                "{text:?} must not be shown"
+            );
+        }
+        let (mut model, _) = ScriptedModel::new("tekst");
+        model.fail = true;
+        assert!(partial_line(&mut model, &pcm, "utt_000001", &default_gate(), &running).is_none());
+    }
+
+    fn closed_utterance(samples: usize) -> Utterance {
+        Utterance {
+            pcm: vec![0.1; samples],
+            evidence: Evidence {
+                speech_frames: 50,
+                total_frames: 60,
+                rms: 0.05,
+            },
+            split_continuation: false,
+        }
+    }
+
+    /// Run `AsrWorker::run_loaded` on a thread against `model` until it has made
+    /// `calls` decodes (or 10 s pass), then close the queue and join it.
+    /// Returns the worker's final `utterance_no` and its `prev_emit_text`.
+    fn run_worker_until(
+        stream: bool,
+        queued: Option<Utterance>,
+        partial: Option<Vec<f32>>,
+        mut model: ScriptedModel,
+        inputs: &Arc<Mutex<Vec<usize>>>,
+        calls: usize,
+        settle: Duration,
+    ) -> (u64, String) {
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(ASR_QUEUE_CAP);
+        let opts = AsrOptions {
+            model_spec: "scripted".into(),
+            gate: default_gate(),
+            n_threads: 1,
+            use_gpu: false,
+            language: crate::whisper_core::types::Language::Polish,
+            metrics_path: None,
+            shed_stale: false,
+            stream,
+            partials: PartialSlot::default(),
+            dictionary: empty_live_dictionary(),
+            remove_hesitations: false,
+        };
+        let model_ref = ModelRef {
+            dir: std::path::PathBuf::new(),
+            assets: &[],
+            kind: crate::model_store::EngineKind::Parakeet,
+        };
+        let (ready_tx, _ready_rx) = std::sync::mpsc::channel();
+        let mut emitter = crate::emit::RecordingEmitter::new();
+        let paused = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        let mut worker = AsrWorker {
+            rx: &mut rx,
+            model_ref: &model_ref,
+            opts: &opts,
+            ready: &ready_tx,
+            emitter: &mut emitter,
+            paused: &paused,
+            running: &running,
+            auto_unload: false,
+            unload_after: Duration::from_secs(0),
+            sound_enabled: false,
+            autopause_enabled: false,
+            gate: opts.gate.clone(),
+            dictionary: opts.dictionary.clone(),
+            remove_hesitations: false,
+            metrics: None,
+            first_load: false,
+            utterance_no: 0,
+            prev_emit_text: String::new(),
+            stash: Vec::new(),
+            was_paused: false,
+            last_unpaused: Instant::now(),
+        };
+        if let Some(u) = queued {
+            assert!(tx.push(u).is_ok());
+        }
+        if let Some(p) = partial {
+            opts.partials.put(p);
+        }
+        // The worker holds a non-`Send` emitter, so it runs here; a helper
+        // thread waits for the expected decodes and then closes the queue.
+        let producer_gone = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while inputs.lock().unwrap().len() < calls && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(settle);
+                drop(tx);
+            });
+            worker.run_loaded(&mut model)
+        });
+        assert!(producer_gone, "the loop must end because the producer left");
+        (worker.utterance_no, worker.prev_emit_text.clone())
+    }
+
+    #[test]
+    fn a_closed_utterance_goes_before_a_waiting_partial() {
+        let (model, inputs) = ScriptedModel::new("dzień dobry");
+        let (utterance_no, prev) = run_worker_until(
+            true,
+            Some(closed_utterance(8_000)),
+            Some(vec![0.1; 20_000]),
+            model,
+            &inputs,
+            2,
+            Duration::from_millis(50),
+        );
+        let seen = inputs.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [8_000 + INFERENCE_PAD_SAMPLES, 20_000 + INFERENCE_PAD_SAMPLES],
+            "final first, then the partial"
+        );
+        // The partial left no trace in the final's bookkeeping.
+        assert_eq!(utterance_no, 1, "only the final took a number");
+        assert_eq!(prev, "dzień dobry");
+    }
+
+    #[test]
+    fn a_partial_alone_is_decoded_but_takes_no_number() {
+        let (model, inputs) = ScriptedModel::new("dzień dobry");
+        let (utterance_no, prev) = run_worker_until(
+            true,
+            None,
+            Some(vec![0.1; 16_000]),
+            model,
+            &inputs,
+            1,
+            Duration::from_millis(50),
+        );
+        assert_eq!(inputs.lock().unwrap().len(), 1);
+        assert_eq!(utterance_no, 0);
+        assert!(prev.is_empty(), "a partial must not feed split-seam dedup");
+    }
+
+    #[test]
+    fn partials_are_ignored_without_stream() {
+        let (model, inputs) = ScriptedModel::new("dzień dobry");
+        run_worker_until(
+            false,
+            None,
+            Some(vec![0.1; 16_000]),
+            model,
+            &inputs,
+            // Nothing is expected, so do not wait for a decode: just give the
+            // loop time to (wrongly) take the partial before the queue closes.
+            0,
+            Duration::from_millis(300),
+        );
+        assert!(inputs.lock().unwrap().is_empty(), "no stream, no partial decode");
     }
 
     #[test]

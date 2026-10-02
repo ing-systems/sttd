@@ -113,13 +113,33 @@ _Avoid_: language detection (that is what Parakeet does, and what `--language
 auto` asks Whisper for), locale
 
 **Padded window**:
-The fixed 30 s of audio a Whisper utterance is decoded in, padded (and
-truncated) to length before it reaches the encoder, which takes exactly 3000
-mel frames because its input axes are constants in the ONNX graph. This is why
+The span of audio a Whisper utterance is decoded in, padded (and truncated) to
+length before it reaches the encoder. The exported encoder takes exactly 3000 mel
+frames (30 s) because its input axes are constants in the ONNX graph, so by default
 Whisper's cost per utterance does not scale with how much was said: a two-second
 utterance costs the same encoder pass as a thirty-second one, and the RTF column
-reports against the window rather than the utterance.
+reports against the window rather than the utterance. Under **streaming mode** the
+window is chosen per utterance instead (the audio rounded up to a second, plus a
+second, never under 15 s or over 30 s).
 _Avoid_: chunk (that is a piece of an utterance, cut by the VAD), clip
+
+**Streaming mode**:
+What `--stream` turns on: **partial transcripts** while an utterance is open and,
+for Whisper, a **padded window** that follows the audio, made possible by
+patching the encoder graph in memory when the model loads. It changes when and how
+fast text appears in the log, never what the final transcript of an utterance goes
+through.
+_Avoid_: live mode, real-time mode (the whole tool is real-time), sliding window
+(there is no overlap between decodes)
+
+**Partial transcript**:
+A decode of an utterance that has not closed yet: its audio so far, cut like a
+close would cut it (up to the last speech plus the minimum tail), decoded about
+once a second and logged. It is a preview only. It takes no utterance number,
+feeds no split-seam dedup, reaches no emitter, metric row or autopause, and it
+loses to any closed utterance waiting in the queue; only the latest one is kept.
+_Avoid_: interim result (that is the interim split, which cuts a real utterance),
+hypothesis, draft
 
 ### Signal paths
 

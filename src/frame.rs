@@ -30,6 +30,9 @@ pub(crate) struct FrameProcessor {
     /// Previous frame's verdict. Gates Agc (1-frame delay breaks the
     /// VAD<->gain feedback loop): silence passes at unity, speech adapts.
     prev_speech: bool,
+    /// `--stream`: hand out partial snapshots of the open utterance
+    /// (`take_partial`). Off = `take_partial` is always `None`.
+    stream: bool,
 }
 
 impl FrameProcessor {
@@ -58,7 +61,26 @@ impl FrameProcessor {
             gate,
             agc: Agc::new(target_rms, max_gain),
             prev_speech: false,
+            stream: false,
         })
+    }
+
+    /// Turn on partial snapshots for `--stream`. Builder-style, like
+    /// `UtteranceBuffer::with_hangover_frames`, so the constructor and the
+    /// tests keep their signature.
+    pub(crate) fn with_streaming(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
+    }
+
+    /// The open utterance so far, when a partial transcript is due (see
+    /// `UtteranceBuffer::partial_snapshot`). Call after `process_frame`: an
+    /// utterance that frame closed is no longer open, so it yields `None`.
+    pub(crate) fn take_partial(&mut self) -> Option<Vec<f32>> {
+        if !self.stream {
+            return None;
+        }
+        self.utterance.partial_snapshot(self.gate.min_speech_rms)
     }
 
     /// The raw hw-rate chunk size every call to `process_frame` must be fed.
@@ -234,6 +256,27 @@ mod tests {
             8.0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn partials_need_streaming_and_an_open_utterance() {
+        // 3 s of a loud 200 Hz tone. Whether the VAD calls a tone speech is not
+        // the point; the switch must hold either way.
+        let tone: Vec<f32> = (0..48_000)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 200.0 * i as f32 / 16_000.0).sin())
+            .collect();
+        let mut off = processor();
+        let hop = off.required_input_frames();
+        for chunk in tone.chunks_exact(hop) {
+            off.process_frame(chunk);
+            assert!(off.take_partial().is_none(), "streaming is off");
+        }
+        // Streaming on, but silence never opens an utterance: nothing to cut.
+        let mut idle = processor().with_streaming(true);
+        for _ in 0..200 {
+            idle.process_frame(&vec![0.0; hop]);
+            assert!(idle.take_partial().is_none());
+        }
     }
 
     #[test]

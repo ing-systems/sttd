@@ -280,18 +280,26 @@ fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
 /// Frames are consumed through a cursor and the remainder is compacted once
 /// at the end, instead of a `drain` per frame (which memmoved the whole
 /// remainder every time).
+///
+/// With `--stream`, a frame that closed nothing may instead leave a partial
+/// snapshot of the open utterance in `partials` (latest wins), and a close drops
+/// the one waiting: its utterance is now a final in the queue.
 fn drain_frames(
     utterance_buffer: &mut Vec<f32>,
     input_frames: usize,
     fp: &mut FrameProcessor,
     asr_tx: &mut Producer<Utterance>,
     push: fn(&mut Producer<Utterance>, Utterance),
+    partials: &crate::asr::PartialSlot,
 ) {
     let mut consumed = 0;
     while utterance_buffer.len() - consumed >= input_frames {
         let frame = &utterance_buffer[consumed..consumed + input_frames];
         if let Some(utterance) = fp.process_frame(frame) {
+            partials.clear();
             push(asr_tx, utterance);
+        } else if let Some(pcm) = fp.take_partial() {
+            partials.put(pcm);
         }
         consumed += input_frames;
     }
@@ -541,10 +549,13 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
     // Capture is already running above and the drain loop below sheds (counted)
     // while it loads.
+    let asr_opts = asr_options(cli, true, live_dict);
+    // The capture loop fills this, the worker drains it (`--stream`).
+    let partials = asr_opts.partials.clone();
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
-        asr_options(cli, true, live_dict),
+        asr_opts,
         make_emitter(cli)?,
         Arc::clone(&paused),
         Arc::clone(&running),
@@ -586,6 +597,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
                     accumulator.clear();
                     accumulator.reserve(hw_rate as usize * 2);
                     fp.discard_pending();
+                    partials.clear();
                     telemetry.device_gone.store(false, Ordering::Release);
                     rebuild_attempts = 0;
                     log::info!("input stream rebuilt ({} Hz)", hw_rate);
@@ -631,6 +643,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             // utterance, noise floor preserved) so pre-pause partials can't
             // leak into the first post-resume utterance.
             fp.hold_pipeline();
+            partials.clear();
         }
         if !now_paused && was_paused {
             // Resume edge: the signal blip already fired and the worker's
@@ -672,6 +685,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             &mut fp,
             &mut asr_tx,
             push_live_utterance,
+            &partials,
         );
 
         // Backpressure visibility: bounded rings shed under load (callback
@@ -701,6 +715,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         &mut fp,
         &mut asr_tx,
         push_live_utterance,
+        &partials,
     );
     // Flush trailing speech, then wait for the ASR thread to actually
     // finish transcribing it (and any earlier backlog) before the process
@@ -875,6 +890,11 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     );
 
     let (model, mut asr_tx, asr_rx) = prepare_model(cli)?;
+    if cli.stream {
+        // Offline decoding has no live text to show, so `--stream` only buys
+        // the short encoder window here.
+        log::info!("--stream in file mode: short encoder window only, no partial transcripts");
+    }
     let mut fp = AcousticConfig::from_cli(cli).make_frame_processor(wav.sample_rate)?;
     let input_frames = fp.required_input_frames();
 
@@ -971,6 +991,16 @@ fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
             ignored.join(", ")
         );
     }
+    if cli.stream {
+        match model.kind {
+            EngineKind::Parakeet => log::info!(
+                "--stream: partial transcripts in the log (Parakeet already sizes its window to the audio)"
+            ),
+            EngineKind::Whisper => log::info!(
+                "--stream: partial transcripts in the log, encoder window follows the audio"
+            ),
+        }
+    }
     match model.kind {
         EngineKind::Parakeet => {
             log::info!("Parakeet auto-detects the spoken language per utterance")
@@ -1000,6 +1030,8 @@ fn asr_options(
         language: cli.language,
         metrics_path: cli.metrics.clone(),
         shed_stale,
+        stream: cli.stream,
+        partials: crate::asr::PartialSlot::default(),
         // The live handle, not a `Vec` snapshot: the D-Bus thread swaps the
         // word list at runtime and the worker observes it per utterance.
         dictionary,
@@ -1097,6 +1129,8 @@ struct AcousticConfig {
     gate: gate::GateConfig,
     hangover_frames: u32,
     target_rms: f32,
+    /// `--stream`: the frame processor may hand out partial snapshots.
+    stream: bool,
 }
 
 impl AcousticConfig {
@@ -1108,6 +1142,7 @@ impl AcousticConfig {
             gate: gate::GateConfig::new(cli.min_rms, cli.min_density),
             hangover_frames: crate::config::hangover_frames(cli.hangover_ms),
             target_rms: cli.target_rms,
+            stream: cli.stream,
         }
     }
 
@@ -1126,6 +1161,7 @@ impl AcousticConfig {
             self.target_rms,
             crate::config::MAX_GAIN,
         )
+        .map(|fp| fp.with_streaming(self.stream))
     }
 }
 
@@ -1315,6 +1351,30 @@ mod tests {
     }
 
     #[test]
+    fn asr_options_carry_stream_and_start_with_an_empty_slot() {
+        let dictionary = || {
+            crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
+                Vec::new(),
+                Default::default(),
+            ))
+            .1
+        };
+        let off = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert!(!asr_options(&off, true, dictionary()).stream);
+        let on = Cli::try_parse_from(["sttd", "--stream"]).expect("flag must parse");
+        let opts = asr_options(&on, true, dictionary());
+        assert!(opts.stream);
+        assert!(opts.partials.take().is_none());
+        // The capture side holds a clone of the same slot.
+        let capture_side = opts.partials.clone();
+        capture_side.put(vec![0.0; 4]);
+        assert_eq!(opts.partials.take().map(|p| p.len()), Some(4));
+        // And the frame processor is told, from the same flag.
+        assert!(AcousticConfig::from_cli(&on).stream);
+        assert!(!AcousticConfig::from_cli(&off).stream);
+    }
+
+    #[test]
     fn acoustic_config_carries_the_cli_tunables() {
         let cli = Cli::try_parse_from([
             "sttd",
@@ -1365,6 +1425,7 @@ mod tests {
             &mut fp,
             &mut asr_tx,
             push_live_utterance,
+            &crate::asr::PartialSlot::default(),
         );
         assert_eq!(buffer.len(), 7);
         assert!(buffer.iter().all(|&s| s == 0.0));

@@ -8,7 +8,7 @@
 // graphs rather than assumed.
 // ---------------------------------------------------------------------------
 
-use ndarray17::{Array3, ArrayD};
+use ndarray17::ArrayD;
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
@@ -28,9 +28,9 @@ pub struct MelConfig {
     pub hop_length: usize,
     pub win_length: usize,
     pub sampling_rate: usize,
-    /// 30 s of 16 kHz audio: the window the encoder was exported for.
-    pub n_samples: usize,
-    /// Mel frames the encoder expects (3000 = `n_samples / hop_length`).
+    /// Mel frames of the full window the encoder was exported for: 3000, i.e.
+    /// 30 s of 16 kHz audio (`n_frames * hop_length` samples). A shorter window
+    /// is allowed only with the patched encoder (`dyn_encoder`).
     pub n_frames: usize,
 }
 
@@ -42,10 +42,34 @@ impl MelConfig {
             hop_length: 160,
             win_length: 400,
             sampling_rate: 16_000,
-            n_samples: 480_000,
             n_frames: 3000,
         }
     }
+}
+
+/// Shortest encoder window the dynamic encoder is given, in mel frames
+/// (15 s). Measured on short clips: a window cut close to the audio makes the
+/// decode loop or return garbage under ~3 s of speech, and the shorter the
+/// window the more words drift. On three espeak Polish clips (1.4 s, 6 s, 10 s)
+/// a 10 s floor changed one word in two of them; 15 s, 20 s and 30 s gave the
+/// 30 s transcript for all three. 15 s is the cheapest of those (see the README).
+pub const MIN_WINDOW_FRAMES: usize = 1500;
+
+/// Encoder window for `audio_samples` of input, in mel frames.
+///
+/// The fixed export always takes the full window. The dynamic encoder follows
+/// the audio: its length rounded up to a whole second, plus one more second of
+/// margin (a window with no margin repeated itself on a 6 s clip), never below
+/// `MIN_WINDOW_FRAMES` and never above the export's 30 s. The result is a whole
+/// number of seconds, so it is even, as the encoder's stride-2 convolution needs.
+pub fn window_frames(audio_samples: usize, dynamic: bool, config: &MelConfig) -> usize {
+    if !dynamic {
+        return config.n_frames;
+    }
+    let per_second = config.sampling_rate / config.hop_length;
+    let audio_frames = audio_samples.div_ceil(config.hop_length);
+    let wanted = audio_frames.div_ceil(per_second) * per_second + per_second;
+    wanted.clamp(MIN_WINDOW_FRAMES, config.n_frames)
 }
 
 /// Decoder layers in large-v3-turbo (4, not the 32 of large-v3). Every KV
@@ -342,16 +366,58 @@ pub struct WhisperModel {
     /// What `--language` selected. Fixed for the process's lifetime; `Auto`
     /// resolves per utterance from the prompt's first-position logits.
     pub language: Language,
+    /// Owns the encoder's input buffer (see `Frontend::extract`).
     pub frontend: Frontend,
-    /// The encoder's `[1, n_mels, n_frames]` input, filled by the frontend for
-    /// every utterance and kept for the process's lifetime: the window is
-    /// pinned, so the buffer never changes shape.
-    pub features: Array3<f32>,
+    /// Whether the encoder is the patched, length-free one (`--stream`, and the
+    /// patch applied), so the window follows the audio. False = the export as
+    /// shipped, always the full 30 s window.
+    pub dynamic_window: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_encoder_always_gets_the_full_window() {
+        let c = MelConfig::large_v3_turbo();
+        for samples in [0, 1, 16_000, 480_000, 960_000] {
+            assert_eq!(window_frames(samples, false, &c), 3000, "samples={samples}");
+        }
+    }
+
+    #[test]
+    fn dynamic_window_has_a_floor_a_margin_and_a_cap() {
+        let c = MelConfig::large_v3_turbo();
+        let w = |samples| window_frames(samples, true, &c);
+        // Floor: anything short gets 15 s, even empty input.
+        assert_eq!(w(0), 1500);
+        assert_eq!(w(16_000), 1500);
+        assert_eq!(w(13 * 16_000), 1500, "13 s + 1 s margin is still under the floor");
+        // Margin: whole seconds of audio plus one more.
+        assert_eq!(w(14 * 16_000), 1500);
+        assert_eq!(w(14 * 16_000 + 1), 1600, "a partial second rounds up, then +1 s");
+        assert_eq!(w(20 * 16_000), 2100);
+        // Cap: the export's 30 s, including longer input.
+        assert_eq!(w(29 * 16_000), 3000);
+        assert_eq!(w(30 * 16_000), 3000);
+        assert_eq!(w(45 * 16_000), 3000);
+    }
+
+    #[test]
+    fn dynamic_window_is_always_even_and_never_shrinks_with_more_audio() {
+        let c = MelConfig::large_v3_turbo();
+        let mut last = 0;
+        for samples in (0..=31 * 16_000).step_by(1_234) {
+            let frames = window_frames(samples, true, &c);
+            assert_eq!(frames % 2, 0, "samples={samples}");
+            assert!((MIN_WINDOW_FRAMES..=c.n_frames).contains(&frames));
+            assert!(frames >= last, "window shrank at samples={samples}");
+            // It always holds the audio (up to the cap).
+            assert!(frames * c.hop_length >= samples.min(c.n_frames * c.hop_length));
+            last = frames;
+        }
+    }
 
     /// The 16 cache input names, in the order `decoder_with_past_model`
     /// declares them, and the output name each is captured from.

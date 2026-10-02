@@ -34,19 +34,31 @@ use std::path::Path;
 
 use ndarray17::{Array2, ArrayD};
 use ort::inputs;
-use ort::session::builder::GraphOptimizationLevel;
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
 use ort::value::TensorRef;
 use tokenizers::Tokenizer;
 
 use super::types::{
-    KvCache, Language, MelConfig, WhisperError, WhisperModel, BEGIN_SUPPRESS_TOKENS,
-    LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
+    window_frames, KvCache, Language, MelConfig, WhisperError, WhisperModel,
+    BEGIN_SUPPRESS_TOKENS, LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
 };
 use crate::decode::{argmax_index, softmax_prob, word_confidences as group_words};
 
 /// Tokens in one prompt: start-of-transcript, language, task, no-timestamps.
 const PROMPT_LEN: usize = 4;
+
+/// Token budget of a decode over `audio_samples` with the dynamic window:
+/// 20 tokens plus 15 per second of audio, never above `cap`.
+///
+/// Speech needs ~10 tokens a second at the fast end, so this has room to spare
+/// for real text and cuts a decode that loops on a short window (measured: a
+/// looping 2.5 s clip ran to the 448-token cap, 1.3 s of decoder time). The
+/// fixed window keeps the plain cap, as before.
+pub(crate) fn token_budget(audio_samples: usize, cap: usize) -> usize {
+    let seconds = audio_samples.div_ceil(16_000);
+    (20 + 15 * seconds).min(cap)
+}
 
 /// `last_hidden_state` is `[1, encoder_seq, d_model]`, and the export pins the
 /// encoder length (1500 = 3000 mel frames / 2) but leaves `d_model` symbolic.
@@ -120,14 +132,20 @@ fn best_unsuppressed(logits: &[f32]) -> Option<usize> {
 impl WhisperModel {
     /// Load the three graphs and the tokenizer from `model_dir` (already
     /// guaranteed to hold them by `model_store::ensure_available`).
+    ///
+    /// `dynamic_window` asks for the length-free encoder (`--stream`): the
+    /// export is patched in memory (see `dyn_encoder`) and the window follows
+    /// the audio. If the patch does not apply the fixed export is loaded
+    /// instead, with a warning, and `dynamic_window` ends up false.
     pub fn new<P: AsRef<Path>>(
         model_dir: P,
         language: Language,
         intra_threads: usize,
+        dynamic_window: bool,
     ) -> Result<Self, WhisperError> {
         let dir = model_dir.as_ref();
         let threads = intra_threads.max(1);
-        let encoder = init_session(dir, "encoder_model_int8.onnx", threads)?;
+        let (encoder, dynamic_window) = init_encoder(dir, threads, dynamic_window)?;
         let decoder = init_session(dir, "decoder_model_int8.onnx", threads)?;
         let decoder_with_past = init_session(dir, "decoder_with_past_model_int8.onnx", threads)?;
 
@@ -137,7 +155,6 @@ impl WhisperModel {
         verify_token_ids(&tokenizer)?;
 
         let frontend = super::frontend::Frontend::new(MelConfig::large_v3_turbo());
-        let features = frontend.feature_buffer();
         Ok(Self {
             encoder,
             decoder,
@@ -145,8 +162,16 @@ impl WhisperModel {
             tokenizer,
             language,
             frontend,
-            features,
+            dynamic_window,
         })
+    }
+
+    /// Samples the encoder decodes for `audio_samples` of input: the window,
+    /// not the audio. 30 s with the fixed export; with the dynamic one it
+    /// follows the audio (`window_frames`), which is what keeps RTF honest.
+    pub fn window_samples(&self, audio_samples: usize) -> usize {
+        let config = &self.frontend.config;
+        window_frames(audio_samples, self.dynamic_window, config) * config.hop_length
     }
 
     /// One utterance through the encoder and the greedy decode.
@@ -161,7 +186,13 @@ impl WhisperModel {
         pcm: &[f32],
         max_tokens: usize,
     ) -> Result<TranscriptionResult, WhisperError> {
-        let hidden = self.run_encoder(pcm)?;
+        let n_frames = window_frames(pcm.len(), self.dynamic_window, &self.frontend.config);
+        let max_tokens = if self.dynamic_window {
+            token_budget(pcm.len(), max_tokens)
+        } else {
+            max_tokens
+        };
+        let hidden = self.run_encoder(pcm, n_frames)?;
 
         // Prompt run. For `--language auto` the language distribution is the
         // first position's logits, which this very call produces, so detection
@@ -228,18 +259,17 @@ impl WhisperModel {
         })
     }
 
-    /// Log-mel features for the utterance, then the encoder over them.
+    /// Log-mel features for the utterance (`n_frames` of window), then the
+    /// encoder over them.
     ///
-    /// Both buffers belong to the model, so neither is allocated per utterance.
-    fn run_encoder(&mut self, pcm: &[f32]) -> Result<ArrayD<f32>, WhisperError> {
-        self.frontend.extract(pcm, &mut self.features)?;
-        debug_assert!(
-            self.features.as_slice().is_some(),
-            "encoder input must be contiguous"
-        );
-        log::trace!("running whisper encoder...");
+    /// The feature buffer belongs to the frontend, so it is not allocated per
+    /// utterance.
+    fn run_encoder(&mut self, pcm: &[f32], n_frames: usize) -> Result<ArrayD<f32>, WhisperError> {
+        let features = self.frontend.extract(pcm, n_frames)?;
+        debug_assert!(features.as_slice().is_some(), "encoder input must be contiguous");
+        log::trace!("running whisper encoder over {n_frames} frames...");
         let outputs = self.encoder.run(inputs![
-            "input_features" => TensorRef::from_array_view(self.features.view())?,
+            "input_features" => TensorRef::from_array_view(features)?,
         ])?;
         encoder_hidden_states(&outputs)
     }
@@ -443,22 +473,64 @@ fn verify_token_ids(tokenizer: &Tokenizer) -> Result<(), WhisperError> {
 ///
 /// The one real lever left is the encoder's fixed 30 s window (~1.06 s of the
 /// total, whatever the utterance holds), and the export pins it at
-/// `input_features = [batch, 128, 3000]` — no shorter window can be fed, and
-/// `with_dimension_override` would only lie about a shape the graph's own
-/// reshapes depend on.
+/// `input_features = [batch, 128, 3000]` — no shorter window can be fed as it
+/// stands, and `with_dimension_override` would only lie about a shape the
+/// graph's own reshapes depend on. `--stream` pulls that lever by patching the
+/// graph itself (`dyn_encoder`), not by overriding its declared shape.
 fn init_session(dir: &Path, file: &str, intra_threads: usize) -> Result<Session, WhisperError> {
     let path = dir.join(file);
     if !path.exists() {
         return Err(WhisperError::MissingAsset(path.display().to_string()));
     }
     log::trace!("loading whisper session from {}...", path.display());
+    Ok(session_builder(intra_threads)?.commit_from_file(path)?)
+}
+
+/// The settings every Whisper session shares (see `init_session`).
+pub(super) fn session_builder(intra_threads: usize) -> Result<SessionBuilder, WhisperError> {
     Ok(Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_intra_threads(intra_threads)?
         .with_inter_threads(1)?
         .with_memory_pattern(false)?
-        .with_parallel_execution(false)?
-        .commit_from_file(path)?)
+        .with_parallel_execution(false)?)
+}
+
+const ENCODER_FILE: &str = "encoder_model_int8.onnx";
+
+/// The encoder session, and whether it is the length-free one.
+///
+/// With `dynamic` the exported graph is read, patched in memory
+/// (`dyn_encoder::patch_encoder`) and loaded from the patched bytes. A graph the
+/// patch does not recognise is not an error: the fixed export loads as before
+/// and the caller learns it from the returned flag.
+fn init_encoder(
+    dir: &Path,
+    intra_threads: usize,
+    dynamic: bool,
+) -> Result<(Session, bool), WhisperError> {
+    if dynamic {
+        let path = dir.join(ENCODER_FILE);
+        if !path.exists() {
+            return Err(WhisperError::MissingAsset(path.display().to_string()));
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|e| WhisperError::MissingAsset(format!("{}: {e}", path.display())))?;
+        match super::dyn_encoder::patch_encoder(bytes) {
+            Ok(patched) => {
+                log::info!(
+                    "whisper encoder patched for variable-length windows ({} MiB)",
+                    patched.len() >> 20
+                );
+                let session = session_builder(intra_threads)?.commit_from_memory(&patched)?;
+                return Ok((session, true));
+            }
+            Err(e) => log::warn!(
+                "cannot make the whisper encoder length-free ({e}); using the fixed 30 s window"
+            ),
+        }
+    }
+    Ok((init_session(dir, ENCODER_FILE, intra_threads)?, false))
 }
 
 /// Sanity check that the constants in `types` describe this export's token
@@ -488,6 +560,16 @@ mod tests {
         assert_eq!(LANG_TOKEN_COUNT, 100);
         assert!((super::super::types::LANG_TOKEN_LAST as i64) < TOK_TRANSCRIBE);
         assert!(BEGIN_SUPPRESS_TOKENS == [220, 50256]);
+    }
+
+    #[test]
+    fn token_budget_scales_with_audio_and_respects_the_cap() {
+        assert_eq!(token_budget(0, 448), 20);
+        assert_eq!(token_budget(16_000, 448), 35);
+        assert_eq!(token_budget(16_001, 448), 50, "a partial second counts whole");
+        assert_eq!(token_budget(10 * 16_000, 448), 170);
+        assert_eq!(token_budget(30 * 16_000, 448), 448, "capped");
+        assert_eq!(token_budget(2 * 16_000, 10), 10, "never above the caller's cap");
     }
 
     #[test]

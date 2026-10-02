@@ -117,6 +117,13 @@ pub(crate) const EARLY_SPLIT_QUIET_RMS: f32 = 0.003;
 pub(crate) const INTERIM_SPLIT_SAMPLES: usize = SAMPLE_RATE as usize * 8;
 /// Pause length that triggers the interim split above: 30 x 10 ms frames.
 pub(crate) const INTERIM_SPLIT_SILENCE_FRAMES: u32 = 30;
+/// `--stream`: audio an open utterance must grow by before the next partial
+/// transcript is cut from it (1 s). The ASR worker keeps only the newest
+/// partial, so a model slower than this simply skips steps.
+pub(crate) const STREAM_STEP_SAMPLES: usize = SAMPLE_RATE as usize;
+/// `--stream`: audio an open utterance needs before its first partial (1 s).
+/// Less than this is a word fragment the model cannot read.
+pub(crate) const STREAM_MIN_SAMPLES: usize = SAMPLE_RATE as usize;
 /// Inference seconds per audio second above which `transcribe_and_emit`
 /// warns: the model is slower than realtime and the backlog (plus shedding)
 /// will grow. See the `--metrics` `rtf` column for per-utterance data.

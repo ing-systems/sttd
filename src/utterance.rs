@@ -1,9 +1,10 @@
 use crate::config::{
     EARLY_SPLIT_QUIET_FRAMES, EARLY_SPLIT_QUIET_RMS, EARLY_SPLIT_SAMPLES,
     EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, INTERIM_SPLIT_SAMPLES, INTERIM_SPLIT_SILENCE_FRAMES,
-    MAX_UTTERANCE_SAMPLES, MIC_CLIP_RATIO, MIC_CLIP_SAMPLE, MIC_LOW_PEAK, ONSET_SPEECH_FRAMES,
-    PREROLL_SAFETY_FRAMES, PREROLL_TRIM_FACTOR, PREROLL_TRIM_FLOOR, RING_FRAMES,
-    SILENCE_FRAMES_THRESHOLD, STRONG_RMS_FACTOR, TAIL_MAX_SAMPLES, TAIL_MIN_SAMPLES,
+    MAX_UTTERANCE_SAMPLES, MIC_CLIP_RATIO, MIC_CLIP_SAMPLE, MIC_LOW_PEAK, MIN_SPEECH_FRAMES,
+    ONSET_SPEECH_FRAMES, PREROLL_SAFETY_FRAMES, PREROLL_TRIM_FACTOR, PREROLL_TRIM_FLOOR,
+    RING_FRAMES, SILENCE_FRAMES_THRESHOLD, STREAM_MIN_SAMPLES, STREAM_STEP_SAMPLES,
+    STRONG_RMS_FACTOR, TAIL_MAX_SAMPLES, TAIL_MIN_SAMPLES,
 };
 use crate::gate::GateConfig;
 use crate::noise::frame_rms;
@@ -125,6 +126,10 @@ pub(crate) struct UtteranceBuffer {
     /// cap) rather than a hangover close. Consumed by `close` into
     /// `Utterance::split_continuation`, then cleared by `reset`.
     pending_split: bool,
+    /// Length of the audio handed out by the last `partial_snapshot` of this
+    /// utterance (`0` = none yet). The next one waits for `STREAM_STEP_SAMPLES`
+    /// more. Cleared by `reset`.
+    partial_end: usize,
 }
 
 impl Default for UtteranceBuffer {
@@ -144,6 +149,7 @@ impl Default for UtteranceBuffer {
             speech_frame_rms: Vec::new(),
             quiet_run: 0,
             pending_split: false,
+            partial_end: 0,
         }
     }
 }
@@ -443,6 +449,42 @@ impl UtteranceBuffer {
         }
     }
 
+    /// The open utterance so far, for a partial transcript (`--stream`), or
+    /// `None` when it is not time for one.
+    ///
+    /// Cut like `close` cuts: up to the last speech frame plus the minimum tail,
+    /// so a pause inside the utterance does not feed silence to the model, and
+    /// nothing new is returned while the speaker is quiet. The first snapshot
+    /// needs `STREAM_MIN_SAMPLES` of audio, each later one `STREAM_STEP_SAMPLES`
+    /// more than the last. The same cheap guards as `close` keep a VAD blip
+    /// from costing a decode: `MIN_SPEECH_FRAMES` of speech, at `min_rms`.
+    ///
+    /// Takes `&mut self` only to remember where the last one ended. It leaves
+    /// the utterance itself untouched: the final transcript is still cut by
+    /// `close`.
+    pub(crate) fn partial_snapshot(&mut self, min_rms: f32) -> Option<Vec<f32>> {
+        if self.buf.is_empty() || self.speech_frames < MIN_SPEECH_FRAMES {
+            return None;
+        }
+        let end = (self.samples_at_last_speech + TAIL_MIN_SAMPLES).min(self.buf.len());
+        let due = if self.partial_end == 0 {
+            end >= STREAM_MIN_SAMPLES
+        } else {
+            end >= self.partial_end + STREAM_STEP_SAMPLES
+        };
+        if !due {
+            return None;
+        }
+        if self.speech_sample_count > 0 {
+            let rms = (self.speech_energy_sum_sq / self.speech_sample_count as f64).sqrt() as f32;
+            if rms < min_rms {
+                return None;
+            }
+        }
+        self.partial_end = end;
+        Some(self.buf[..end].to_vec())
+    }
+
     /// Decide whether the accumulated utterance is real speech and, if so, trim
     /// its trailing silence and return it. Resets `self` to its (empty) default
     /// state either way, leaving the pre-roll ring intact.
@@ -550,6 +592,7 @@ impl UtteranceBuffer {
         self.speech_frame_rms.clear();
         self.quiet_run = 0;
         self.pending_split = false;
+        self.partial_end = 0;
     }
 
     /// Discard everything for a pause transition: like `reset`, but also
@@ -1256,6 +1299,122 @@ mod tests {
         assert_eq!(buffer.push_frame(&silence, false), FrameAction::Flush);
         let utterance = buffer.close(&gate_for(0.0, 0.0)).unwrap();
         assert!(utterance.split_continuation);
+    }
+
+    /// Feed `n` speech frames of 0.3 and return how many snapshots came back.
+    fn snapshots_over(buffer: &mut UtteranceBuffer, n: usize, min_rms: f32) -> Vec<usize> {
+        let speech = vec![0.3f32; FRAME_16K];
+        let mut lens = Vec::new();
+        for _ in 0..n {
+            buffer.push_frame(&speech, true);
+            if let Some(pcm) = buffer.partial_snapshot(min_rms) {
+                lens.push(pcm.len());
+            }
+        }
+        lens
+    }
+
+    #[test]
+    fn partial_snapshot_waits_for_the_minimum_then_steps() {
+        let mut buffer = UtteranceBuffer::new();
+        // 350 frames = 3.5 s of speech. Onset opens at frame 3 (no pre-roll
+        // here), so audio runs one frame ahead of the count; the first
+        // snapshot is the first moment 1 s is buffered, then one per second.
+        let lens = snapshots_over(&mut buffer, 350, DEFAULT_MIN_SPEECH_RMS);
+        assert_eq!(lens.len(), 3, "snapshots at ~1 s, ~2 s, ~3 s: {lens:?}");
+        assert!(lens[0] >= STREAM_MIN_SAMPLES);
+        for pair in lens.windows(2) {
+            assert!(
+                pair[1] >= pair[0] + STREAM_STEP_SAMPLES,
+                "each snapshot adds at least one step: {lens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_snapshot_is_cut_at_the_last_speech_plus_the_minimum_tail() {
+        let mut buffer = UtteranceBuffer::new();
+        snapshots_over(&mut buffer, 150, DEFAULT_MIN_SPEECH_RMS);
+        let at_speech = buffer.samples_at_last_speech;
+        // A pause: the buffer grows by silence, the snapshot must not.
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..50 {
+            buffer.push_frame(&silence, false);
+        }
+        assert!(buffer.buf.len() > at_speech + TAIL_MIN_SAMPLES);
+        // More speech so a snapshot is due; it must not contain the pause tail
+        // beyond what `close` would keep.
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..120 {
+            buffer.push_frame(&speech, true);
+        }
+        let end = buffer.samples_at_last_speech;
+        let pcm = buffer.partial_snapshot(DEFAULT_MIN_SPEECH_RMS).expect("due");
+        assert_eq!(pcm.len(), (end + TAIL_MIN_SAMPLES).min(buffer.buf.len()));
+        // And quiet again: nothing new is due while the speaker is silent.
+        for _ in 0..100 {
+            buffer.push_frame(&silence, false);
+            assert!(buffer.partial_snapshot(DEFAULT_MIN_SPEECH_RMS).is_none());
+        }
+    }
+
+    #[test]
+    fn partial_snapshot_ignores_a_vad_blip_and_quiet_noise() {
+        // Too little speech: a blip of 10 frames never gets a decode.
+        let mut blip = UtteranceBuffer::new();
+        assert!(snapshots_over(&mut blip, 10, DEFAULT_MIN_SPEECH_RMS).is_empty());
+        // Enough speech but quieter than the rms gate: same guard `close` has.
+        let mut quiet = UtteranceBuffer::new();
+        assert!(snapshots_over(&mut quiet, 300, 0.5).is_empty());
+        // Nothing open, nothing to snapshot.
+        assert!(UtteranceBuffer::new()
+            .partial_snapshot(DEFAULT_MIN_SPEECH_RMS)
+            .is_none());
+    }
+
+    #[test]
+    fn partial_snapshot_does_not_disturb_the_final_utterance() {
+        let mut with = UtteranceBuffer::new();
+        let mut without = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..250 {
+            with.push_frame(&speech, true);
+            with.partial_snapshot(DEFAULT_MIN_SPEECH_RMS);
+            without.push_frame(&speech, true);
+        }
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            with.push_frame(&silence, false);
+            without.push_frame(&silence, false);
+        }
+        let a = with.close(&gate_for(0.0, 0.0)).unwrap();
+        let b = without.close(&gate_for(0.0, 0.0)).unwrap();
+        assert_eq!(a.pcm, b.pcm);
+        assert_eq!(a.evidence.speech_frames, b.evidence.speech_frames);
+    }
+
+    #[test]
+    fn partial_steps_restart_with_the_next_utterance_and_after_discard() {
+        let mut buffer = UtteranceBuffer::new();
+        let first = snapshots_over(&mut buffer, 250, DEFAULT_MIN_SPEECH_RMS);
+        assert!(!first.is_empty());
+        // Close it (a long hangover), then the next utterance starts over: its
+        // first snapshot is the same size as the first utterance's first.
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            buffer.push_frame(&silence, false);
+        }
+        buffer.close(&gate_for(0.0, 0.0)).unwrap();
+        let second = snapshots_over(&mut buffer, 250, DEFAULT_MIN_SPEECH_RMS);
+        let second_first = *second.first().expect("the next utterance snapshots again");
+        assert!(
+            (STREAM_MIN_SAMPLES..STREAM_MIN_SAMPLES + STREAM_STEP_SAMPLES).contains(&second_first),
+            "a new utterance starts at the minimum, not at the old step: {second_first}"
+        );
+        // A pause discards the state the same way.
+        buffer.discard();
+        assert_eq!(buffer.partial_end, 0);
+        assert!(buffer.partial_snapshot(DEFAULT_MIN_SPEECH_RMS).is_none());
     }
 
     #[test]

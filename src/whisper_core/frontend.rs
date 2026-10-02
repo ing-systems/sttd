@@ -25,7 +25,7 @@
 // ---------------------------------------------------------------------------
 
 use ndarray17::linalg::general_mat_mul;
-use ndarray17::{Array2, Array3, Axis};
+use ndarray17::{Array2, ArrayView3, ArrayViewMut2, Axis};
 use realfft::RealToComplex;
 use realfft::num_complex::Complex;
 use std::f32::consts::PI;
@@ -61,8 +61,13 @@ pub struct Frontend {
     /// Reusable FFT input/output/scratch buffers.
     fft_out: Vec<Complex<f32>>,
     fft_scratch: Vec<Complex<f32>>,
-    /// Power spectrogram scratch: `[n_fft / 2 + 1, n_frames]`.
+    /// Power spectrogram scratch: `[n_fft / 2 + 1, frames]`, reallocated only
+    /// when the window length changes.
     spectrogram: Array2<f32>,
+    /// The encoder's `[1, n_mels, frames]` input, in a buffer sized for the
+    /// full window: a shorter window is a prefix of it, so a change of window
+    /// never allocates.
+    features: Vec<f32>,
 }
 
 impl Frontend {
@@ -84,22 +89,17 @@ impl Frontend {
             padded: Vec::new(),
             frame,
             spectrogram: Array2::zeros((freq_bins, config.n_frames)),
+            features: vec![0.0; config.n_mels * config.n_frames],
         }
     }
 
-    /// The `[1, n_mels, n_frames]` destination `extract` fills: the encoder's
-    /// input shape, which this frontend's window pins for every utterance
-    /// whatever the audio length. Allocate it once and reuse it.
-    pub fn feature_buffer(&self) -> Array3<f32> {
-        Array3::zeros((1, self.config.n_mels, self.config.n_frames))
-    }
-
-    /// Raw 16 kHz mono samples -> `[1, 128, 3000]` log-mel features in the
-    /// layout the encoder expects, written into `features`.
+    /// Raw 16 kHz mono samples -> `[1, 128, n_frames]` log-mel features in the
+    /// layout the encoder expects.
     ///
-    /// The destination is the caller's so it survives the call: the engine holds
-    /// one buffer for the process's lifetime, instead of allocating and zeroing
-    /// 1.5 MB of features per utterance to hand ownership over.
+    /// `n_frames` is the encoder window (`types::window_frames`): 3000 for the
+    /// fixed export, any value up to that for the patched one. The returned
+    /// view borrows the frontend's own buffer, which is rewritten in full on
+    /// every call, so nothing is allocated per utterance.
     ///
     /// Audio longer than the window is truncated to it and logged: an
     /// utterance is capped at 30 s upstream (`MAX_UTTERANCE_SAMPLES`), so this
@@ -108,25 +108,30 @@ impl Frontend {
     pub fn extract(
         &mut self,
         audio: &[f32],
-        features: &mut Array3<f32>,
-    ) -> Result<(), WhisperError> {
-        debug_assert_eq!(
-            features.dim(),
-            (1, self.config.n_mels, self.config.n_frames)
-        );
-        debug_assert!(features.is_standard_layout(), "ort rejects a strided tensor");
-        if audio.len() > self.config.n_samples {
+        n_frames: usize,
+    ) -> Result<ArrayView3<'_, f32>, WhisperError> {
+        if n_frames == 0 || n_frames > self.config.n_frames {
+            return Err(WhisperError::Frontend(format!(
+                "window of {n_frames} frames is outside 1..={}",
+                self.config.n_frames
+            )));
+        }
+        let n_samples = n_frames * self.config.hop_length;
+        if audio.len() > n_samples {
             log::debug!(
-                "whisper window is {} samples, truncating {} ({} samples dropped)",
-                self.config.n_samples,
+                "whisper window is {n_samples} samples, truncating {} ({} samples dropped)",
                 audio.len(),
-                audio.len() - self.config.n_samples
+                audio.len() - n_samples
             );
         }
-        self.pad_and_reflect(audio);
-        self.stft()?;
-        self.log_mel(features);
-        Ok(())
+        self.pad_and_reflect(audio, n_samples);
+        self.stft(n_frames)?;
+        self.log_mel(n_frames)?;
+        let len = self.config.n_mels * n_frames;
+        Ok(ArrayView3::from_shape(
+            (1, self.config.n_mels, n_frames),
+            &self.features[..len],
+        )?)
     }
 
     /// Zero-pad (or truncate) to the window length, then reflect-pad by
@@ -136,8 +141,8 @@ impl Frontend {
     /// slice: for an utterance shorter than the window the mirrored samples
     /// come from the zero padding, and the right-hand reflection is zeros
     /// throughout. The reflect pad omits the edge sample, hence the `- 1`.
-    fn pad_and_reflect(&mut self, audio: &[f32]) {
-        let n = self.config.n_samples;
+    fn pad_and_reflect(&mut self, audio: &[f32], n_samples: usize) {
+        let n = n_samples;
         let half = self.config.n_fft / 2;
         let len = audio.len().min(n);
         // Layout: `half` reflected samples, then `n` window samples (the audio
@@ -159,15 +164,18 @@ impl Frontend {
     /// Power spectrogram of the padded signal into `self.spectrogram`.
     ///
     /// The centre pad makes this `n_samples / hop` frames — 3000 for the 30 s
-    /// window, which is exactly the encoder's `input_features` frame count, so
-    /// the buffers are sized once in `new` and never resized.
-    fn stft(&mut self) -> Result<(), WhisperError> {
+    /// window, which is exactly the encoder's `input_features` frame count. The
+    /// scratch is reallocated only when the window length changes.
+    fn stft(&mut self, n_frames: usize) -> Result<(), WhisperError> {
         let n_fft = self.config.n_fft;
         let hop_length = self.config.hop_length;
         let win_length = self.config.win_length;
         let freq_bins = n_fft / 2 + 1;
         let num_frames = (self.padded.len() - n_fft) / hop_length;
-        debug_assert_eq!(self.spectrogram.shape(), [freq_bins, num_frames]);
+        debug_assert_eq!(num_frames, n_frames);
+        if self.spectrogram.shape() != [freq_bins, num_frames] {
+            self.spectrogram = Array2::zeros((freq_bins, num_frames));
+        }
         // Whisper's analysis window fills the FFT buffer exactly (`win_length
         // == n_fft == 400`) and every frame has `n_fft` samples available, so
         // there is no unwritten tail to clear and the old
@@ -197,12 +205,13 @@ impl Frontend {
     }
 
     /// Mel projection, `log10` with the window-relative clamp, and the affine
-    /// map into the encoder's input range, all into `features`.
-    fn log_mel(&mut self, features: &mut Array3<f32>) {
-        // C <- 1 * mel_basis * spectrogram + 0 * C: writes into the caller's
-        // feature buffer instead of allocating per utterance.
-        let mut view = features.view_mut();
-        let mut mel = view.index_axis_mut(Axis(0), 0);
+    /// map into the encoder's input range, all into `self.features`.
+    fn log_mel(&mut self, n_frames: usize) -> Result<(), WhisperError> {
+        let len = self.config.n_mels * n_frames;
+        let features = &mut self.features[..len];
+        // C <- 1 * mel_basis * spectrogram + 0 * C: writes into the frontend's
+        // own feature buffer instead of allocating per utterance.
+        let mut mel = ArrayViewMut2::from_shape((self.config.n_mels, n_frames), &mut *features)?;
         general_mat_mul(
             1.0,
             &self.mel_basis.view(),
@@ -219,6 +228,7 @@ impl Frontend {
             *value = ((*value).max(LOG_FLOOR).log10()).max(floor);
             *value = (*value + LOG_OFFSET) / LOG_SCALE;
         }
+        Ok(())
     }
 }
 
@@ -238,6 +248,7 @@ fn periodic_hann(len: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray17::Array3;
 
     fn tone(len: usize) -> Vec<f32> {
         (0..len)
@@ -245,40 +256,44 @@ mod tests {
             .collect()
     }
 
-    /// One `extract` into a fresh buffer, which is what the engine does not do
-    /// (it reuses one) but is what these checks want to look at.
-    fn features(audio: &[f32]) -> Array3<f32> {
+    /// One `extract` on a fresh frontend, copied out, which is what the engine
+    /// does not do (it reuses one frontend) but is what these checks want.
+    fn features_in(audio: &[f32], n_frames: usize) -> Array3<f32> {
         let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
-        let mut out = frontend.feature_buffer();
-        frontend.extract(audio, &mut out).unwrap();
-        out
+        frontend.extract(audio, n_frames).unwrap().to_owned()
+    }
+
+    fn features(audio: &[f32]) -> Array3<f32> {
+        features_in(audio, MelConfig::large_v3_turbo().n_frames)
     }
 
     /// Straightforward reimplementation of `log_mel_spectrogram` with no
     /// cached buffers and no reuse: pad to the window, reflect-pad, windowed
     /// rFFT, drop the last frame, mel, clamp, scale. The optimized `extract`
     /// must agree with it.
-    fn reference(audio: &[f32]) -> Array3<f32> {
+    fn reference(audio: &[f32], n_frames: usize) -> Array3<f32> {
         let c = MelConfig::large_v3_turbo();
+        let n_samples = n_frames * c.hop_length;
         let half = c.n_fft / 2;
-        let len = audio.len().min(c.n_samples);
+        let len = audio.len().min(n_samples);
 
         // Zero-pad to the window, then reflect-pad by n_fft/2 each side. The
         // reflections read the padded window, so a short utterance mirrors its
         // own zero padding.
-        let mut signal = vec![0.0f32; half + c.n_samples + half];
+        let mut signal = vec![0.0f32; half + n_samples + half];
         signal[half..half + len].copy_from_slice(&audio[..len]);
         let left = &mut signal[..half];
-        for (dst, i) in left.iter_mut().zip((c.n_samples - half..c.n_samples).rev()) {
+        for (dst, i) in left.iter_mut().zip((n_samples - half..n_samples).rev()) {
             *dst = if i < len { audio[i] } else { 0.0 };
         }
-        assert_eq!(signal.len(), c.n_samples + 2 * half);
+        assert_eq!(signal.len(), n_samples + 2 * half);
 
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let plan = planner.plan_fft_forward(c.n_fft);
         let window = periodic_hann(c.win_length);
         // Centre pad gives n_samples/hop + 1 frames; drop the last.
         let num_frames = (signal.len() - c.n_fft) / c.hop_length;
+        assert_eq!(num_frames, n_frames);
         let freq_bins = c.n_fft / 2 + 1;
         let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
         let mut input = vec![0.0f32; c.n_fft];
@@ -314,7 +329,7 @@ mod tests {
         for len in [8_000, 96_000, 480_000] {
             let audio = tone(len);
             let got = features(&audio);
-            let want = reference(&audio);
+            let want = reference(&audio, 3000);
             assert_eq!(got.shape(), want.shape(), "len={len}");
             for (g, w) in got.iter().zip(want.iter()) {
                 assert!((g - w).abs() < 1e-5, "len={len} feature mismatch: {g} vs {w}");
@@ -322,11 +337,32 @@ mod tests {
         }
     }
 
-    /// The encoder graph's `input_features` axes are constants, so the output
-    /// must be `[1, 128, 3000]` for *every* input length — this is the property
-    /// that makes per-utterance cost independent of utterance length.
+    /// A shorter window is the same recipe over fewer samples, so it must agree
+    /// with the reference at that length — in particular the left reflection
+    /// reads the *end of the shorter window*, and the peak clamp is taken over
+    /// the shorter window only.
     #[test]
-    fn output_is_always_the_fixed_encoder_window() {
+    fn extract_matches_the_reference_at_shorter_windows() {
+        for (len, n_frames) in [(8_000, 1000), (96_000, 1000), (96_000, 1500), (160_000, 1000)] {
+            let audio = tone(len);
+            let got = features_in(&audio, n_frames);
+            let want = reference(&audio, n_frames);
+            assert_eq!(got.shape(), [1, 128, n_frames], "len={len}");
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert!(
+                    (g - w).abs() < 1e-5,
+                    "len={len} n_frames={n_frames} feature mismatch: {g} vs {w}"
+                );
+            }
+        }
+    }
+
+    /// The encoder graph's `input_features` axes are constants in the fixed
+    /// export, so the default window must be `[1, 128, 3000]` for *every* input
+    /// length — this is the property that makes per-utterance cost independent
+    /// of utterance length there.
+    #[test]
+    fn output_is_always_the_requested_window() {
         for len in [0, 1_600, 48_000, 480_000, 960_000] {
             let features = features(&tone(len));
             assert_eq!(features.shape(), &[1, 128, 3000], "len={len}");
@@ -336,6 +372,19 @@ mod tests {
             );
             assert!(features.as_slice().is_some(), "len={len}");
         }
+        for n_frames in [100, 1000, 1234, 2999] {
+            let features = features_in(&tone(48_000), n_frames);
+            assert_eq!(features.shape(), &[1, 128, n_frames]);
+            assert!(features.is_standard_layout());
+        }
+    }
+
+    #[test]
+    fn extract_rejects_a_window_outside_the_export() {
+        let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
+        assert!(frontend.extract(&tone(1_600), 0).is_err());
+        assert!(frontend.extract(&tone(1_600), 3001).is_err());
+        assert!(frontend.extract(&tone(1_600), 3000).is_ok());
     }
 
     /// An empty buffer must still yield a full window of finite features: a
@@ -349,6 +398,7 @@ mod tests {
             features.iter().all(|v| v.is_finite()),
             "silence produced a non-finite feature"
         );
+        assert!(features_in(&[], 1000).iter().all(|v| v.is_finite()));
     }
 
     /// The log clamp is relative to the window maximum, so a quiet window is
@@ -375,20 +425,19 @@ mod tests {
         }
     }
 
-    /// `extract` fills the caller's buffer and keeps every other one, so the
-    /// same audio must produce the same features on the second pass — a buffer
-    /// that had to be reallocated or re-zeroed per call would show up here as
-    /// stale values from the utterance in between.
+    /// `extract` rewrites the frontend's buffer in full and keeps every other
+    /// one, so the same audio must produce the same features on the second pass
+    /// — even with a different window in between. A buffer that kept stale
+    /// values from the utterance in between would show up here.
     #[test]
-    fn extract_refills_the_callers_buffer_every_call() {
+    fn extract_refills_the_buffer_every_call_across_window_changes() {
         let mut frontend = Frontend::new(MelConfig::large_v3_turbo());
-        let mut out = frontend.feature_buffer();
-        frontend.extract(&tone(96_000), &mut out).unwrap();
-        let first = out.clone();
-        frontend.extract(&tone(48_000), &mut out).unwrap();
-        frontend.extract(&tone(96_000), &mut out).unwrap();
-        assert_eq!(first.shape(), out.shape());
-        for (a, b) in first.iter().zip(out.iter()) {
+        let first = frontend.extract(&tone(96_000), 1000).unwrap().to_owned();
+        frontend.extract(&tone(48_000), 3000).unwrap();
+        frontend.extract(&tone(48_000), 1500).unwrap();
+        let again = frontend.extract(&tone(96_000), 1000).unwrap().to_owned();
+        assert_eq!(first.shape(), again.shape());
+        for (a, b) in first.iter().zip(again.iter()) {
             assert!((a - b).abs() < 1e-6, "{a} vs {b}: buffer was not fully rewritten");
         }
     }

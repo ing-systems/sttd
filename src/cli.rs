@@ -106,6 +106,24 @@ pub(crate) struct Cli {
     )]
     pub(crate) language: Language,
 
+    /// Live-streaming mode. While you speak, sttd decodes the open utterance
+    /// about once a second and logs the partial text (`info`, `partial`); the
+    /// final transcript, gates, clipboard and paste are unchanged. With
+    /// Whisper it also patches the encoder in memory so the window follows the
+    /// audio (15 s at least) instead of always being 30 s: about 2x less
+    /// time per utterance. Microphone mode only for partials; `--file` gets the
+    /// short window alone.
+    #[arg(
+        long,
+        env = "STTD_STREAM",
+        default_value_t = false,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Model"
+    )]
+    pub(crate) stream: bool,
+
     /// Load the model onto the GPU (`off`/`0` = CPU-only).
     #[arg(
         long,
@@ -447,6 +465,7 @@ mod tests {
         assert_eq!(cli.vad_threshold, DEFAULT_VAD_THRESHOLD);
         assert_eq!(cli.vad_adapt, DEFAULT_VAD_ADAPT);
         assert!(!cli.copy);
+        assert!(!cli.stream, "streaming is opt-in");
         assert!(!cli.paste);
         assert_eq!(cli.paste_mode, PasteMode::CtrlV);
         assert!(!cli.paste_last);
@@ -622,6 +641,15 @@ mod tests {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert!(cli.pid_file_path().ends_with("sttd.pid"));
         assert!(cli.log_file_path().ends_with("sttd.log"));
+    }
+
+    #[test]
+    fn cli_stream_parses_bare_and_with_a_value() {
+        let cli = Cli::try_parse_from(["sttd", "--stream"]).expect("bare flag must parse");
+        assert!(cli.stream);
+        let cli = Cli::try_parse_from(["sttd", "--stream", "off"]).expect("off must parse");
+        assert!(!cli.stream);
+        assert!(Cli::try_parse_from(["sttd", "--stream", "sometimes"]).is_err());
     }
 
     #[test]
