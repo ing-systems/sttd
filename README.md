@@ -230,7 +230,7 @@ Key tunables:
 | `--dump-dir` / `STTD_DUMP_DIR` (`-o`) | unset | Write WAV+TXT per utterance; keeps newest 100 pairs. TXT for drops starts with `DROPPED(<reason>)`. |
 | `--metrics` / `STTD_METRICS` | unset | Append JSONL per utterance (timing, RTF, evidence, verdict, text). |
 | `--start-paused` / `STTD_START_PAUSED` | on | Start paused; file mode ignores it. |
-| `--autopause` / `STTD_AUTOPAUSE` | off | Pause again after each emission; each resume arms one sentence. |
+| `--autopause` / `STTD_AUTOPAUSE` | off | Pause again after each emission; each resume arms one sentence. The pause flushes the utterance buffer first, so speech made while the model was decoding is not lost. |
 | `--no-dbus` / `STTD_NO_DBUS` | off | Skip the session-bus service (both interfaces). Signals and `--stop` keep working. File mode never starts it. |
 | `--auto-unload` / `STTD_AUTO_UNLOAD` | off | Unload model while paused to free VRAM. |
 | `--auto-unload-after` / `STTD_AUTO_UNLOAD_AFTER` | `180` s | Pause duration before unload; `0` = immediate. |
@@ -248,11 +248,18 @@ Signals (microphone mode, `src/main.rs:458-486`):
 
 | Signal | Effect |
 | --- | --- |
-| `SIGUSR1` | Pause. |
+| `SIGUSR1` | Pause; the utterance buffer is flushed first (see below). |
 | `SIGUSR2` | Resume; with `--autopause` arms one sentence. |
-| `SIGHUP` | Toggle pause/run. |
+| `SIGHUP` | Toggle pause/run; pausing flushes the utterance buffer first. |
 | `SIGTERM` | Graceful stop, flush trailing speech. |
 | `Ctrl-C` | Same as `SIGTERM`. |
+
+Pausing never loses the last sentence: the pause edge cuts the open utterance
+buffer and transcribes it while the run is held, so it reaches stdout, the
+clipboard and `--dump-dir` right away. Anything else waiting in the model queue
+at that moment is dropped unless it closed within the last 2 s (`asr.rs`'s
+`keep_while_paused`): a queue that far behind is a real backlog, and transcribing
+it later would paste stale text into whatever window has focus.
 
 Daemon files default to `<tmp>/sttd.pid`, `<tmp>/sttd.log`, `<tmp>/sttd-last.txt`.
 
@@ -274,7 +281,8 @@ D-Bus (microphone mode, unless `--no-dbus`): one bus name `org.sttd.Daemon` with
 | `org.sttd.Daemon` | `/org/sttd/Daemon` | `Pause`, `Resume`, `Toggle`, property `Paused`, signal `StateChanged` |
 | `org.sttd.Dictionary` | `/org/sttd/Dictionary` | `LoadFile`, `ReplaceWords`, `AddWords`, `RemoveWords`, `GetWords`, `Contains`, properties `Count` and `Dirty`, signal `DictionaryChanged` |
 
-Pause control:
+Pause control (`Pause` and `Toggle` flush the utterance buffer, same as
+`SIGUSR1`/`SIGHUP` above):
 
 ```sh
 busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Pause

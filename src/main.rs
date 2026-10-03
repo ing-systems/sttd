@@ -589,7 +589,9 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let mut rebuild_attempts: u32 = 0;
     let mut was_paused = paused.load(Ordering::Acquire);
     if was_paused {
-        // Start-paused: drop any callback audio that raced stream start.
+        // Start-paused: drop any callback audio that raced stream start. Not
+        // `flush_on_pause`: nothing has been spoken yet, so there is no open
+        // utterance to save.
         fp.discard_pending();
     }
     while running.load(Ordering::Acquire) {
@@ -653,13 +655,33 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         // Full-pipeline hold while paused: no resampling, no VAD, no
         // utterance, no floor learning, no ASR input. The raw ring is
         // drained and dropped so resume starts fresh with no stale speech;
-        // the ASR worker idles and holds its queue (see asr).
+        // the ASR worker transcribes the pause flush and drops the rest of
+        // its queue (see asr).
         let now_paused = paused.load(Ordering::Acquire);
         if now_paused && !was_paused {
-            // Pause entry edge: full clear (resamplers + Hp + Agc + detector +
-            // utterance, noise floor preserved) so pre-pause partials can't
-            // leak into the first post-resume utterance.
-            fp.hold_pipeline();
+            // Pause entry edge. First the frames already drained: bounded by
+            // one hw frame (no fresh `drain_raw_into`, which after a device
+            // rebuild could hold seconds of pre-rebuild audio), so the cut
+            // below sees the tail of what was said.
+            drain_frames(
+                &mut accumulator,
+                input_frames,
+                &mut fp,
+                &mut asr_tx,
+                push_live_utterance,
+                &partials,
+            );
+            // Then cut and queue the open utterance before the hold discards
+            // it: pausing must not lose the last sentence. `Wait` rather than
+            // the live `Drop` policy — a queue near full means a slow model,
+            // which is exactly when this sentence would be dropped, and the
+            // loop is about to park for the whole pause anyway.
+            if let Some(utterance) = fp.flush_on_pause() {
+                push_utterance(&mut asr_tx, utterance, Backpressure::Wait);
+            }
+            // The hold itself (resamplers + Hp + Agc + detector + pre-roll,
+            // noise floor preserved) is inside `flush_on_pause`, so pre-pause
+            // audio cannot leak into the first post-resume utterance.
             partials.clear();
         }
         if !now_paused && was_paused {

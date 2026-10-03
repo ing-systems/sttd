@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::config::{
     EARLY_SPLIT_QUIET_FRAMES, EARLY_SPLIT_QUIET_RMS, EARLY_SPLIT_SAMPLES,
     EARLY_SPLIT_SILENCE_FRAMES, FRAME_16K, INTERIM_SPLIT_SAMPLES, INTERIM_SPLIT_SILENCE_FRAMES,
@@ -56,6 +58,27 @@ pub(crate) struct Utterance {
     /// (see `asr::remove_split_overlap`); hangover closes leave it false so
     /// distinct sentences are never merged.
     pub(crate) split_continuation: bool,
+    /// True when this utterance was cut by the pause edge rather than by a
+    /// silence hangover: the last thing said before the run was held, which no
+    /// hangover will ever get to close. The worker transcribes it while the
+    /// pause holds (see `asr::keep_while_paused`) instead of dropping it as
+    /// stale backlog.
+    pub(crate) pause_flush: bool,
+    /// When the buffer closed this utterance, i.e. when its text started
+    /// waiting for the model. Stamped by `close` and read by the worker to
+    /// tell a sentence that closed just before a pause (still what the
+    /// speaker just said) from a backlog the model is minutes behind on.
+    pub(crate) queued_at: Instant,
+}
+
+impl Utterance {
+    /// Mark this as the utterance the pause edge flushed (see the
+    /// `pause_flush` field). Called by `FrameProcessor::flush_on_pause`
+    /// after the cut, so it covers an utterance that the trailing flush
+    /// closed rather than the open buffer.
+    pub(crate) fn mark_pause_flush(&mut self) {
+        self.pause_flush = true;
+    }
 }
 
 /// Whether `UtteranceBuffer::push_frame` wants the caller to close the
@@ -574,6 +597,10 @@ impl UtteranceBuffer {
                 rms,
             },
             split_continuation: self.pending_split,
+            // Stamped here, not at the push: the wait starts when the
+            // buffer cuts the text (see `Utterance::queued_at`).
+            queued_at: Instant::now(),
+            pause_flush: false,
         };
         self.reset();
         Some(utterance)
@@ -913,6 +940,34 @@ mod tests {
         assert!(utterance.evidence.total_frames > 0);
         assert!(utterance.evidence.density() >= DEFAULT_MIN_DENSITY);
         assert!(utterance.evidence.rms > 0.0);
+    }
+
+    #[test]
+    fn close_leaves_the_pause_flush_unset_and_stamps_the_queue_time() {
+        // A hangover close is not a pause flush: only the pause edge marks
+        // one, and the worker relies on the difference to tell the sentence
+        // the speaker just finished from a backlog.
+        let mut buffer = UtteranceBuffer::new();
+        let speech = vec![0.3f32; FRAME_16K];
+        for _ in 0..25 {
+            buffer.push_frame(&speech, true);
+        }
+        let silence = vec![0.0f32; FRAME_16K];
+        for _ in 0..(SILENCE_FRAMES_THRESHOLD + 1) {
+            buffer.push_frame(&silence, false);
+        }
+        let before = Instant::now();
+        let mut utterance = buffer
+            .close(&gate_for(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY))
+            .expect("real speech must be sent to the model");
+        assert!(!utterance.pause_flush, "a hangover close is not a flush");
+        assert!(
+            utterance.queued_at >= before,
+            "queued_at is stamped at the close, so the wait starts there"
+        );
+
+        utterance.mark_pause_flush();
+        assert!(utterance.pause_flush);
     }
 
     #[test]

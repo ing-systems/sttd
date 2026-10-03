@@ -202,15 +202,35 @@ impl FrameProcessor {
 
     /// Full-pipeline hold (pause): same as `discard_pending` — no background
     /// learning, no resampling, frozen floor. The main loop parks (drains and
-    /// drops raw) after calling this once on the pause edge.
+    /// drops raw) after calling this once on the pause edge; `flush_on_pause`
+    /// folds it into the pause-edge sequence.
     pub(crate) fn hold_pipeline(&mut self) {
         self.discard_pending();
     }
 
-    /// Flush any trailing speech. Call once at shutdown / end of input.
-    /// Returns the trailing utterance, if any. Keeps iterating past a
-    /// mid-flush close instead of returning immediately (see
-    /// `process_frame`'s doc comment for why).
+    /// Pause edge: cut the open utterance and hand it back so the last thing
+    /// said survives the hold, then hold the pipeline as `hold_pipeline` does.
+    /// Returns the flushed utterance (marked as a pause flush), or `None` when
+    /// nothing was buffered or the acoustic gates dropped it.
+    ///
+    /// Order is the point: the hold discards the utterance buffer, so the cut
+    /// has to happen first. Marking after the trailing flush covers an
+    /// utterance that `signal`'s zero-padded tail closed rather than the open
+    /// buffer. The caller queues the result (see `asr::keep_while_paused`),
+    /// because the worker drops untagged backlog while a pause is held.
+    pub(crate) fn flush_on_pause(&mut self) -> Option<Utterance> {
+        let mut flushed = self.flush_trailing_speech();
+        if let Some(utterance) = flushed.as_mut() {
+            utterance.mark_pause_flush();
+        }
+        self.hold_pipeline();
+        flushed
+    }
+
+    /// Flush any trailing speech. Call once at shutdown / end of input, and on
+    /// the pause edge (see `flush_on_pause`). Returns the trailing utterance,
+    /// if any. Keeps iterating past a mid-flush close instead of returning
+    /// immediately (see `process_frame`'s doc comment for why).
     pub(crate) fn flush_trailing_speech(&mut self) -> Option<Utterance> {
         let mut closed = None;
         for pair in self.signal.flush() {
@@ -228,6 +248,7 @@ impl FrameProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MIN_SPEECH_FRAMES;
 
     fn processor() -> FrameProcessor {
         FrameProcessor::new(
@@ -243,6 +264,59 @@ mod tests {
         .unwrap()
     }
 
+    /// Same, with the acoustic gates off (rms gate and density floor at 0), so
+    /// a test sees only `MIN_SPEECH_FRAMES` deciding whether the audio counts
+    /// as speech enough to be transmitted.
+    fn processor_without_gates() -> FrameProcessor {
+        FrameProcessor::new(
+            16_000,
+            DenoiserKind::Bypass,
+            0.5,
+            true,
+            GateConfig::new(0.0, 0.0),
+            80,
+            0.0,
+            8.0,
+        )
+        .unwrap()
+    }
+
+    /// Voiced-ish audio: a harmonic stack under a 4 Hz envelope, which is what
+    /// the detector expects speech to look like.
+    fn voiced(hop: usize, t: f32) -> Vec<f32> {
+        (0..hop)
+            .map(|i| {
+                let s = t + i as f32 / 16_000.0;
+                let env = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * 4.0 * s).sin();
+                let tone = (2.0 * std::f32::consts::PI * 140.0 * s).sin()
+                    + 0.6 * (2.0 * std::f32::consts::PI * 700.0 * s).sin()
+                    + 0.3 * (2.0 * std::f32::consts::PI * 2400.0 * s).sin();
+                0.25 * env * tone / 1.9
+            })
+            .collect()
+    }
+
+    /// Feed syllable-like bursts (40 ms of voice, 20 ms of near silence). The
+    /// gaps hold the adaptive VAD floor down, so the bursts keep being flagged
+    /// as speech; one steady tone is learned as background instead and never
+    /// reaches `MIN_SPEECH_FRAMES`.
+    fn speak(fp: &mut FrameProcessor, bursts: usize) {
+        let hop = fp.required_input_frames();
+        let mut t = 0.0f32;
+        let step = hop as f32 / 16_000.0;
+        for _ in 0..bursts {
+            for _ in 0..4 {
+                fp.process_frame(&voiced(hop, t));
+                t += step;
+            }
+            for _ in 0..2 {
+                let quiet: Vec<f32> = voiced(hop, t).iter().map(|s| s * 0.02).collect();
+                fp.process_frame(&quiet);
+                t += step;
+            }
+        }
+    }
+
     #[test]
     fn a_partial_needs_an_open_utterance() {
         // 3 s of silence never opens an utterance, so there is nothing to cut a
@@ -253,6 +327,49 @@ mod tests {
             idle.process_frame(&vec![0.0; hop]);
             assert!(idle.take_partial().is_none());
         }
+    }
+
+    #[test]
+    fn flush_on_pause_holds_the_pipeline_with_nothing_buffered() {
+        // Silence never opens an utterance, so the pause edge has nothing to
+        // save — and must still hold the pipeline.
+        let mut fp = processor();
+        let hop = fp.required_input_frames();
+        for _ in 0..50 {
+            fp.process_frame(&vec![0.0; hop]);
+        }
+        assert!(fp.flush_on_pause().is_none(), "nothing was buffered");
+        assert!(
+            !fp.has_open_utterance(),
+            "the pause must leave no open buffer"
+        );
+    }
+
+    #[test]
+    fn flush_on_pause_hands_back_the_open_utterance_marked_as_a_flush() {
+        // The regression this guards: the pause edge used to hold the pipeline
+        // first, which discarded the open utterance and lost the last thing
+        // said. The cut must come first, and what it returns must be marked so
+        // the worker keeps it while the pause holds.
+        let mut fp = processor_without_gates();
+        speak(&mut fp, 30);
+        assert!(
+            fp.has_open_utterance(),
+            "the trailing gap is short of the hangover, so the utterance is still open"
+        );
+        let flushed = fp
+            .flush_on_pause()
+            .expect("the open utterance must be cut, not discarded");
+        assert!(!flushed.pcm.is_empty());
+        assert!(flushed.pause_flush, "the worker must keep this while held");
+        assert!(
+            flushed.evidence.speech_frames >= MIN_SPEECH_FRAMES,
+            "the synthetic bursts must reach the speech-frame floor"
+        );
+        // The hold still ran: nothing is left open, and a second pause edge
+        // has nothing to hand back.
+        assert!(!fp.has_open_utterance());
+        assert!(fp.flush_on_pause().is_none());
     }
 
     #[test]

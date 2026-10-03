@@ -27,6 +27,14 @@ It spans utterances on purpose: it always holds the run-up to whatever opens
 next.
 _Avoid_: lookback, ring buffer (as a name for the audio itself)
 
+**Pause flush**:
+The utterance the buffer is cut into at a pause edge, because the run is being
+held and the hold would otherwise discard it. The pause cuts it before any
+hangover can, and it is transcribed while the pause holds rather than waiting
+for the resume. Only a pause flush and a close that is still fresh survive the
+pause — an older queued utterance is a backlog, and stays dropped.
+_Avoid_: final flush, tail flush, end-of-input flush (that is the shutdown one)
+
 ### What the acoustics observed
 
 **Acoustic evidence**:

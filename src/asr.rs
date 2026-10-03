@@ -410,30 +410,43 @@ pub(crate) fn should_unload(
 
 /// Whether a just-finished utterance should re-pause the pipeline:
 /// single-shot resume fires only on an actually emitted transcript, never
-/// on a drop or a failed inference, so noise can't steal the shot.
-/// Pure over its inputs for tests.
-pub(crate) const fn should_autopause(autopause_enabled: bool, emitted: bool) -> bool {
-    autopause_enabled && emitted
+/// on a drop or a failed inference, so noise can't steal the shot. An
+/// utterance transcribed while the run is already held (the pause flush)
+/// never re-pauses: the pipeline is already quiet, so firing would only
+/// repeat the log line and the beep. Pure over its inputs for tests.
+pub(crate) const fn should_autopause(
+    autopause_enabled: bool,
+    emitted: bool,
+    already_paused: bool,
+) -> bool {
+    autopause_enabled && emitted && !already_paused
 }
 
-/// Whether the worker should drain the ASR queue right now: exactly on
-/// the false->true edge of `paused` (`was_paused` is the pause state as of
-/// the last time the caller checked it). Pure so the edge condition is
-/// testable without a live `rtrb` queue or thread; the actual drain (`rx.pop`
-/// in a loop) stays a side effect in the caller.
+/// How long a queued utterance may wait and still be transcribed while a
+/// pause is held (see `keep_while_paused`). The pause is noticed within one
+/// loop iteration (~12 ms) and a normal decode takes well under a second, so
+/// anything inside this window is text the speaker just said. Past it the
+/// model is behind by seconds, which is what makes the text stale.
+pub(crate) const PAUSE_KEEP_MAX_WAITED: Duration = Duration::from_secs(2);
+
+/// Whether an utterance that reached the queue before the pause may still be
+/// transcribed while the run is held. A pause flush always may: the capture
+/// side cut it at this very edge, so it is the freshest audio there is. An
+/// ordinary close may too while it is still fresh, which covers the sentence
+/// that closed milliseconds before the pause was noticed — dropping that one
+/// is the loss this whole path exists to prevent.
 ///
-/// Utterances queued just before a pause is noticed must not survive it:
-/// with `--copy`/`--paste` enabled, transcribing them on resume types
-/// stale content into whatever window has focus, possibly minutes later.
-/// Firing only on the edge (not on every paused tick) means a long pause
-/// drains once, not on a busy-loop.
-pub(crate) const fn should_drain_on_pause(was_paused: bool, now_paused: bool) -> bool {
-    now_paused && !was_paused
+/// Everything older is a real backlog (the model runs slower than realtime,
+/// or the run sat unloaded), and it stays dropped: with `--copy`/`--paste`
+/// enabled, transcribing it later types stale content into whatever window
+/// has focus, possibly minutes after it was said. Pure for tests.
+pub(crate) fn keep_while_paused(pause_flush: bool, waited: Duration) -> bool {
+    pause_flush || waited < PAUSE_KEEP_MAX_WAITED
 }
 
-/// Drain all queued utterances, returning how many were dropped. Pause-edge
-/// and paused-shutdown discards share this so stale utterances never survive
-/// a pause into a later emission.
+/// Drain all queued utterances, returning how many were dropped. The
+/// paused-shutdown discard uses this so stale utterances never survive into a
+/// later emission.
 fn drain_queue(rx: &mut Consumer<Utterance>) -> usize {
     let mut n = 0;
     while rx.pop().is_ok() {
@@ -453,7 +466,7 @@ fn fire_autopause(
     utterance_no: u64,
     sound_enabled: bool,
 ) {
-    if should_autopause(autopause_enabled, emitted) {
+    if should_autopause(autopause_enabled, emitted, paused.load(Ordering::Acquire)) {
         paused.store(true, Ordering::Release);
         *was_paused = true;
         log::info!("autopaused after utt_{utterance_no:06} (--autopause, single-shot)");
@@ -626,7 +639,7 @@ impl AsrWorker<'_> {
     /// unloaded, in order, before the live loop starts.
     ///
     /// A re-pause mid-replay drops the rest of the stash outright, same as
-    /// the live queue's pause-edge drain (`should_drain_on_pause`): stale
+    /// the live queue's stale drop (`keep_while_paused`): stale
     /// audio from before an arbitrary-length pause must not silently wait for
     /// a future resume and then transcribe (and with --copy/--paste enabled,
     /// be typed into whatever window has focus).
@@ -714,22 +727,35 @@ impl AsrWorker<'_> {
     fn run_loaded(&mut self, model: &mut dyn SpeechModel) -> bool {
         self.replay_stash(model);
         loop {
-            // Full hold: while paused, idle without popping so queued
-            // utterances wait for resume instead of transcribing through pause.
+            // Full hold: while paused, take only what the pause itself
+            // produced — the flush the capture side cut at this edge, plus
+            // anything still fresh — and drop the rest.
             if self.paused.load(Ordering::Relaxed) {
-                if should_drain_on_pause(self.was_paused, true) {
-                    // Pause edge: drop whatever is already queued. Without
-                    // this, utterances closed just before the pause was
-                    // noticed survive it and transcribe (and, with --copy/
-                    // --paste enabled, get typed into whatever window has
-                    // focus) on resume — possibly minutes later. Consistent
-                    // with the shutdown-while-paused drain a few lines below,
-                    // and with `hold_pipeline`'s own discard semantics on the
-                    // capture side of this same edge.
-                    let n = drain_queue(self.rx);
-                    if n > 0 {
-                        log::warn!("dropping {n} queued utterance(s) (paused)");
+                let mut fresh = Vec::new();
+                let mut dropped = 0usize;
+                while let Ok(utterance) = self.rx.pop() {
+                    // Empty audio is skipped silently, as the unpaused arm
+                    // below does: it is not a dropped sentence.
+                    if utterance.pcm.is_empty() {
+                        continue;
                     }
+                    if keep_while_paused(utterance.pause_flush, utterance.queued_at.elapsed()) {
+                        fresh.push(utterance);
+                    } else {
+                        dropped += 1;
+                    }
+                }
+                if dropped > 0 {
+                    // With --copy/--paste enabled, transcribing these on
+                    // resume would type stale content into whatever window
+                    // has focus, possibly minutes after it was said.
+                    log::warn!("dropping {dropped} queued utterance(s) (paused)");
+                }
+                // Arrival order, and no autopause from here: `transcribe`
+                // reads the pause flag and stays quiet (see
+                // `should_autopause`).
+                for utterance in fresh {
+                    self.transcribe(model, utterance);
                 }
                 std::thread::sleep(Duration::from_millis(50));
                 self.was_paused = true;
@@ -1861,24 +1887,33 @@ mod tests {
     #[test]
     fn autopause_fires_only_on_emit_when_enabled() {
         // Disabled never fires, even on emit.
-        assert!(!should_autopause(false, true));
-        assert!(!should_autopause(false, false));
+        assert!(!should_autopause(false, true, false));
+        assert!(!should_autopause(false, false, false));
         // Enabled fires only when the transcript was actually emitted;
         // drops and failed inferences (false) must not steal the shot.
-        assert!(!should_autopause(true, false));
-        assert!(should_autopause(true, true));
+        assert!(!should_autopause(true, false, false));
+        assert!(should_autopause(true, true, false));
+        // A pause flush is transcribed while the run is already held: firing
+        // again would only repeat the log line and the beep.
+        assert!(!should_autopause(true, true, true));
+        assert!(!should_autopause(false, true, true));
     }
 
     #[test]
-    fn drain_on_pause_fires_only_on_the_edge() {
-        // The transition into pause (edge) drains once...
-        assert!(should_drain_on_pause(false, true));
-        // ...but a tick that's already paused (no fresh edge) must not
-        // re-drain on every 50 ms poll of a long pause.
-        assert!(!should_drain_on_pause(true, true));
-        // Not paused: nothing to drain either way.
-        assert!(!should_drain_on_pause(false, false));
-        assert!(!should_drain_on_pause(true, false));
+    fn keep_while_paused_takes_the_flush_and_only_fresh_text() {
+        // The pause flush was cut at this very edge, so it is never stale.
+        assert!(keep_while_paused(true, Duration::from_secs(600)));
+        assert!(keep_while_paused(true, Duration::ZERO));
+        // An ordinary close survives only while it is still fresh: the
+        // sentence that closed milliseconds before the pause must go through,
+        // a backlog the model is minutes behind on must not.
+        assert!(keep_while_paused(false, Duration::ZERO));
+        assert!(keep_while_paused(
+            false,
+            PAUSE_KEEP_MAX_WAITED - Duration::from_millis(1)
+        ));
+        assert!(!keep_while_paused(false, PAUSE_KEEP_MAX_WAITED));
+        assert!(!keep_while_paused(false, Duration::from_secs(600)));
     }
 
     #[test]
@@ -2053,19 +2088,35 @@ mod tests {
                 rms: 0.05,
             },
             split_continuation: false,
+            queued_at: Instant::now(),
+            pause_flush: false,
+        }
+    }
+
+    /// Same, but as the pause edge or a stale backlog would leave it: tagged
+    /// as a flush, or queued long enough ago to count as stale.
+    fn queued_utterance(samples: usize, pause_flush: bool, waited: Duration) -> Utterance {
+        Utterance {
+            queued_at: Instant::now()
+                .checked_sub(waited)
+                .expect("host uptime must exceed the waited window"),
+            pause_flush,
+            ..closed_utterance(samples)
         }
     }
 
     /// Run `AsrWorker::run_loaded` on a thread against `model` until it has made
     /// `calls` decodes (or 10 s pass), then close the queue and join it.
-    /// Returns the worker's final `utterance_no` and its `prev_emit_text`.
+    /// `paused` starts the worker with the run already held. Returns the
+    /// worker's final `utterance_no` and its `prev_emit_text`.
     fn run_worker_until(
-        queued: Option<Utterance>,
+        queued: Vec<Utterance>,
         partial: Option<Vec<f32>>,
         mut model: ScriptedModel,
         inputs: &Arc<Mutex<Vec<usize>>>,
         calls: usize,
         settle: Duration,
+        paused: bool,
     ) -> (u64, String) {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(ASR_QUEUE_CAP);
         let opts = AsrOptions {
@@ -2088,7 +2139,7 @@ mod tests {
         };
         let (ready_tx, _ready_rx) = std::sync::mpsc::channel();
         let mut emitter = crate::emit::RecordingEmitter::new();
-        let paused = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(paused));
         let running = Arc::new(AtomicBool::new(true));
         let mut worker = AsrWorker {
             rx: &mut rx,
@@ -2113,7 +2164,7 @@ mod tests {
             was_paused: false,
             last_unpaused: Instant::now(),
         };
-        if let Some(u) = queued {
+        for u in queued {
             assert!(tx.push(u).is_ok());
         }
         if let Some(p) = partial {
@@ -2140,12 +2191,13 @@ mod tests {
     fn a_closed_utterance_goes_before_a_waiting_partial() {
         let (model, inputs) = ScriptedModel::new("dzień dobry");
         let (utterance_no, prev) = run_worker_until(
-            Some(closed_utterance(8_000)),
+            vec![closed_utterance(8_000)],
             Some(vec![0.1; 20_000]),
             model,
             &inputs,
             2,
             Duration::from_millis(50),
+            false,
         );
         let seen = inputs.lock().unwrap().clone();
         assert_eq!(
@@ -2165,16 +2217,50 @@ mod tests {
     fn a_partial_alone_is_decoded_but_takes_no_number() {
         let (model, inputs) = ScriptedModel::new("dzień dobry");
         let (utterance_no, prev) = run_worker_until(
-            None,
+            vec![],
             Some(vec![0.1; 16_000]),
             model,
             &inputs,
             1,
             Duration::from_millis(50),
+            false,
         );
         assert_eq!(inputs.lock().unwrap().len(), 1);
         assert_eq!(utterance_no, 0);
         assert!(prev.is_empty(), "a partial must not feed split-seam dedup");
+    }
+
+    #[test]
+    fn a_held_run_transcribes_the_pause_flush_and_only_fresh_text() {
+        let (model, inputs) = ScriptedModel::new("dzień dobry");
+        // Arrival order: a backlog the model is minutes behind on, a sentence
+        // that closed just before the pause, then the flush the pause edge cut.
+        let (utterance_no, prev) = run_worker_until(
+            vec![
+                queued_utterance(8_000, false, Duration::from_secs(5)),
+                queued_utterance(9_000, false, Duration::ZERO),
+                queued_utterance(10_000, true, Duration::from_secs(5)),
+            ],
+            None,
+            model,
+            &inputs,
+            2,
+            Duration::from_millis(50),
+            true,
+        );
+        assert_eq!(
+            *inputs.lock().unwrap(),
+            [
+                9_000 + INFERENCE_PAD_SAMPLES,
+                10_000 + INFERENCE_PAD_SAMPLES
+            ],
+            "the fresh close and the flush go through while held; the stale backlog does not"
+        );
+        assert_eq!(
+            utterance_no, 2,
+            "only the two kept utterances took a number"
+        );
+        assert_eq!(prev, "dzień dobry");
     }
 
     #[test]
