@@ -635,6 +635,11 @@ pub(crate) struct RecordingEmitter {
 pub(crate) struct RecordedEmission {
     pub tag: String,
     pub text: String,
+    /// The disposition as the worker decided it, verbatim. Kept because
+    /// `emitted` + `drop_kind` cannot express it: `DropEmpty` is neither an
+    /// emit nor a `Drop { kind }`, so an `Emit` of empty text and a
+    /// `DropEmpty` would otherwise be indistinguishable here.
+    pub verdict: TranscriptVerdict,
     pub emitted: bool,
     pub drop_kind: Option<TranscriptDropKind>,
     pub copied: bool,
@@ -661,6 +666,7 @@ impl Emitter for RecordingEmitter {
         let mut record = RecordedEmission {
             tag: emission.tag.to_string(),
             text: emission.text.to_string(),
+            verdict: emission.verdict,
             emitted: false,
             drop_kind: None,
             copied: false,

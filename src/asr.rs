@@ -68,14 +68,15 @@ pub(crate) trait SpeechModel {
 /// Load the model `ModelRef` names. Called once per load/reload cycle by
 /// `AsrWorker::load_once`. Dispatches on the kind `resolve_model` classified,
 /// so the engine choice is settled before any session is opened.
-pub(crate) fn load_model(model: &ModelRef, opts: &AsrOptions) -> Result<Box<dyn SpeechModel>> {
+pub(crate) fn load_model(model: &ModelRef, config: &AsrConfig) -> Result<Box<dyn SpeechModel>> {
     Ok(match model.kind {
         crate::model_store::EngineKind::Parakeet => {
-            Box::new(crate::parakeet::ParakeetModel::load(&model.dir, opts)?)
+            Box::new(crate::parakeet::ParakeetModel::load(&model.dir, config)?)
                 as Box<dyn SpeechModel>
         }
         crate::model_store::EngineKind::Whisper => {
-            Box::new(crate::whisper::WhisperModel::load(&model.dir, opts)?) as Box<dyn SpeechModel>
+            Box::new(crate::whisper::WhisperModel::load(&model.dir, config)?)
+                as Box<dyn SpeechModel>
         }
     })
 }
@@ -119,7 +120,7 @@ pub(crate) fn with_loading_ticker<T>(label: &str, f: impl FnOnce() -> Result<T>)
 /// worker-thread local and must never be touched from the bus thread).
 ///
 /// Ownership split: the hooked `dbus::DictionaryState` goes to `dbus::spawn`,
-/// this value goes into `AsrOptions`. Both are cheap clones of the same state,
+/// this value goes into `AsrConfig`. Both are cheap clones of the same state,
 /// so a swap on the bus is visible to the next utterance either way.
 pub(crate) struct LiveDictionary {
     shared: crate::dbus::DictionaryState,
@@ -133,7 +134,7 @@ impl LiveDictionary {
     /// Attach the booster hook to a `dbus::DictionaryState` clone.
     ///
     /// Returns the hooked clone (hand it to `dbus::spawn`) and this value
-    /// (put it in `AsrOptions::dictionary`). A swap then reaches the worker
+    /// (put it in `AsrConfig::dictionary`). A swap then reaches the worker
     /// twice over the same list: through `words()` for post-correction, and
     /// through the queue for the engine boost.
     pub(crate) fn new(
@@ -214,39 +215,62 @@ impl PartialSlot {
     }
 }
 
-/// Tunables the ASR worker needs, resolved once from `Cli`.
-/// Emission policy (`dump_dir`, clipboard, paste) lives with the
-/// `Emitter`, not here.
+/// Everything the ASR worker needs, resolved once from `Cli` on the main thread
+/// and owned by the worker from then on.
+///
+/// One carrier for the worker's configuration: the engines, the gates and the
+/// queue policy all read it from here, and the worker holds no second copy of
+/// any of it. Emission policy (`dump_dir`, clipboard, paste) is not here — it
+/// belongs to the `Emitter`, which is built and owned separately.
 #[derive(Debug, Clone)]
-pub(crate) struct AsrOptions {
+pub(crate) struct AsrConfig {
+    // ---- engine settings, read by `parakeet` / `whisper` at load ----
+    /// `--model` as typed, for the engine's ready line.
     pub(crate) model_spec: String,
-    pub(crate) gate: GateConfig,
     pub(crate) n_threads: i32,
     pub(crate) use_gpu: bool,
     /// Decoding language for the Whisper engine (fixed once at startup). Parakeet
     /// auto-detects per utterance and ignores this.
     pub(crate) language: crate::whisper_core::types::Language,
-    /// Live custom vocabulary: the post-gate correction list plus the queue
-    /// that hands swapped words to the loaded engine (see `LiveDictionary`).
-    /// Empty = off. Shared with the D-Bus thread, so it changes at runtime.
-    pub(crate) dictionary: LiveDictionary,
-    /// Strip hesitation/filler words in post-gate cleaning (see `clean`).
-    /// Off by default.
-    pub(crate) remove_hesitations: bool,
-    /// Append per-utterance JSON metrics here when `Some` (see `--metrics`).
-    /// Opened by the worker at startup; open errors only warn, never fail
-    /// transcription.
-    pub(crate) metrics_path: Option<PathBuf>,
-    /// Shed oldest-first past `ASR_SHED_KEEP` (microphone mode). File mode
-    /// sets false: offline decoding must be lossless.
-    pub(crate) shed_stale: bool,
     /// `--audio-ctx`: floor of the dynamic Whisper window, in mel frames. The
     /// encoder graph is patched at load, so the window follows the audio;
     /// Parakeet sizes its own window and ignores this.
     pub(crate) audio_ctx: usize,
+
+    // ---- gates and cleaning ----
+    /// Shared with the capture side, so both paths judge the same thresholds.
+    pub(crate) gate: GateConfig,
+    /// Strip hesitation/filler words in post-gate cleaning (see `clean`).
+    /// Off by default.
+    pub(crate) remove_hesitations: bool,
+    /// Live custom vocabulary: the post-gate correction list plus the queue
+    /// that hands swapped words to the loaded engine (see `LiveDictionary`).
+    /// Empty = off. Shared with the D-Bus thread, so it changes at runtime.
+    pub(crate) dictionary: LiveDictionary,
+
+    // ---- queue policy ----
+    /// Shed oldest-first past `ASR_SHED_KEEP` (microphone mode). File mode
+    /// sets false: offline decoding must be lossless.
+    pub(crate) shed_stale: bool,
     /// Where the capture loop leaves the open utterance for partial decoding.
     /// Shared with the capture side.
     pub(crate) partials: PartialSlot,
+
+    // ---- observability ----
+    /// Append per-utterance JSON metrics here when `Some` (see `--metrics`).
+    /// Opened once by `AsrWorker::new`; open errors only warn, never fail
+    /// transcription.
+    pub(crate) metrics_path: Option<PathBuf>,
+
+    // ---- runtime policy ----
+    /// `--auto-unload`: free VRAM while paused, reload eagerly on resume.
+    pub(crate) auto_unload: bool,
+    /// `--auto-unload-after` as a duration.
+    pub(crate) auto_unload_after: Duration,
+    /// Audible cues on pause, resume and when transcription is ready.
+    pub(crate) sound: bool,
+    /// `--autopause`: re-pause after each emitted transcript, single-shot.
+    pub(crate) autopause: bool,
 }
 
 /// Backlog past which the loaded loop sheds the weakest utterances (see
@@ -297,18 +321,19 @@ pub(crate) fn resolve_n_threads(requested: i32, auto: i32) -> i32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Start the ASR worker thread and hand back its handle plus a channel that
+/// reports the *first* model load's outcome.
+///
+/// Six parameters, one of them the configuration: everything the worker needs
+/// beyond its two shared flags arrives in `config`, resolved once on the main
+/// thread. The worker owns it.
 pub(crate) fn spawn_asr_worker(
-    rx: Consumer<Utterance>,
+    mut rx: Consumer<Utterance>,
     model: ModelRef,
-    opts: AsrOptions,
-    emitter: impl Emitter + Send + 'static,
+    config: AsrConfig,
+    mut emitter: impl Emitter + Send + 'static,
     paused: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
-    auto_unload: bool,
-    auto_unload_after_secs: u64,
-    sound_enabled: bool,
-    autopause_enabled: bool,
 ) -> (
     JoinHandle<()>,
     std::sync::mpsc::Receiver<Result<(), String>>,
@@ -317,80 +342,25 @@ pub(crate) fn spawn_asr_worker(
     let handle = std::thread::Builder::new()
         .name("asr".into())
         .spawn(move || {
-            let mut emitter = emitter;
-            let mut rx = rx;
-            if let Err(e) = asr_loop(
+            let mut worker = AsrWorker::new(
                 &mut rx,
-                &model,
-                &opts,
-                ready_tx,
+                model,
+                config,
+                &ready_tx,
                 &mut emitter,
                 &paused,
                 &running,
-                auto_unload,
-                auto_unload_after_secs,
-                sound_enabled,
-                autopause_enabled,
-            ) {
+            );
+            // `load_once` signals the first load outcome via `ready` itself
+            // (later reloads only log), so an `Err` here always means initial
+            // init failed and re-sending is a harmless duplicate.
+            if let Err(e) = worker.run() {
                 log::error!("asr worker failed: {e:?}");
+                let _ = ready_tx.send(Err(e.to_string()));
             }
         })
         .expect("failed to spawn asr thread");
     (handle, ready_rx)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn asr_loop(
-    rx: &mut Consumer<Utterance>,
-    model: &ModelRef,
-    opts: &AsrOptions,
-    ready: std::sync::mpsc::Sender<Result<(), String>>,
-    emitter: &mut impl Emitter,
-    paused: &Arc<AtomicBool>,
-    running: &Arc<AtomicBool>,
-    auto_unload: bool,
-    auto_unload_after_secs: u64,
-    sound_enabled: bool,
-    autopause_enabled: bool,
-) -> Result<()> {
-    let mut worker = AsrWorker {
-        rx,
-        model_ref: model,
-        opts,
-        ready: &ready,
-        emitter,
-        paused,
-        running,
-        auto_unload,
-        unload_after: Duration::from_secs(auto_unload_after_secs),
-        sound_enabled,
-        autopause_enabled,
-        // Resolved once here, not per utterance: the gate thresholds and the
-        // cleaning policy are fixed for the session. The dictionary is the
-        // live handle (it changes over D-Bus), so it is a shared clone.
-        gate: opts.gate.clone(),
-        dictionary: opts.dictionary.clone(),
-        remove_hesitations: opts.remove_hesitations,
-        // Observability only: a broken metrics path must never take down
-        // transcription, so open errors warn once and disable the log.
-        metrics: open_metrics_log(opts.metrics_path.as_deref()),
-        first_load: true,
-        utterance_no: 0,
-        prev_emit_text: String::new(),
-        stash: Vec::new(),
-        was_paused: false,
-        last_unpaused: Instant::now(),
-    };
-    // `AsrWorker::load_once` signals the *first* load outcome via `ready`
-    // itself (later reloads only log); an `Err` return here therefore always
-    // means initial init failed, and re-sending is a harmless duplicate.
-    match worker.run() {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = ready.send(Err(e.to_string()));
-            Err(e)
-        }
-    }
 }
 
 /// Whether the model should be unloaded right now: auto-unload enabled and
@@ -513,24 +483,16 @@ fn deliver_boost_words(
 /// flags.
 struct AsrWorker<'a> {
     rx: &'a mut Consumer<Utterance>,
-    model_ref: &'a ModelRef,
-    opts: &'a AsrOptions,
+    model_ref: ModelRef,
+    /// The one copy of the worker's configuration. Everything the loop, the
+    /// gates and the engines need is read from here.
+    config: AsrConfig,
     ready: &'a std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &'a mut dyn Emitter,
     paused: &'a Arc<AtomicBool>,
     running: &'a Arc<AtomicBool>,
-    auto_unload: bool,
-    /// `--auto-unload-after` as a duration.
-    unload_after: Duration,
-    sound_enabled: bool,
-    autopause_enabled: bool,
-    /// Resolved once from `opts` at startup, then fixed.
-    gate: GateConfig,
-    /// Live dictionary handle (see `LiveDictionary`): a snapshot per
-    /// utterance, never a held lock.
-    dictionary: LiveDictionary,
-    remove_hesitations: bool,
-    /// `--metrics` JSONL writer, disabled on any open/write error.
+    /// `--metrics` JSONL writer, disabled on any open/write error. Opened once
+    /// in `new`, so a broken path cannot fail transcription mid-run.
     metrics: Option<std::io::BufWriter<std::fs::File>>,
     first_load: bool,
     /// Tag counter, owned here so numbering stays monotonic across reloads.
@@ -550,6 +512,40 @@ struct AsrWorker<'a> {
     /// `load_once`.
     was_paused: bool,
     last_unpaused: Instant,
+}
+
+impl<'a> AsrWorker<'a> {
+    /// The one construction of a worker: production and tests both come through
+    /// here, so the per-load state below cannot be set up two different ways.
+    fn new(
+        rx: &'a mut Consumer<Utterance>,
+        model_ref: ModelRef,
+        config: AsrConfig,
+        ready: &'a std::sync::mpsc::Sender<Result<(), String>>,
+        emitter: &'a mut dyn Emitter,
+        paused: &'a Arc<AtomicBool>,
+        running: &'a Arc<AtomicBool>,
+    ) -> Self {
+        // Observability only: a broken metrics path must never take down
+        // transcription, so open errors warn once and disable the log.
+        let metrics = open_metrics_log(config.metrics_path.as_deref());
+        Self {
+            rx,
+            model_ref,
+            config,
+            ready,
+            emitter,
+            paused,
+            running,
+            metrics,
+            first_load: true,
+            utterance_no: 0,
+            prev_emit_text: String::new(),
+            stash: Vec::new(),
+            was_paused: false,
+            last_unpaused: Instant::now(),
+        }
+    }
 }
 
 impl AsrWorker<'_> {
@@ -589,7 +585,7 @@ impl AsrWorker<'_> {
     /// running session. Also resets the per-load state: the auto-unload
     /// clock and the pause-edge tracker.
     fn load_once(&mut self) -> Result<Loaded> {
-        let mut model = match load_model(self.model_ref, self.opts) {
+        let mut model = match load_model(&self.model_ref, &self.config) {
             Ok(m) => m,
             Err(e) => {
                 if self.first_load {
@@ -622,7 +618,7 @@ impl AsrWorker<'_> {
         // Ready jingle ("speak now") only when actually unpaused: a first
         // load that finishes while `--start-paused` (or a reload that races
         // a re-pause) stays silent, and the resume edge below cues later.
-        if self.sound_enabled && !self.paused.load(Ordering::Relaxed) {
+        if self.config.sound && !self.paused.load(Ordering::Relaxed) {
             crate::sound::play_ready();
         }
         // A pause that raced the (tens of seconds) load gets a full fresh
@@ -669,7 +665,7 @@ impl AsrWorker<'_> {
     /// so a swap racing a long inference is never dropped: the next
     /// `transcribe` picks it up.
     fn apply_boost_words(&mut self, model: &mut dyn SpeechModel) {
-        deliver_boost_words(&mut self.dictionary, model);
+        deliver_boost_words(&mut self.config.dictionary, model);
     }
 
     /// One utterance through inference, gate and emission, then the
@@ -681,26 +677,26 @@ impl AsrWorker<'_> {
         self.apply_boost_words(model);
         // One `Arc` per utterance, dropped at the end: post-correction sees a
         // consistent list, and no lock is held across inference.
-        let words = self.dictionary.words();
+        let words = self.config.dictionary.words();
         let emitted = transcribe_and_emit(
             model,
             &utterance,
             self.utterance_no,
-            &self.gate,
+            &self.config.gate,
             self.running,
             &mut *self.emitter,
             &mut self.metrics,
             &words,
-            self.remove_hesitations,
+            self.config.remove_hesitations,
             &mut self.prev_emit_text,
         );
         fire_autopause(
-            self.autopause_enabled,
+            self.config.autopause,
             emitted,
             self.paused,
             &mut self.was_paused,
             self.utterance_no,
-            self.sound_enabled,
+            self.config.sound,
         );
     }
 
@@ -712,7 +708,7 @@ impl AsrWorker<'_> {
         self.apply_boost_words(model);
         // The number the utterance will get when it closes.
         let tag = format!("utt_{:06}", self.utterance_no + 1);
-        if let Some(line) = partial_line(model, pcm, &tag, &self.gate, self.running) {
+        if let Some(line) = partial_line(model, pcm, &tag, &self.config.gate, self.running) {
             log::info!("{line}");
         }
     }
@@ -798,7 +794,7 @@ impl AsrWorker<'_> {
                     // Idle: decode the open utterance's newest snapshot if one
                     // is waiting, else nap. Only here, so a closed utterance in
                     // the queue always goes first.
-                    match self.opts.partials.take() {
+                    match self.config.partials.take() {
                         Some(pcm) => self.transcribe_partial(model, &pcm),
                         None => std::thread::sleep(Duration::from_millis(20)),
                     }
@@ -859,17 +855,17 @@ impl AsrWorker<'_> {
     /// pure function so its edge cases are testable without a worker.
     fn should_unload_now(&self, now_paused: bool) -> bool {
         should_unload(
-            self.auto_unload,
+            self.config.auto_unload,
             now_paused,
             self.last_unpaused.elapsed(),
-            self.unload_after,
+            self.config.auto_unload_after,
         )
     }
 
     fn log_unload(&self, model: &dyn SpeechModel) {
         log::info!(
             "paused {}s, unloading {} model to free VRAM...",
-            self.unload_after.as_secs(),
+            self.config.auto_unload_after.as_secs(),
             model.engine_name()
         );
     }
@@ -877,7 +873,7 @@ impl AsrWorker<'_> {
     /// Ready jingle on the resume edge: a short-pause resume (model never
     /// unloaded) has no reload path to cue it.
     fn ack_resume(&mut self) {
-        if self.sound_enabled && self.was_paused {
+        if self.config.sound && self.was_paused {
             crate::sound::play_ready();
         }
         self.was_paused = false;
@@ -887,7 +883,7 @@ impl AsrWorker<'_> {
     /// queue with the weakest shed first (see `shed_survivors`). Survivors
     /// stay in arrival order.
     fn take_backlog(&mut self, first: Utterance, engine_name: &str) -> Vec<Utterance> {
-        if !self.opts.shed_stale || self.rx.slots() <= ASR_SHED_KEEP {
+        if !self.config.shed_stale || self.rx.slots() <= ASR_SHED_KEEP {
             return vec![first];
         }
         let mut backlog = vec![first];
@@ -1019,7 +1015,6 @@ pub(crate) fn shed_survivors(scores: &[(f32, f32)], keep: usize) -> Vec<usize> {
 /// inputs (formatting only) so tests don't touch the filesystem or GPU.
 /// `infer_ms` covers inference alone (conditioning/gain excluded); `rtf` is
 /// inference seconds per audio second (>1 = slower than realtime).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn format_metrics_row(
     tag: &str,
     samples: usize,
@@ -1051,7 +1046,6 @@ pub(crate) fn format_metrics_row(
 /// keeps every transcribed utterance even on a hard kill right after.
 /// Write errors disable the log with a single warning (never fail
 /// transcription for observability).
-#[allow(clippy::too_many_arguments)]
 fn write_metrics_row(
     metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
     tag: &str,
@@ -1714,6 +1708,33 @@ mod tests {
         GateConfig::new(DEFAULT_MIN_SPEECH_RMS, DEFAULT_MIN_DENSITY)
     }
 
+    /// A worker's configuration with the settings tests want: no shedding, no
+    /// metrics file, no dictionary, no sound, default thresholds. Declared here
+    /// rather than at module level because it draws on `default_gate` and
+    /// `empty_live_dictionary`, which are both in this module.
+    ///
+    /// This supplies defaults; it does not wire. The wiring still crosses one
+    /// seam, `AsrWorker::new`.
+    fn for_tests() -> AsrConfig {
+        AsrConfig {
+            model_spec: "scripted".to_string(),
+            n_threads: DEFAULT_THREADS,
+            use_gpu: false,
+            language: crate::whisper_core::types::Language::Auto,
+            audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
+            gate: default_gate(),
+            remove_hesitations: false,
+            dictionary: empty_live_dictionary(),
+            shed_stale: false,
+            partials: PartialSlot::default(),
+            metrics_path: None,
+            auto_unload: false,
+            auto_unload_after: Duration::from_secs(0),
+            sound: false,
+            autopause: false,
+        }
+    }
+
     #[test]
     fn condition_removes_dc_offset() {
         // Soundcard offset must not reach the model: a constant 0.1 offset
@@ -1936,18 +1957,9 @@ mod tests {
         // Bad model dir must propagate via the ready channel instead of
         // silently capturing into a dead queue.
         let (_tx, rx) = rtrb::RingBuffer::new(ASR_QUEUE_CAP);
-        let opts = AsrOptions {
+        let config = AsrConfig {
             model_spec: "bogus".to_string(),
-            gate: default_gate(),
-            n_threads: DEFAULT_THREADS,
-            use_gpu: false,
-            language: crate::whisper_core::types::Language::Auto,
-            metrics_path: None,
-            shed_stale: false,
-            audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
-            partials: PartialSlot::default(),
-            dictionary: empty_live_dictionary(),
-            remove_hesitations: false,
+            ..for_tests()
         };
         let bad = ModelRef {
             dir: std::path::PathBuf::from("/nonexistent/parakeet-bogus"),
@@ -1957,14 +1969,10 @@ mod tests {
         let (handle, ready) = spawn_asr_worker(
             rx,
             bad,
-            opts,
+            config,
             crate::emit::RecordingEmitter::new(),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            false,
-            0,
-            false,
-            false,
         );
         match ready.recv_timeout(std::time::Duration::from_secs(120)) {
             Ok(Ok(())) => panic!("bad model path must not signal ready"),
@@ -2119,19 +2127,6 @@ mod tests {
         paused: bool,
     ) -> (u64, String) {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(ASR_QUEUE_CAP);
-        let opts = AsrOptions {
-            model_spec: "scripted".into(),
-            gate: default_gate(),
-            n_threads: 1,
-            use_gpu: false,
-            language: crate::whisper_core::types::Language::Auto,
-            metrics_path: None,
-            shed_stale: false,
-            audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
-            partials: PartialSlot::default(),
-            dictionary: empty_live_dictionary(),
-            remove_hesitations: false,
-        };
         let model_ref = ModelRef {
             dir: std::path::PathBuf::new(),
             assets: &[],
@@ -2141,34 +2136,25 @@ mod tests {
         let mut emitter = crate::emit::RecordingEmitter::new();
         let paused = Arc::new(AtomicBool::new(paused));
         let running = Arc::new(AtomicBool::new(true));
-        let mut worker = AsrWorker {
-            rx: &mut rx,
-            model_ref: &model_ref,
-            opts: &opts,
-            ready: &ready_tx,
-            emitter: &mut emitter,
-            paused: &paused,
-            running: &running,
-            auto_unload: false,
-            unload_after: Duration::from_secs(0),
-            sound_enabled: false,
-            autopause_enabled: false,
-            gate: opts.gate.clone(),
-            dictionary: opts.dictionary.clone(),
-            remove_hesitations: false,
-            metrics: None,
-            first_load: false,
-            utterance_no: 0,
-            prev_emit_text: String::new(),
-            stash: Vec::new(),
-            was_paused: false,
-            last_unpaused: Instant::now(),
-        };
+        // The same constructor production uses, so the per-load state under
+        // test is the state the worker really starts in.
+        let mut worker = AsrWorker::new(
+            &mut rx,
+            model_ref,
+            for_tests(),
+            &ready_tx,
+            &mut emitter,
+            &paused,
+            &running,
+        );
+        // `run_loaded` is entered directly, so the first-load bookkeeping
+        // `new` performed has already happened and must not repeat.
+        worker.first_load = false;
         for u in queued {
             assert!(tx.push(u).is_ok());
         }
         if let Some(p) = partial {
-            opts.partials.put(p);
+            worker.config.partials.put(p);
         }
         // The worker holds a non-`Send` emitter, so it runs here; a helper
         // thread waits for the expected decodes and then closes the queue.
@@ -2368,5 +2354,100 @@ mod tests {
         let long_prev = "un deux trois quatre cinq six sept";
         let long_cur = "un deux trois quatre cinq six sept huit";
         assert_eq!(remove_split_overlap(long_prev, long_cur), long_cur);
+    }
+
+    /// One utterance through `transcribe_and_emit` with a scripted decode, a
+    /// recording emitter and no metrics file. Returns what was emitted and the
+    /// caller's `prev_emit_text` afterwards, which is the pair the two tests
+    /// below need to pin.
+    fn run_pass(
+        text: &str,
+        remove_hesitations: bool,
+        prev_emit_text: &mut String,
+    ) -> (bool, crate::emit::RecordedEmission) {
+        let (mut model, _inputs) = ScriptedModel::new(text);
+        let running = Arc::new(AtomicBool::new(true));
+        let mut emitter = crate::emit::RecordingEmitter::new();
+        let emitted = transcribe_and_emit(
+            &mut model,
+            &closed_utterance(16_000),
+            1,
+            &default_gate(),
+            &running,
+            &mut emitter,
+            &mut None,
+            &[],
+            remove_hesitations,
+            prev_emit_text,
+        );
+        let record = emitter
+            .records
+            .pop()
+            .expect("every pass reaches the emitter exactly once");
+        (emitted, record)
+    }
+
+    /// Cleaning can remove everything (`clean.rs`), and emitting the empty
+    /// result would clobber the clipboard. The verdict must be downgraded to
+    /// `DropEmpty` and the split-seam text left alone, so the next utterance's
+    /// dedup still compares against what was actually said.
+    #[test]
+    fn cleaning_to_nothing_downgrades_the_verdict_instead_of_emitting_empty_text() {
+        let mut prev = String::from("coś wcześniej");
+        // The gate accepts it (not empty, not boilerplate, not a loop);
+        // `clean` then strips every filler.
+        let (emitted, record) = run_pass("eee um", true, &mut prev);
+
+        assert!(!emitted, "nothing was emitted");
+        assert_eq!(
+            record.verdict,
+            crate::gate::TranscriptVerdict::DropEmpty,
+            "the verdict must say the text was cleaned away"
+        );
+        assert!(record.text.trim().is_empty(), "text={:?}", record.text);
+        assert!(!record.emitted, "an empty Emit must not count as emitted");
+        assert_eq!(record.drop_kind, None, "DropEmpty is not a drop kind");
+        assert!(
+            !record.copied && !record.pasted && !record.printed,
+            "no side effect may run for an empty transcript"
+        );
+        assert_eq!(
+            prev, "coś wcześniej",
+            "a drop must not advance the split-seam text"
+        );
+    }
+
+    /// Split-seam dedup compares against the last thing actually said, so
+    /// `prev_emit_text` advances on an emit and is left alone by a drop.
+    /// Without that, one dropped utterance would let the next continuation
+    /// strip words the speaker did say twice.
+    #[test]
+    fn prev_emit_text_advances_on_an_emit_and_never_on_a_drop() {
+        let mut prev = String::new();
+        let (emitted, record) = run_pass("dzień dobry", false, &mut prev);
+        assert!(emitted);
+        assert_eq!(
+            record.verdict,
+            crate::gate::TranscriptVerdict::Emit,
+            "verdict={:?}",
+            record.verdict
+        );
+        assert_eq!(prev, "dzień dobry", "an emit advances the dedup baseline");
+
+        // `napisy` is exact-match hallucination boilerplate (`config.rs`).
+        let (emitted, record) = run_pass("napisy", false, &mut prev);
+        assert!(!emitted, "boilerplate must not be emitted");
+        assert_eq!(
+            record.verdict,
+            crate::gate::TranscriptVerdict::Drop {
+                kind: crate::gate::TranscriptDropKind::Hallucination
+            },
+            "verdict={:?}",
+            record.verdict
+        );
+        assert_eq!(
+            prev, "dzień dobry",
+            "a drop must not become the dedup baseline"
+        );
     }
 }

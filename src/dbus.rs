@@ -20,8 +20,9 @@
 // File IO in `LoadFile` is a plain `std::fs` read on purpose: a dictionary
 // file is a few kB, and no async filesystem feature is pulled in.
 //
-// The public surface is wired by the main lane (startup, signal handlers, ASR
-// booster hook); until then the unused items must not warn.
+// The D-Bus interface names, the zbus method signatures and the mutators
+// behind them are reached only through `spawn`, and the ones below it through
+// `asr`/`main`; the compiler cannot see across those dynamic boundaries.
 #![allow(dead_code)]
 
 use std::collections::HashSet;

@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
+use crate::asr::{with_loading_ticker, AsrConfig, SpeechModel, Transcript};
 use crate::config::WHISPER_MAX_NEW_TOKENS;
 use crate::device;
 use crate::whisper_core::WhisperModel as CoreModel;
@@ -53,9 +53,9 @@ impl WhisperModel {
     ///
     /// `--gpu` asks for CUDA; a build without CUDA support (or without a
     /// usable device) gets CPU sessions and one warning.
-    pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
-        let device = device::resolve(opts.use_gpu);
-        let intra_threads = opts.n_threads.max(1) as usize;
+    pub(crate) fn load(dir: &Path, config: &AsrConfig) -> Result<Self> {
+        let device = device::resolve(config.use_gpu);
+        let intra_threads = config.n_threads.max(1) as usize;
         log::info!("loading whisper model ({})...", dir.display());
         let inner = with_loading_ticker("whisper model", || {
             // Streaming always asks for the length-free encoder: the export is
@@ -64,10 +64,10 @@ impl WhisperModel {
             // instead, with a warning, and `dynamic_window` ends up false.
             CoreModel::new(
                 dir,
-                opts.language.clone(),
+                config.language.clone(),
                 intra_threads,
                 true,
-                opts.audio_ctx,
+                config.audio_ctx,
                 device,
             )
             .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))
@@ -86,9 +86,9 @@ impl WhisperModel {
         // happen.
         let ready_line = format!(
             "whisper ready (model={}, lang={}, threads={}, gpu={}, window={window})",
-            opts.model_spec,
+            config.model_spec,
             inner.language,
-            opts.n_threads,
+            config.n_threads,
             device.is_gpu()
         );
         log::info!("{}", ready_line);

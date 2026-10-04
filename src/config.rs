@@ -292,167 +292,25 @@ fn locale_code(locale: &str) -> Option<String> {
 pub(crate) const DEFAULT_MODELS_DIR: &str = env!("STTD_MODELS_DIR");
 pub(crate) const DEFAULT_MODEL_SPEC: &str = "parakeet";
 
-/// Comma-separated valid specs for `--model` error messages (both catalogs,
-/// Parakeet first).
-pub(crate) fn valid_model_specs() -> String {
-    PARAKEET_CATALOG
-        .iter()
-        .map(|(s, ..)| *s)
-        .chain(std::iter::once("parakeet"))
-        .chain(WHISPER_CATALOG.iter().map(|(s, ..)| *s))
-        .chain(std::iter::once("whisper"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Parakeet-TDT-0.6B-v3 weights, published as loose ONNX files (no archive)
-/// rather than a single `.bin`: the engine loads from a directory containing
-/// an encoder, a decoder_joint, `vocab.txt` and `tokenizer.json`
-/// (phrase-boosting; without it transcription works but boosting stays off).
-/// Mel features are computed in Rust (`parakeet_core::frontend`), so no
-/// `nemo128.onnx` and no `config.json`/`preprocessor_config.json` are needed.
-///
-/// One export, `parakeet-ultra-int8`, in its own Hugging Face repository. It
-/// keeps the base architecture and tokenizer (128 mel features, subsampling 8, a
-/// `vocab.txt` byte-identical to the base checkpoint), so the Rust frontend and
-/// the `PreprocessorConfig::tdt_0_6b` recipe still apply unchanged.
-///
-/// `(spec, repo resolve root, weights folder)`. The repository is not one flat
-/// file list: the ONNX weights sit in its `int8/` folder, `vocab.txt` at its
-/// root. `tokenizer.json` is absent from the export, so it comes from the
-/// upstream NVIDIA checkpoint (`PARAKEET_TOKENIZER_URL`).
-pub(crate) const PARAKEET_SOURCES: &[(&str, &str, &str)] = &[(
-    "parakeet-ultra-int8",
-    "https://huggingface.co/Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx/resolve/main/",
-    "int8/",
-)];
-/// Download source for a catalog spec: `(repo resolve root, weights folder)`.
-pub(crate) fn parakeet_source_for_spec(spec: &str) -> Option<(&'static str, &'static str)> {
-    PARAKEET_SOURCES
-        .iter()
-        .find(|(s, ..)| *s == spec)
-        .map(|(_, root, folder)| (*root, *folder))
-}
-
-/// Upstream NVIDIA checkpoint, source of `tokenizer.json` (absent from the
-/// export, which drops the SentencePiece files).
-pub(crate) const PARAKEET_TOKENIZER_URL: &str =
-    "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/tokenizer.json";
-
-/// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
-/// The ultra int8 export is the default variant (`PARAKEET_DEFAULT_SPEC`).
-/// Every spec must have a matching row in `PARAKEET_SOURCES` (checked by the
-/// tests). Filenames match what the engine looks for, so no renaming after
-/// download, even though the repository stores the ONNX weights under an `int8/`
-/// folder (see `model_store::parakeet_asset_url`).
-pub(crate) const PARAKEET_CATALOG: &[(&str, &str, &[&str], &str)] = &[
-    // `parakeet-ultra-int8` is the default (`PARAKEET_DEFAULT_SPEC`).
-    (
-        "parakeet-ultra-int8",
-        "parakeet-ultra-int8",
-        &[
-            "encoder-model.int8.onnx",
-            "decoder_joint-model.int8.onnx",
-            "vocab.txt",
-            "tokenizer.json",
-        ],
-        "638 MiB",
-    ),
-];
-
 /// Short alias for `--model parakeet`, resolving to the default int8 variant,
-/// `parakeet-ultra-int8` (see `PARAKEET_CATALOG`).
+/// `parakeet-ultra-int8`. Read by `model_store`'s Parakeet catalog; it lives
+/// here with the other CLI defaults rather than beside the catalog because
+/// `Whisper`'s counterpart is read the same way by three `whisper_core` files.
 pub(crate) const PARAKEET_DEFAULT_SPEC: &str = "parakeet-ultra-int8";
 
-/// Look up a `PARAKEET_CATALOG` entry by spec, accepting the `parakeet`
-/// alias for the default (int8) variant.
-pub(crate) fn parakeet_entry_for_spec(
-    spec: &str,
-) -> Option<&'static (
-    &'static str,
-    &'static str,
-    &'static [&'static str],
-    &'static str,
-)> {
-    let spec = if spec == "parakeet" {
-        PARAKEET_DEFAULT_SPEC
-    } else {
-        spec
-    };
-    PARAKEET_CATALOG.iter().find(|(s, ..)| *s == spec)
-}
+/// Short alias for `--model whisper`, resolving to the int8 variant,
+/// `whisper-large-v3-turbo-int8`. Read by `model_store`'s Whisper catalog and
+/// by `whisper_core` (its token id table and its window default).
+pub(crate) const WHISPER_DEFAULT_SPEC: &str = "whisper-large-v3-turbo-int8";
 
 // ---------------------------------------------------------------------------
 // Whisper catalog
 // ---------------------------------------------------------------------------
 
-/// Whisper large-v3-turbo weights, published as loose ONNX files: the engine
-/// loads from a directory containing three graphs and `tokenizer.json`.
-/// Mel features are computed in Rust (`whisper_core::frontend`), so no
-/// `nemo128.onnx`-style preprocessor session and no `config.json` /
-/// `preprocessor_config.json` are needed.
-///
-/// Three graphs, not one: `decoder_model` runs the prompt (and produces the
-/// cross-attention KV cache), then `decoder_with_past_model` runs every
-/// following token off that cache. The single-graph `decoder_model_merged`
-/// alternative is deliberately not used — it re-runs cross-attention over all
-/// 1500 encoder frames per token, which costs ~40 GFLOP per token here.
-///
-/// The ONNX layout is not one flat file list: the graphs sit in the
-/// repository's `onnx/` folder, `tokenizer.json` at its root.
-///
-/// `(spec, repo resolve root, weights folder)`.
-pub(crate) const WHISPER_SOURCES: &[(&str, &str, &str)] = &[(
-    "whisper-large-v3-turbo-int8",
-    "https://huggingface.co/onnx-community/whisper-large-v3-turbo/resolve/main/",
-    "onnx/",
-)];
-
-/// Download source for a catalog spec: `(repo resolve root, weights folder)`.
-pub(crate) fn whisper_source_for_spec(spec: &str) -> Option<(&'static str, &'static str)> {
-    WHISPER_SOURCES
-        .iter()
-        .find(|(s, ..)| *s == spec)
-        .map(|(_, root, folder)| (*root, *folder))
-}
-
-/// `(spec, dir under DEFAULT_MODELS_DIR, files to download, upstream size)`.
-/// The directory name equals the spec, which selects the download source (see
-/// `WHISPER_SOURCES`). Filenames match what the engine looks for, so no
-/// renaming after download even though the repository stores the graphs under
-/// its `onnx/` folder.
-pub(crate) const WHISPER_CATALOG: &[(&str, &str, &[&str], &str)] = &[(
-    "whisper-large-v3-turbo-int8",
-    "whisper-large-v3-turbo-int8",
-    &[
-        "encoder_model_int8.onnx",
-        "decoder_model_int8.onnx",
-        "decoder_with_past_model_int8.onnx",
-        "tokenizer.json",
-    ],
-    "1443 MiB",
-)];
-
-/// Short alias for `--model whisper`, resolving to the int8 variant,
-/// `whisper-large-v3-turbo-int8` (see `WHISPER_CATALOG`).
-pub(crate) const WHISPER_DEFAULT_SPEC: &str = "whisper-large-v3-turbo-int8";
-
-/// Look up a `WHISPER_CATALOG` entry by spec, accepting the `whisper` alias.
-pub(crate) fn whisper_entry_for_spec(
-    spec: &str,
-) -> Option<&'static (
-    &'static str,
-    &'static str,
-    &'static [&'static str],
-    &'static str,
-)> {
-    let spec = if spec == "whisper" {
-        WHISPER_DEFAULT_SPEC
-    } else {
-        spec
-    };
-    WHISPER_CATALOG.iter().find(|(s, ..)| *s == spec)
-}
+/// Upstream NVIDIA checkpoint, source of `tokenizer.json` (absent from the
+/// export, which drops the SentencePiece files).
+pub(crate) const PARAKEET_TOKENIZER_URL: &str =
+    "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/tokenizer.json";
 
 /// Longest run of tokens a Whisper decode may emit before it is cut off,
 /// mirroring the export's `max_target_positions` (448) from `config.json`.
@@ -586,6 +444,7 @@ pub(crate) fn parse_linear_rms(s: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_store::PARAKEET_CATALOG;
 
     #[test]
     fn parse_bool_accepts_common_spellings() {
@@ -736,103 +595,19 @@ mod tests {
         assert_eq!(RTF_WARN_RTF, 1.0);
     }
 
+    /// The compiled-in default must name a real row in the Parakeet catalog:
+    /// `--model` unset resolves through it, so a stale value here would send
+    /// every run to a spec that no longer exists.
     #[test]
     fn default_model_spec_is_parakeet() {
         assert_eq!(DEFAULT_MODEL_SPEC, "parakeet");
         assert_eq!(DEFAULT_MODELS_DIR, "models");
-        // The `parakeet` alias must resolve via the Parakeet catalog.
-        assert!(parakeet_entry_for_spec(DEFAULT_MODEL_SPEC).is_some());
-    }
-
-    #[test]
-    fn parakeet_catalog_entries_are_self_consistent() {
-        assert_eq!(PARAKEET_CATALOG.len(), 1);
-        assert_eq!(PARAKEET_SOURCES.len(), PARAKEET_CATALOG.len());
-        for (spec, dir, files, _size) in PARAKEET_CATALOG {
-            assert_eq!(*dir, *spec, "dir must equal spec for {spec}");
-            assert!(!files.is_empty(), "{spec} must list at least one file");
-            assert!(
-                files.contains(&"vocab.txt"),
-                "{spec} must download vocab.txt"
-            );
-            assert_eq!(parakeet_entry_for_spec(spec).map(|e| e.0), Some(*spec));
-            assert!(
-                parakeet_source_for_spec(spec).is_some(),
-                "{spec} must have a PARAKEET_SOURCES row"
-            );
-        }
-        assert!(parakeet_source_for_spec("parakeet-bogus").is_none());
-    }
-
-    #[test]
-    fn parakeet_alias_resolves_to_int8_default() {
-        assert_eq!(PARAKEET_DEFAULT_SPEC, "parakeet-ultra-int8");
-        let default_entry =
-            parakeet_entry_for_spec(PARAKEET_DEFAULT_SPEC).expect("default spec must resolve");
-        let alias_entry = parakeet_entry_for_spec("parakeet").expect("alias must resolve");
-        assert_eq!(default_entry.0, alias_entry.0);
         assert!(
-            default_entry.2.iter().any(|f| f.contains("int8")),
-            "default variant must be int8"
+            PARAKEET_CATALOG
+                .entry_for_spec(DEFAULT_MODEL_SPEC)
+                .is_some(),
+            "the default must resolve via the Parakeet catalog"
         );
-        assert!(parakeet_entry_for_spec("parakeet-bogus").is_none());
-    }
-
-    #[test]
-    fn valid_model_specs_lists_parakeet_catalog() {
-        let specs = valid_model_specs();
-        assert!(specs.contains(DEFAULT_MODEL_SPEC));
-        assert!(specs.contains(PARAKEET_DEFAULT_SPEC));
-        assert!(specs.contains("parakeet"));
-    }
-
-    #[test]
-    fn whisper_catalog_entries_are_self_consistent() {
-        assert_eq!(WHISPER_CATALOG.len(), 1);
-        assert_eq!(WHISPER_SOURCES.len(), WHISPER_CATALOG.len());
-        for (spec, dir, files, size) in WHISPER_CATALOG {
-            assert_eq!(*dir, *spec, "dir must equal spec for {spec}");
-            assert!(!files.is_empty(), "{spec} must list at least one file");
-            assert!(
-                files.contains(&"tokenizer.json"),
-                "{spec} must download the tokenizer"
-            );
-            assert_eq!(whisper_entry_for_spec(spec).map(|e| e.0), Some(*spec));
-            assert!(
-                whisper_source_for_spec(spec).is_some(),
-                "{spec} must have a WHISPER_SOURCES row"
-            );
-            // The decode loop needs all three graphs: the prompt, the
-            // cached steps, and the encoder that feeds both.
-            for graph in [
-                "encoder_model_int8.onnx",
-                "decoder_model_int8.onnx",
-                "decoder_with_past_model_int8.onnx",
-            ] {
-                assert!(files.contains(&graph), "{spec} must download {graph}");
-            }
-            // Stated size must at least cover the four files it lists.
-            let stated: f64 = size
-                .trim_end_matches(" MiB")
-                .parse()
-                .expect("size must be a number of MiB");
-            assert!(stated > 1000.0, "{spec} size {size} looks wrong for int8");
-        }
-        assert!(whisper_source_for_spec("whisper-bogus").is_none());
-    }
-
-    #[test]
-    fn whisper_alias_resolves_to_int8_default() {
-        assert_eq!(WHISPER_DEFAULT_SPEC, "whisper-large-v3-turbo-int8");
-        let default_entry =
-            whisper_entry_for_spec(WHISPER_DEFAULT_SPEC).expect("default spec must resolve");
-        let alias_entry = whisper_entry_for_spec("whisper").expect("alias must resolve");
-        assert_eq!(default_entry.0, alias_entry.0);
-        assert!(
-            alias_entry.2.iter().any(|f| f.contains("int8")),
-            "default variant must be int8"
-        );
-        assert!(whisper_entry_for_spec("whisper-bogus").is_none());
     }
 
     #[test]
@@ -841,14 +616,5 @@ mod tests {
         // ever moves, this constant is the one to re-check.
         assert_eq!(WHISPER_MAX_NEW_TOKENS, 448);
         assert!(WHISPER_MAX_NEW_TOKENS < MAX_UTTERANCE_SAMPLES / FRAME_16K);
-    }
-
-    #[test]
-    fn valid_model_specs_lists_both_catalogs() {
-        let specs = valid_model_specs();
-        assert!(specs.contains(PARAKEET_DEFAULT_SPEC));
-        assert!(specs.contains("parakeet"));
-        assert!(specs.contains(WHISPER_DEFAULT_SPEC));
-        assert!(specs.contains("whisper"));
     }
 }

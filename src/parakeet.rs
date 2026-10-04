@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
+use crate::asr::{with_loading_ticker, AsrConfig, SpeechModel, Transcript};
 use crate::config::PARAKEET_MIN_SAMPLES;
 use crate::device;
 use crate::parakeet_core::ParakeetModel as CoreModel;
@@ -38,9 +38,9 @@ impl ParakeetModel {
     /// but boosting stays off (warned once). The live dictionary is synced
     /// here (see `SpeechModel::set_boost_words`), so a swap that landed while
     /// a previous instance was unloaded is already in place.
-    pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
-        let device = device::resolve(opts.use_gpu);
-        let intra_threads = opts.n_threads.max(1) as usize;
+    pub(crate) fn load(dir: &Path, config: &AsrConfig) -> Result<Self> {
+        let device = device::resolve(config.use_gpu);
+        let intra_threads = config.n_threads.max(1) as usize;
         let tokenizer_path = dir.join("tokenizer.json");
         let tokenizer_opt = tokenizer_path.exists().then_some(tokenizer_path);
         if tokenizer_opt.is_none() {
@@ -55,15 +55,15 @@ impl ParakeetModel {
                 .map_err(|e| anyhow::anyhow!("failed to load parakeet model: {e}"))
                 .context("failed to load parakeet model")
         })?;
-        // Snapshot, not a held lock: `opts.dictionary` is the live handle.
-        let startup_words = opts.dictionary.words();
+        // Snapshot, not a held lock: `config.dictionary` is the live handle.
+        let startup_words = config.dictionary.words();
         inner.set_boost_words(&startup_words);
         Ok(Self {
             inner,
             ready_line: format!(
                 "parakeet ready (model={}, threads={}, gpu={})",
-                opts.model_spec,
-                opts.n_threads,
+                config.model_spec,
+                config.n_threads,
                 device.is_gpu()
             ),
         })

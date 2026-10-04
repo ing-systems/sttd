@@ -65,9 +65,8 @@ use signal_hook::iterator::Signals;
 
 mod cli;
 use cli::Cli;
-mod config;
-use config::{DEFAULT_MODELS_DIR, PARAKEET_CATALOG, WHISPER_CATALOG};
 mod capture;
+mod config;
 use capture::*;
 mod clean;
 mod daemon;
@@ -91,9 +90,9 @@ mod vad;
 mod wav;
 use wav::*;
 mod model_store;
-use model_store::{ensure_available, resolve_model, EngineKind, ModelRef};
+use model_store::{ensure_available, resolve_model, EngineKind, ModelRef, CATALOGS};
 mod asr;
-use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
+use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrConfig};
 mod decode;
 mod device;
 mod mel;
@@ -145,36 +144,20 @@ fn init_logging() {
         .init();
 }
 
-/// Print known models — both catalogs — as one aligned table per engine, with
-/// a two-character leading marker: `*` = currently selected (effective
-/// `--model` after CLI > `STTD_MODEL` > compiled-in default), `I` = installed
-/// (weights present on disk). A row can carry both (`*I`).
+/// Print known models — both catalogs — as one aligned table per engine, each
+/// rendered by its own catalog (columns SPEC/DIR/SIZE, since both engines ship
+/// as a directory of files rather than one), with a two-character leading
+/// marker: `*` = currently selected (effective `--model` after CLI >
+/// `STTD_MODEL` > compiled-in default), `I` = installed (weights present on
+/// disk). A row can carry both (`*I`).
 fn print_available_models(cli: &Cli) {
     let input = cli.model_input();
 
     let mut any_selected = false;
-    for (label, catalog, alias) in [
-        (
-            "parakeet",
-            PARAKEET_CATALOG,
-            (crate::config::PARAKEET_DEFAULT_SPEC, "parakeet"),
-        ),
-        (
-            "whisper",
-            WHISPER_CATALOG,
-            (crate::config::WHISPER_DEFAULT_SPEC, "whisper"),
-        ),
-    ] {
-        let selected = selected_catalog_spec_for_input(catalog, alias, &input);
-        let installed: Vec<bool> = catalog
-            .iter()
-            .map(|(_, dir, files, _)| {
-                let base = Path::new(DEFAULT_MODELS_DIR).join(dir);
-                files.iter().all(|f| base.join(f).exists())
-            })
-            .collect();
-        println!("{label} models:");
-        print!("{}", format_catalog_models(catalog, selected, &installed));
+    for catalog in CATALOGS {
+        let selected = catalog.entry_for_spec(&input).map(|e| e.spec);
+        println!("{} models:", catalog.engine.as_str());
+        print!("{}", catalog.render_table(selected));
         any_selected |= selected.is_some();
     }
 
@@ -184,90 +167,6 @@ fn print_available_models(cli: &Cli) {
             println!("selected: {trimmed} (not in catalog)");
         }
     }
-}
-
-/// Map a `--model` input value to the catalog spec it selects in `catalog`, if
-/// any: an exact spec match, or that catalog's short `alias`, which stands for
-/// `alias_spec`.
-///
-/// `alias` has to be passed in rather than looked up, because the two catalogs
-/// use the same alias names for different defaults — the label alone does not
-/// say which engine is meant. Both engines ship as directories, so a bare
-/// basename comparison would be meaningless.
-fn selected_catalog_spec_for_input(
-    catalog: &[(
-        &'static str,
-        &'static str,
-        &'static [&'static str],
-        &'static str,
-    )],
-    alias: (&'static str, &'static str),
-    input: &str,
-) -> Option<&'static str> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed == alias.1 {
-        return Some(alias.0);
-    }
-    catalog
-        .iter()
-        .find(|(s, ..)| *s == trimmed)
-        .map(|(spec, ..)| *spec)
-}
-
-/// Render one `--list-models` table: `*`/`I` marker scheme over `catalog`
-/// (columns SPEC/DIR/SIZE, since both engines ship as a directory of files
-/// rather than one).
-fn format_catalog_models(
-    catalog: &[(
-        &'static str,
-        &'static str,
-        &'static [&'static str],
-        &'static str,
-    )],
-    selected: Option<&str>,
-    installed: &[bool],
-) -> String {
-    let spec_w = catalog
-        .iter()
-        .map(|(s, ..)| s.len())
-        .max()
-        .unwrap_or(0)
-        .max("SPEC".len());
-    let dir_w = catalog
-        .iter()
-        .map(|(_, d, ..)| d.len())
-        .max()
-        .unwrap_or(0)
-        .max("DIR".len());
-    let size_w = catalog
-        .iter()
-        .map(|(_, _, _, s)| s.len())
-        .max()
-        .unwrap_or(0)
-        .max("SIZE".len());
-    let mut out = String::new();
-    out.push_str(&format!(
-        "   {0:<1$}  {2:<3$}  {4:>5$}\n",
-        "SPEC", spec_w, "DIR", dir_w, "SIZE", size_w
-    ));
-    for (i, (spec, dir, _files, size)) in catalog.iter().enumerate() {
-        let is_selected = selected == Some(*spec);
-        let is_installed = installed.get(i).copied().unwrap_or(false);
-        let marker = match (is_selected, is_installed) {
-            (true, true) => "*I",
-            (true, false) => "* ",
-            (false, true) => "I ",
-            (false, false) => "  ",
-        };
-        out.push_str(&format!(
-            "{marker} {0:<1$}  {2:<3$}  {4:>5$}\n",
-            spec, spec_w, dir, dir_w, size, size_w
-        ));
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -567,20 +466,16 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
     // Capture is already running above and the drain loop below sheds (counted)
     // while it loads.
-    let asr_opts = asr_options(cli, true, live_dict);
+    let asr_config = asr_config(cli, true, live_dict);
     // The capture loop fills this, the worker drains it (partial transcripts).
-    let partials = asr_opts.partials.clone();
+    let partials = asr_config.partials.clone();
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
-        asr_opts,
+        asr_config,
         make_emitter(cli)?,
         Arc::clone(&paused),
         Arc::clone(&running),
-        cli.auto_unload,
-        cli.auto_unload_after,
-        cli.sound,
-        cli.autopause,
     );
     let mut asr_ready_ok = false;
 
@@ -953,20 +848,21 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
-        asr_options(cli, false, live_dict),
-        make_emitter(cli)?,
-        // File mode has no pause signalling; a permanently-clear flag plus
+        // File mode has no pause signalling, so a permanently-clear flag plus
         // disabled auto-unload can never trigger an unload mid-file. Sounds
         // stay off offline: no pause/resume transitions exist to cue.
         // Autopause is forced off for the same reason: file input must never
         // flip the (unread) pause flag into an unload mid-file.
+        AsrConfig {
+            auto_unload: false,
+            sound: false,
+            autopause: false,
+            ..asr_config(cli, false, live_dict)
+        },
+        make_emitter(cli)?,
         Arc::new(AtomicBool::new(false)),
         // File input runs to completion; inference is never aborted.
         Arc::new(AtomicBool::new(true)),
-        false,
-        cli.auto_unload_after,
-        false,
-        false,
     );
     // Fail fast on model-load/dump-dir errors before processing the file:
     // no realtime capture to keep bounded here, so blocking wait is fine.
@@ -1059,23 +955,30 @@ fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
     Ok(())
 }
 
-fn asr_options(cli: &Cli, shed_stale: bool, dictionary: crate::asr::LiveDictionary) -> AsrOptions {
-    AsrOptions {
+/// The worker's whole configuration, resolved once from `Cli` on this thread
+/// before the worker starts. The `Cli` → config mapping lives here, not in
+/// `asr`, so the worker module never learns what a command line is.
+fn asr_config(cli: &Cli, shed_stale: bool, dictionary: crate::asr::LiveDictionary) -> AsrConfig {
+    AsrConfig {
         model_spec: cli.model_input(),
-        // The transcript gate shares the acoustic thresholds, so both come
-        // from one resolved config.
-        gate: AcousticConfig::from_cli(cli).gate,
         n_threads: resolve_n_threads(cli.threads, auto_threads()),
         use_gpu: cli.gpu,
         language: cli.language(),
-        metrics_path: cli.metrics.clone(),
-        shed_stale,
         audio_ctx: cli.audio_ctx,
-        partials: crate::asr::PartialSlot::default(),
+        // The transcript gate shares the acoustic thresholds, so both come
+        // from one resolved config.
+        gate: AcousticConfig::from_cli(cli).gate,
+        remove_hesitations: cli.remove_hesitations,
         // The live handle, not a `Vec` snapshot: the D-Bus thread swaps the
         // word list at runtime and the worker observes it per utterance.
         dictionary,
-        remove_hesitations: cli.remove_hesitations,
+        shed_stale,
+        partials: crate::asr::PartialSlot::default(),
+        metrics_path: cli.metrics.clone(),
+        auto_unload: cli.auto_unload,
+        auto_unload_after: Duration::from_secs(cli.auto_unload_after),
+        sound: cli.sound,
+        autopause: cli.autopause,
     }
 }
 
@@ -1165,7 +1068,7 @@ fn make_emitter(cli: &Cli) -> Result<SystemEmitter> {
 /// The capture-side tunables, resolved once from `Cli` and shared by both
 /// input paths: the microphone opens a `FrameProcessor` per device open (and
 /// per rebuild), file mode opens one, and the same thresholds reach the ASR
-/// worker through `AsrOptions::gate`. Keeping them in one struct is what
+/// worker through `AsrConfig::gate`. Keeping them in one struct is what
 /// stops the two paths from drifting apart, and it keeps `Utterance` free of
 /// config (only evidence).
 struct AcousticConfig {
@@ -1219,103 +1122,6 @@ mod tests {
             assets: &[],
             kind,
         }
-    }
-
-    /// A spec belongs to exactly one catalog: a Whisper spec must not be
-    /// selectable in the Parakeet table, or the `*` marker would light up in
-    /// both. Each catalog's short alias resolves to its own default, which is
-    /// why the alias is a parameter and not looked up from the table.
-    #[test]
-    fn selection_is_per_catalog_and_exact() {
-        let parakeet = (crate::config::PARAKEET_DEFAULT_SPEC, "parakeet");
-        let whisper = (crate::config::WHISPER_DEFAULT_SPEC, "whisper");
-        assert_eq!(
-            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "parakeet-ultra-int8"),
-            Some("parakeet-ultra-int8")
-        );
-        assert_eq!(
-            selected_catalog_spec_for_input(
-                PARAKEET_CATALOG,
-                parakeet,
-                "whisper-large-v3-turbo-int8"
-            ),
-            None
-        );
-        assert_eq!(
-            selected_catalog_spec_for_input(
-                WHISPER_CATALOG,
-                whisper,
-                "whisper-large-v3-turbo-int8"
-            ),
-            Some("whisper-large-v3-turbo-int8")
-        );
-        assert_eq!(
-            selected_catalog_spec_for_input(WHISPER_CATALOG, whisper, "parakeet-ultra-int8"),
-            None
-        );
-        // Aliases.
-        assert_eq!(
-            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "parakeet"),
-            Some("parakeet-ultra-int8")
-        );
-        assert_eq!(
-            selected_catalog_spec_for_input(WHISPER_CATALOG, whisper, "whisper"),
-            Some("whisper-large-v3-turbo-int8")
-        );
-        // The wrong catalog's alias is not a spec there.
-        assert_eq!(
-            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "whisper"),
-            None
-        );
-        assert_eq!(
-            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, "small"),
-            None
-        );
-        assert_eq!(
-            selected_catalog_spec_for_input(PARAKEET_CATALOG, parakeet, ""),
-            None
-        );
-    }
-
-    #[test]
-    fn models_table_aligns_columns_and_marks_rows() {
-        for (catalog, spec) in [
-            (PARAKEET_CATALOG, "parakeet-ultra-int8"),
-            (WHISPER_CATALOG, "whisper-large-v3-turbo-int8"),
-        ] {
-            let installed = vec![false; catalog.len()];
-            let table = format_catalog_models(catalog, Some(spec), &installed);
-            let lines: Vec<&str> = table.lines().collect();
-            assert_eq!(lines.len(), catalog.len() + 1, "{spec}");
-            assert!(lines[0].contains("SPEC"));
-            assert!(lines[0].contains("DIR"));
-            assert!(lines[0].contains("SIZE"));
-            let row = lines
-                .iter()
-                .find(|l| l.contains(spec))
-                .unwrap_or_else(|| panic!("row for {spec} must exist"));
-            // Selected but not installed.
-            assert!(row.starts_with("* "), "{spec} row={row:?}");
-        }
-    }
-
-    #[test]
-    fn models_table_marks_installed_rows_independently_of_selection() {
-        let catalog = WHISPER_CATALOG;
-        let spec = "whisper-large-v3-turbo-int8";
-        let row_with = |selected: Option<&str>, installed: bool| {
-            let table = format_catalog_models(catalog, selected, &[installed]);
-            table
-                .lines()
-                .find(|l| l.contains(spec))
-                .unwrap_or_else(|| panic!("row for {spec} must exist"))
-                .to_string()
-        };
-        // Installed but not selected, then both markers, then neither. A row
-        // can carry `*` and `I` independently.
-        assert!(row_with(None, true).starts_with("I "));
-        assert!(row_with(Some(spec), true).starts_with("*I"));
-        assert!(row_with(None, false).starts_with("  "));
     }
 
     #[test]
@@ -1444,13 +1250,13 @@ mod tests {
         ))
         .1;
         assert_eq!(
-            asr_options(&cli, true, dictionary).language,
+            asr_config(&cli, true, dictionary).language,
             Language::Explicit("en".to_string())
         );
     }
 
     #[test]
-    fn asr_options_start_with_an_empty_partial_slot() {
+    fn asr_config_starts_with_an_empty_partial_slot() {
         let dictionary = || {
             crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
                 Vec::new(),
@@ -1459,12 +1265,12 @@ mod tests {
             .1
         };
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
-        let opts = asr_options(&cli, true, dictionary());
-        assert!(opts.partials.take().is_none());
+        let config = asr_config(&cli, true, dictionary());
+        assert!(config.partials.take().is_none());
         // The capture side holds a clone of the same slot.
-        let capture_side = opts.partials.clone();
+        let capture_side = config.partials.clone();
         capture_side.put(vec![0.0; 4]);
-        assert_eq!(opts.partials.take().map(|p| p.len()), Some(4));
+        assert_eq!(config.partials.take().map(|p| p.len()), Some(4));
     }
 
     #[test]
@@ -1498,7 +1304,7 @@ mod tests {
             Default::default(),
         ))
         .1;
-        assert_eq!(asr_options(&cli, true, dictionary).gate.min_density, 0.5);
+        assert_eq!(asr_config(&cli, true, dictionary).gate.min_density, 0.5);
     }
 
     #[test]
