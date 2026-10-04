@@ -30,6 +30,7 @@ use super::helpers::{load_tokenizer, tokenize_word_to_ids, word_confidences, wor
 use super::transcription_engine::TranscriptionResult;
 use super::types::{DecoderState, ParakeetError, ParakeetModel, TimestampedResult};
 use crate::decode::{argmax_index, softmax_prob};
+use crate::device::Device;
 
 /// Tokens, frame timestamps and raw-logit probabilities of one decoded
 /// sequence, kept index-aligned by the decode loops.
@@ -182,11 +183,20 @@ impl ParakeetModel {
         quantized: bool,
         tokenizer_path: Option<&Path>,
         intra_threads: usize,
+        device: Device,
     ) -> Result<Self, ParakeetError> {
         let threads = intra_threads.max(1);
-        let encoder = Self::init_session(&model_dir, "encoder-model", threads, quantized)?;
-        let decoder_joint =
-            Self::init_session(&model_dir, "decoder_joint-model", threads, quantized)?;
+        let encoder = Self::init_session(&model_dir, "encoder-model", threads, quantized, device)?;
+        // The TDT joint runs once per emitted frame on tiny tensors, so it
+        // always stays on CPU: CUDA transfer latency costs more than the
+        // compute it saves.
+        let decoder_joint = Self::init_session(
+            &model_dir,
+            "decoder_joint-model",
+            threads,
+            quantized,
+            Device::Cpu,
+        )?;
 
         let (vocab, blank_idx) = Self::load_vocab(&model_dir)?;
         let vocab_size = vocab.len();
@@ -321,9 +331,18 @@ impl ParakeetModel {
         model_name: &str,
         intra_threads: usize,
         try_quantized: bool,
+        device: Device,
     ) -> Result<Session, ParakeetError> {
-        // CPU is the default execution provider: no `with_execution_providers`
-        // call needed (mirrors `parakeet-rs` CPU path).
+        // Downgrade before any CUDA call: `cuda_available` probes the ORT
+        // CUDA execution provider, so a build without the `cuda` feature or
+        // without a usable driver must not reach the CUDA load path.
+        let device = match device {
+            Device::Cuda if !crate::device::cuda_available() => {
+                log::warn!("CUDA EP not available; running parakeet encoder on CPU");
+                Device::Cpu
+            }
+            other => other,
+        };
 
         // Try quantized version first if requested, fallback to regular version
         let model_filename = if try_quantized {
@@ -346,15 +365,28 @@ impl ParakeetModel {
             regular_name
         };
 
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(intra_threads)?
-            .with_inter_threads(1)?
-            .with_memory_pattern(false)?
-            .with_parallel_execution(false)?
-            .commit_from_file(model_dir.as_ref().join(&model_filename))?;
+        let model_path = model_dir.as_ref().join(&model_filename);
+        let base_builder = || -> Result<ort::session::builder::SessionBuilder, ParakeetError> {
+            Ok(Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(intra_threads)?
+                .with_inter_threads(1)?
+                .with_memory_pattern(false)?
+                .with_parallel_execution(false)?)
+        };
 
-        Ok(session)
+        match crate::device::apply(base_builder()?, device).commit_from_file(&model_path) {
+            Ok(session) => Ok(session),
+            // A CUDA load can fail at commit time (out of memory, driver
+            // mismatch, unsupported ops). Retry once on CPU so the model
+            // still loads.
+            Err(e) if matches!(device, Device::Cuda) => {
+                log::warn!("parakeet encoder CUDA load failed ({e}); falling back to CPU");
+                Ok(crate::device::apply(base_builder()?, Device::Cpu)
+                    .commit_from_file(&model_path)?)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn load_vocab<P: AsRef<Path>>(model_dir: P) -> Result<(Vec<String>, i32), ParakeetError> {

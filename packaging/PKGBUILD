@@ -31,6 +31,11 @@ optdepends=(
 # !debug: keep makepkg from splitting debug info out of an already-stripped
 # binary.
 options=(!debug !lto)
+# GPU: build() below makes a CPU-only binary (no `--features cuda`). A cuda
+# build needs `cuda` and `cudnn` added to makedepends, `cargo build --release
+# --locked --features cuda` in build(), and the ONNX Runtime provider
+# `libonnxruntime_providers_cuda.so` installed beside /usr/bin/sttd (the
+# binary finds it through an $ORIGIN rpath, not the system loader path).
 source=()
 sha256sums=()
 

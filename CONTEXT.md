@@ -91,7 +91,9 @@ Rust mel frontend, dictionary phrase-boosting on its greedy decode, and per-word
 confidences for the dictionary gate) and Whisper large-v3-turbo (three `ort`
 sessions, a Rust log-mel frontend, and a KV-cached greedy decode with the same
 per-word confidences but no phrase boosting). Parakeet auto-detects the spoken
-language per utterance; Whisper is told which to decode in.
+language per utterance; Whisper is told which to decode in. A `cuda`-feature
+build runs the encoders on the CUDA execution provider and keeps the decoders
+on CPU.
 (Sherpa-onnx support lives on branch `sherpa-onnx`.)
 _Avoid_: model (bare, when the engine — as opposed to the weights — is meant), backend
 

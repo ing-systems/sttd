@@ -8,7 +8,10 @@
 // per-word confidences, so the dictionary fuzzy correction runs gated
 // (Phase B) instead of ungated.
 //
-// Runs on CPU. `--gpu` warns and falls back to CPU.
+// With `--gpu` (and a build that has CUDA support) the encoder session runs on
+// the CUDA execution provider. The decoder_joint always stays on CPU. When
+// CUDA is unavailable, or the CUDA load fails, the encoder falls back to CPU and
+// the fallback is logged.
 // ---------------------------------------------------------------------------
 
 use std::path::Path;
@@ -35,8 +38,9 @@ impl ParakeetModel {
     /// here (see `SpeechModel::set_boost_words`), so a swap that landed while
     /// a previous instance was unloaded is already in place.
     pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
-        if opts.use_gpu {
-            log::warn!("--gpu is set but Parakeet runs on CPU in this build; running on CPU");
+        let device = crate::device::requested(opts.use_gpu);
+        if opts.use_gpu && matches!(device, crate::device::Device::Cpu) {
+            log::warn!("--gpu is set but this build has no CUDA support (build with --features cuda) or CUDA is unavailable; running on CPU");
         }
         let intra_threads = opts.n_threads.max(1) as usize;
         let tokenizer_path = dir.join("tokenizer.json");
@@ -49,7 +53,7 @@ impl ParakeetModel {
         }
         log::info!("loading parakeet model ({})...", dir.display());
         let mut inner = with_loading_ticker("parakeet model", || {
-            CoreModel::new(dir, true, tokenizer_opt.as_deref(), intra_threads)
+            CoreModel::new(dir, true, tokenizer_opt.as_deref(), intra_threads, device)
                 .map_err(|e| anyhow::anyhow!("failed to load parakeet model: {e}"))
                 .context("failed to load parakeet model")
         })?;
@@ -59,8 +63,10 @@ impl ParakeetModel {
         Ok(Self {
             inner,
             ready_line: format!(
-                "parakeet ready (model={}, threads={}, gpu=false)",
-                opts.model_spec, opts.n_threads
+                "parakeet ready (model={}, threads={}, gpu={})",
+                opts.model_spec,
+                opts.n_threads,
+                matches!(device, crate::device::Device::Cuda)
             ),
         })
     }

@@ -1,4 +1,4 @@
 [build]
 # Optimize for the host CPU by default (AVX2/VNNI/etc.): this is a local
 # real-time binary, not a portable release. The prebuilt ORT library ships as-is.
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=native", "-Clink-args=-Wl,-rpath,$ORIGIN"]

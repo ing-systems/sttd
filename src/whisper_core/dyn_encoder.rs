@@ -521,6 +521,7 @@ fn patch_with(mut model: Vec<u8>, expected_reshapes: usize) -> Result<Vec<u8>, P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::Device;
 
     fn tensor(name: &str, data_type: u64, raw: &[u8]) -> Vec<u8> {
         let mut body = varint_field(TENSOR_DIMS, (raw.len() / 8) as u64);
@@ -821,11 +822,11 @@ mod tests {
         }
         let bytes = std::fs::read(&path).unwrap();
         let patched = patch_encoder(bytes.clone()).expect("shipped export must patch");
-        let mut original = super::super::engine::session_builder(4)
+        let mut original = super::super::engine::session_builder(4, Device::Cpu)
             .unwrap()
             .commit_from_memory(&bytes)
             .unwrap();
-        let mut dynamic = super::super::engine::session_builder(4)
+        let mut dynamic = super::super::engine::session_builder(4, Device::Cpu)
             .unwrap()
             .commit_from_memory(&patched)
             .unwrap();

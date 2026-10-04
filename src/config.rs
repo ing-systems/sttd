@@ -213,6 +213,8 @@ pub(crate) const DEFAULT_AUTO_UNLOAD_AFTER_SECS: u64 = 180;
 /// physical cores at startup. Override with `STTD_THREADS`.
 pub(crate) const DEFAULT_THREADS: i32 = 8;
 /// Whether to load the model onto the GPU (`use_gpu`). Default false.
+/// Takes effect only in a build made with `--features cuda`; in a build
+/// without that feature the request warns and the model runs on CPU.
 /// Override with `STTD_GPU=1` / `--gpu` for GPU machines.
 pub(crate) const DEFAULT_USE_GPU: bool = false;
 

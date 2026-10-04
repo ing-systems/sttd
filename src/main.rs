@@ -95,6 +95,7 @@ use model_store::{ensure_available, resolve_model, EngineKind, ModelRef};
 mod asr;
 use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrOptions};
 mod decode;
+mod device;
 mod mel;
 mod parakeet;
 mod parakeet_core;
@@ -1008,11 +1009,14 @@ fn resolve_model_input(cli: &Cli) -> Result<ModelRef> {
 }
 
 /// Flags the selected engine ignores, so the no-effect is visible instead of
-/// silent. Both engines run on CPU in this build (`--gpu` is accepted but has
-/// no provider behind it); `--language` only means something to Whisper.
+/// silent. Without the `cuda` feature both engines run on CPU, so `--gpu` is
+/// accepted but has no provider behind it. With the `cuda` feature the
+/// Parakeet and Whisper encoders use CUDA and the decoders stay on CPU, so
+/// `--gpu` applies and is not reported here. `--language` only means something
+/// to Whisper.
 fn ignored_model_flags(cli: &Cli, model: &ModelRef) -> Vec<&'static str> {
     let mut flags = Vec::new();
-    if cli.gpu {
+    if cli.gpu && !cfg!(feature = "cuda") {
         flags.push("--gpu");
     }
     if model.kind == EngineKind::Parakeet && cli.language.is_some() {
@@ -1333,12 +1337,20 @@ mod tests {
         }
     }
 
+    /// `--gpu` is a no-op only in a CPU-only build. A `cuda` build runs the
+    /// encoders on the CUDA EP, so the flag applies to both engines and no
+    /// longer belongs in the ignored set.
     #[test]
-    fn gpu_is_ignored_by_both_engines() {
+    fn gpu_is_ignored_by_both_engines_without_cuda() {
         let cli = Cli::try_parse_from(["sttd", "--gpu"]).expect("flags must parse");
+        let expected: Vec<&'static str> = if cfg!(feature = "cuda") {
+            Vec::new()
+        } else {
+            vec!["--gpu"]
+        };
         for kind in [EngineKind::Parakeet, EngineKind::Whisper] {
             let model = model_ref(kind, "models/x");
-            assert_eq!(ignored_model_flags(&cli, &model), vec!["--gpu"]);
+            assert_eq!(ignored_model_flags(&cli, &model), expected);
         }
     }
 

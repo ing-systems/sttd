@@ -26,7 +26,9 @@
 // correction in `dictionary` still applies, and the per-word confidences this
 // engine does report gate it as they do for Parakeet.
 //
-// Runs on CPU. `--gpu` warns and falls back, as with Parakeet.
+// Runs the encoder on the CUDA device when the build has one and `--gpu` asks
+// for it, else on CPU. The decoders stay on the CPU (`whisper_core::engine`),
+// and `--gpu` without CUDA support warns and falls back, as with Parakeet.
 // ---------------------------------------------------------------------------
 
 use std::path::Path;
@@ -37,6 +39,7 @@ use anyhow::{Context, Result};
 
 use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
 use crate::config::WHISPER_MAX_NEW_TOKENS;
+use crate::device::{self, Device};
 use crate::whisper_core::WhisperModel as CoreModel;
 
 pub(crate) struct WhisperModel {
@@ -47,9 +50,13 @@ pub(crate) struct WhisperModel {
 impl WhisperModel {
     /// Load a Whisper model from `dir` (already guaranteed to hold the three
     /// graphs and `tokenizer.json` by `model_store::ensure_available`).
+    ///
+    /// `--gpu` asks for CUDA; a build without CUDA support (or without a
+    /// usable device) gets CPU sessions and one warning.
     pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
-        if opts.use_gpu {
-            log::warn!("--gpu is set but Whisper runs on CPU in this build; running on CPU");
+        let device = device::requested(opts.use_gpu);
+        if opts.use_gpu && matches!(device, Device::Cpu) {
+            log::warn!("--gpu is set but this build has no CUDA support; running on CPU");
         }
         let intra_threads = opts.n_threads.max(1) as usize;
         log::info!("loading whisper model ({})...", dir.display());
@@ -64,6 +71,7 @@ impl WhisperModel {
                 intra_threads,
                 true,
                 opts.audio_ctx,
+                device,
             )
             .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))
             .context("failed to load whisper model")
@@ -80,8 +88,11 @@ impl WhisperModel {
         // (`Language::resolve`), and the ready line must say what will actually
         // happen.
         let ready_line = format!(
-            "whisper ready (model={}, lang={}, threads={}, gpu=false, window={window})",
-            opts.model_spec, inner.language, opts.n_threads
+            "whisper ready (model={}, lang={}, threads={}, gpu={}, window={window})",
+            opts.model_spec,
+            inner.language,
+            opts.n_threads,
+            matches!(device, Device::Cuda)
         );
         log::info!("{}", ready_line);
         Ok(Self { inner, ready_line })

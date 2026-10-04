@@ -93,7 +93,7 @@ A window cut close to the audio is worse than a short one: with no margin a 6 s 
 
 In a simulated live run (a 24 s file with pauses, streamed through the real VAD and model, 15 s floor) partials came one per second, each 0.41 - 0.69 s to decode, and the three finals matched the fixed-window run. A machine that needs more than a second per decode simply skips steps. Known limit: a partial is cut mid-word, so it can misspell words that the final gets right (`po zągiem` for `pociągiem`).
 
-Both engines run on CPU. `--gpu` is accepted and warned about for both.
+Without the `cuda` feature both engines run on CPU. With it, the Parakeet and Whisper encoders run on the CUDA execution provider and the decoders stay on CPU, TF32 is off, and transcripts are therefore not bit-exact against a CPU run. `--gpu` selects the CUDA path and is accepted without a warning in such a build; in a CPU-only build it is accepted and warned about for both engines.
 
 Resolution (`src/model_store.rs`):
 
@@ -114,6 +114,7 @@ sttd --list-devices --device usb
 ```sh
 cargo build --release
 cargo build --release --features denoise
+cargo build --release --features cuda
 STTD_MODELS_DIR=/usr/share/sttd/models cargo build --release
 ```
 
@@ -122,6 +123,9 @@ Notes:
 - `.cargo/config.toml:1-4` sets `-C target-cpu=native`.
 - `ort` downloads ONNX Runtime binaries at build time (`download-binaries`).
 - `denoise` pulls DeepFilterNet3 (`tract` backend).
+- `cuda` needs CUDA 13 and cuDNN 9 at runtime, not only at build time. The ONNX Runtime provider library must sit beside the binary, so copy it in and run the linker step that adds an `$ORIGIN` rpath; a provider found on the system loader path alone does not survive a move of the binary. The TensorRT execution provider ships in the same distribution but is never registered.
+- The vendored ONNX Runtime 1.28 CUDA provider ships no kernel for Blackwell `sm_120` GPUs, such as the RTX 5070, so `--gpu` fails there with CUDA error 209 and falls back only when no CUDA device is visible. Tested on an RTX 5070.
+- Under CUDA, `--threads` sets ORT `intra_op` for the CPU-resident nodes only (the decoders); the CUDA nodes ignore it.
 
 Test:
 
@@ -214,7 +218,7 @@ Key tunables:
 | `--channel` / `STTD_CHANNEL` | `mix` | `mix`, `auto` (loudest), or channel index `N`. |
 | `--denoiser` / `STTD_DENOISER` | `none` | `none` or `deepfilter` (needs `denoise` feature). VAD branch only. |
 | `--threads` / `STTD_THREADS` | `0` (auto) | Decoder threads; `0` = physical cores. |
-| `--gpu` / `STTD_GPU` | off | Accepted and warned about: both engines run on CPU in this build. |
+| `--gpu` / `STTD_GPU` | off | Load the model on the CUDA EP. Needs a `cuda`-feature build: encoders run on CUDA, decoders stay on CPU, TF32 is off, so transcripts are not bit-exact against CPU. Without that feature the flag is accepted and warned about, because both engines run on CPU. Not usable on Blackwell `sm_120` GPUs (RTX 5070), which the vendored ONNX Runtime 1.28 CUDA provider does not support. |
 | `--vad-threshold` / `STTD_VAD_THRESHOLD` | `0.5` | Min earshot score for speech. |
 | `--vad-adapt` / `STTD_VAD_ADAPT` | on | Adapt threshold to noise floor with hysteresis. |
 | `--min-rms` / `STTD_MIN_RMS` | `0.003` | Min speech-only RMS to keep utterance. `0` disables. |

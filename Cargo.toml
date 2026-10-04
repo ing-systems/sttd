@@ -51,6 +51,10 @@ zbus = { version = "5", default-features = false, features = [
 [features]
 default = []
 denoise = ["dep:deep_filter", "dep:ndarray"]
+# GPU inference. `ort/cuda` links the CUDA/cuDNN execution provider;
+# `ort/copy-dylibs` copies the CUDA provider shared objects next to the
+# binary, so `$ORIGIN` (see .cargo/config.toml rpath) finds them.
+cuda = ["ort/cuda", "ort/copy-dylibs"]
 
 [profile.release]
 strip = true

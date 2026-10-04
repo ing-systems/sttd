@@ -44,6 +44,7 @@ use super::types::{
     BEGIN_SUPPRESS_TOKENS, LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
 };
 use crate::decode::{argmax_index, softmax_prob, word_confidences as group_words};
+use crate::device::Device;
 
 /// Tokens in one prompt: start-of-transcript, language, task, no-timestamps.
 const PROMPT_LEN: usize = 4;
@@ -140,18 +141,30 @@ impl WhisperModel {
     ///
     /// `min_window_frames` is the floor that follow stops at (`--audio-ctx`);
     /// it is stored but unused unless `dynamic_window` ends up true.
+    ///
+    /// `device` is the requested placement. Only the encoder runs on it: the
+    /// two decoders stay on the CPU, because they run once per generated token
+    /// over a single id, where the transfer of the encoder states and the KV
+    /// cache costs more than the run itself. A CUDA session that fails to
+    /// commit falls back to the CPU once (see `init_session`).
     pub fn new<P: AsRef<Path>>(
         model_dir: P,
         language: Language,
         intra_threads: usize,
         dynamic_window: bool,
         min_window_frames: usize,
+        device: Device,
     ) -> Result<Self, WhisperError> {
         let dir = model_dir.as_ref();
         let threads = intra_threads.max(1);
-        let (encoder, dynamic_window) = init_encoder(dir, threads, dynamic_window)?;
-        let decoder = init_session(dir, "decoder_model_int8.onnx", threads)?;
-        let decoder_with_past = init_session(dir, "decoder_with_past_model_int8.onnx", threads)?;
+        let (encoder, dynamic_window) = init_encoder(dir, threads, dynamic_window, device)?;
+        let decoder = init_session(dir, "decoder_model_int8.onnx", threads, Device::Cpu)?;
+        let decoder_with_past = init_session(
+            dir,
+            "decoder_with_past_model_int8.onnx",
+            threads,
+            Device::Cpu,
+        )?;
 
         let tokenizer_path = dir.join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -507,23 +520,44 @@ fn verify_token_ids(tokenizer: &Tokenizer) -> Result<(), WhisperError> {
 /// stands, and `with_dimension_override` would only lie about a shape the
 /// graph's own reshapes depend on. Streaming pulls that lever by patching the
 /// graph itself (`dyn_encoder`), not by overriding its declared shape.
-fn init_session(dir: &Path, file: &str, intra_threads: usize) -> Result<Session, WhisperError> {
+///
+/// `device` picks the execution provider (see `crate::device::apply`), and is
+/// applied last so it sees the builder with all the settings above already on
+/// it. A CUDA commit that fails falls back to the CPU once, so a build with
+/// CUDA support that finds no usable device still transcribes.
+fn init_session(
+    dir: &Path,
+    file: &str,
+    intra_threads: usize,
+    device: Device,
+) -> Result<Session, WhisperError> {
     let path = dir.join(file);
     if !path.exists() {
         return Err(WhisperError::MissingAsset(path.display().to_string()));
     }
     log::trace!("loading whisper session from {}...", path.display());
-    Ok(session_builder(intra_threads)?.commit_from_file(path)?)
+    match session_builder(intra_threads, device)?.commit_from_file(&path) {
+        Ok(session) => Ok(session),
+        Err(e) if matches!(device, Device::Cuda) => {
+            log::warn!("cannot load {file} on CUDA ({e}); retrying on CPU");
+            Ok(session_builder(intra_threads, Device::Cpu)?.commit_from_file(&path)?)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The settings every Whisper session shares (see `init_session`).
-pub(super) fn session_builder(intra_threads: usize) -> Result<SessionBuilder, WhisperError> {
-    Ok(Session::builder()?
+pub(super) fn session_builder(
+    intra_threads: usize,
+    device: Device,
+) -> Result<SessionBuilder, WhisperError> {
+    let builder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_intra_threads(intra_threads)?
         .with_inter_threads(1)?
         .with_memory_pattern(false)?
-        .with_parallel_execution(false)?)
+        .with_parallel_execution(false)?;
+    Ok(crate::device::apply(builder, device))
 }
 
 const ENCODER_FILE: &str = "encoder_model_int8.onnx";
@@ -534,11 +568,23 @@ const ENCODER_FILE: &str = "encoder_model_int8.onnx";
 /// (`dyn_encoder::patch_encoder`) and loaded from the patched bytes. A graph the
 /// patch does not recognise is not an error: the fixed export loads as before
 /// and the caller learns it from the returned flag.
+///
+/// Both paths load on `device` and fall back to the CPU once if a CUDA commit
+/// fails. A CUDA request without a usable device is downgraded here, before any
+/// session is built, so the encoder never goes through a provider that cannot
+/// load.
 fn init_encoder(
     dir: &Path,
     intra_threads: usize,
     dynamic: bool,
+    device: Device,
 ) -> Result<(Session, bool), WhisperError> {
+    let device = if matches!(device, Device::Cuda) && !crate::device::cuda_available() {
+        log::warn!("no CUDA device available for the whisper encoder; running it on CPU");
+        Device::Cpu
+    } else {
+        device
+    };
     if dynamic {
         let path = dir.join(ENCODER_FILE);
         if !path.exists() {
@@ -552,7 +598,16 @@ fn init_encoder(
                     "whisper encoder patched for variable-length windows ({} MiB)",
                     patched.len() >> 20
                 );
-                let session = session_builder(intra_threads)?.commit_from_memory(&patched)?;
+                let session = match session_builder(intra_threads, device)?
+                    .commit_from_memory(&patched)
+                {
+                    Ok(session) => session,
+                    Err(e) if matches!(device, Device::Cuda) => {
+                        log::warn!("cannot load the patched whisper encoder on CUDA ({e}); retrying on CPU");
+                        session_builder(intra_threads, Device::Cpu)?.commit_from_memory(&patched)?
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 return Ok((session, true));
             }
             Err(e) => log::warn!(
@@ -560,7 +615,10 @@ fn init_encoder(
             ),
         }
     }
-    Ok((init_session(dir, ENCODER_FILE, intra_threads)?, false))
+    Ok((
+        init_session(dir, ENCODER_FILE, intra_threads, device)?,
+        false,
+    ))
 }
 
 /// Sanity check that the constants in `types` describe this export's token
