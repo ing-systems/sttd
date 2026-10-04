@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 
 use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
 use crate::config::WHISPER_MAX_NEW_TOKENS;
-use crate::device::{self, Device};
+use crate::device;
 use crate::whisper_core::WhisperModel as CoreModel;
 
 pub(crate) struct WhisperModel {
@@ -54,10 +54,7 @@ impl WhisperModel {
     /// `--gpu` asks for CUDA; a build without CUDA support (or without a
     /// usable device) gets CPU sessions and one warning.
     pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
-        let device = device::requested(opts.use_gpu);
-        if opts.use_gpu && matches!(device, Device::Cpu) {
-            log::warn!("--gpu is set but this build has no CUDA support; running on CPU");
-        }
+        let device = device::resolve(opts.use_gpu);
         let intra_threads = opts.n_threads.max(1) as usize;
         log::info!("loading whisper model ({})...", dir.display());
         let inner = with_loading_ticker("whisper model", || {
@@ -92,7 +89,7 @@ impl WhisperModel {
             opts.model_spec,
             inner.language,
             opts.n_threads,
-            matches!(device, Device::Cuda)
+            device.is_gpu()
         );
         log::info!("{}", ready_line);
         Ok(Self { inner, ready_line })

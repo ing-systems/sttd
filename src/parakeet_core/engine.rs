@@ -16,7 +16,7 @@
 use ndarray17::{Array, Array1, Array2, ArrayD, ArrayViewD, IxDyn};
 use once_cell::sync::Lazy;
 use ort::inputs;
-use ort::session::builder::GraphOptimizationLevel;
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
 use ort::value::TensorRef;
 use regex::Regex;
@@ -333,17 +333,6 @@ impl ParakeetModel {
         try_quantized: bool,
         device: Device,
     ) -> Result<Session, ParakeetError> {
-        // Downgrade before any CUDA call: `cuda_available` probes the ORT
-        // CUDA execution provider, so a build without the `cuda` feature or
-        // without a usable driver must not reach the CUDA load path.
-        let device = match device {
-            Device::Cuda if !crate::device::cuda_available() => {
-                log::warn!("CUDA EP not available; running parakeet encoder on CPU");
-                Device::Cpu
-            }
-            other => other,
-        };
-
         // Try quantized version first if requested, fallback to regular version
         let model_filename = if try_quantized {
             let quantized_name = format!("{}.int8.onnx", model_name);
@@ -366,27 +355,28 @@ impl ParakeetModel {
         };
 
         let model_path = model_dir.as_ref().join(&model_filename);
-        let base_builder = || -> Result<ort::session::builder::SessionBuilder, ParakeetError> {
-            Ok(Session::builder()?
-                .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .with_intra_threads(intra_threads)?
-                .with_inter_threads(1)?
-                .with_memory_pattern(false)?
-                .with_parallel_execution(false)?)
+        // `device` owns the downgrade and the CPU retry, so all this has to
+        // describe is where a session goes and which file it loads.
+        let build = |device| -> Result<Session, ParakeetError> {
+            Ok(
+                crate::device::apply(Self::session_builder(intra_threads)?, device)
+                    .commit_from_file(&model_path)?,
+            )
         };
+        crate::device::commit_with_cpu_fallback(device, &format!("parakeet {model_name}"), build)
+    }
 
-        match crate::device::apply(base_builder()?, device).commit_from_file(&model_path) {
-            Ok(session) => Ok(session),
-            // A CUDA load can fail at commit time (out of memory, driver
-            // mismatch, unsupported ops). Retry once on CPU so the model
-            // still loads.
-            Err(e) if matches!(device, Device::Cuda) => {
-                log::warn!("parakeet encoder CUDA load failed ({e}); falling back to CPU");
-                Ok(crate::device::apply(base_builder()?, Device::Cpu)
-                    .commit_from_file(&model_path)?)
-            }
-            Err(e) => Err(e.into()),
-        }
+    /// The ORT settings every parakeet session shares. Kept apart from
+    /// [`Self::init_session`] because the provider is attached afterwards by
+    /// `crate::device::apply`, and because the CPU retry needs a fresh builder:
+    /// committing one consumes it.
+    fn session_builder(intra_threads: usize) -> Result<SessionBuilder, ParakeetError> {
+        Ok(Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(intra_threads)?
+            .with_inter_threads(1)?
+            .with_memory_pattern(false)?
+            .with_parallel_execution(false)?)
     }
 
     fn load_vocab<P: AsRef<Path>>(model_dir: P) -> Result<(Vec<String>, i32), ParakeetError> {

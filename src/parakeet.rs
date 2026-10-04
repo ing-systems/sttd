@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 
 use crate::asr::{with_loading_ticker, AsrOptions, SpeechModel, Transcript};
 use crate::config::PARAKEET_MIN_SAMPLES;
+use crate::device;
 use crate::parakeet_core::ParakeetModel as CoreModel;
 
 pub(crate) struct ParakeetModel {
@@ -38,10 +39,7 @@ impl ParakeetModel {
     /// here (see `SpeechModel::set_boost_words`), so a swap that landed while
     /// a previous instance was unloaded is already in place.
     pub(crate) fn load(dir: &Path, opts: &AsrOptions) -> Result<Self> {
-        let device = crate::device::requested(opts.use_gpu);
-        if opts.use_gpu && matches!(device, crate::device::Device::Cpu) {
-            log::warn!("--gpu is set but this build has no CUDA support (build with --features cuda) or CUDA is unavailable; running on CPU");
-        }
+        let device = device::resolve(opts.use_gpu);
         let intra_threads = opts.n_threads.max(1) as usize;
         let tokenizer_path = dir.join("tokenizer.json");
         let tokenizer_opt = tokenizer_path.exists().then_some(tokenizer_path);
@@ -66,7 +64,7 @@ impl ParakeetModel {
                 "parakeet ready (model={}, threads={}, gpu={})",
                 opts.model_spec,
                 opts.n_threads,
-                matches!(device, crate::device::Device::Cuda)
+                device.is_gpu()
             ),
         })
     }

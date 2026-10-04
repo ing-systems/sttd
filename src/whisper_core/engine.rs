@@ -523,8 +523,9 @@ fn verify_token_ids(tokenizer: &Tokenizer) -> Result<(), WhisperError> {
 ///
 /// `device` picks the execution provider (see `crate::device::apply`), and is
 /// applied last so it sees the builder with all the settings above already on
-/// it. A CUDA commit that fails falls back to the CPU once, so a build with
-/// CUDA support that finds no usable device still transcribes.
+/// it. `crate::device::commit_with_cpu_fallback` owns the downgrade and the
+/// retry, so this only has to describe where a session goes and which file it
+/// loads.
 fn init_session(
     dir: &Path,
     file: &str,
@@ -536,14 +537,13 @@ fn init_session(
         return Err(WhisperError::MissingAsset(path.display().to_string()));
     }
     log::trace!("loading whisper session from {}...", path.display());
-    match session_builder(intra_threads, device)?.commit_from_file(&path) {
-        Ok(session) => Ok(session),
-        Err(e) if matches!(device, Device::Cuda) => {
-            log::warn!("cannot load {file} on CUDA ({e}); retrying on CPU");
-            Ok(session_builder(intra_threads, Device::Cpu)?.commit_from_file(&path)?)
-        }
-        Err(e) => Err(e.into()),
-    }
+    crate::device::commit_with_cpu_fallback(
+        device,
+        file,
+        |device| -> Result<Session, WhisperError> {
+            Ok(session_builder(intra_threads, device)?.commit_from_file(&path)?)
+        },
+    )
 }
 
 /// The settings every Whisper session shares (see `init_session`).
@@ -569,22 +569,15 @@ const ENCODER_FILE: &str = "encoder_model_int8.onnx";
 /// patch does not recognise is not an error: the fixed export loads as before
 /// and the caller learns it from the returned flag.
 ///
-/// Both paths load on `device` and fall back to the CPU once if a CUDA commit
-/// fails. A CUDA request without a usable device is downgraded here, before any
-/// session is built, so the encoder never goes through a provider that cannot
-/// load.
+/// Both paths load on `device` through
+/// `crate::device::commit_with_cpu_fallback`, so each one downgrades a request
+/// with no usable device and retries a failed CUDA commit on the CPU.
 fn init_encoder(
     dir: &Path,
     intra_threads: usize,
     dynamic: bool,
     device: Device,
 ) -> Result<(Session, bool), WhisperError> {
-    let device = if matches!(device, Device::Cuda) && !crate::device::cuda_available() {
-        log::warn!("no CUDA device available for the whisper encoder; running it on CPU");
-        Device::Cpu
-    } else {
-        device
-    };
     if dynamic {
         let path = dir.join(ENCODER_FILE);
         if !path.exists() {
@@ -598,16 +591,13 @@ fn init_encoder(
                     "whisper encoder patched for variable-length windows ({} MiB)",
                     patched.len() >> 20
                 );
-                let session = match session_builder(intra_threads, device)?
-                    .commit_from_memory(&patched)
-                {
-                    Ok(session) => session,
-                    Err(e) if matches!(device, Device::Cuda) => {
-                        log::warn!("cannot load the patched whisper encoder on CUDA ({e}); retrying on CPU");
-                        session_builder(intra_threads, Device::Cpu)?.commit_from_memory(&patched)?
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+                let session = crate::device::commit_with_cpu_fallback(
+                    device,
+                    "the patched whisper encoder",
+                    |device| -> Result<Session, WhisperError> {
+                        Ok(session_builder(intra_threads, device)?.commit_from_memory(&patched)?)
+                    },
+                )?;
                 return Ok((session, true));
             }
             Err(e) => log::warn!(
