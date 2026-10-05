@@ -43,7 +43,7 @@ See `src/main.rs:1-51` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdic
 
 - Linux x86_64, Rust stable, `alsa-lib`.
 - ~638 MiB disk for the default Parakeet `int8` model, or ~1443 MiB for Whisper.
-- Optional: ~114 MiB more for the translator pair that `--translate` downloads on first use, or ~870 MiB for the multilingual `nllb-200-distilled-600M`.
+- Optional: ~165 MiB more for the translator pair that `--translate` downloads on first use, or ~1.3 GiB for the multilingual `nllb-200-distilled-600M`.
 - Optional: `wl-clipboard` (`wl-copy`) for `--copy`, `ydotool` + `ydotoold` for `--paste` (Wayland only), `espeak-ng` (+ its voice data package) for `--speak`, PipeWire/WirePlumber for capture, Python 3 stdlib for `tools/`.
 
 ## Models
@@ -147,7 +147,7 @@ Two kinds of model sit behind `--translate-model`, and they are told apart by ea
 
 ### Pair translators (the default)
 
-[MarianMT](https://huggingface.co/docs/transformers/model_doc/marian) `opus-mt` exports, one repository per language pair, fetched on first use from `huggingface.co/Xenova/opus-mt-<src>-<tgt>` into `<models>/translators/<spec>/` (two int8 graphs, the tokenizer and `config.json`, ~114 MiB per pair).
+[MarianMT](https://huggingface.co/docs/transformers/model_doc/marian) `opus-mt` exports, one repository per language pair, fetched on first use from `huggingface.co/Xenova/opus-mt-<src>-<tgt>` into `<models>/translators/<spec>/` (three int8 graphs, the tokenizer and `config.json`, ~165 MiB per pair).
 
 **The pair comes from `--language` plus `--translate`, and coverage is thin where you might expect it to be wide.** These are per-pair models, so a direction that nobody exported does not exist:
 
@@ -164,7 +164,7 @@ Polish is the sore spot: `Helsinki-NLP` publishes ten `opus-mt-pl-*` models (`pl
 
 ### Multilingual translators
 
-`--translate-model nllb-200-distilled-600M` is one model for **every** direction, which removes the table above. It is ~870 MiB (both graphs are about four times a pair's) and translates roughly 8x slower per utterance.
+`--translate-model nllb-200-distilled-600M` is one model for **every** direction, which removes the table above. It is ~1.3 GiB (its three graphs are about four times a pair's) and translates roughly 8x slower per utterance.
 
 ```sh
 sttd --language pl --translate de --translate-model nllb-200-distilled-600M
@@ -179,7 +179,7 @@ sttd --language pl --translate ja --translate-model nllb-200-distilled-600M
 Three things to know before using one:
 
 - **It needs a named `--language`,** unlike a pair export. The source language is something the model is *told*, not something its weights decide, so `--language auto` has nothing to tell it.
-- **It is slower, and much bigger.** ~800 ms per utterance on four threads against ~100 ms for a pair, with the same uncached O(n²) decode over a decoder four times the width — which is why its token cap is 48 against a pair's 96. If you translate continuously, the latency is the cost of the coverage.
+- **It is slower, and much bigger.** ~680 ms per utterance on four threads against ~80 ms for a pair, over a decoder four times the width — which is why its token cap is 48 against a pair's 96. If you translate continuously, the latency is the cost of the coverage.
 - **Under Parakeet, `--language` does not name what it is transcribed in.** Parakeet detects the spoken language per utterance and ignores `--language` for transcription; for a multilingual translator the flag only tells the *translator* what to assume. sttd warns about this at startup, because speech in another language will then be mistranslated.
 
 NLLB spells languages the FLORES way (`pol_Latn`, `eng_Latn`, `deu_Latn`). `--language` and `--translate` take the ISO-639-1 codes sttd uses everywhere else and sttd maps them; a FLORES code also passes through verbatim, so all ~200 are reachable. A code neither form matches is refused with the examples — deliberately, since NLLB's 256k-entry BPE vocabulary contains ordinary subword pieces that look like language codes, and passing a typo through would mistranslate silently.
@@ -190,14 +190,14 @@ Four properties are worth knowing:
 
 - **The step runs after the gates.** A dropped utterance is never translated, and a hallucination or repetition gate judges the source text, never the translation.
 - **A failure emits the source.** If the model returns nothing or the decode fails, sttd warns and emits the source text unchanged, so a translation fault never costs you the sentence.
-- **Translation runs on its own thread**, behind a 4-deep FIFO, so it never adds its 60–150 ms (or ~800 ms) to the gap between utterances. A full queue drops the *oldest* waiting transcript and says so, rather than the newest.
+- **Translation runs on its own thread**, behind a 4-deep FIFO, so it never adds its 60–150 ms (or ~700 ms) to the gap between utterances. A full queue drops the *oldest* waiting transcript and says so, rather than the newest.
 - **512 tokens is a quality window, not a shape limit.** Text is split on sentence terminators (`.` `!` `?` `;` newline, not `:`) and each piece is truncated to 512 tokens, so quality falls off past that. Text with no terminator stays one piece.
 
 **Eval runs must not use `--translate`.** `tools/eval.py` scores sttd's `--stdout` lines against each reference `.txt`, and with `--translate` those lines hold the translation. The WER then measures the translation model, not the speech model. If you do run with `--translate`, the source transcript is in the `src_text` column of the `--metrics` rows, not in the scored text.
 
 With `--speak`, a `--voice` whose key language differs from the target warns too (`pl_PL-*` reads English badly). The comparison uses the code you typed, so a multilingual run into `eng_Latn` is matched against a `pl_PL-*` voice correctly.
 
-Implementation (`src/translate.rs`, `src/translator_store.rs`): two `ort` sessions (encoder plus the merged decoder, the same pattern as `parakeet_core` and `whisper_core`) with a greedy decode and no prompt. The decode cannot use the KV cache (the export's cached branch is broken), so each step re-runs the decoder over the whole sequence; that makes it O(n²) in output length, which is what the token cap bounds. Measured on four threads: 100 ms for a `opus-mt-pl-en` pair, 763 ms for NLLB `pl → en`, 817 ms for `pl → de`.
+Implementation (`src/translate.rs`, `src/translator_store.rs`): three `ort` sessions and a greedy decode with no prompt — the encoder, the merged decoder for the prompt step, and the `decoder_with_past` graph for every step after it. The split is what makes the decode O(n) in output length: the prompt step fills a key/value cache and each later step adds one token to it, so nothing is recomputed. It is the same two-graph shape `whisper_core` already uses, and for the same reason — the merged graph alone re-runs cross-attention over every encoder frame per generated token. Measured on four threads: 79 ms for a `opus-mt-pl-en` pair, 677 ms for NLLB `pl → en`, 730 ms for `pl → de`.
 
 Four details the models decide rather than the code, all read from each export's own `config.json`:
 
@@ -331,7 +331,7 @@ Key tunables:
 | `--speak` / `STTD_SPEAK` | off | Read each accepted transcript aloud through the default output device (needs `espeak-ng`). Holds the microphone while it speaks, so what you say during playback is discarded — pair it with `--autopause`, or use headphones. Independent of `--sound`. |
 | `--voice` / `STTD_VOICE` | `pl_PL-gosia-medium` | Piper voice key or a voice directory. Downloaded on first use (~60 MiB). Ignored, and not downloaded, without `--speak`. |
 | `--translate` / `STTD_TRANSLATE` | unset | Translate each accepted transcript into `<LANG>` before emission. Unset: no translation step and no translator download. Every emission channel then receives the translation. The direction comes from `--language` plus this flag; with the default pair translator only exported pairs exist (see *Translation*). |
-| `--translate-model` / `STTD_TRANSLATE_MODEL` | unset | Override the resolved direction: a catalog spec (`opus-mt-mul-en`, or `nllb-200-distilled-600M` for every direction at ~870 MiB), or a directory holding `encoder_model_quantized.onnx`, `decoder_model_merged_quantized.onnx`, `tokenizer.json` and `config.json`. Downloaded on first use. Ignored, and not downloaded, without `--translate`. |
+| `--translate-model` / `STTD_TRANSLATE_MODEL` | unset | Override the resolved direction: a catalog spec (`opus-mt-mul-en`, or `nllb-200-distilled-600M` for every direction at ~1.3 GiB), or a directory holding `encoder_model_quantized.onnx`, `decoder_model_merged_quantized.onnx`, `decoder_with_past_model_quantized.onnx`, `tokenizer.json` and `config.json`. Downloaded on first use. Ignored, and not downloaded, without `--translate`. |
 | `--copy` / `STTD_COPY` | off | Copy each emission via `wl-copy`. |
 | `--paste` / `STTD_PASTE` | off | Paste via `ydotool`. Runs only when copy runs on fresh text. |
 | `--paste-mode` / `STTD_PASTE_MODE` | `ctrl-v` | `ctrl-v`, `ctrl-shift-v`, or `type`. |

@@ -22,11 +22,17 @@
 // read, so a re-exported or re-quantized model is described by its file rather
 // than by constants compiled here.
 //
+// **Both decoder graphs are fetched, and both are needed.** The merged one runs
+// the prompt step and is the only graph that computes the cross-attention keys;
+// the `with_past` one runs every step after it and is the only one that reads a
+// cache. A decode through the merged graph alone re-runs the whole prefix per
+// token, which is O(n²) in output length — see `translate::Translator`.
+//
 // Layout mirrors `voice_store` deliberately: a spec resolves into
-// `<models>/translators/<spec>/` with the four files sttd reads flat on disk,
+// `<models>/translators/<spec>/` with the five files sttd reads flat on disk,
 // whatever nesting the repository uses upstream (`onnx/encoder_model_quantized.onnx`).
 // The translate step never sees the repository layout, and no renaming happens
-// after download. Both families publish the *same four filenames at the same
+// after download. Both families publish the *same five filenames at the same
 // repository paths*, so the asset list is one list, not one list per family.
 //
 // Deliberately *not* part of `model_store`: a translator is not a speech
@@ -45,11 +51,18 @@ use crate::config::{
 /// Encoder graph, inside a translator directory and inside the repository
 /// (`onnx/`). Same name for both families.
 const ENCODER_FILE: &str = "encoder_model_quantized.onnx";
-/// Merged decoder graph (prompt step and later steps in one graph), same two
-/// locations. The `decoder_with_past` variant is deliberately not used: its
-/// cached branch cannot be bootstrapped without a second graph (see
-/// `translate::Translator::run_step`).
+/// Merged decoder graph: the prompt step, and every later step as well, because
+/// one graph takes both. Same two locations.
 const DECODER_FILE: &str = "decoder_model_merged_quantized.onnx";
+/// Decoder graph for the steps *after* the prompt, the one that reads a
+/// key/value cache instead of recomputing it. Same two locations.
+///
+/// The second half of the decode. The merged graph above re-runs the whole
+/// sequence on every step, which is **O(n²) in output length**; this graph takes
+/// one token per step against the cache the merged graph returned, which is
+/// O(n). Both are published for both families, and the split is the same one
+/// `whisper_core` runs — see `translate::Translator::run_cached_step`.
+const DECODER_WITH_PAST_FILE: &str = "decoder_with_past_model_quantized.onnx";
 /// Tokenizer, at the repository root.
 const TOKENIZER_FILE: &str = "tokenizer.json";
 /// The export's `config.json`, also at the repository root. Under a KiB, and the
@@ -57,16 +70,21 @@ const TOKENIZER_FILE: &str = "tokenizer.json";
 /// and its opening and stopping token ids.
 const CONFIG_FILE: &str = "config.json";
 
-/// The four files every translator needs, as `(repo path, file name)`. The
+/// The five files every translator needs, as `(repo path, file name)`. The
 /// repository nests the graphs under `onnx/` and keeps the tokenizer and the
 /// config at the root; on disk all are flat. One file set for **both** families,
 /// which is why it is a constant and not a per-family list: `Xenova` publishes
-/// `onnx/encoder_model_quantized.onnx` and
-/// `onnx/decoder_model_merged_quantized.onnx` under `opus-mt-pl-en` and under
+/// `onnx/encoder_model_quantized.onnx`,
+/// `onnx/decoder_model_merged_quantized.onnx` and
+/// `onnx/decoder_with_past_model_quantized.onnx` under `opus-mt-pl-en` and under
 /// `nllb-200-distilled-600M` alike.
 const ASSETS: &[(&str, &str)] = &[
     ("onnx/encoder_model_quantized.onnx", ENCODER_FILE),
     ("onnx/decoder_model_merged_quantized.onnx", DECODER_FILE),
+    (
+        "onnx/decoder_with_past_model_quantized.onnx",
+        DECODER_WITH_PAST_FILE,
+    ),
     ("tokenizer.json", TOKENIZER_FILE),
     ("config.json", CONFIG_FILE),
 ];
@@ -105,44 +123,155 @@ pub(crate) const CATALOG: &[TranslatorPair] = &[
     // the primary path, and `--translate` into any other language from Polish
     // fails with the valid targets named rather than silently mistranslating --
     // unless the run names `nllb-200-distilled-600M`, which can.
-    TranslatorPair { src: "pl", tgt: "en" },
+    TranslatorPair {
+        src: "pl",
+        tgt: "en",
+    },
     // The `--language auto` fallback: many supported sources into English.
-    TranslatorPair { src: "mul", tgt: "en" },
-    TranslatorPair { src: "de", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "de" },
-    TranslatorPair { src: "fr", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "fr" },
-    TranslatorPair { src: "es", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "es" },
-    TranslatorPair { src: "it", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "it" },
-    TranslatorPair { src: "uk", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "uk" },
-    TranslatorPair { src: "ru", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "ru" },
-    TranslatorPair { src: "cs", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "cs" },
-    TranslatorPair { src: "nl", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "nl" },
-    TranslatorPair { src: "sv", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "sv" },
-    TranslatorPair { src: "da", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "da" },
-    TranslatorPair { src: "tr", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "hu" },
-    TranslatorPair { src: "en", tgt: "fi" },
-    TranslatorPair { src: "et", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "zh" },
-    TranslatorPair { src: "zh", tgt: "en" },
-    TranslatorPair { src: "ja", tgt: "en" },
-    TranslatorPair { src: "ko", tgt: "en" },
-    TranslatorPair { src: "ar", tgt: "en" },
-    TranslatorPair { src: "en", tgt: "ar" },
-    TranslatorPair { src: "hi", tgt: "en" },
-    TranslatorPair { src: "th", tgt: "en" },
-    TranslatorPair { src: "vi", tgt: "en" },
-    TranslatorPair { src: "af", tgt: "en" },
-    TranslatorPair { src: "id", tgt: "en" },
+    TranslatorPair {
+        src: "mul",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "de",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "de",
+    },
+    TranslatorPair {
+        src: "fr",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "fr",
+    },
+    TranslatorPair {
+        src: "es",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "es",
+    },
+    TranslatorPair {
+        src: "it",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "it",
+    },
+    TranslatorPair {
+        src: "uk",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "uk",
+    },
+    TranslatorPair {
+        src: "ru",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "ru",
+    },
+    TranslatorPair {
+        src: "cs",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "cs",
+    },
+    TranslatorPair {
+        src: "nl",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "nl",
+    },
+    TranslatorPair {
+        src: "sv",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "sv",
+    },
+    TranslatorPair {
+        src: "da",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "da",
+    },
+    TranslatorPair {
+        src: "tr",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "hu",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "fi",
+    },
+    TranslatorPair {
+        src: "et",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "zh",
+    },
+    TranslatorPair {
+        src: "zh",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "ja",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "ko",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "ar",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "en",
+        tgt: "ar",
+    },
+    TranslatorPair {
+        src: "hi",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "th",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "vi",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "af",
+        tgt: "en",
+    },
+    TranslatorPair {
+        src: "id",
+        tgt: "en",
+    },
 ];
 
 /// The multilingual export: one repository, every direction.
@@ -236,27 +365,28 @@ pub(crate) fn spec_for(pair: &TranslatorPair) -> String {
 /// Which HF organization an export is published under. Both families are
 /// converted by the same publisher, which is why one `ASSETS` list serves both.
 fn repo_of(spec: &str) -> &'static str {
-    if spec == NLLB_SPEC { NLLB_REPO } else { OPUS_MT_REPO }
+    if spec == NLLB_SPEC {
+        NLLB_REPO
+    } else {
+        OPUS_MT_REPO
+    }
 }
 
 /// Where one repository is fetched from. `resolve/main` rather than `main` so a
 /// spec pinned to a revision upstream resolves.
 fn repo_base(spec: &str) -> String {
-    format!("https://huggingface.co/{}/{spec}/resolve/main/", repo_of(spec))
-}
-
-/// The repository one spec lives in: the spec is the repository name, so this is
-/// the same string `repo_base` builds.
-fn repo_for(spec: &str) -> String {
-    repo_base(spec)
+    format!(
+        "https://huggingface.co/{}/{spec}/resolve/main/",
+        repo_of(spec)
+    )
 }
 
 /// Where a published file of `spec` is fetched from.
 ///
-/// The one place a download URL is built, so a token in [`ASSETS`] and the URL it
-/// resolves to cannot drift apart.
+/// `repo_base` and the asset's repository path, in one place, so a token in
+/// [`ASSETS`] and the URL it resolves to cannot drift apart.
 fn asset_url(spec: &str, repo_path: &str) -> String {
-    format!("{}{repo_path}", repo_for(spec))
+    format!("{}{repo_path}", repo_base(spec))
 }
 
 /// Which model family an export belongs to, read out of its `config.json`.
@@ -292,21 +422,21 @@ impl Family {
 
     /// Longest run of tokens a translation decode may emit before it is cut off.
     ///
-    /// A repetition-loop guard, not a quality limit — a translated sentence is a
-    /// sentence or two. It is small because of *how* the decode runs: the merged
-    /// export's cached branch cannot be bootstrapped, so `use_cache_branch` is
-    /// `false` on every step and each step re-runs the decoder over the whole
-    /// sequence (see `translate::Translator::run_step`). That is **O(n²) in output
-    /// length**, and the per-step cost scales with the family's decoder width, so
-    /// the same cap is not the same cost twice.
+    /// A repetition-loop guard, not a quality limit and not a cost limit — a
+    /// translated sentence is a sentence or two. It is small because a repetition
+    /// loop is the one way a greedy decode runs away, and the decode is otherwise
+    /// **O(n) in output length**: the prompt step fills a key/value cache and every
+    /// step after it adds one token (see `translate::Translator::run_cached_step`).
+    /// So this is a bound on how much work one utterance can ask for, not the thing
+    /// keeping a quadratic tail in check — the single-graph form that needed a
+    /// per-family cap for that is gone.
     ///
-    /// Marian is 6 layers of `d_model` 512: measured 61–150 ms per utterance on
-    /// four threads for the 6–14 tokens a sentence takes, and 96 keeps the
-    /// quadratic tail inside a second. NLLB is 12 layers of `d_model` 1024 — four
-    /// times the arithmetic per step — so 96 would extrapolate to roughly two
-    /// minutes on one utterance. 48 puts a runaway at about 10 s, inside the
-    /// 15 s translation-drain deadline, and still covers a sentence with no
-    /// terminator in it, which is what `translate::split_sentences` hands over.
+    /// It stays per family anyway, because the two decoders cost different amounts
+    /// per step: Marian is 6 layers of `d_model` 512, NLLB 12 of 1024. Measured on
+    /// four threads with the cache, one sentence is 79 ms for a pair and 677 ms for
+    /// NLLB, so 96 covers a runaway in about 2 s and 48 in about 11 s. Marian's 96
+    /// also still covers a sentence with no terminator in it, which is what
+    /// `translate::split_sentences` hands over.
     pub(crate) const fn max_new_tokens(self) -> usize {
         match self {
             Self::Marian => 96,
@@ -403,8 +533,10 @@ pub(crate) struct TranslatorRef {
     pub(crate) dir: PathBuf,
     /// Encoder graph inside `dir`.
     pub(crate) encoder: PathBuf,
-    /// Merged decoder graph inside `dir`.
+    /// Merged decoder graph inside `dir`: the prompt step.
     pub(crate) decoder: PathBuf,
+    /// Cached decoder graph inside `dir`: every step after the prompt.
+    pub(crate) decoder_with_past: PathBuf,
     /// Tokenizer inside `dir`.
     pub(crate) tokenizer: PathBuf,
     /// The export's `config.json` inside `dir`.
@@ -412,6 +544,40 @@ pub(crate) struct TranslatorRef {
     /// `(repo path, file name)` pairs to fetch when missing. Empty for a
     /// user-supplied directory, which is validated but never downloaded into.
     pub(crate) assets: Vec<(&'static str, &'static str)>,
+}
+
+impl TranslatorRef {
+    /// The five files of a translator, named inside `dir`.
+    ///
+    /// One constructor for all three ways a reference is built — a catalog pair,
+    /// the multilingual spec, and a directory the user pointed at — because the
+    /// five file names and the four path joins are the same in every one of them
+    /// and only `spec`, the direction and the asset list differ. Written out
+    /// three times, a fifth file would have reached two of them.
+    ///
+    /// `src`/`tgt` are empty for a spec or directory that names no pair: the
+    /// direction is not a property of those weights, and filling them in would
+    /// put a lie in the log line that prints them.
+    fn in_dir(
+        dir: PathBuf,
+        spec: String,
+        src: &str,
+        tgt: &str,
+        assets: &[(&'static str, &'static str)],
+    ) -> Self {
+        Self {
+            encoder: dir.join(ENCODER_FILE),
+            decoder: dir.join(DECODER_FILE),
+            decoder_with_past: dir.join(DECODER_WITH_PAST_FILE),
+            tokenizer: dir.join(TOKENIZER_FILE),
+            config: dir.join(CONFIG_FILE),
+            dir,
+            assets: assets.to_vec(),
+            spec,
+            src: src.to_string(),
+            tgt: tgt.to_string(),
+        }
+    }
 }
 
 /// A translator, resolved, downloaded **and read**: where its files are, and what
@@ -474,9 +640,12 @@ fn is_flores_code(code: &str) -> bool {
     // refuses `POL_LATN` — which `token_to_id` would not resolve anyway, so letting
     // it through would trade a clear error for a bare "no such token".
     let lower = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_lowercase());
-    let capitalised =
-        |s: &str| s.len() == 4 && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_lowercase())
-            && s.starts_with(|c: char| c.is_ascii_uppercase());
+    let capitalised = |s: &str| {
+        s.len() == 4
+            && s.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_lowercase())
+            && s.starts_with(|c: char| c.is_ascii_uppercase())
+    };
     lower(iso3, 3) && capitalised(script)
 }
 
@@ -556,10 +725,10 @@ const NLLB_CODES: &[(&str, &str)] = &[
 /// [`is_flores_code`] for why an unknown code must not reach the vocabulary.
 fn nllb_code(code: &str) -> Option<String> {
     let trimmed = code.trim();
-    if let Some((_, flores)) = NLLB_CODES
-        .iter()
-        .find(|(iso, _)| *iso == normalize_nllb(trimmed))
-    {
+    // Normalized once, not once per row: the table is 44 rows and the
+    // normalization allocates.
+    let lower = normalize_nllb(trimmed);
+    if let Some((_, flores)) = NLLB_CODES.iter().find(|(iso, _)| *iso == lower) {
         return Some((*flores).to_string());
     }
     // The verbatim path keeps its **case**: FLORES spells the script in capitals
@@ -609,21 +778,11 @@ fn unknown_nllb(code: &str, flag: &str) -> anyhow::Error {
     )
 }
 
-/// Build the reference for a catalog pair.
+/// Build the reference for a catalog pair: the pair names the direction, so
+/// `src`/`tgt` are the catalog's own codes.
 fn ref_for(pair: &TranslatorPair) -> TranslatorRef {
     let spec = spec_for(pair);
-    let dir = translator_dir(&spec);
-    TranslatorRef {
-        encoder: dir.join(ENCODER_FILE),
-        decoder: dir.join(DECODER_FILE),
-        tokenizer: dir.join(TOKENIZER_FILE),
-        config: dir.join(CONFIG_FILE),
-        dir,
-        assets: ASSETS.to_vec(),
-        spec,
-        src: pair.src.to_string(),
-        tgt: pair.tgt.to_string(),
-    }
+    TranslatorRef::in_dir(translator_dir(&spec), spec, pair.src, pair.tgt, ASSETS)
 }
 
 /// Build the reference for a multilingual spec.
@@ -631,18 +790,7 @@ fn ref_for(pair: &TranslatorPair) -> TranslatorRef {
 /// No `src`/`tgt`: the direction is not a property of these weights, and filling
 /// them in would put a lie in the log line that prints them.
 fn multilingual_ref(spec: &str) -> TranslatorRef {
-    let dir = translator_dir(spec);
-    TranslatorRef {
-        encoder: dir.join(ENCODER_FILE),
-        decoder: dir.join(DECODER_FILE),
-        tokenizer: dir.join(TOKENIZER_FILE),
-        config: dir.join(CONFIG_FILE),
-        dir,
-        assets: ASSETS.to_vec(),
-        spec: spec.to_string(),
-        src: String::new(),
-        tgt: String::new(),
-    }
+    TranslatorRef::in_dir(translator_dir(spec), spec.to_string(), "", "", ASSETS)
 }
 
 /// Resolve a source and a target language into a pair translator. A pair the
@@ -679,9 +827,7 @@ fn resolve_pair(src: &str, tgt: &str) -> Result<TranslatorRef> {
 fn pair_for_spec(spec: &str) -> Option<&'static TranslatorPair> {
     let rest = spec.strip_prefix("opus-mt-")?;
     let (src, tgt) = rest.split_once('-')?;
-    CATALOG
-        .iter()
-        .find(|p| p.src == src && p.tgt == tgt)
+    pair_for(src, tgt)
 }
 
 /// Resolve a `--translate-model` value: a directory path (contains a path
@@ -693,7 +839,8 @@ pub(crate) fn resolve(input: &str) -> Result<TranslatorRef> {
         anyhow::bail!(
             "empty --translate-model value; expected a translator spec \
              (e.g. {TRANSLATE_EXAMPLE_PAIR}, {NLLB_SPEC}) or a directory holding \
-             {ENCODER_FILE}, {DECODER_FILE}, {TOKENIZER_FILE} and {CONFIG_FILE}"
+             {ENCODER_FILE}, {DECODER_FILE}, {DECODER_WITH_PAST_FILE}, \
+             {TOKENIZER_FILE} and {CONFIG_FILE}"
         );
     }
     if trimmed.contains('/') || trimmed.contains('\\') {
@@ -706,22 +853,17 @@ pub(crate) fn resolve(input: &str) -> Result<TranslatorRef> {
         }
         // A user directory names no catalog pair, so the codes are empty: the
         // direction is a property of the weights, and sttd does not read a
-        // direction out of a directory name.
-        return Ok(TranslatorRef {
-            spec: dir
-                .file_name()
+        // direction out of a directory name. Its own name is the identity.
+        return Ok(TranslatorRef::in_dir(
+            dir.clone(),
+            dir.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| trimmed.to_string()),
-            src: String::new(),
-            tgt: String::new(),
-            encoder: dir.join(ENCODER_FILE),
-            decoder: dir.join(DECODER_FILE),
-            tokenizer: dir.join(TOKENIZER_FILE),
-            config: dir.join(CONFIG_FILE),
-            dir,
-            assets: Vec::new(),
-        });
+            "",
+            "",
+            &[],
+        ));
     }
     let spec = normalize(trimmed);
     // `nllb-200-distilled-600M` is matched case-insensitively so a spec typed in
@@ -741,7 +883,13 @@ pub(crate) fn resolve(input: &str) -> Result<TranslatorRef> {
 }
 
 /// Every file a translator directory must hold.
-const REQUIRED_FILES: [&str; 4] = [ENCODER_FILE, DECODER_FILE, TOKENIZER_FILE, CONFIG_FILE];
+const REQUIRED_FILES: [&str; 5] = [
+    ENCODER_FILE,
+    DECODER_FILE,
+    DECODER_WITH_PAST_FILE,
+    TOKENIZER_FILE,
+    CONFIG_FILE,
+];
 
 /// The first required file that is not in `dir`, or `None` when the directory is
 /// a complete translator.
@@ -850,8 +998,8 @@ fn read_config(t: &TranslatorRef) -> Result<ModelFacts> {
             shape.heads
         );
     }
-    let d_model = usize::try_from(field("d_model")?)
-        .map_err(|_| bad("d_model that fits a usize"))?;
+    let d_model =
+        usize::try_from(field("d_model")?).map_err(|_| bad("d_model that fits a usize"))?;
     if d_model % shape.heads != 0 {
         anyhow::bail!(
             "{} declares d_model {d_model} over {} heads; the head width would not be a whole number",
@@ -985,8 +1133,6 @@ pub(crate) fn prepare_from_direction(direction: Direction<'_>) -> Result<Prepare
     finish(reference, direction)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,7 +1160,7 @@ mod tests {
         dir
     }
 
-    const ALL_FILES: [&str; 4] = REQUIRED_FILES;
+    const ALL_FILES: [&str; 5] = REQUIRED_FILES;
 
     /// `opus-mt-pl-en`'s own numbers, as literals. What sttd compiles in is only
     /// the *absence* of these; the values arrive from the file.
@@ -1047,6 +1193,11 @@ mod tests {
             assert_eq!(t.dir, translator_dir(&t.spec));
             assert_eq!(t.encoder, translator_dir(&t.spec).join(ENCODER_FILE));
             assert_eq!(t.decoder, translator_dir(&t.spec).join(DECODER_FILE));
+            assert_eq!(
+                t.decoder_with_past,
+                translator_dir(&t.spec).join(DECODER_WITH_PAST_FILE),
+                "the cached decoder is fetched like the other two graphs"
+            );
             assert_eq!(t.tokenizer, translator_dir(&t.spec).join(TOKENIZER_FILE));
             assert_eq!(t.assets, ASSETS.to_vec(), "one file set per pair");
             // The spec round-trips back to the same row, so a directory name
@@ -1061,20 +1212,20 @@ mod tests {
         let pair = pair_for("pl", "en").expect("pl-en is in the catalog");
         assert_eq!(spec_for(pair), "opus-mt-pl-en");
         assert_eq!(
-            repo_for(&spec_for(pair)),
+            repo_base(&spec_for(pair)),
             "https://huggingface.co/Xenova/opus-mt-pl-en/resolve/main/"
         );
         // Each pair is its own repository, so two pairs never share one.
         assert_ne!(
-            repo_for(&spec_for(pair)),
-            repo_for(&spec_for(
+            repo_base(&spec_for(pair)),
+            repo_base(&spec_for(
                 pair_for("de", "en").expect("de-en is in the catalog")
             ))
         );
         // The multilingual export lives in the same publisher, so it resolves too,
         // and it is not a pair: no `opus-mt-` prefix, and nothing to split.
         assert_eq!(
-            repo_for(NLLB_SPEC),
+            repo_base(NLLB_SPEC),
             "https://huggingface.co/Xenova/nllb-200-distilled-600M/resolve/main/"
         );
         assert!(pair_for_spec(NLLB_SPEC).is_none());
@@ -1098,6 +1249,10 @@ mod tests {
             assert_eq!(
                 asset_url(spec, "onnx/decoder_model_merged_quantized.onnx"),
                 format!("{base}onnx/decoder_model_merged_quantized.onnx")
+            );
+            assert_eq!(
+                asset_url(spec, "onnx/decoder_with_past_model_quantized.onnx"),
+                format!("{base}onnx/decoder_with_past_model_quantized.onnx")
             );
             assert_eq!(
                 asset_url(spec, "tokenizer.json"),
@@ -1139,7 +1294,10 @@ mod tests {
             .to_string();
         assert!(err.contains("en -> pt"), "err={err}");
         let targets = valid_targets("en");
-        assert!(targets.contains("de") && targets.contains("zh"), "{targets}");
+        assert!(
+            targets.contains("de") && targets.contains("zh"),
+            "{targets}"
+        );
         let listed: Vec<&str> = targets.split(", ").collect();
         let mut sorted = listed.clone();
         sorted.sort_unstable();
@@ -1255,9 +1413,16 @@ mod tests {
         // Matched case-insensitively, but the *canonical* spelling is what names
         // the repository and the directory: the lowercased match value is not
         // reused for either.
-        for typed in ["nllb-200-distilled-600M", "NLLB-200-DISTILLED-600M", "  nllb-200-distilled-600m "] {
+        for typed in [
+            "nllb-200-distilled-600M",
+            "NLLB-200-DISTILLED-600M",
+            "  nllb-200-distilled-600m ",
+        ] {
             let t = resolve(typed).unwrap_or_else(|e| panic!("{typed:?}: {e}"));
-            assert_eq!(t.spec, NLLB_SPEC, "{typed:?} must normalize to the canonical spec");
+            assert_eq!(
+                t.spec, NLLB_SPEC,
+                "{typed:?} must normalize to the canonical spec"
+            );
             assert_eq!(t.dir, translator_dir(NLLB_SPEC), "{typed:?}");
         }
     }
@@ -1377,7 +1542,12 @@ mod tests {
         for (iso, flores) in NLLB_CODES {
             assert_eq!(
                 tokenizer.token_to_id(flores),
-                Some(tokenizers::Tokenizer::from_file(&path).unwrap().token_to_id(flores).unwrap()),
+                Some(
+                    tokenizers::Tokenizer::from_file(&path)
+                        .unwrap()
+                        .token_to_id(flores)
+                        .unwrap()
+                ),
                 "{iso} maps to {flores}, which the model must have"
             );
             assert!(
@@ -1439,7 +1609,16 @@ mod tests {
             assert_eq!(nllb_code(code).as_deref(), Some(code));
         }
         // And anything else is refused rather than handed to the vocabulary.
-        for bad in ["pl_PL", "aut", "klingon", "pol", "pol_Latin", "POL_LATN", "12", ""] {
+        for bad in [
+            "pl_PL",
+            "aut",
+            "klingon",
+            "pol",
+            "pol_Latin",
+            "POL_LATN",
+            "12",
+            "",
+        ] {
             assert_eq!(nllb_code(bad), None, "{bad:?} must not resolve");
         }
         // `normalize` would fold the separator away; the NLLB path must not.
@@ -1456,8 +1635,19 @@ mod tests {
             assert!(is_flores_code(good), "{good} must be accepted");
         }
         for bad in [
-            "pl", "pol", "pol_latn2", "pol_Latn2", "POL_LATN", "pol-Latn", "pol_Latin", "pol_Lat",
-            "pol_Latnn", "polx_Latn", "12_Latn", "_Latn", "pol_",
+            "pl",
+            "pol",
+            "pol_latn2",
+            "pol_Latn2",
+            "POL_LATN",
+            "pol-Latn",
+            "pol_Latin",
+            "pol_Lat",
+            "pol_Latnn",
+            "polx_Latn",
+            "12_Latn",
+            "_Latn",
+            "pol_",
         ] {
             assert!(!is_flores_code(bad), "{bad} must not be accepted");
         }
@@ -1509,7 +1699,9 @@ mod tests {
             "a FLORES code must keep its script capitals or token_to_id finds nothing"
         );
         assert!(
-            NLLB_CODES.iter().all(|(iso, _)| iso == &iso.to_ascii_lowercase()),
+            NLLB_CODES
+                .iter()
+                .all(|(iso, _)| iso == &iso.to_ascii_lowercase()),
             "the ISO half is spelled lowercase throughout"
         );
     }
@@ -1521,9 +1713,7 @@ mod tests {
         let pol_en = |src: Option<&str>, tgt: &str| nllb_codes(Direction { src, tgt });
         // `anyhow::Error` is not `PartialEq`, so a success is compared by value and
         // a failure by its message.
-        let codes = |src: Option<&str>, tgt: &str| {
-            pol_en(src, tgt).map_err(|e| e.to_string())
-        };
+        let codes = |src: Option<&str>, tgt: &str| pol_en(src, tgt).map_err(|e| e.to_string());
         assert_eq!(
             codes(Some("pl"), "en"),
             Ok(("pol_Latn".to_string(), "eng_Latn".to_string()))
@@ -1535,9 +1725,14 @@ mod tests {
         );
         // `--language auto` is the one case with no answer: the source is unknown
         // per utterance and this model is told which way to go.
-        let err = pol_en(None, "en").expect_err("auto has no source").to_string();
+        let err = pol_en(None, "en")
+            .expect_err("auto has no source")
+            .to_string();
         assert!(err.contains("--language"), "err={err}");
-        assert!(err.contains("--translate-model"), "the way out is named: {err}");
+        assert!(
+            err.contains("--translate-model"),
+            "the way out is named: {err}"
+        );
         // An unknown target is `--translate`'s to fix, and the message says so.
         let err = pol_en(Some("pl"), "klingon")
             .expect_err("an unknown target must be refused")
@@ -1570,6 +1765,7 @@ mod tests {
         );
         assert_eq!(t.encoder, dir.join(ENCODER_FILE));
         assert_eq!(t.decoder, dir.join(DECODER_FILE));
+        assert_eq!(t.decoder_with_past, dir.join(DECODER_WITH_PAST_FILE));
         assert_eq!(t.tokenizer, dir.join(TOKENIZER_FILE));
         assert!(t.assets.is_empty(), "a path is validated, never fetched");
         assert!(
@@ -1590,7 +1786,10 @@ mod tests {
         assert_eq!(prepared.facts.start_token, 63429);
         assert_eq!(prepared.facts.eos_token, 0);
         assert_eq!(prepared.facts.pad_token, Some(63429));
-        assert!(prepared.codes.is_none(), "a pair export has no codes to pass");
+        assert!(
+            prepared.codes.is_none(),
+            "a pair export has no codes to pass"
+        );
 
         // A directory missing its decoder is not a translator: refused at
         // resolution, before anything is opened, with the file named.
@@ -1599,6 +1798,17 @@ mod tests {
             .expect_err("a directory without a decoder graph is not a translator")
             .to_string();
         assert!(err.contains(DECODER_FILE), "err={err}");
+
+        // The cached decoder is required too, and that is a real cost of running a
+        // decode through two graphs: a directory holding the other four files is no
+        // longer a translator. Refused by name, the same way, rather than loading
+        // and failing on a missing session.
+        std::fs::write(dir.join(DECODER_FILE), b"x").unwrap();
+        std::fs::remove_file(dir.join(DECODER_WITH_PAST_FILE)).unwrap();
+        let err = resolve(dir.to_str().unwrap())
+            .expect_err("a directory without the cached decoder is not a translator")
+            .to_string();
+        assert!(err.contains(DECODER_WITH_PAST_FILE), "err={err}");
 
         // Neither is a directory with an empty one in it, nor one that does not
         // exist.

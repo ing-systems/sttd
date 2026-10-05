@@ -96,12 +96,13 @@ machine translation (as a name for the step)
 
 **Translator**:
 The loaded, ready-to-run translation model a transcript is handed to when the
-translation step runs — two `ort` sessions (encoder plus merged decoder) and its
-tokenizer, chosen once at startup and fixed for the process's lifetime. It is not
-a speech model: it never sees audio, and it is stored beside the models rather
-than inside them, so the model catalog cannot name one. A pair translator is small
-(~114 MiB) and fast; a multilingual one is neither. A long or technical piece of
-text translates worse than a short sentence either way.
+translation step runs — three `ort` sessions (the encoder, the merged decoder for
+the prompt step and the cached decoder for the rest) and its tokenizer, chosen once
+at startup and fixed for the process's lifetime. It is not a speech model: it
+never sees audio, and it is stored beside the models rather than inside them, so
+the model catalog cannot name one. A pair translator is small (~165 MiB) and fast;
+a multilingual one is neither. A long or technical piece of text translates worse
+than a short sentence either way.
 _Avoid_: model (bare), speech model, engine (that is a speech engine),
 translation model (that is the weights, not the loaded one)
 
@@ -141,10 +142,13 @@ _Avoid_: locale, lang tag, language (bare — that is what the code names)
 **Translation thread**:
 The thread a transcript is handed to for translation, between the ASR worker and
 the emitter. Off the worker on purpose: translation is 60 to 130 ms of CPU for a
-pair translator and ~800 ms for a multilingual one, against the worker's 50 ms of
+pair translator and ~700 ms for a multilingual one, against the worker's 50 ms of
 inference — so it is not work to put in the gap between utterances. Its queue is a
 bounded FIFO, oldest dropped first — unlike speech, a backlog of translations is
-work in order rather than something stale.
+work in order rather than something stale. Shutdown drains it: the trailing
+utterance is translated rather than dropped, and what bounds the wait is the
+decode's own token cap rather than a deadline, because a flag cannot interrupt a
+translation already running.
 _Avoid_: translation worker, translator thread, async translation
 
 **Voice**:
@@ -270,6 +274,18 @@ graphs keep this split — one runs the prompt and produces it, the other runs
 each later token off it. Parakeet has no counterpart (it decodes frame by frame
 with no attention cache).
 _Avoid_: KV cache (fine as a term, but the split is the point), hidden state
+
+**Decoder cache**:
+The same two halves for a **translator**, over the same two graphs and for the
+same reason: a merged decoder re-runs the whole prefix — and all the
+cross-attention over the source sentence — for every token it emits, which is
+O(n²) in output length. The prompt step runs the merged graph and fills the
+cache; every later step runs the cached graph on one token. The cross half is
+written once per utterance and the self half once per token, which is why a
+cached step is cheap and a single-graph one is not. Measured: 79 ms for a Marian
+pair, 677 ms for a multilingual one, per short sentence.
+_Avoid_: speech cache (that is Whisper's), prompt cache, attention cache
+(the split is the point)
 
 **Model branch**:
 The signal path that gets transcribed, kept raw and undenoised, because the

@@ -11,12 +11,32 @@
 //
 // Four parts live in this file. The pure half (`split_sentences`,
 // `fallback_or_translated`, `patched_value`, `next_token`) needs no weights, so
-// it is unit-tested without a model. `Translator` owns the two `ort` sessions and
-// the tokenizer. `TranslationOut` is the thread the translator runs on, with a
+// it is unit-tested without a model. `Translator` owns the three `ort` sessions
+// and the tokenizer. `TranslationOut` is the thread the translator runs on, with a
 // bounded FIFO in front of it so a translation never stalls the next decode.
 //
-// Two model families run through those same two graphs, and they differ in
-// exactly two places, both of them **inputs**:
+// **The decode is two graphs, and why is the one thing here worth reading.** The
+// export ships a merged decoder and a `decoder_with_past` one. A single graph
+// cannot do both halves of a seq2seq decode, because the graph that computes the
+// cross-attention keys is not the graph that reads them back:
+//
+// * The **prompt step** runs the merged graph. It takes `encoder_hidden_states`,
+//   opens the decoder on the family's opening ids, and — this is the part that is
+//   measured rather than assumed — returns the key/value cache under `present.`
+//   even with `use_cache_branch` false. `true` cannot: that branch fails on an
+//   empty past with `encoder_attn/Reshape_4 ... The dimension with value zero
+//   exceeds the dimension size of the input tensor`.
+// * Every **later step** runs the cached graph, one token at a time against the
+//   cache. It takes no `encoder_hidden_states` and no cache flag, because the
+//   cross-attention half travels inside the cache, and it returns the self half
+//   only.
+//
+// So the decode is **O(n) in output length** instead of the O(n²) a single graph
+// re-running its own prefix costs, and the cross-attention keys and values are
+// computed once per utterance rather than once per token.
+//
+// Two model families run through those same graphs, and they differ in exactly
+// two places, both of them **inputs**:
 //
 // * A MarianMT pair export takes raw text and opens its decoder on
 //   `decoder_start_token_id`, because the weights already only do one direction.
@@ -32,11 +52,12 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
+use ndarray17::{ArrayD, ArrayViewD};
 use ort::session::Session;
 use ort::session::SessionInputValue;
 use ort::value::{Tensor, TensorRef, ValueType};
@@ -47,13 +68,21 @@ use crate::emit::{Emission, Emitter};
 use crate::translator_store::{Family, GraphShape, Prepared};
 
 /// The name prefix of the decoder's cache inputs. The matching outputs are the
-/// same strings under `present.`, which this decode never reads.
+/// same strings under `present.`, which [`present_name`] derives from this.
 ///
 /// A `past_key_values.N.{decoder,encoder}.{key,value}` shape, which is what
 /// names a slot: `N` walks layers and the two halves are self- and
 /// cross-attention. How many there are is the export's own
 /// [`GraphShape::cache_slots`], not a constant here.
 const PAST_PREFIX: &str = "past_key_values.";
+
+/// The two halves of a cache slot, as the export spells them inside a slot name.
+///
+/// Which attention a slot belongs to is not something sttd decides: the export
+/// names it, and reading the name is what keeps a cross-attention tensor out of a
+/// self-attention slot. Both halves are the same shape, so nothing else would.
+const SELF_SLOT: &str = ".decoder.";
+const CROSS_SLOT: &str = ".encoder.";
 
 /// Split text into the pieces that go through the model one at a time.
 ///
@@ -177,9 +206,7 @@ fn patched_value(value: &mut serde_json::Value) -> bool {
     let Some(object) = value.as_object_mut() else {
         return false;
     };
-    let null_charsmap = object
-        .get("normalizer")
-        .is_some_and(has_null_charsmap);
+    let null_charsmap = object.get("normalizer").is_some_and(has_null_charsmap);
     if null_charsmap {
         object.remove("normalizer");
     }
@@ -192,15 +219,22 @@ fn patched_value(value: &mut serde_json::Value) -> bool {
 /// dependency, so a tokenizer the build cannot read fails here rather than
 /// mid-utterance.
 fn patched_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {
-    let raw = std::fs::read_to_string(path)
+    let raw = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
+    let mut value: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
     if !value.is_object() {
         anyhow::bail!("{} is not a tokenizer object", path.display());
     }
     let patched = patched_value(&mut value);
-    let bytes = serde_json::to_vec(&value)?;
+    // Only a patched document is written back out. An unpatched one is already the
+    // bytes on disk, and a multilingual export's `tokenizer.json` is 16.5 MiB, so
+    // re-serializing it would move the whole file to arrive at the same place.
+    let bytes = if patched {
+        serde_json::to_vec(&value)?
+    } else {
+        raw
+    };
     let tokenizer = Tokenizer::from_bytes(&bytes)
         .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", path.display()))?;
     if patched {
@@ -326,7 +360,8 @@ impl Suppressed {
     }
 }
 
-/// A loaded translator: both graphs, the tokenizer, and the family's framing.
+/// A loaded translator: all three graphs, the tokenizer, and the family's
+/// framing.
 ///
 /// One `Translator` is one direction, and the direction is fixed for the life of
 /// the process, so nothing here is rebuilt per utterance. The sessions live on
@@ -339,15 +374,24 @@ pub(crate) struct Translator {
     /// and the bare spec for a directory, which names no direction at all.
     direction: String,
     encoder: Session,
+    /// The prompt step, on the merged decoder: it takes `encoder_hidden_states`,
+    /// opens the decoder on the family's opening ids, and hands back the cache
+    /// every later step reads.
     decoder: Session,
+    /// Every step after the prompt, on the cached decoder: one token against the
+    /// cache, so the cost of a step no longer grows with the output.
+    ///
+    /// A separate graph because the merged one cannot be asked for its own cache:
+    /// `use_cache_branch` is `true` only on a path that fails with an empty past
+    /// (see [`PAST_PREFIX`]), and `false` returns the cache but recomputes
+    /// everything in front of it. This graph takes the past as an input, has no
+    /// `use_cache_branch` and no `encoder_hidden_states` — the cross-attention
+    /// half travels inside the cache — and returns the self-attention half only.
+    decoder_cached: Session,
     tokenizer: Tokenizer,
     /// How this family is fed: open on the export's own start token, or wrap the
     /// source in a language code and open on the target one.
     feed: Feed,
-    /// The export's own decoder geometry, read from its `config.json`. Held here
-    /// because an empty cache tensor cannot carry a dynamic head axis, so the head
-    /// count and width have to be known before the first step.
-    shape: GraphShape,
     /// `eos_token_id` from the export's config. Where a decode stops.
     eos_token: i64,
     /// Ids the decode may never emit. See [`Suppressed`].
@@ -355,16 +399,23 @@ pub(crate) struct Translator {
     /// Longest run of tokens one decode may emit, per family. See
     /// `translator_store::Family::max_new_tokens`.
     max_new_tokens: usize,
+    /// The prompt step's cache inputs, empty: the merged graph's own
+    /// `past_key_values.*` names with the shapes the prompt sends them in. Read
+    /// at load because the graph's metadata does not change, and a step that
+    /// re-walked it would rebuild 24 or 48 names per token.
+    prompt_slots: CacheSlots,
+    /// The same for the cached graph, which is what a decode's cache is keyed by.
+    cached_slots: CacheSlots,
 }
 
 impl Translator {
-    /// Load the encoder, the merged decoder and the tokenizer.
+    /// Load the encoder, both decoder graphs and the tokenizer.
     ///
-    /// `prepared` comes from `translator_store::prepare`, so the four files are
+    /// `prepared` comes from `translator_store::prepare`, so the five files are
     /// already on disk **and the export's own `config.json` has been read**: the
     /// family, the decoder shape and the token ids all arrive as facts rather than
-    /// as placeholders a load has to second-guess. Both sessions run on the CPU
-    /// with the settings the piper voice uses: one intra-op thread count, no
+    /// as placeholders a load has to second-guess. All three sessions run on the
+    /// CPU with the settings the piper voice uses: one intra-op thread count, no
     /// parallel execution, no memory pattern.
     pub(crate) fn load(prepared: &Prepared, intra_threads: usize) -> Result<Self> {
         let r = &prepared.reference;
@@ -372,13 +423,38 @@ impl Translator {
         let tokenizer = patched_tokenizer(&r.tokenizer)?;
         let encoder = cpu_session(&r.encoder, intra_threads, "translation encoder")?;
         let decoder = cpu_session(&r.decoder, intra_threads, "translation decoder")?;
+        let decoder_cached = cpu_session(
+            &r.decoder_with_past,
+            intra_threads,
+            "cached translation decoder",
+        )?;
         require_input(&encoder, "input_ids", &r.encoder)?;
         require_input(&encoder, "attention_mask", &r.encoder)?;
         require_input(&decoder, "input_ids", &r.decoder)?;
         require_input(&decoder, "encoder_hidden_states", &r.decoder)?;
         require_input(&decoder, "encoder_attention_mask", &r.decoder)?;
         require_input(&decoder, "use_cache_branch", &r.decoder)?;
-        check_cache_inputs(&decoder, &r.decoder, &facts.shape)?;
+        // The cached graph opens one token at a time and reads the cross-attention
+        // half out of the cache, so these three are the whole of its input list.
+        require_input(&decoder_cached, "input_ids", &r.decoder_with_past)?;
+        require_input(
+            &decoder_cached,
+            "encoder_attention_mask",
+            &r.decoder_with_past,
+        )?;
+        let prompt_slots = cache_slots(&decoder, &r.decoder, &facts.shape)?;
+        let cached_slots = cache_slots(&decoder_cached, &r.decoder_with_past, &facts.shape)?;
+        // Both graphs have to name their slots the same way, or the cache the
+        // prompt fills would be fed back under names the cached graph does not
+        // declare -- which is not an error, it is a decode that reads nothing.
+        if prompt_slots.names() != cached_slots.names() {
+            anyhow::bail!(
+                "{} and {} name their cache inputs differently; the two decoders \
+                 cannot share one cache",
+                r.decoder.display(),
+                r.decoder_with_past.display(),
+            );
+        }
 
         let (feed, suppressed) = match (facts.family, &prepared.codes) {
             // A pair export: open on the id its own config publishes, and block
@@ -403,12 +479,15 @@ impl Translator {
             // written down, so a re-converted vocabulary cannot go stale.
             (Family::Nllb, Some((src_code, tgt_code))) => {
                 let token_of = |code: &str| -> Result<i64> {
-                    tokenizer.token_to_id(code).map(|id| id as i64).ok_or_else(|| {
-                        anyhow::anyhow!(
+                    tokenizer
+                        .token_to_id(code)
+                        .map(|id| id as i64)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
                             "{} has no {code:?} token; this export cannot translate that language",
                             r.spec
                         )
-                    })
+                        })
                 };
                 let added: Vec<i64> = tokenizer
                     .get_added_tokens_decoder()
@@ -443,23 +522,26 @@ impl Translator {
             None => r.spec.clone(),
         };
         log::info!(
-            "translator: {} ({direction}, CPU, no prompt, eos={}, {} cache slots, cap {} tokens)",
-            r.spec,
-            facts.eos_token,
-            facts.shape.cache_slots(),
-            facts.family.max_new_tokens(),
+            "translator: {spec} ({direction}, CPU, eos={eos}, {slots} cache slots, \
+             cap {cap} tokens, cached decode)",
+            spec = r.spec,
+            eos = facts.eos_token,
+            slots = facts.shape.cache_slots(),
+            cap = facts.family.max_new_tokens(),
         );
         Ok(Self {
             spec: r.spec.clone(),
             direction,
             encoder,
             decoder,
+            decoder_cached,
             tokenizer,
             feed,
-            shape: facts.shape,
             eos_token: facts.eos_token,
             suppressed,
             max_new_tokens: facts.family.max_new_tokens(),
+            prompt_slots,
+            cached_slots,
         })
     }
 
@@ -486,7 +568,7 @@ impl Translator {
         Ok(translated.join(" "))
     }
 
-    /// One piece through the encoder and the greedy decode.
+    /// One piece through the encoder, the prompt step and the cached decode.
     ///
     /// The framing is the family's, and it is the only place [`Feed`] is read:
     /// a pair export encodes the text as it stands, a multilingual one encodes it
@@ -496,30 +578,39 @@ impl Translator {
             .tokenizer
             .encode(piece, self.feed.adds_special_tokens())
             .map_err(|e| anyhow::anyhow!("failed to tokenize the source text: {e}"))?;
-        let mut text: Vec<i64> = encoding.get_ids().iter().map(|id| *id as i64).collect();
+        let text: Vec<i64> = encoding.get_ids().iter().map(|id| *id as i64).collect();
         // The framing counts against the budget, so the two cannot overrun it
         // between them: a 512-token piece plus a code and an `</s>` is 514 ids.
         let budget = TRANSLATE_MAX_INPUT_TOKENS.saturating_sub(self.feed.framing());
-        if text.len() > budget {
+        let text: Vec<i64> = if text.len() > budget {
             log::warn!(
                 "translator {}: piece of {} tokens cut to {budget}",
                 self.spec,
                 text.len()
             );
-            text.truncate(budget);
-        }
+            text[..budget].to_vec()
+        } else {
+            text
+        };
+        // One `match` builds the whole frame, because which ids it holds is the
+        // family's rule rather than two independent pushes.
         let mut ids: Vec<i64> = Vec::with_capacity(text.len() + self.feed.framing());
-        if let Feed::LangTagged { src, .. } = self.feed {
-            ids.push(src);
-        }
-        ids.append(&mut text);
-        if matches!(self.feed, Feed::LangTagged { .. }) {
-            // The closing `</s>` is what tells the encoder the source sentence has
-            // ended. Without it the source code in front is just another token.
-            ids.push(self.eos_token);
+        match self.feed {
+            Feed::Fixed { .. } => ids.extend_from_slice(&text),
+            Feed::LangTagged { src, .. } => {
+                ids.push(src);
+                ids.extend_from_slice(&text);
+                // The closing `</s>` is what tells the encoder the source sentence
+                // has ended. Without it the source code in front is just another
+                // token.
+                ids.push(self.eos_token);
+            }
         }
         let hidden = self.run_encoder(&ids)?;
         let enc_len = ids.len();
+        // The one attention mask both steps take, built once: the prompt step
+        // masks the encoder for the whole decode, and so does every step after it.
+        let encoder_mask = vec![1i64; enc_len];
 
         // The decoder opens on the family's opening ids and nothing else: the source
         // text reaches the model through `encoder_hidden_states` and nowhere else.
@@ -530,13 +621,16 @@ impl Translator {
         // graphs, the same ids and the same weights give correct English from
         // 63429. For a multilingual export it is `[start, target code]` — see
         // `Feed::opening`, where the two-id shape is measured against the weights.
-        let mut sequence: Vec<i64> = self.feed.opening();
-        let mut tokens: Vec<u32> = Vec::new();
-        let mut produced = 0usize;
+        //
+        // That run also fills the cache: it is the only step that can, and it is
+        // why the prompt runs on the merged graph at all.
+        let opening = self.feed.opening();
+        let (mut cache, first) = self.run_prompt_step(&opening, &hidden, &encoder_mask)?;
 
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut next = first;
+        let mut produced = 0usize;
         loop {
-            let logits = self.run_step(&sequence, &hidden, enc_len)?;
-            let next = next_token(&logits, &self.suppressed);
             if next as i64 == self.eos_token {
                 break;
             }
@@ -546,11 +640,12 @@ impl Translator {
                 log::warn!(
                     "translator {}: decode hit the {}-token cap; \
                      the translation of this piece is cut short",
-                    self.spec, self.max_new_tokens
+                    self.spec,
+                    self.max_new_tokens
                 );
                 break;
             }
-            sequence.push(next as i64);
+            next = self.run_cached_step(next as i64, &mut cache, &encoder_mask)?;
         }
         self.tokenizer
             .decode(&tokens, true)
@@ -558,7 +653,7 @@ impl Translator {
     }
 
     /// The encoder over one piece's token ids, returning its hidden states.
-    fn run_encoder(&mut self, ids: &[i64]) -> Result<ndarray17::ArrayD<f32>> {
+    fn run_encoder(&mut self, ids: &[i64]) -> Result<ArrayD<f32>> {
         let len = ids.len();
         let named: Vec<(&str, SessionInputValue<'_>)> = vec![
             (
@@ -591,38 +686,41 @@ impl Translator {
         Ok(hidden.to_owned())
     }
 
-    /// One decoder run over the whole sequence so far, returning its last logits
-    /// row.
+    /// The prompt step: the opening ids through the merged decoder, returning the
+    /// cache it filled and the first token to emit.
     ///
-    /// **The KV cache is never used, and never fed back.** `use_cache_branch` is
-    /// `false` on every run, and every `past_key_values` input goes out empty
-    /// (`[1, heads, 0, head_dim]`, read from the export's own config). The
-    /// export's `true` branch fails on every path tried:
+    /// **This is the only step that runs the merged graph, and the only one that
+    /// can fill the cache.** The merged decoder is the graph that computes the
+    /// cross-attention keys and values in the first place, and it is the graph
+    /// that takes `encoder_hidden_states`; the cached one has neither. So the
+    /// prompt runs here, and every token after it runs on `decoder_cached`.
+    ///
+    /// `use_cache_branch` is `false`, and that is what makes the run succeed *and*
+    /// hand back a cache. `true` is the branch that fails on an empty past:
     ///
     /// ```text
     /// If node 'optimum::if' ... encoder_attn/Reshape_4 ...
     /// The dimension with value zero exceeds the dimension size of the input tensor.
     /// ```
     ///
-    /// The empty past is still sent because omitting the inputs fails the same
-    /// `optimum::if` node with `No operator matching`. The consequence is that
-    /// every step re-runs the decoder over the whole sequence, which makes the
-    /// decode **O(n²) in output length**. At 6 to 14 output tokens that measures
-    /// 61 to 128 ms per utterance on four threads for a Marian pair;
-    /// `Family::max_new_tokens` is what keeps the quadratic tail bounded, and it is
-    /// per family because NLLB's decoder is four times the arithmetic per step.
-    fn run_step(
+    /// The empty past is still sent because omitting the inputs fails that same
+    /// node with `No operator matching`. The `false` branch returns the current
+    /// keys and values under `present.` — measured on both exports, and the
+    /// reason the whole split works: the cache this step fills is the one every
+    /// later step reads, so nothing is recomputed and no step grows with the
+    /// output.
+    fn run_prompt_step(
         &mut self,
-        ids: &[i64],
-        hidden: &ndarray17::ArrayD<f32>,
-        enc_len: usize,
-    ) -> ort::Result<Vec<f32>> {
-        let slots = self.empty_cache_inputs();
+        opening: &[i64],
+        hidden: &ArrayD<f32>,
+        encoder_mask: &[i64],
+    ) -> Result<(KvCache, usize)> {
+        let slots = self.prompt_slots.empty_inputs();
         let mut named: Vec<(&str, SessionInputValue<'_>)> =
-            Vec::with_capacity(slots.len() + 4);
+            Vec::with_capacity(self.prompt_slots.empty.len() + 4);
         named.push((
             "input_ids",
-            Tensor::from_array((vec![1usize, ids.len()], ids.to_vec()))?.into(),
+            Tensor::from_array((vec![1usize, opening.len()], opening.to_vec()))?.into(),
         ));
         named.push((
             "encoder_hidden_states",
@@ -630,66 +728,79 @@ impl Translator {
         ));
         named.push((
             "encoder_attention_mask",
-            Tensor::from_array((vec![1usize, enc_len], vec![1i64; enc_len]))?.into(),
+            Tensor::from_array((vec![1usize, encoder_mask.len()], encoder_mask.to_vec()))?.into(),
+        ));
+        named.push(("use_cache_branch", use_cache_branch_tensor(false)?.into()));
+        named.extend(slots);
+        let outputs = self
+            .decoder
+            .run(named)
+            .context("failed to run the translation decoder's prompt step")?;
+        let first = pick_token(&outputs, &self.suppressed, "the prompt step")?;
+        let cache = KvCache::capture(&self.cached_slots, &outputs)
+            .context("failed to capture the decoder's key/value cache")?;
+        Ok((cache, first))
+    }
+
+    /// One generated token through the cached decoder, against the cache the
+    /// prompt step filled, returning the next token to emit.
+    ///
+    /// One id in, one position of work: the tokens already emitted are in the
+    /// cache, and the cross-attention keys and values are in it too, which is why
+    /// this graph takes neither `encoder_hidden_states` nor a cache flag. The
+    /// whole decode is therefore **O(n) in output length** rather than the O(n²) a
+    /// single graph re-running its own prefix costs.
+    fn run_cached_step(
+        &mut self,
+        token: i64,
+        cache: &mut KvCache,
+        encoder_mask: &[i64],
+    ) -> Result<usize> {
+        let mut named: Vec<(&str, SessionInputValue<'_>)> = Vec::with_capacity(cache.len() + 2);
+        named.push((
+            "input_ids",
+            Tensor::from_array((vec![1usize, 1], vec![token]))?.into(),
         ));
         named.push((
-            "use_cache_branch",
-            use_cache_branch_tensor(false)?.into(),
+            "encoder_attention_mask",
+            Tensor::from_array((vec![1usize, encoder_mask.len()], encoder_mask.to_vec()))?.into(),
         ));
-        for (name, shape) in &slots {
-            let zeros = vec![0f32; shape.iter().product()];
-            named.push((name.as_str(), Tensor::from_array((shape.clone(), zeros))?.into()));
-        }
-        let outputs = self.decoder.run(named)?;
-
-        let logits = outputs
-            .get("logits")
-            .ok_or_else(|| ort::Error::new("the decoder returned no logits"))?
-            .try_extract_array::<f32>()?;
-        let shape = logits.shape().to_vec();
-        let vocab = match shape.as_slice() {
-            [1, positions, vocab] if *positions > 0 && *vocab > 0 => *vocab,
-            other => {
-                return Err(ort::Error::new(format!(
-                    "expected decoder logits [1, positions, vocab], got {other:?}"
-                )))
-            }
-        };
-        let flat = logits
-            .as_slice()
-            .ok_or_else(|| ort::Error::new("the decoder logits are not contiguous"))?;
-        Ok(flat[flat.len() - vocab..].to_vec())
+        named.extend(cache.named_inputs()?);
+        let outputs = self
+            .decoder_cached
+            .run(named)
+            .context("failed to run the translation decoder's cached step")?;
+        let next = pick_token(&outputs, &self.suppressed, "a cached step")?;
+        cache
+            .update_self(&outputs)
+            .context("failed to read the decoder's next key/value cache")?;
+        Ok(next)
     }
+}
 
-    /// The cache inputs as `(name, empty shape)` pairs, in the order the graph
-    /// declares them, so a name and its tensor cannot drift apart. How many there
-    /// are is a property of the export — 24 for a Marian pair, 48 for NLLB — and
-    /// `check_cache_inputs` has already refused a graph that disagrees with its own
-    /// config.
-    ///
-    /// The shape comes from the graph's metadata with the sequence axis set to
-    /// zero. Any axis the metadata leaves dynamic keeps the shape read from
-    /// `config.json`: a zero-length tensor cannot carry a dynamic axis, so the head
-    /// count and head width have to come from somewhere, and the export's config is
-    /// the somewhere.
-    fn empty_cache_inputs(&self) -> Vec<(String, Vec<usize>)> {
-        self.decoder
-            .inputs()
-            .iter()
-            .filter(|i| i.name().starts_with(PAST_PREFIX))
-            .map(|i| {
-                let declared = match i.dtype() {
-                    ValueType::Tensor { shape, .. } => shape
-                        .as_ref()
-                        .iter()
-                        .map(|d| if *d < 0 { None } else { Some(*d as usize) })
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
-                };
-                (i.name().to_string(), empty_cache_shape(&declared, self.shape))
-            })
-            .collect()
-    }
+/// The token a decoder run's last logits row points at.
+///
+/// The row is read in place: `try_extract_array` hands back a view into the
+/// session's own output, so copying the row out would move the whole vocabulary —
+/// 63,430 floats for a pair, 256,206 for a multilingual one — once per token to
+/// look at it a single time.
+///
+/// A free function rather than a method because a run's outputs borrow the
+/// session, and the suppressed table is a different field of the translator; the
+/// two borrows are only disjoint if neither reaches for all of `self`.
+fn pick_token(
+    outputs: &ort::session::SessionOutputs<'_>,
+    suppressed: &Suppressed,
+    what: &str,
+) -> Result<usize> {
+    let logits = outputs
+        .get("logits")
+        .ok_or_else(|| anyhow::anyhow!("{what} returned no logits"))?
+        .try_extract_array::<f32>()
+        .with_context(|| format!("{what} logits are not an f32 array"))?;
+    let (row, _vocab) =
+        last_logits_row(&logits).with_context(|| format!("{what} returned unusable logits"))?;
+    Ok(next_token(row, suppressed))
 }
 
 /// The rank of `use_cache_branch`: one axis holding one flag.
@@ -720,15 +831,12 @@ const USE_CACHE_BRANCH_SHAPE: [i64; 1] = [1];
 /// The winning id is not skipped outright: the best id that is allowed wins
 /// instead, which costs one pass over the row rather than a sort of it. A tie
 /// keeps the lower id, the rule `argmax_index` uses. A row with nothing allowed in
-/// it falls back to the plain argmax rather than inventing an id.
+/// it falls back to the plain argmax, in a second pass — which neither family
+/// ever reaches, since neither suppresses a whole row, and which is why the
+/// common case compares each logit once rather than twice.
 fn next_token(logits: &[f32], suppressed: &Suppressed) -> usize {
     let mut best: Option<(usize, f32)> = None;
-    let mut plain: Option<(usize, f32)> = None;
     for (id, &logit) in logits.iter().enumerate() {
-        // `>` on both, so a tie keeps the lower id.
-        if plain.is_none_or(|(_, top)| logit > top) {
-            plain = Some((id, logit));
-        }
         if suppressed.blocks(id) {
             continue;
         }
@@ -736,15 +844,53 @@ fn next_token(logits: &[f32], suppressed: &Suppressed) -> usize {
             best = Some((id, logit));
         }
     }
-    best.or(plain).map_or(0, |(id, _)| id)
+    if best.is_some() {
+        return best.map_or(0, |(id, _)| id);
+    }
+    argmax(logits)
+}
+
+/// The largest logit's id, the lower one on a tie. The fallback for a row that
+/// suppresses every id in it: the decode still has to produce a token it can act
+/// on rather than nothing.
+fn argmax(logits: &[f32]) -> usize {
+    let mut best: Option<(usize, f32)> = None;
+    for (id, &logit) in logits.iter().enumerate() {
+        if best.is_none_or(|(_, top)| logit > top) {
+            best = Some((id, logit));
+        }
+    }
+    best.map_or(0, |(id, _)| id)
+}
+
+/// The last logits row of a `[1, positions, vocab]` decoder output, and the row
+/// stride.
+///
+/// The final position is the one that predicts the next token; the ones before it
+/// predict tokens already chosen. `ort` hands back a dense tensor, so the row is
+/// one contiguous `vocab`-long run of the flat data. The rank is checked rather
+/// than assumed: an unexpected shape means the graph is not the one this decode
+/// was written against, and every row read off it would be silently wrong.
+fn last_logits_row<'a>(logits: &'a ArrayViewD<'a, f32>) -> Result<(&'a [f32], usize)> {
+    let shape = logits.shape();
+    let vocab = match shape {
+        [_batch, positions, vocab] if *positions > 0 && *vocab > 0 => *vocab,
+        other => {
+            anyhow::bail!("expected decoder logits [1, positions, vocab], got {other:?}")
+        }
+    };
+    let flat = logits
+        .as_slice()
+        .ok_or_else(|| anyhow::anyhow!("the decoder logits are not contiguous"))?;
+    Ok((&flat[flat.len() - vocab..], vocab))
 }
 
 /// The `use_cache_branch` flag tensor for one decoder run.
 ///
 /// Built here rather than inline at the call site because the rank is the whole
 /// point: a scalar of the right value is still the wrong tensor, and only the run
-/// itself says so. The value is always `false` (see `run_step`); the shape is
-/// what a test can check without weights.
+/// itself says so. The value is always `false` (see `run_prompt_step`); the shape
+/// is what a test can check without weights.
 fn use_cache_branch_tensor(use_cache: bool) -> ort::Result<Tensor<bool>> {
     Tensor::from_array((USE_CACHE_BRANCH_SHAPE, vec![use_cache]))
 }
@@ -819,57 +965,245 @@ fn require_input(session: &Session, name: &str, path: &std::path::Path) -> Resul
     )
 }
 
-/// Check the cache inputs at load: the export must declare exactly as many as its
-/// own `config.json` says it has layers, with no duplicates, and hold them as f32,
-/// which is the only type this decode builds.
+/// What one decoder session declares about its key/value cache, read once at load.
 ///
-/// A missing slot is worth a load-time error rather than a per-step failure: the
-/// count is a property of the export, not of the text. Nor is it a constant — a
-/// Marian pair declares 24 (6 layers x self+cross x key+value) and NLLB 48 — so it
-/// is compared against the geometry read out of the model rather than a number
-/// written here.
-fn check_cache_inputs(session: &Session, path: &std::path::Path, shape: &GraphShape) -> Result<()> {
+/// Both halves of the answer, because a decode needs both: the empty tensors the
+/// prompt step sends, and which of them a cached step replaces.
+struct CacheSlots {
+    /// `(input name, empty tensor)` in the order the graph declares its inputs.
+    /// Built at load because the graph's metadata does not change and a step that
+    /// re-walked it would rebuild 24 or 48 names per generated token.
+    empty: Vec<(String, ArrayD<f32>)>,
+    /// `(index into empty, output name)` for the self-attention slots only — the
+    /// ones a step replaces. The output name is the input name without its
+    /// `past_key_values.` prefix, so a name and the tensor read into it cannot
+    /// drift apart.
+    self_attention: Vec<(usize, String)>,
+}
+
+impl CacheSlots {
+    /// The slot names, sorted, for comparing two graphs' cache contracts.
+    fn names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.empty.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// The empty slots as named inputs, borrowed from the tensors built at load.
+    ///
+    /// Views rather than fresh tensors: a zero-length slot holds no elements, so
+    /// the only per-step cost is naming it.
+    fn empty_inputs(&self) -> impl Iterator<Item = (&str, SessionInputValue<'_>)> {
+        self.empty.iter().map(|(name, tensor)| {
+            (
+                name.as_str(),
+                TensorRef::from_array_view(tensor.view())
+                    .expect("a cache slot built here must be convertible")
+                    .into(),
+            )
+        })
+    }
+}
+
+/// The key/value cache one utterance's decode runs against: what the prompt step
+/// produced, fed back to every step after it.
+///
+/// **Two halves, and only one of them moves.** A slot is
+/// `[batch, heads, sequence, head_dim]`, and the export's own name says which
+/// attention a slot belongs to: `past_key_values.N.decoder.*` is self-attention
+/// and grows by one token per step, `past_key_values.N.encoder.*` is
+/// cross-attention and is a function of the encoder output alone. The cached
+/// decoder returns **only the self half** under `present.` — measured on both
+/// exports — because the cross half is an input it never rewrites. So the cross
+/// tensors the prompt filled are handed back unchanged for the whole decode, and
+/// reading them out of every step's output would copy the encoder's keys and
+/// values once per token for no change at all.
+///
+/// Slot order is the cached graph's own, read at load and shared with the
+/// [`CacheSlots`] that names them, so a cross-attention tensor cannot end up in a
+/// self-attention slot. That mistake would be no error: both halves are
+/// `[1, heads, n, head_dim]`, and only the transcript would show it.
+struct KvCache {
+    /// `(input name, tensor)` in slot order: per layer, the self-attention key
+    /// and value, then the cross-attention key and value.
+    slots: Vec<(String, ArrayD<f32>)>,
+    /// `(index into slots, output name)` for the self-attention slots. See
+    /// [`CacheSlots::self_attention`]; the cross half is not in it because a step
+    /// never rewrites it.
+    self_attention: Vec<(usize, String)>,
+}
+
+impl KvCache {
+    /// Both halves, read out of a prompt run's outputs by the names
+    /// [`CacheSlots`] derived from the cached graph.
+    ///
+    /// Owned rather than borrowed: the tensors belong to the session's output
+    /// borrow, and the decode outlives it. The copy is the point of caching — one
+    /// copy of the encoder's keys and values, against re-running the whole prefix
+    /// on every step.
+    fn capture(slots: &CacheSlots, outputs: &ort::session::SessionOutputs<'_>) -> Result<Self> {
+        let read = |name: &str| -> Result<ArrayD<f32>> {
+            outputs
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("the prompt step returned no {name}"))?
+                .try_extract_array::<f32>()
+                .map(|view| view.to_owned())
+                .with_context(|| format!("{name} is not an f32 array"))
+        };
+        let mut cache = KvCache {
+            slots: Vec::with_capacity(slots.empty.len()),
+            self_attention: slots.self_attention.clone(),
+        };
+        for (name, _) in &slots.empty {
+            cache.slots.push((name.clone(), read(&present_name(name))?));
+        }
+        Ok(cache)
+    }
+
+    /// How many slots this cache feeds, for sizing the step's input list.
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Every slot as a named input, in slot order, borrowed rather than rebuilt.
+    fn named_inputs(&self) -> Result<Vec<(&str, SessionInputValue<'_>)>> {
+        self.slots
+            .iter()
+            .map(|(name, tensor)| {
+                Ok((
+                    name.as_str(),
+                    TensorRef::from_array_view(tensor.view())
+                        .with_context(|| format!("{name} must be convertible"))?
+                        .into(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Replace the self-attention half from one cached run, leaving the
+    /// cross-attention half as the prompt left it.
+    ///
+    /// Only the self half is read out, and that is the whole reason this is not
+    /// `cache.slots = capture(...)`: the cross tensors are megabytes that would
+    /// be copied out of the output and back on every single token, unchanged.
+    fn update_self(&mut self, outputs: &ort::session::SessionOutputs<'_>) -> Result<()> {
+        for (index, name) in &self.self_attention {
+            self.slots[*index].1 = outputs
+                .get(name.as_str())
+                .ok_or_else(|| anyhow::anyhow!("a cached step returned no {name}"))?
+                .try_extract_array::<f32>()
+                .with_context(|| format!("{name} is not an f32 array"))?
+                .to_owned();
+        }
+        Ok(())
+    }
+}
+
+/// The name a `past_key_values.N.*` cache input is returned under: the same
+/// string without its prefix (`present.N.decoder.key`).
+///
+/// Derived from the input name rather than read off the graph's output list, which
+/// is what makes a name and the tensor stored under it one fact instead of two.
+fn present_name(input_name: &str) -> String {
+    input_name.replacen(PAST_PREFIX, "present.", 1)
+}
+
+/// Whether a cache slot is the self-attention half — the only one a cached step
+/// rewrites, and the only one a slot's name has to be read to tell apart.
+///
+/// The cross half is named too, and that is the whole point of asking: both are
+/// `[1, heads, n, head_dim]`, so a decoder key fed to an encoder slot is not a
+/// shape error, it is a translation that quietly falls apart.
+fn is_self_slot(name: &str) -> bool {
+    name.contains(SELF_SLOT)
+}
+
+/// Read one decoder session's cache contract, and refuse a graph that does not
+/// have the one this decode needs.
+///
+/// The export must declare exactly as many slots as its own `config.json` says it
+/// has layers (four per layer: a self- and a cross-attention key and value), with
+/// no duplicates, all of them f32, and it must name both halves — a session
+/// declaring only one would decode against a cache silently missing half its
+/// attention.
+///
+/// Every one of those is worth a load-time error rather than a per-step failure,
+/// because they are properties of the export rather than of the text. Nor is the
+/// count a constant: a Marian pair declares 24 and NLLB 48, so it is compared
+/// against the geometry read out of the model rather than a number written here.
+fn cache_slots(
+    session: &Session,
+    path: &std::path::Path,
+    shape: &GraphShape,
+) -> Result<CacheSlots> {
+    let mut empty: Vec<(String, ArrayD<f32>)> = Vec::new();
+    let mut self_attention: Vec<(usize, String)> = Vec::new();
+    for input in session.inputs() {
+        if !input.name().starts_with(PAST_PREFIX) {
+            continue;
+        }
+        let name = input.name().to_string();
+        let declared = match input.dtype() {
+            ValueType::Tensor { shape, ty, .. }
+                if *ty == ort::value::TensorElementType::Float32 =>
+            {
+                shape
+                    .as_ref()
+                    .iter()
+                    .map(|d| if *d < 0 { None } else { Some(*d as usize) })
+                    .collect::<Vec<_>>()
+            }
+            other => anyhow::bail!(
+                "{} holds cache input {name} of a type this decode does not build: \
+                 {other:?}",
+                path.display()
+            ),
+        };
+        // Which half a slot belongs to is read off the export's own name, so the
+        // self slots are the ones a step replaces and the cross slots the ones it
+        // leaves alone. A slot named neither is refused rather than guessed at:
+        // guessing would put an encoder key where a decoder key belongs, and both
+        // are `[1, heads, n, head_dim]`, so nothing would say so.
+        if is_self_slot(&name) {
+            self_attention.push((empty.len(), present_name(&name)));
+        } else if !name.contains(CROSS_SLOT) {
+            anyhow::bail!(
+                "{} names cache input {name} as neither self- nor cross-attention; \
+                 this decode cannot tell which half of the cache it belongs to",
+                path.display()
+            )
+        }
+        empty.push((
+            name,
+            ArrayD::from_shape_vec(empty_cache_shape(&declared, *shape), vec![])?,
+        ));
+    }
     let expected = shape.cache_slots();
-    let mut names: Vec<&str> = session
-        .inputs()
-        .iter()
-        .map(|i| i.name())
-        .filter(|n| n.starts_with(PAST_PREFIX))
-        .collect();
-    if names.len() != expected {
+    if empty.len() != expected {
         anyhow::bail!(
             "{} declares {} cache inputs, expected {expected} ({} layers)",
             path.display(),
-            names.len(),
+            empty.len(),
             shape.layers,
         );
     }
+    if self_attention.is_empty() {
+        anyhow::bail!(
+            "{} declares no self-attention cache input; a cached step would have \
+             nothing to write its keys into",
+            path.display()
+        );
+    }
+    let mut names: Vec<&str> = empty.iter().map(|(name, _)| name.as_str()).collect();
     names.sort_unstable();
     names.dedup();
     if names.len() != expected {
         anyhow::bail!("{} declares duplicate cache input names", path.display());
     }
-    for input in session.inputs() {
-        if !input.name().starts_with(PAST_PREFIX) {
-            continue;
-        }
-        let f32_tensor = matches!(
-            input.dtype(),
-            ValueType::Tensor {
-                ty: ort::value::TensorElementType::Float32,
-                ..
-            }
-        );
-        if !f32_tensor {
-            anyhow::bail!(
-                "{} holds cache input {} of a type this decode does not build; \
-                 expected f32",
-                path.display(),
-                input.name()
-            );
-        }
-    }
-    Ok(())
+    Ok(CacheSlots {
+        empty,
+        self_attention,
+    })
 }
 
 /// One accepted transcript on its way to the translation thread.
@@ -890,20 +1224,10 @@ pub(crate) struct TranslationJob {
 
 /// Bounded depth of the translation queue.
 ///
-/// Emissions are seconds apart and a translation takes 60 to 130 ms, so this
-/// never fills in practice. It is here so that a stalled or slow translator costs
-/// queued work rather than the inference thread's time.
+/// Emissions are seconds apart and a translation takes 80 to 700 ms, so this never
+/// fills in practice. It is here so that a stalled or slow translator costs queued
+/// work rather than the inference thread's time.
 pub(crate) const TRANSLATION_QUEUE_DEPTH: usize = 4;
-
-/// How long `TranslationOut::drop` waits for the queued translations to finish
-/// before cutting them off.
-///
-/// The trailing utterance has to be translated, not dropped: `--file
-/// --translate en` with the last transcript swallowed would be the channel
-/// silently losing work, and it is the same reasoning the ASR shutdown flush and
-/// `SpeechOut::drop` use. Bounded because a translator that never returns must
-/// not hang the process.
-const TRANSLATE_DRAIN_MS: u64 = 15_000;
 
 /// The translated emission: hand it a transcript, a dedicated thread translates
 /// and emits it.
@@ -924,10 +1248,6 @@ pub(crate) struct TranslationOut {
     queue: Arc<(Mutex<VecDeque<TranslationJob>>, Condvar)>,
     /// Set by `drop`, so the thread finishes the queue and exits.
     closed: Arc<AtomicBool>,
-    /// Deadline for the queued work, set by `drop`, in milliseconds since the
-    /// thread started — a monotonic `u64` rather than an `Instant` so it can
-    /// cross the thread boundary. Zero means "no deadline".
-    finish_by_ms: Arc<AtomicU64>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -947,32 +1267,19 @@ impl TranslationOut {
         let queue: Arc<(Mutex<VecDeque<TranslationJob>>, Condvar)> =
             Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let closed = Arc::new(AtomicBool::new(false));
-        let finish_by_ms = Arc::new(AtomicU64::new(0));
 
         let handle = {
-            let (queue, closed, finish_by_ms) = (
-                Arc::clone(&queue),
-                Arc::clone(&closed),
-                Arc::clone(&finish_by_ms),
-            );
+            let (queue, closed) = (Arc::clone(&queue), Arc::clone(&closed));
             std::thread::Builder::new()
                 .name("translate".into())
                 .spawn(move || {
-                    translate_loop(
-                        &queue,
-                        &closed,
-                        &finish_by_ms,
-                        translator,
-                        emitter.as_mut(),
-                        metrics,
-                    )
+                    translate_loop(&queue, &closed, translator, emitter.as_mut(), metrics)
                 })
                 .ok()
         };
         Self {
             queue,
             closed,
-            finish_by_ms,
             handle,
         }
     }
@@ -984,7 +1291,7 @@ impl TranslationOut {
     /// so the log says which transcript was lost rather than only that one was.
     pub(crate) fn enqueue(&self, job: TranslationJob) {
         let dropped = {
-            let (lock, _) = &*self.queue;
+            let (lock, wakeup) = &*self.queue;
             let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             let mut dropped = None;
             while pending.len() >= TRANSLATION_QUEUE_DEPTH {
@@ -995,6 +1302,10 @@ impl TranslationOut {
                 }
             }
             pending.push_back(job);
+            // Notified with the lock held, which is what lets the thread wait
+            // without a timeout: a notification sent after the waiter has checked
+            // the queue and before it sleeps is the one a bare `notify_all` loses.
+            wakeup.notify_all();
             dropped
         };
         if let Some(tag) = dropped {
@@ -1003,21 +1314,25 @@ impl TranslationOut {
                  oldest waiting transcript {tag} to make room"
             );
         }
-        let (_, wakeup) = &*self.queue;
-        wakeup.notify_all();
     }
 }
 
 impl Drop for TranslationOut {
     fn drop(&mut self) {
-        // Give the thread a deadline, then close the queue: it finishes what is
-        // waiting and exits, and `join` waits for that. Without the deadline a
-        // translator that never returns would hang the process on `--stop`.
-        self.finish_by_ms
-            .store(TRANSLATE_DRAIN_MS, Ordering::Release);
+        // Close the queue, then join: the thread finishes what is waiting and
+        // exits, and the join is what waits for that. No more jobs can arrive,
+        // since the only producer is the ASR worker holding this value.
         self.closed.store(true, Ordering::Release);
-        let (_, wakeup) = &*self.queue;
-        wakeup.notify_all();
+        {
+            let (lock, wakeup) = &*self.queue;
+            // The lock is taken and released only to be sure the flag is visible
+            // before the wakeup, which is what `enqueue` does too: a notification
+            // sent between the thread's check of the queue and its sleep is the one
+            // a bare `notify_all` loses, and holding the lock across both is what
+            // rules that out.
+            drop(lock.lock().unwrap_or_else(|e| e.into_inner()));
+            wakeup.notify_all();
+        }
         if let Some(handle) = self.handle.take() {
             if handle.join().is_err() {
                 log::warn!("translation thread panicked");
@@ -1028,35 +1343,34 @@ impl Drop for TranslationOut {
 
 /// One thread's whole job: take the oldest pending transcript, translate it,
 /// write its metrics row, emit it, repeat until closed and empty.
+///
+/// The trailing utterance is translated, not dropped: `--file --translate en` with
+/// the last transcript swallowed would be the channel silently losing work, and it
+/// is the same reasoning the ASR shutdown flush and `SpeechOut::drop` use. So
+/// `closed` ends the loop only once the queue is empty.
+///
+/// The wait is therefore unbounded on purpose, and what bounds the shutdown is
+/// the work itself: a piece's decode stops at
+/// [`translator_store::Family::max_new_tokens`] tokens, so the drain is bounded by
+/// the queue depth and the transcript's length. A wall-clock deadline would have
+/// to interrupt a translation already in flight to be any tighter, which is not
+/// something a flag can do.
 fn translate_loop(
     queue: &(Mutex<VecDeque<TranslationJob>>, Condvar),
     closed: &AtomicBool,
-    finish_by_ms: &AtomicU64,
     mut translator: Translator,
     emitter: &mut dyn Emitter,
     mut metrics: Option<std::io::BufWriter<std::fs::File>>,
 ) {
-    // A monotonic start, so the deadline is a plain elapsed-time comparison and
-    // needs no clock agreement across the thread boundary.
-    let started = Instant::now();
-    loop {
-        // Past the drain deadline with work still waiting: give up on it and say
-        // so, rather than running the loop to completion.
-        if let Some(job) = take_or_expire(queue, closed, finish_by_ms, started) {
-            emit_one(&mut translator, emitter, &mut metrics, job);
-        } else {
-            return;
-        }
+    while let Some(job) = next_job(queue, closed) {
+        emit_one(&mut translator, emitter, &mut metrics, job);
     }
 }
 
-/// The next job to translate, or `None` when the thread is done: either the
-/// queue was closed and drained, or the drain deadline passed with work waiting.
-fn take_or_expire(
+/// The next job to translate, or `None` once the queue is closed and empty.
+fn next_job(
     queue: &(Mutex<VecDeque<TranslationJob>>, Condvar),
     closed: &AtomicBool,
-    finish_by_ms: &AtomicU64,
-    started: Instant,
 ) -> Option<TranslationJob> {
     let (lock, wakeup) = queue;
     let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1067,21 +1381,9 @@ fn take_or_expire(
         if closed.load(Ordering::Acquire) {
             return None;
         }
-        let deadline_ms = finish_by_ms.load(Ordering::Acquire);
-        // A deadline is only set by `drop`, so the queue is closed by now and the
-        // pending count can only be zero. Checking it before the wait keeps the
-        // bounded shutdown honest even if the wakeup were ever missed.
-        if deadline_ms > 0 && started.elapsed().as_millis() as u64 >= deadline_ms {
-            return None;
-        }
-        let wait = match deadline_ms {
-            0 => Duration::from_millis(250),
-            _ => Duration::from_millis(50),
-        };
-        let (guard, _) = wakeup
-            .wait_timeout(pending, wait)
-            .unwrap_or_else(|e| e.into_inner());
-        pending = guard;
+        // No timeout: both notifiers send under the lock, so a wakeup cannot be
+        // lost between the check above and this sleep.
+        pending = wakeup.wait(pending).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -1237,10 +1539,7 @@ mod tests {
             value.get("normalizer").is_some(),
             "the fixture must reproduce the null charsmap"
         );
-        assert!(
-            patched_value(&mut value),
-            "a null charsmap must be dropped"
-        );
+        assert!(patched_value(&mut value), "a null charsmap must be dropped");
         assert!(
             !String::from_utf8_lossy(&serde_json::to_vec(&value).unwrap())
                 .contains("precompiled_charsmap"),
@@ -1495,7 +1794,11 @@ mod tests {
         let mut logits = vec![-45f32; 8];
         logits[2] = 10.0;
         logits[6] = -1.0;
-        assert_eq!(next_token(&logits, &suppressed), 2, "eos must stay reachable");
+        assert_eq!(
+            next_token(&logits, &suppressed),
+            2,
+            "eos must stay reachable"
+        );
     }
 
     /// The ids come from the model, so the load path has to insist on having read
@@ -1524,7 +1827,9 @@ mod tests {
                 "{pair} start token"
             );
             assert_eq!(
-                config.get("eos_token_id").and_then(serde_json::Value::as_i64),
+                config
+                    .get("eos_token_id")
+                    .and_then(serde_json::Value::as_i64),
                 Some(eos),
                 "{pair} eos token"
             );
@@ -1606,14 +1911,17 @@ mod tests {
             empty_cache_shape(&[Some(1), Some(8)], marian_shape()),
             vec![1, 8, 0, 64]
         );
-        assert_eq!(empty_cache_shape(&[Some(1), Some(8)], nllb_shape()), vec![1, 16, 0, 64]);
+        assert_eq!(
+            empty_cache_shape(&[Some(1), Some(8)], nllb_shape()),
+            vec![1, 16, 0, 64]
+        );
     }
 
-    /// Every cache input is sent empty on every step, so the input set never
-    /// varies with the text. Pinned as a shape assertion because the failure it
-    /// prevents is a load-time shape error, not a wrong answer.
+    /// The prompt step is the only one that sends an empty cache, and a cached step
+    /// is the only one that sends a filled one. Pinned as a shape assertion because
+    /// the failure it prevents is a load-time shape error, not a wrong answer.
     #[test]
-    fn a_past_slot_is_fed_empty_on_every_call() {
+    fn a_past_slot_is_fed_empty_by_the_prompt_step() {
         for (shape, heads) in [(marian_shape(), 8), (nllb_shape(), 16)] {
             let slot = empty_cache_shape(&[None, Some(heads), None, Some(64)], shape);
             assert_eq!(slot, vec![1, heads, 0, 64]);
@@ -1626,6 +1934,64 @@ mod tests {
         }
     }
 
+    /// Which slots a cached step replaces, and what it reads them out of.
+    ///
+    /// The one thing nothing else can check: `cache_slots` only ever runs against a
+    /// loaded session, and getting the split wrong feeds each layer's
+    /// cross-attention tensors to its self-attention slot — the same
+    /// `[1, heads, n, head_dim]` either way, so nothing errors and only the
+    /// transcript shows it. So the naming, the split and the output name are pinned
+    /// here against the export's own convention, over both families' layer counts.
+    #[test]
+    fn a_cached_step_replaces_the_self_attention_slots_only() {
+        for shape in [marian_shape(), nllb_shape()] {
+            // What a real export calls its slots, in its own order: per layer, the
+            // self key and value, then the cross key and value.
+            let slots: Vec<String> = (0..shape.layers)
+                .flat_map(|layer| {
+                    [SELF_SLOT, CROSS_SLOT].into_iter().flat_map(move |half| {
+                        ["key", "value"]
+                            .into_iter()
+                            .map(move |kv| format!("{PAST_PREFIX}{layer}{half}{kv}"))
+                    })
+                })
+                .collect();
+            assert_eq!(slots.len(), shape.cache_slots(), "four slots per layer");
+
+            let self_slots: Vec<&String> = slots.iter().filter(|n| is_self_slot(n)).collect();
+            assert_eq!(
+                self_slots.len(),
+                shape.layers * 2,
+                "one self key and a value per layer"
+            );
+            for name in &self_slots {
+                assert!(
+                    !name.contains(CROSS_SLOT),
+                    "{name} is one half or the other"
+                );
+                // And each is read back out under its own name with the prefix
+                // swapped, which is the only derivation that keeps a name and the
+                // tensor stored under it from drifting apart.
+                let present = present_name(name);
+                assert_eq!(present, name.replacen(PAST_PREFIX, "present.", 1));
+                assert!(
+                    present.starts_with("present.") && !present.contains(PAST_PREFIX),
+                    "{present} is not a present name"
+                );
+            }
+            // The cross half is captured once, at the prompt, and never rewritten:
+            // a cached step that replaced it would copy the encoder's keys and
+            // values out of the output and back on every token, unchanged.
+            for name in slots.iter().filter(|n| n.contains(CROSS_SLOT)) {
+                assert!(!is_self_slot(name), "{name} must stay out of the self half");
+            }
+        }
+        // A name the export did not use is not a slot this decode can place, which
+        // is why `cache_slots` refuses one rather than guessing which half it is.
+        assert!(!is_self_slot("past_key_values.0.encoder.key"));
+        assert!(!is_self_slot("past_key_values.0.something.key"));
+    }
+
     /// The cache contract is read from the model, so what is pinned here is the
     /// *arithmetic* — four slots per layer — and the two shapes it produces. The
     /// slot count is not written down in either family: a Marian export declares
@@ -1633,8 +1999,16 @@ mod tests {
     /// the config said rather than against a constant.
     #[test]
     fn the_cache_slot_count_follows_the_layer_count() {
-        assert_eq!(marian_shape().cache_slots(), 24, "6 x self+cross x key+value");
-        assert_eq!(nllb_shape().cache_slots(), 48, "12 x self+cross x key+value");
+        assert_eq!(
+            marian_shape().cache_slots(),
+            24,
+            "6 x self+cross x key+value"
+        );
+        assert_eq!(
+            nllb_shape().cache_slots(),
+            48,
+            "12 x self+cross x key+value"
+        );
         // Both agree with `d_model / head_dim == heads`, which is where the head
         // width comes from.
         for (shape, d_model) in [(marian_shape(), 512), (nllb_shape(), 1024)] {
@@ -1650,15 +2024,19 @@ mod tests {
     /// catch a wrong start token, a wrong cache shape or a wrong graph contract —
     /// every one of which produced garbage while unit tests were green.
     ///
-    /// Ignored by default because it needs the ~114 MiB of weights at
-    /// `models/translators/opus-mt-pl-en/`; it also skips itself when they are not
-    /// there, so `--ignored` is safe on a fresh checkout.
+    /// Ignored by default because it needs the ~110 MiB of weights at
+    /// `models/translators/opus-mt-pl-en/`. It skips itself when they are not
+    /// there rather than fetching them: `--ignored` on a fresh checkout is a
+    /// question about what is on disk, not a 1.3 GiB download.
     ///
     /// Run it with:
     /// `cargo test -- --ignored real_export_translates_polish_to_english --nocapture`
     #[test]
     #[ignore = "needs the downloaded opus-mt-pl-en weights in models/translators/opus-mt-pl-en/"]
     fn real_export_translates_polish_to_english() {
+        if !weights_are_present("opus-mt-pl-en") {
+            return;
+        }
         let prepared = crate::translator_store::prepare(
             "opus-mt-pl-en",
             crate::translator_store::Direction {
@@ -1666,8 +2044,7 @@ mod tests {
                 tgt: "en",
             },
         )
-        .expect("the pl-en spec must resolve and download");
-        skip_without_weights(&prepared);
+        .expect("the pl-en spec must resolve");
         assert_eq!(prepared.facts.family, Family::Marian);
         assert_eq!(prepared.facts.start_token, 63429);
         assert_eq!(prepared.facts.shape.cache_slots(), 24);
@@ -1677,8 +2054,10 @@ mod tests {
         let (out, ms) = timed_translate(&mut translator, "Kot siedzi na stole.");
         eprintln!("marian pl->en output: {out:?} ({ms:.0} ms)");
         assert_translation_is_english_prose(&out, "cat");
-        // The quadratic tail has to stay inside a second at this size, or the
-        // uncached decode is not the shape the latency claim assumes.
+        // A cached decode is O(n) in output length, so one sentence is a handful of
+        // single-token steps: 79 ms measured on four threads. The bound is loose on
+        // purpose, and it is about the decode still being O(n) — a regression to the
+        // single-graph form costs a factor, not a rounding error.
         assert!(ms < 1_000.0, "one sentence took {ms:.0} ms");
     }
 
@@ -1689,15 +2068,18 @@ mod tests {
     /// unfinished. Both produce fluent text, so neither is caught by an assertion
     /// on emptiness.
     ///
-    /// Ignored by default because it needs ~870 MiB of weights at
-    /// `models/translators/nllb-200-distilled-600M/`; it also skips itself when
-    /// they are not there, so `--ignored` is safe on a fresh checkout.
+    /// Ignored by default because it needs the ~1.3 GiB of weights at
+    /// `models/translators/nllb-200-distilled-600M/`; it skips itself when they are
+    /// not there, so `--ignored` is safe on a fresh checkout.
     ///
     /// Run it with:
     /// `cargo test -- --ignored real_nllb_translates_polish_to_english --nocapture`
     #[test]
     #[ignore = "needs the downloaded nllb-200-distilled-600M weights"]
     fn real_nllb_translates_polish_to_english() {
+        if !weights_are_present(crate::translator_store::NLLB_SPEC) {
+            return;
+        }
         let prepared = crate::translator_store::prepare(
             crate::translator_store::NLLB_SPEC,
             crate::translator_store::Direction {
@@ -1705,8 +2087,7 @@ mod tests {
                 tgt: "en",
             },
         )
-        .expect("the NLLB spec must resolve and download");
-        skip_without_weights(&prepared);
+        .expect("the NLLB spec must resolve");
         // The family and the geometry come out of the file, and they are the two
         // things a hard-coded shape would get wrong.
         assert_eq!(prepared.facts.family, Family::Nllb);
@@ -1722,9 +2103,12 @@ mod tests {
         eprintln!("nllb pl->en output: {english:?} ({ms:.0} ms)");
         assert_translation_is_english_prose(&english, "cat");
         // The cap is what bounds a runaway, so a normal sentence has to be far
-        // under it: 48 tokens over a decoder four times the width is ~10 s at the
-        // observed per-step cost, inside the 15 s drain deadline.
+        // under it: 48 single-token steps over a decoder four times the width is
+        // 677 ms measured on four threads.
         assert!(ms < 8_000.0, "one sentence took {ms:.0} ms");
+        // Both directions' sessions are live at once from here, which is ~1.8 GiB of
+        // weights plus their arenas, so the first one goes before the second loads.
+        drop(translator);
 
         // A direction a Marian pair export cannot reach at all: this is the whole
         // reason the multilingual export exists.
@@ -1743,8 +2127,14 @@ mod tests {
         let mut translator = Translator::load(&german, 4).expect("the export must load");
         let (german_out, ms) = timed_translate(&mut translator, "Kot siedzi na stole.");
         eprintln!("nllb pl->de output: {german_out:?} ({ms:.0} ms)");
-        assert!(!german_out.trim().is_empty(), "translation must not be empty");
-        assert!(!german_out.contains('\u{2581}'), "metaspace leaked: {german_out:?}");
+        assert!(
+            !german_out.trim().is_empty(),
+            "translation must not be empty"
+        );
+        assert!(
+            !german_out.contains('\u{2581}'),
+            "metaspace leaked: {german_out:?}"
+        );
         // It must be German, not the English the run above produced: the target
         // code is what decides the direction, and a decode that ignored it would
         // return the same text for both.
@@ -1756,17 +2146,30 @@ mod tests {
         assert!(ms < 8_000.0, "one sentence took {ms:.0} ms");
     }
 
-    /// Skip a test that needs weights which are not there, rather than failing a
-    /// clean checkout that runs `--ignored`.
-    fn skip_without_weights(prepared: &crate::translator_store::Prepared) {
-        if prepared.reference.tokenizer.is_file() {
-            return;
+    /// Whether a spec's weights are already on disk, saying so when they are not.
+    ///
+    /// Checked **before** `prepare`, which is the point: `prepare` downloads
+    /// whatever is missing, so a helper that ran after it would find the files it
+    /// was checking for and never skip. An `--ignored` test that quietly fetches
+    /// 1.3 GiB is not a test anyone runs on a fresh checkout.
+    fn weights_are_present(spec: &str) -> bool {
+        let r = crate::translator_store::resolve(spec).expect("the spec must resolve");
+        let present = [
+            &r.encoder,
+            &r.decoder,
+            &r.decoder_with_past,
+            &r.tokenizer,
+            &r.config,
+        ]
+        .into_iter()
+        .all(|path| path.is_file());
+        if !present {
+            eprintln!(
+                "skipping: no weights in {} (run sttd with --translate-model {spec} once)",
+                r.dir.display()
+            );
         }
-        eprintln!(
-            "skipping: no weights at {} (run sttd with --translate-model {} once)",
-            prepared.reference.dir.display(),
-            prepared.reference.spec,
-        );
+        present
     }
 
     fn timed_translate(translator: &mut Translator, text: &str) -> (String, f64) {
@@ -1790,7 +2193,10 @@ mod tests {
         );
         let letters = out.chars().filter(char::is_ascii_alphabetic).count();
         let visible = out.chars().filter(|c| !c.is_whitespace()).count();
-        assert!(visible > 0, "translation has no visible characters: {out:?}");
+        assert!(
+            visible > 0,
+            "translation has no visible characters: {out:?}"
+        );
         assert!(
             letters * 10 >= visible * 6,
             "output is not mostly letters ({letters} of {visible}): {out:?}"
