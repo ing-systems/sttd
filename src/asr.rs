@@ -27,6 +27,7 @@ use crate::config::{
 use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
 use crate::model_store::ModelRef;
+use crate::translate::{TranslationJob, TranslationOut};
 use crate::utterance::Utterance;
 
 /// Result of one inference: the joined text plus per-word model confidences
@@ -327,11 +328,13 @@ pub(crate) fn resolve_n_threads(requested: i32, auto: i32) -> i32 {
 /// Six parameters, one of them the configuration: everything the worker needs
 /// beyond its two shared flags arrives in `config`, resolved once on the main
 /// thread. The worker owns it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_asr_worker(
     mut rx: Consumer<Utterance>,
     model: ModelRef,
     config: AsrConfig,
     mut emitter: impl Emitter + Send + 'static,
+    translation: Option<TranslationOut>,
     paused: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 ) -> (
@@ -348,6 +351,7 @@ pub(crate) fn spawn_asr_worker(
                 config,
                 &ready_tx,
                 &mut emitter,
+                translation,
                 &paused,
                 &running,
             );
@@ -489,6 +493,14 @@ struct AsrWorker<'a> {
     config: AsrConfig,
     ready: &'a std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &'a mut dyn Emitter,
+    /// The translation step (`--translate`), owned by the worker like the engine.
+    /// `None` = the step is off, and every utterance is emitted as transcribed.
+    ///
+    /// This is the *queue*, not the translator: the `ort` sessions live on the
+    /// translation thread inside, because translating inline would add 60 to
+    /// 130 ms of CPU to every gap between utterances. The worker only ever
+    /// submits jobs (see `TranslationOut::enqueue`).
+    translation: Option<TranslationOut>,
     paused: &'a Arc<AtomicBool>,
     running: &'a Arc<AtomicBool>,
     /// `--metrics` JSONL writer, disabled on any open/write error. Opened once
@@ -517,12 +529,14 @@ struct AsrWorker<'a> {
 impl<'a> AsrWorker<'a> {
     /// The one construction of a worker: production and tests both come through
     /// here, so the per-load state below cannot be set up two different ways.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         rx: &'a mut Consumer<Utterance>,
         model_ref: ModelRef,
         config: AsrConfig,
         ready: &'a std::sync::mpsc::Sender<Result<(), String>>,
         emitter: &'a mut dyn Emitter,
+        translation: Option<TranslationOut>,
         paused: &'a Arc<AtomicBool>,
         running: &'a Arc<AtomicBool>,
     ) -> Self {
@@ -535,6 +549,7 @@ impl<'a> AsrWorker<'a> {
             config,
             ready,
             emitter,
+            translation,
             paused,
             running,
             metrics,
@@ -685,6 +700,7 @@ impl AsrWorker<'_> {
             &self.config.gate,
             self.running,
             &mut *self.emitter,
+            &mut self.translation,
             &mut self.metrics,
             &words,
             self.config.remove_hesitations,
@@ -916,7 +932,9 @@ impl AsrWorker<'_> {
 
 /// Open the `--metrics` JSONL log for appending (creating parent dirs).
 /// Observability only: errors are returned for the caller to warn-and-disable.
-fn open_metrics_log(path: Option<&std::path::Path>) -> Option<std::io::BufWriter<std::fs::File>> {
+pub(crate) fn open_metrics_log(
+    path: Option<&std::path::Path>,
+) -> Option<std::io::BufWriter<std::fs::File>> {
     let path = path?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1015,6 +1033,11 @@ pub(crate) fn shed_survivors(scores: &[(f32, f32)], keep: usize) -> Vec<usize> {
 /// inputs (formatting only) so tests don't touch the filesystem or GPU.
 /// `infer_ms` covers inference alone (conditioning/gain excluded); `rtf` is
 /// inference seconds per audio second (>1 = slower than realtime).
+///
+/// `source` is the pre-translation text, written as a `src_text` column only
+/// when the translation step ran. `None` writes the row exactly as it was
+/// before that step existed, so a run without `--translate` and an old log stay
+/// comparable.
 pub(crate) fn format_metrics_row(
     tag: &str,
     samples: usize,
@@ -1022,12 +1045,17 @@ pub(crate) fn format_metrics_row(
     verdict: crate::gate::TranscriptVerdict,
     text: &str,
     infer_ms: f64,
+    source: Option<&str>,
 ) -> String {
     let (audio_sec, rtf) = infer_rtf(samples, infer_ms);
+    let src_text = match source {
+        Some(src) => format!(",\"src_text\":\"{}\"", escape_json_string(src)),
+        None => String::new(),
+    };
     format!(
         "{{\"tag\":\"{}\",\"samples\":{},\"audio_sec\":{:.3},\"infer_ms\":{:.1},\"rtf\":{:.3},\
          \"speech_frames\":{},\"total_frames\":{},\"density\":{:.3},\"rms\":{:.5},\
-         \"verdict\":\"{}\",\"text\":\"{}\"}}",
+         \"verdict\":\"{}\",\"text\":\"{}\"{}}}",
         escape_json_string(tag),
         samples,
         audio_sec,
@@ -1039,6 +1067,7 @@ pub(crate) fn format_metrics_row(
         evidence.rms,
         verdict_slug(verdict),
         escape_json_string(text),
+        src_text,
     )
 }
 
@@ -1046,7 +1075,8 @@ pub(crate) fn format_metrics_row(
 /// keeps every transcribed utterance even on a hard kill right after.
 /// Write errors disable the log with a single warning (never fail
 /// transcription for observability).
-fn write_metrics_row(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_metrics_row(
     metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
     tag: &str,
     samples: usize,
@@ -1054,10 +1084,11 @@ fn write_metrics_row(
     verdict: crate::gate::TranscriptVerdict,
     text: &str,
     infer_ms: f64,
+    source: Option<&str>,
 ) {
     use std::io::Write;
     let Some(w) = metrics else { return };
-    let row = format_metrics_row(tag, samples, evidence, verdict, text, infer_ms);
+    let row = format_metrics_row(tag, samples, evidence, verdict, text, infer_ms, source);
     if let Err(e) = writeln!(w, "{row}") {
         log::warn!("metrics: write failed: {e:?} (metrics disabled)");
         *metrics = None;
@@ -1156,6 +1187,7 @@ fn transcribe_and_emit(
     gate: &GateConfig,
     running: &Arc<AtomicBool>,
     emitter: &mut dyn Emitter,
+    translation: &mut Option<TranslationOut>,
     metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
     dictionary: &[String],
     remove_hesitations: bool,
@@ -1239,9 +1271,41 @@ fn transcribe_and_emit(
                 final_text.clear();
             }
             let final_trimmed = final_text.trim();
+            // The split-seam dedup stays source-vs-source: it compares what was
+            // said, which is what the gates judged, not what was translated.
             if emitted {
                 *prev_emit_text = final_trimmed.to_string();
             }
+            // The translation step runs last, after every gate, and only for an
+            // utterance that is actually emitted: a drop is never translated.
+            // `fallback_or_translated` owns the failure policy, so a failed or
+            // empty translation emits the source text with a warn rather than
+            // losing the utterance.
+            // The translation step runs last, after every gate, and only for an
+            // utterance that is actually emitted: a drop is never translated.
+            //
+            // With the step on, the job is handed to the translation thread and
+            // this function does not emit: the thread owns the translated text,
+            // so it owns the emission and the metrics row too. The `pcm` copy is
+            // what the queue needs, since the utterance is gone by the time the
+            // thread gets to it.
+            if let Some(out) = translation.as_ref() {
+                if emitted {
+                    out.enqueue(TranslationJob {
+                        tag: tag.clone(),
+                        pcm: utterance.pcm.clone(),
+                        source: final_trimmed.to_string(),
+                        verdict,
+                        evidence: utterance.evidence,
+                        samples: decoded_samples,
+                        infer_ms,
+                    });
+                    return true;
+                }
+            }
+            // No step, or a drop: the transcript is its own emission. A drop is
+            // never translated, so nothing is spent on text the pipeline decided
+            // not to emit.
             write_metrics_row(
                 metrics,
                 &tag,
@@ -1250,6 +1314,7 @@ fn transcribe_and_emit(
                 verdict,
                 final_trimmed,
                 infer_ms,
+                None,
             );
             emitter.emit(Emission {
                 tag: &tag,
@@ -1632,6 +1697,7 @@ mod tests {
             TranscriptVerdict::Emit,
             "Dzień dobry",
             250.0,
+            None,
         );
         assert!(row.contains("\"tag\":\"utt_000001\""), "{row}");
         assert!(row.contains("\"samples\":16000"), "{row}");
@@ -1640,7 +1706,49 @@ mod tests {
         assert!(row.contains("\"rtf\":0.250"), "{row}");
         assert!(row.contains("\"verdict\":\"emit\""), "{row}");
         assert!(row.contains("\"text\":\"Dzień dobry\""), "{row}");
+        // No translation step ran, so no `src_text` column: the row is exactly
+        // what it was before that column existed.
+        assert!(!row.contains("src_text"), "{row}");
         assert!(row.starts_with('{') && row.ends_with('}'));
+    }
+
+    #[test]
+    fn metrics_row_carries_the_source_text_only_when_translation_ran() {
+        use crate::gate::TranscriptVerdict;
+        let evidence = Evidence {
+            speech_frames: 100,
+            total_frames: 200,
+            rms: 0.02,
+        };
+        let row = format_metrics_row(
+            "utt_000003",
+            16_000,
+            &evidence,
+            TranscriptVerdict::Emit,
+            "Good morning",
+            250.0,
+            Some("Dzień dobry"),
+        );
+        assert!(row.contains("\"text\":\"Good morning\""), "{row}");
+        assert!(row.contains("\"src_text\":\"Dzień dobry\""), "{row}");
+        // `text` is the translation and comes first, so `src_text` can never be
+        // mistaken for it by a reader or a `text` field lookup.
+        assert!(
+            row.find("\"text\":").unwrap() < row.find("\"src_text\":").unwrap(),
+            "{row}"
+        );
+        assert!(row.ends_with("\"src_text\":\"Dzień dobry\"}"), "{row}");
+        // The source is escaped like every other string.
+        let row = format_metrics_row(
+            "utt_000004",
+            16_000,
+            &evidence,
+            TranscriptVerdict::Emit,
+            "x",
+            0.0,
+            Some("quote \"here\""),
+        );
+        assert!(row.contains("\"src_text\":\"quote \\\"here\\\"\""), "{row}");
     }
 
     #[test]
@@ -1658,6 +1766,7 @@ mod tests {
             TranscriptVerdict::DropEmpty,
             "quote \"here\"\nnewline",
             0.0,
+            None,
         );
         assert!(
             row.contains("\"text\":\"quote \\\"here\\\"\\nnewline\""),
@@ -1971,6 +2080,7 @@ mod tests {
             bad,
             config,
             crate::emit::RecordingEmitter::new(),
+            None,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
@@ -2144,6 +2254,8 @@ mod tests {
             for_tests(),
             &ready_tx,
             &mut emitter,
+            // No translation step: these tests drive the source-text pipeline.
+            None,
             &paused,
             &running,
         );
@@ -2375,6 +2487,8 @@ mod tests {
             &default_gate(),
             &running,
             &mut emitter,
+            // No translation step: these tests pin the source-text pipeline.
+            &mut None,
             &mut None,
             &[],
             remove_hesitations,
@@ -2448,6 +2562,49 @@ mod tests {
         assert_eq!(
             prev, "dzień dobry",
             "a drop must not become the dedup baseline"
+        );
+    }
+
+    /// The text the emitter receives when the translation step is on: the
+    /// translation, or the source text when the translation fails or comes back
+    /// empty.
+    ///
+    /// `Translator` holds two `ort` sessions, so no unit test can build one.
+    /// What is under test here is the step's failure policy, which
+    /// `fallback_or_translated` owns outright, and the emitter's text is that
+    /// function's return value. The model-run half needs weights and is out of
+    /// scope for a unit test.
+    ///
+    /// The call is now on the translation thread rather than inline here, which
+    /// does not change the policy: `emit_one` in `translate` applies this same
+    /// function to the job's `source` before it touches the emitter.
+    #[test]
+    fn the_emitted_text_is_the_translation_or_the_source_fallback() {
+        use crate::translate::fallback_or_translated;
+        // A translation that arrives: that is what is emitted.
+        assert_eq!(
+            fallback_or_translated("Dzień dobry", Ok("Good morning".to_string()), "utt_000001"),
+            "Good morning"
+        );
+        // A translation that failed: the source, not an empty emission.
+        assert_eq!(
+            fallback_or_translated(
+                "Dzień dobry",
+                Err(anyhow::anyhow!("the decoder ran out of cache slots")),
+                "utt_000002"
+            ),
+            "Dzień dobry"
+        );
+        // A translation that came back empty: also the source, so an empty
+        // string never reaches the clipboard.
+        assert_eq!(
+            fallback_or_translated("Dzień dobry", Ok(String::new()), "utt_000003"),
+            "Dzień dobry"
+        );
+        // A whitespace-only translation is empty for this purpose too.
+        assert_eq!(
+            fallback_or_translated("Dzień dobry", Ok("   ".to_string()), "utt_000004"),
+            "Dzień dobry"
         );
     }
 }

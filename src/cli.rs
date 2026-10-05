@@ -271,6 +271,41 @@ pub(crate) struct Cli {
     )]
     pub(crate) speak: bool,
 
+    /// Translate every accepted transcript into this language (`pl`, `en`,
+    /// `de`, ...) before it is emitted. Runs after the gates, so a gate still
+    /// judges the source text; only what the clipboard, the paste, `--speak`
+    /// and stdout receive changes. A translation that fails or comes back empty
+    /// warns and emits the source text.
+    ///
+    /// The pair comes from `--language` plus this flag, and only the pairs
+    /// published as ONNX exports exist: `--language pl --translate en` is the
+    /// primary path, because Polish has exactly one exported pair upstream.
+    /// `--language auto --translate en` uses the many-sources-into-English model.
+    #[arg(
+        long,
+        env = "STTD_TRANSLATE",
+        value_name = "LANG",
+        help_heading = "Emission"
+    )]
+    pub(crate) translate: Option<String>,
+
+    /// Translator to translate with, overriding the pair `--translate` and
+    /// `--language` resolve to: a catalog spec (`opus-mt-mul-en`) or a path to a
+    /// translator directory already on disk, downloaded on first use into
+    /// `<models>/translators/<spec>/`. Needs `--translate`; ignored (and not
+    /// downloaded) without it.
+    ///
+    /// No default: the pair is derived from the run's own languages, and a
+    /// compiled-in value would both be wrong for most runs and read in `--help` as
+    /// though it were in effect.
+    #[arg(
+        long,
+        env = "STTD_TRANSLATE_MODEL",
+        value_name = "SPEC|PATH",
+        help_heading = "Emission"
+    )]
+    pub(crate) translate_model: Option<String>,
+
     /// Piper voice to speak with: any key from `rhasspy/piper-voices` (e.g.
     /// `pl_PL-gosia-medium`, `en_US-amy-medium`), downloaded on first use into
     /// `<models>/voices/<key>/`, or a path to a voice directory already on
@@ -545,6 +580,12 @@ mod tests {
         assert!(!cli.remove_hesitations);
         assert!(!cli.stdout);
         assert!(!cli.speak);
+        assert_eq!(cli.translate, None, "--translate has no fixed default");
+        assert_eq!(
+            cli.translate_model, None,
+            "the translator is derived from --language plus --translate, so the \
+             flag has no default to show"
+        );
         assert_eq!(cli.voice, DEFAULT_VOICE);
         assert_eq!(cli.list_voices, None);
         assert!(cli.start_paused);
@@ -666,6 +707,53 @@ mod tests {
         // `--speak=off` like every other bool.
         let cli = Cli::try_parse_from(["sttd", "--speak", "off"]).expect("must parse");
         assert!(!cli.speak);
+    }
+
+    #[test]
+    fn cli_translate_and_translate_model_parse() {
+        let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
+        assert_eq!(cli.translate, None, "the step is off unless asked for");
+        assert_eq!(cli.translate_model, None, "no translator until one is asked for");
+
+        let cli = Cli::try_parse_from(["sttd", "--translate", "en"]).expect("must parse");
+        assert_eq!(cli.translate.as_deref(), Some("en"));
+
+        // Any code parses here; which pairs exist is the store's question, and it
+        // answers it with a message naming the ones that do rather than refusing
+        // at the flag.
+        let cli = Cli::try_parse_from(["sttd", "--translate", "yue"]).expect("must parse");
+        assert_eq!(cli.translate.as_deref(), Some("yue"));
+
+        // The override takes a catalog spec or a directory, and both survive
+        // parsing intact.
+        let cli = Cli::try_parse_from(["sttd", "--translate-model", "opus-mt-mul-en"])
+            .expect("spec must parse");
+        assert_eq!(cli.translate_model.as_deref(), Some("opus-mt-mul-en"));
+        let cli =
+            Cli::try_parse_from(["sttd", "--translate-model", "/opt/marian"]).expect("path must parse");
+        assert_eq!(cli.translate_model.as_deref(), Some("/opt/marian"));
+
+        // Neither flag conflicts with the other input paths: translation is a
+        // step inside a run, not a mode of its own.
+        for other in [
+            vec!["--file", "a.wav"],
+            vec!["--start"],
+            vec!["--stdout"],
+            vec!["--speak"],
+        ] {
+            let mut args = vec!["sttd", "--translate", "en"];
+            args.extend(other.iter().copied());
+            assert!(
+                Cli::try_parse_from(args).is_ok(),
+                "--translate must accept {other:?}"
+            );
+        }
+        // `--translate-model` alone is a no-op run, exactly like `--voice`
+        // without `--speak`: it must not conflict either.
+        assert!(Cli::try_parse_from(["sttd", "--translate-model", "opus-mt-mul-en"]).is_ok());
+        // A value is required for both.
+        assert!(Cli::try_parse_from(["sttd", "--translate"]).is_err());
+        assert!(Cli::try_parse_from(["sttd", "--translate-model"]).is_err());
     }
 
     #[test]

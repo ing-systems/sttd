@@ -104,6 +104,9 @@ mod mel;
 mod parakeet;
 mod parakeet_core;
 mod piper;
+mod translate;
+use translate::{Translator, TranslationOut};
+mod translator_store;
 mod voice_store;
 mod whisper;
 mod whisper_core;
@@ -518,7 +521,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
     // Capture is already running above and the drain loop below sheds (counted)
     // while it loads.
-    let asr_config = asr_config(cli, true, live_dict);
+    let mut asr_config = asr_config(cli, true, live_dict);
     // The capture loop fills this, the worker drains it (partial transcripts).
     let partials = asr_config.partials.clone();
     // The emitter owns the speak thread; its flag is how the capture loop below
@@ -527,11 +530,33 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // does not exist.
     let emitter = make_emitter(cli)?;
     let speaking = emitter.speaking_flag();
+    // The translator is loaded here, on the main thread, before the worker
+    // starts: it is ~114 MiB of weights and a setup problem (no file, no write
+    // access) that should fail fast rather than on the first utterance.
+    let translator = make_translator(cli)?;
+    // With the step on, the translation thread becomes the writer of every
+    // metrics row: its `text` column has to hold what the emitter received, which
+    // after translation is not what this thread knows. The worker keeps the
+    // writer only when there is no translation, so exactly one of the two threads
+    // ever opens the file.
+    let translation = match translator {
+        None => None,
+        Some(translator) => {
+            let metrics = asr::open_metrics_log(asr_config.metrics_path.as_deref());
+            asr_config.metrics_path = None;
+            Some(TranslationOut::spawn(
+                translator,
+                Box::new(emitter.sharing()),
+                metrics,
+            ))
+        }
+    };
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
         asr_config,
         emitter,
+        translation,
         Arc::clone(&paused),
         Arc::clone(&running),
     );
@@ -930,21 +955,42 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     ))
     .1;
 
+    // File mode has no pause signalling, so a permanently-clear flag plus
+    // disabled auto-unload can never trigger an unload mid-file. Sounds stay off
+    // offline: no pause/resume transitions exist to cue. Autopause is forced off
+    // for the same reason: file input must never flip the (unread) pause flag into
+    // an unload mid-file.
+    let mut config = AsrConfig {
+        auto_unload: false,
+        sound: false,
+        autopause: false,
+        ..asr_config(cli, false, live_dict)
+    };
+    // The emitter is built before the translator because the translation thread
+    // emits through a sharing handle onto the same queue.
+    let emitter = make_emitter(cli)?;
+    // File mode builds the translator exactly as the microphone path does, so an
+    // offline `--file ... --translate en` prints English.
+    let translation = match make_translator(cli)? {
+        None => None,
+        Some(translator) => {
+            // Same rule as the live path: with translation on, the metrics rows
+            // belong to the thread that knows the translated text.
+            let metrics = asr::open_metrics_log(config.metrics_path.as_deref());
+            config.metrics_path = None;
+            Some(TranslationOut::spawn(
+                translator,
+                Box::new(emitter.sharing()),
+                metrics,
+            ))
+        }
+    };
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
-        // File mode has no pause signalling, so a permanently-clear flag plus
-        // disabled auto-unload can never trigger an unload mid-file. Sounds
-        // stay off offline: no pause/resume transitions exist to cue.
-        // Autopause is forced off for the same reason: file input must never
-        // flip the (unread) pause flag into an unload mid-file.
-        AsrConfig {
-            auto_unload: false,
-            sound: false,
-            autopause: false,
-            ..asr_config(cli, false, live_dict)
-        },
-        make_emitter(cli)?,
+        config,
+        emitter,
+        translation,
         Arc::new(AtomicBool::new(false)),
         // File input runs to completion; inference is never aborted.
         Arc::new(AtomicBool::new(true)),
@@ -1191,6 +1237,144 @@ fn make_speech(cli: &Cli) -> Result<Option<SpeechOut>> {
     Ok(Some(SpeechOut::spawn(loaded)))
 }
 
+/// The translation step (`--translate`), resolved once from `Cli` on the main
+/// thread: the pair, the download, and the two `ort` sessions. `None` when the
+/// flag is absent, so nothing is resolved and nothing is downloaded.
+///
+/// A `--translate-model` without `--translate` warns, mirroring the
+/// `--voice`-without-`--speak` rule — a flag that silently pulled ~114 MiB nobody
+/// asked for is worse than one that does nothing.
+///
+/// The source language is the one Whisper was told to decode in, because that is
+/// what the transcript is. Under MarianMT the pair **is** the direction, so there
+/// is no prompt to degrade: `Auto` picks the many-sources-into-English model when
+/// the target is English, and refuses otherwise rather than translating with a
+/// pair the user did not ask for.
+fn make_translator(cli: &Cli) -> Result<Option<Translator>> {
+    let Some(target) = cli
+        .translate
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        // Warned rather than silently ignored, and only when the user actually
+        // typed one: the default is not a thing they asked for. Same rule as
+        // `--voice` without `--speak`.
+        if cli.translate.is_some() {
+            log::warn!("--translate needs a language code (e.g. en); the step is off");
+        }
+        if cli.translate_model.is_some() {
+            log::warn!("--translate-model is ignored without --translate");
+        }
+        return Ok(None);
+    };
+    let r = match cli.translate_model.as_deref().map(str::trim) {
+        Some(spec) if !spec.is_empty() => crate::translator_store::prepare(spec)
+            .with_context(|| format!("failed to prepare translator {spec}"))?,
+        _ => resolve_pair_for_run(cli, target)?,
+    };
+    if r.src.is_empty() {
+        // A user directory names no pair, so there is no direction to log.
+        log::info!(
+            "translate: emitting every transcript in {target} (translator {})",
+            r.spec
+        );
+    } else {
+        log::info!(
+            "translate: emitting every transcript as {} -> {target} (translator {})",
+            r.src, r.spec
+        );
+    }
+    if cli.speak {
+        warn_on_voice_language_mismatch(cli, target);
+    }
+    let intra_threads = resolve_n_threads(cli.threads, auto_threads()).max(1) as usize;
+    let translator =
+        Translator::load(&r, intra_threads).context("failed to load the translator")?;
+    Ok(Some(translator))
+}
+
+/// The pair a run translates with, from `--language` and `--translate`, downloaded
+/// if it is not on disk yet.
+///
+/// `--language auto` is the one case that needs a rule rather than a lookup: the
+/// source is unknown per utterance, and a MarianMT model is a fixed direction, so
+/// there is no pair to name. Into English the answer is `opus-mt-mul-en`, upstream's
+/// many-sources-into-English model. Into anything else there is no honest answer —
+/// `opus-mt-<src>-<tgt>` would have to guess the source — so it refuses and says
+/// which targets have a many-source model.
+///
+/// Coverage is thin in one direction and the message says so: Polish has exactly
+/// one exported pair upstream, so `--language pl --translate de` is an error naming
+/// `en`, not a mistranslation. The store owns the wording.
+fn resolve_pair_for_run(cli: &Cli, target: &str) -> Result<crate::translator_store::TranslatorRef> {
+    match cli.language() {
+        Language::Explicit(code) | Language::System(code) => {
+            let t = crate::translator_store::prepare_pair(&code, target)?;
+            Ok(t)
+        }
+        Language::Auto => {
+            if crate::translator_store::has_pair("mul", target) {
+                log::info!(
+                    "--language auto leaves the source unknown; using the many-source \
+                     model (opus-mt-mul-{target}). Pass --language CODE for a pair \
+                     specific to your language"
+                );
+                Ok(crate::translator_store::prepare_pair("mul", target)?)
+            } else {
+                // No many-source model into this target: the direction is the
+                // model's identity, so there is nothing to fall back to. Name the
+                // sources that do work, since one of them is probably the answer.
+                let sources = crate::translator_store::sources_for(target);
+                let named = if sources.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Languages that can be translated into {target}: {}.", sources.join(", "))
+                };
+                anyhow::bail!(
+                    "--language auto cannot translate into {target}: the only model covering \
+                     an unknown source is opus-mt-mul-en.{named} Or pass --language CODE to \
+                     name the source (e.g. --language pl --translate en)"
+                )
+            }
+        }
+    }
+}
+
+/// Warn when the `--speak` voice speaks a different language than the one being
+/// written to the clipboard. Not an error: a translation can still be read aloud
+/// in the wrong language, which is bad but not fatal, and the user may know
+/// their voice speaks it.
+///
+/// The check is on the voice key's language prefix (`pl_PL-...`, `en_US-...`),
+/// which is the only place a piper voice states its language. Split out so the
+/// rule is testable without a voice or a translator.
+fn voice_language(key: &str) -> Option<&str> {
+    let key = key.trim();
+    if key.contains('/') || key.contains('\\') {
+        return None;
+    }
+    let lang = key.split(['_', '-']).next()?;
+    (!lang.is_empty()).then_some(lang)
+}
+
+/// Warn when the voice speaks a different language than the one being written to
+/// the clipboard.
+fn warn_on_voice_language_mismatch(cli: &Cli, target: &str) {
+    let key = cli.voice.trim();
+    let Some(voice_lang) = voice_language(key) else {
+        return;
+    };
+    if voice_lang.eq_ignore_ascii_case(target) {
+        return;
+    }
+    log::warn!(
+        "--voice {key} is a {voice_lang} voice but --translate writes {target}: \
+         sttd will read the translation aloud in {voice_lang} \
+         (pick a {target} voice with --voice)"
+    );
+}
+
 /// The capture-side tunables, resolved once from `Cli` and shared by both
 /// input paths: the microphone opens a `FrameProcessor` per device open (and
 /// per rebuild), file mode opens one, and the same thresholds reach the ASR
@@ -1248,6 +1432,18 @@ mod tests {
             assets: &[],
             kind,
         }
+    }
+
+    #[test]
+    fn a_voice_key_states_its_language_and_a_path_states_nothing() {
+        assert_eq!(voice_language("pl_PL-gosia-medium"), Some("pl"));
+        assert_eq!(voice_language("en_US-amy-medium"), Some("en"));
+        assert_eq!(voice_language("de_DE-thorsten"), Some("de"));
+        // A path is a directory, not a key: no language to compare against.
+        assert_eq!(voice_language("/opt/voices/amy"), None);
+        assert_eq!(voice_language("C:\\voices\\amy"), None);
+        // Nothing before the first separator.
+        assert_eq!(voice_language("-medium"), None);
     }
 
     #[test]

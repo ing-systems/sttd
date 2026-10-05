@@ -332,8 +332,19 @@ fn speak_loop(
 /// exercised through `RecordingEmitter`; this only shells out to binaries
 /// and files.
 pub(crate) struct SystemEmitter {
-    tx: Option<Producer<OwnedEmission>>,
+    /// The emission queue, shared with any `sharing()` handle.
+    ///
+    /// `Producer` is `Send` but not `Sync`, so two emitters writing the same queue
+    /// need the mutex. One uncontended lock per utterance against a disk write and
+    /// a process spawn on the other side.
+    tx: Option<Arc<Mutex<Producer<OwnedEmission>>>>,
     worker: Option<JoinHandle<()>>,
+    /// True on the handle that owns the queue and the worker thread.
+    ///
+    /// This flag, not `worker: None`, is what tells `Drop` whether closing the
+    /// queue is its job: `tx` is an `Arc`, so `take()` on a sharing handle would
+    /// close the queue for the owner too and lose the trailing utterance.
+    owns_queue: bool,
     /// Kept for the final prune in `Drop` (the worker thread owns the only
     /// other copy).
     dump_dir: Option<PathBuf>,
@@ -450,11 +461,36 @@ impl SystemEmitter {
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn emit thread: {e}"))?;
         Ok(Self {
-            tx: Some(tx),
+            tx: Some(Arc::new(Mutex::new(tx))),
             worker: Some(handle),
+            owns_queue: true,
             dump_dir,
             worker_speaking,
         })
+    }
+
+    /// A second handle onto the same emission queue, for a thread that must emit
+    /// off the ASR worker.
+    ///
+    /// The translation step is the reason: it runs on its own thread so a
+    /// translation never stalls the next decode, and it emits through this so the
+    /// clipboard, the paste, the dump and the speech all stay in one order on one
+    /// worker. A second queue would mean a second worker racing the first for the
+    /// clipboard.
+    ///
+    /// Its `Drop` is a no-op for the queue (`owns_queue` is `false`), so the
+    /// owning emitter is still the one that closes and joins, and it may be
+    /// dropped in either order.
+    pub(crate) fn sharing(&self) -> SystemEmitter {
+        SystemEmitter {
+            tx: self.tx.clone(),
+            worker: None,
+            owns_queue: false,
+            // The worker owns the only other copy of this; a sharing handle has
+            // no business pruning it, and `Drop` returns before that anyway.
+            dump_dir: None,
+            worker_speaking: None,
+        }
     }
 }
 
@@ -478,6 +514,14 @@ impl SystemEmitter {
 
 impl Drop for SystemEmitter {
     fn drop(&mut self) {
+        if !self.owns_queue {
+            // A sharing handle owns nothing: the queue, the worker thread and the
+            // dump directory all belong to the emitter that spawned them, and it
+            // is that handle's `Drop` that closes and joins. Dropping the last
+            // sharing handle before the owner would otherwise leave the queue
+            // open with nothing reading it.
+            return;
+        }
         // Close the channel first so the worker drains and exits, then join.
         // Flushing here is what guarantees `--stop`/Ctrl-C keeps the trailing
         // utterance instead of dropping it at process teardown.
@@ -501,15 +545,17 @@ impl Drop for SystemEmitter {
 impl Emitter for SystemEmitter {
     fn emit(&mut self, emission: Emission<'_>) {
         let owned = OwnedEmission::from_borrowed(emission);
-        if let Some(tx) = self.tx.as_mut() {
-            // Bounded: never blocks inference. Only fails when full or when
-            // the worker died, neither of which must take transcription down.
-            if let Err(rtrb::PushError::Full(back)) = tx.push(owned) {
-                if tx.is_abandoned() {
-                    log::warn!("emit worker gone, dropping {}", back.tag);
-                } else {
-                    log::warn!("emit queue full, dropping {}", back.tag);
-                }
+        let Some(cell) = self.tx.as_ref() else { return };
+        // Locked rather than `get_mut`: with a translation step in play this
+        // emitter is one of two writing the same queue.
+        let mut tx = cell.lock().unwrap_or_else(|e| e.into_inner());
+        // Bounded: never blocks inference. Only fails when full or when
+        // the worker died, neither of which must take transcription down.
+        if let Err(rtrb::PushError::Full(back)) = tx.push(owned) {
+            if tx.is_abandoned() {
+                log::warn!("emit worker gone, dropping {}", back.tag);
+            } else {
+                log::warn!("emit queue full, dropping {}", back.tag);
             }
         }
     }

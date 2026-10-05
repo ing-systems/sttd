@@ -79,8 +79,49 @@ What happens after the transcript gate emits: opt-in stdout print
 (`--stdout`), clipboard copy, auto-paste, spoken transcript (`--speak`), and
 WAV/TXT dump. Owned by the emitter module behind a
 seam; the ASR worker hands it one emission per utterance — tag, raw audio,
-trimmed text, verdict, acoustic evidence — and gets back nothing.
+trimmed text, verdict, acoustic evidence — and gets back nothing. When the
+translation step ran, the translation thread is the caller and the text it
+receives is the translation, so the source text is no longer what leaves the
+pipeline.
 _Avoid_: output, sink, side effects (as a name)
+
+**Translation**:
+The optional step between the gates and the emission, enabled by
+`--translate <LANG>`. It rewrites the text of an already accepted transcript and
+hands the result to the emitter. The gates, the dictionary and the hesitation
+stripping act on the source text, never on the translation. A failure does not
+drop the utterance: sttd warns and emits the source text instead.
+_Avoid_: post-processing, output translation (it happens before emission),
+machine translation (as a name for the step)
+
+**Translator**:
+The loaded, ready-to-run translation model a transcript is handed to when the
+translation step runs — a MarianMT `opus-mt` pair, two `ort` sessions (encoder
+plus merged decoder) and its tokenizer, chosen once at startup and fixed for the
+process's lifetime. It is not a speech model: it never sees audio, and it is
+stored beside the models rather than inside them, so the model catalog cannot name
+one. It is a small model, and a long or technical piece of text translates worse
+than a short sentence.
+_Avoid_: model (bare), speech model, engine (that is a speech engine),
+translation model (that is the weights, not the loaded one)
+
+**Pair**:
+The source and target languages a translator is fixed to, as one identifier:
+`pl-en`. It is also the upstream repository name, which is why a spec, a log line
+and a directory under `<models>/translators/` all read the same. The pair comes
+from `--language` plus `--translate`, and only pairs published as ONNX exports
+exist: `--language pl --translate en` works and Polish into anything else fails,
+because Polish has exactly one exported pair upstream.
+_Avoid_: spec (a `--translate-model` value names a pair or a directory, so the
+pair is the narrower thing), direction, model pair
+
+**Translation thread**:
+The thread a transcript is handed to for translation, between the ASR worker and
+the emitter. Off the worker on purpose: translation is 60 to 130 ms of CPU against
+the worker's 50 ms of inference. Its queue is a bounded FIFO, oldest dropped
+first — unlike speech, a backlog of translations is work in order rather than
+something stale.
+_Avoid_: translation worker, translator thread, async translation
 
 **Voice**:
 A piper TTS voice: a VITS `.onnx` graph plus the `.onnx.json` config beside it,

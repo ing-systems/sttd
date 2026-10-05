@@ -481,6 +481,46 @@ pub(crate) fn parse_linear_rms(s: &str) -> Result<f32, String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Translators (`--translate`)
+//
+// One flag, `--translate <LANG>`, runs the transcript through a MarianMT
+// seq2seq model before emission. Like `--voice`, it is a separate store with
+// its own subdirectory: a translator is not a speech engine, so `model_store`'s
+// catalog must never be able to name one.
+// ---------------------------------------------------------------------------
+
+/// Directory under `DEFAULT_MODELS_DIR` every `--translate-model` spec
+/// resolves into. Beside the speech models, never inside one.
+pub(crate) const TRANSLATORS_SUBDIR: &str = "translators";
+
+/// Hugging Face organization the MarianMT ONNX exports are published under.
+/// One repository per language pair, named `opus-mt-<src>-<tgt>` (see
+/// `translator_store::repo_for`).
+pub(crate) const OPUS_MT_REPO: &str = "Xenova";
+
+/// The pair `--translate-model` names in its own error message, and the pair the
+/// ignored-test path resolves. Not a default: a run derives its pair from the
+/// decoding language plus `--translate`, because the pair *is* the direction and
+/// there is no correct one to compile in.
+pub(crate) const TRANSLATE_DEFAULT_PAIR: &str = "pl-en";
+
+/// Longest run of tokens a translation decode may emit before it is cut off.
+///
+/// This is a repetition-loop guard, not a quality limit: a Marian output is a
+/// sentence or two, and measured runs emit 6 to 14 tokens. The cap is small
+/// because the decode cannot use the KV cache (see `translate::Translator::run_step`),
+/// which makes it **O(n²) in output length** — 6 to 14 tokens measures 61 to
+/// 128 ms on four threads, while 256 passes would extrapolate to roughly 40 s on
+/// one utterance. 96 keeps the quadratic tail inside a second.
+pub(crate) const TRANSLATE_MAX_NEW_TOKENS: usize = 96;
+
+/// Token budget for one translated piece: over this the ids are truncated (see
+/// `translate::Translator::translate`). Marian takes raw text, so no prompt
+/// shares the budget. Matches the tokenizer's own `model_max_length` of 512, so
+/// cutting past it is a quality choice rather than a shape requirement.
+pub(crate) const TRANSLATE_MAX_INPUT_TOKENS: usize = 512;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +696,26 @@ mod tests {
         // ever moves, this constant is the one to re-check.
         assert_eq!(WHISPER_MAX_NEW_TOKENS, 448);
         assert!(WHISPER_MAX_NEW_TOKENS < MAX_UTTERANCE_SAMPLES / FRAME_16K);
+    }
+
+    /// The compiled-in default pair must name a row of the translator catalog:
+    /// anything that resolves a pair from it would otherwise send a run to a
+    /// model upstream does not publish.
+    #[test]
+    fn translate_default_pair_is_in_the_catalog() {
+        let (src, tgt) = TRANSLATE_DEFAULT_PAIR
+            .split_once('-')
+            .expect("a pair is written src-tgt");
+        assert!(
+            crate::translator_store::CATALOG
+                .iter()
+                .any(|p| p.src == src && p.tgt == tgt),
+            "the default pair must resolve via the translator catalog"
+        );
+        // Pinned because the cap is a performance bound, not a taste call: the
+        // decode cannot use the KV cache, so it is O(n^2) in output length. See
+        // the constant's doc comment for the measurements behind 96.
+        assert_eq!(TRANSLATE_MAX_NEW_TOKENS, 96);
+        assert_eq!(TRANSLATE_MAX_INPUT_TOKENS, 512);
     }
 }

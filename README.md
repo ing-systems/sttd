@@ -13,6 +13,7 @@ Single Rust binary. No server. No network at runtime except first model download
 - Utterance buffering with 300 ms pre-roll, 800 ms hangover, interim and early splits.
 - Acoustic gates (RMS, speech density) and transcript gates (hallucination, repetition).
 - Parakeet-TDT-0.6B-v3 (`int8` default, `fp32` optional) through `ort`, with Rust mel frontend.
+- Optional translation of each accepted transcript before emission (`--translate`, MarianMT `opus-mt` ONNX, per language pair).
 - Emission to stdout, Wayland clipboard (`wl-copy`), auto-paste (`ydotool`), spoken transcript (`--speak`, piper), WAV+TXT dump, last-text file, JSONL metrics.
 - Offline file mode, daemon mode, systemd user unit, pause/resume signals.
 - Optional VAD-branch denoiser (DeepFilterNet3, `denoise` feature).
@@ -24,7 +25,7 @@ Single Rust binary. No server. No network at runtime except first model download
 cpal (hw rate, N ch) -> channel pick|mix -> 10 ms frames
   -> VAD branch: resample to 16 kHz -> earshot -> verdict per frame
   -> model branch: resample to 16 kHz (raw) -> utterance buffer
-  -> rtrb queue -> ASR worker -> conditioning -> Parakeet -> gates -> emitter
+  -> rtrb queue -> ASR worker -> conditioning -> Parakeet -> gates -> [translation] -> emitter
 ```
 
 Details:
@@ -34,13 +35,15 @@ Details:
 - An open utterance closes after `--hangover-ms` of silence (default 800 ms). Only trimmed audio plus a short tail reaches the model. Long speech emits interim splits past 8 s and force-splits past 28-30 s.
 - Conditioning removes DC, applies 5 ms fades, and guards peaks. `Hp` removes 80 Hz hum. `Agc` lifts quiet speech toward the target RMS.
 - Drops never emit. Emits go to the configured emitter.
+- The gates see the source text. With `--translate`, the step between the gates and the emitter rewrites the text, so only the emitter gets the translation (see *Translation*).
 
-See `src/main.rs:1-51` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdict`, `gate`, `hallucination`, `emission`, `model spec`, `VAD/model branch`, `direct hop`).
+See `src/main.rs:1-51` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdict`, `gate`, `hallucination`, `emission`, `translation`, `translator`, `model spec`, `VAD/model branch`, `direct hop`).
 
 ## Requirements
 
 - Linux x86_64, Rust stable, `alsa-lib`.
 - ~638 MiB disk for the default Parakeet `int8` model, or ~1443 MiB for Whisper.
+- Optional: ~114 MiB more for the translator pair that `--translate` downloads on first use.
 - Optional: `wl-clipboard` (`wl-copy`) for `--copy`, `ydotool` + `ydotoold` for `--paste` (Wayland only), `espeak-ng` (+ its voice data package) for `--speak`, PipeWire/WirePlumber for capture, Python 3 stdlib for `tools/`.
 
 ## Models
@@ -129,6 +132,46 @@ The voice is fetched on first use from `huggingface.co/rhasspy/piper-voices` int
 - **The microphone is held while sttd speaks.** Otherwise it transcribes itself, and on a laptop mic that becomes a loop. The hold is the same pipeline hold as a pause, on its own flag (the pause flag is yours — setting it would trigger an unload or an autopause that has nothing to do with this). The cost is explicit: **what you say during playback is discarded, not queued.** So `--speak` pairs with `--autopause` (each resume arms one sentence), or with headphones. Without either, dictation and playback eat each other — sttd warns about this at startup.
 
 Implementation (`src/piper.rs`, `src/voice_store.rs`): one `ort` session per voice, run directly, the same pattern as `parakeet_core` and `whisper_core`. No TTS framework sits in between, because none fits this build — `piper-rs` and `dengjen-piper-rs` pin `ort` to an exact older release, `piper-tts-rs` is GPL-3.0, and `piper-plus` is a fork with its own phonemizer and model extensions. The graph is small and fixed (`input`, `input_lengths`, `scales` = noise/length/noise_w, plus `sid` on multi-speaker models), so the work is the phoneme string and the contract, both of which follow upstream piper exactly: one clause per espeak line, the clause terminator re-attached (espeak's `--ipa` drops it, and it is what carries the intonation), `(lang)` switches stripped, the NFD code-point split, the `[BOS, PAD, (ids…, PAD)*, EOS]` id layout, and piper's peak normalize with its `0.01` floor.
+
+## Translation
+
+`--translate <LANG>` runs each accepted transcript through an ONNX translation model before emission, so stdout, the clipboard, auto-paste and `--speak` all receive the translated text. The gates, the dictionary and `clean` keep seeing the source text.
+
+```sh
+sttd --translate en                          # English output, Polish source (the primary path)
+sttd --language auto --translate en          # English output, any source language
+sttd --translate de --translate-model /opt/translators/mine
+```
+
+The models are [MarianMT](https://huggingface.co/docs/transformers/model_doc/marian) `opus-mt` exports, one repository per language pair, fetched on first use from `huggingface.co/Xenova/opus-mt-<src>-<tgt>` into `<models>/translators/<spec>/` (two int8 graphs, the tokenizer and `config.json`, ~114 MiB per pair). `--translate-model` overrides the pair with an explicit spec or a directory already on disk.
+
+**The pair comes from `--language` plus `--translate`, and coverage is thin where you might expect it to be wide.** These are per-pair models, so a direction that nobody exported does not exist:
+
+| | Languages |
+|---|---|
+| `--language pl --translate en` | works — the primary path |
+| `--language <code> --translate en` | 25 source languages, including `de`, `fr`, `es`, `ru`, `uk`, `zh` |
+| `--language en --translate <code>` | 20 target languages |
+| `--language pl --translate <anything else>` | **fails**, naming what Polish can reach (`en`) |
+| `--language auto --translate en` | uses the many-sources-into-English model |
+| `--language auto --translate <not en>` | fails: no many-source model exists for that target |
+
+Polish is the sore spot: `Helsinki-NLP` publishes ten `opus-mt-pl-*` models (`pl-de`, `pl-fr`, `pl-es`, `pl-uk`, `pl-sv`, `pl-no`, `pl-ar`, `pl-eo`, `pl-lt`, `pl-en`) but only `pl-en` has been converted to ONNX, and there is no `X-pl` pair in either direction. sttd refuses rather than mistranslating, and the error names the alternative.
+
+Four properties are worth knowing:
+
+- **The step runs after the gates.** A dropped utterance is never translated, and a hallucination or repetition gate judges the source text, never the translation.
+- **A failure emits the source.** If the model returns nothing or the decode fails, sttd warns and emits the source text unchanged, so a translation fault never costs you the sentence.
+- **Translation runs on its own thread**, behind a 4-deep FIFO, so it never adds its 60–150 ms to the gap between utterances. A full queue drops the *oldest* waiting transcript and says so, rather than the newest.
+- **512 tokens is a quality window, not a shape limit.** Text is split on sentence terminators (`.` `!` `?` `;` newline, not `:`) and each piece is truncated to 512 tokens, so quality falls off past that. Text with no terminator stays one piece.
+
+**Eval runs must not use `--translate`.** `tools/eval.py` scores sttd's `--stdout` lines against each reference `.txt`, and with `--translate` those lines hold the translation. The WER then measures the translation model, not the speech model. If you do run with `--translate`, the source transcript is in the `src_text` column of the `--metrics` rows, not in the scored text.
+
+With `--speak`, a `--voice` whose key language differs from the target warns too (`pl_PL-*` reads English badly).
+
+Implementation (`src/translate.rs`, `src/translator_store.rs`): two `ort` sessions (encoder plus the merged decoder, the same pattern as `parakeet_core` and `whisper_core`) with a greedy decode and no prompt — MarianMT takes the raw text, and the language direction is baked into which weights were loaded. The decode cannot use the KV cache (the export's cached branch is broken), so each step re-runs the decoder over the whole sequence; that makes it O(n²) in output length, which is why the 96-token cap is what it is. Measured 61–150 ms per utterance on four threads.
+
+Two details the models decide rather than the code, both read from each export's own `config.json`: the decoder's opening and stopping token ids are **per pair** (`pl-en` starts at 63429, `mul-en` at 64171), and the **pad id must be suppressed** — the int8 `mul-en` export pins its pad logit at `0.000` while every real token sits near `-40`, so a plain argmax emits `<pad>` forever and the translation comes out empty.
 
 ## Build
 
@@ -254,11 +297,13 @@ Key tunables:
 | `--stdout` / `STTD_STDOUT` | off | Print one line per accepted utterance. |
 | `--speak` / `STTD_SPEAK` | off | Read each accepted transcript aloud through the default output device (needs `espeak-ng`). Holds the microphone while it speaks, so what you say during playback is discarded — pair it with `--autopause`, or use headphones. Independent of `--sound`. |
 | `--voice` / `STTD_VOICE` | `pl_PL-gosia-medium` | Piper voice key or a voice directory. Downloaded on first use (~60 MiB). Ignored, and not downloaded, without `--speak`. |
+| `--translate` / `STTD_TRANSLATE` | unset | Translate each accepted transcript into `<LANG>` before emission. Unset: no translation step and no translator download. Every emission channel then receives the translation. The pair comes from `--language` plus this flag; only exported pairs exist (see *Translation*). |
+| `--translate-model` / `STTD_TRANSLATE_MODEL` | unset | Override the resolved pair: a catalog spec (`opus-mt-mul-en`), or a directory holding `encoder_model_quantized.onnx`, `decoder_model_merged_quantized.onnx`, `tokenizer.json` and `config.json`. Downloaded on first use (~114 MiB per pair). Ignored, and not downloaded, without `--translate`. |
 | `--copy` / `STTD_COPY` | off | Copy each emission via `wl-copy`. |
 | `--paste` / `STTD_PASTE` | off | Paste via `ydotool`. Runs only when copy runs on fresh text. |
 | `--paste-mode` / `STTD_PASTE_MODE` | `ctrl-v` | `ctrl-v`, `ctrl-shift-v`, or `type`. |
 | `--dump-dir` / `STTD_DUMP_DIR` (`-o`) | unset | Write WAV+TXT per utterance; keeps newest 100 pairs. TXT for drops starts with `DROPPED(<reason>)`. |
-| `--metrics` / `STTD_METRICS` | unset | Append JSONL per utterance (timing, RTF, evidence, verdict, text). |
+| `--metrics` / `STTD_METRICS` | unset | Append JSONL per utterance (timing, RTF, evidence, verdict, text). With `--translate`, `text` holds the translation and `src_text` the source. |
 | `--start-paused` / `STTD_START_PAUSED` | on | Start paused; file mode ignores it. |
 | `--autopause` / `STTD_AUTOPAUSE` | off | Pause again after each emission; each resume arms one sentence. The pause flushes the utterance buffer first, so speech made while the model was decoding is not lost. |
 | `--no-dbus` / `STTD_NO_DBUS` | off | Skip the session-bus service (both interfaces). Signals and `--stop` keep working. File mode never starts it. |
@@ -383,6 +428,8 @@ src/gate.rs          acoustic/transcript verdicts
 src/emit.rs          stdout/clipboard/paste/speak/dump/last-text
 src/piper.rs         piper voice: config, espeak phonemes, ort VITS run
 src/voice_store.rs   voice index, --voice resolution, voice download
+src/translate.rs     MarianMT translator + the translation thread: sentence split, ort greedy decode
+src/translator_store.rs  language-pair catalog, pair resolution, download
 src/dictionary.rs    custom vocabulary
 src/clean.rs         filler stripping
 src/daemon.rs        start/stop/status
@@ -392,6 +439,7 @@ tools/dump2corpus.py build eval corpus from --dump-dir
 packaging/           PKGBUILD, sttd.service
 models/              gitignored weights (default int8 + silero legacy file)
 models/voices/       downloaded piper voices + the cached voices.json index
+models/translators/  downloaded translators (--translate)
 CONTEXT.md           domain vocabulary
 ```
 
