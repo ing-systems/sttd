@@ -96,31 +96,55 @@ machine translation (as a name for the step)
 
 **Translator**:
 The loaded, ready-to-run translation model a transcript is handed to when the
-translation step runs — a MarianMT `opus-mt` pair, two `ort` sessions (encoder
-plus merged decoder) and its tokenizer, chosen once at startup and fixed for the
-process's lifetime. It is not a speech model: it never sees audio, and it is
-stored beside the models rather than inside them, so the model catalog cannot name
-one. It is a small model, and a long or technical piece of text translates worse
-than a short sentence.
+translation step runs — two `ort` sessions (encoder plus merged decoder) and its
+tokenizer, chosen once at startup and fixed for the process's lifetime. It is not
+a speech model: it never sees audio, and it is stored beside the models rather
+than inside them, so the model catalog cannot name one. A pair translator is small
+(~114 MiB) and fast; a multilingual one is neither. A long or technical piece of
+text translates worse than a short sentence either way.
 _Avoid_: model (bare), speech model, engine (that is a speech engine),
 translation model (that is the weights, not the loaded one)
 
 **Pair**:
-The source and target languages a translator is fixed to, as one identifier:
-`pl-en`. It is also the upstream repository name, which is why a spec, a log line
-and a directory under `<models>/translators/` all read the same. The pair comes
-from `--language` plus `--translate`, and only pairs published as ONNX exports
-exist: `--language pl --translate en` works and Polish into anything else fails,
-because Polish has exactly one exported pair upstream.
-_Avoid_: spec (a `--translate-model` value names a pair or a directory, so the
-pair is the narrower thing), direction, model pair
+The source and target languages a **pair translator** is fixed to, as one
+identifier: `pl-en`. It is also the upstream repository name, which is why a spec,
+a log line and a directory under `<models>/translators/` all read the same. A pair
+comes from `--language` plus `--translate`, and only pairs published as ONNX
+exports exist — unless the run names a **multilingual translator**, which has no
+pair at all.
+_Avoid_: spec (a `--translate-model` value names a translator or a directory, so
+the pair is the narrower thing), direction, model pair
+
+**Translator family**:
+Which of the two kinds of translation model a run has, read out of the export's own
+`config.json` rather than assumed from its name. A **pair** (MarianMT) is one
+repository for one direction: the pair *is* the model, the weights fix the way, and
+the decoder opens on `decoder_start_token_id`. A **multilingual** (NLLB-200) is one
+repository for every direction, so the way is an *input*: a language code in front
+of the encoder's text and the target code opening the decoder. Nothing else about
+running them differs — same two graphs, same greedy decode, same failure handling —
+so the family is the only branch, and it is data rather than a flag.
+_Avoid_: type, kind, backend, model type (that is the `config.json` field it is
+read from)
+
+**Language code**:
+How sttd spells a language for a translator. The ISO-639-1 codes `--language` and
+`--translate` use (`pl`, `en`, `de`) are sttd's own vocabulary; a multilingual
+export spells them the FLORES way (`pol_Latn`, `eng_Latn`, `deu_Latn`), and that
+mapping is the one piece of language data sttd holds rather than reads from a
+model, because NLLB needs an ISO-639-3 code, a script, and a FLORES spelling that
+is neither of the first two for five languages. A code the mapping does not know is
+refused rather than passed through, because the model's vocabulary holds ordinary
+BPE pieces that look like language codes and a typo would mistranslate silently.
+_Avoid_: locale, lang tag, language (bare — that is what the code names)
 
 **Translation thread**:
 The thread a transcript is handed to for translation, between the ASR worker and
-the emitter. Off the worker on purpose: translation is 60 to 130 ms of CPU against
-the worker's 50 ms of inference. Its queue is a bounded FIFO, oldest dropped
-first — unlike speech, a backlog of translations is work in order rather than
-something stale.
+the emitter. Off the worker on purpose: translation is 60 to 130 ms of CPU for a
+pair translator and ~800 ms for a multilingual one, against the worker's 50 ms of
+inference — so it is not work to put in the gap between utterances. Its queue is a
+bounded FIFO, oldest dropped first — unlike speech, a backlog of translations is
+work in order rather than something stale.
 _Avoid_: translation worker, translator thread, async translation
 
 **Voice**:

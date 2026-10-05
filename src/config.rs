@@ -496,29 +496,33 @@ pub(crate) const TRANSLATORS_SUBDIR: &str = "translators";
 
 /// Hugging Face organization the MarianMT ONNX exports are published under.
 /// One repository per language pair, named `opus-mt-<src>-<tgt>` (see
-/// `translator_store::repo_for`).
+/// `translator_store::spec_for`).
 pub(crate) const OPUS_MT_REPO: &str = "Xenova";
 
-/// The pair `--translate-model` names in its own error message, and the pair the
-/// ignored-test path resolves. Not a default: a run derives its pair from the
-/// decoding language plus `--translate`, because the pair *is* the direction and
-/// there is no correct one to compile in.
-pub(crate) const TRANSLATE_DEFAULT_PAIR: &str = "pl-en";
+/// The same publisher for the multilingual export, named separately because it
+/// is a different kind of repository: `translator_store::NLLB_SPEC` is one model
+/// for every direction, not one per pair. Same organization, and the same four
+/// filenames at the same repository paths, which is what lets one asset list
+/// serve both families.
+pub(crate) const NLLB_REPO: &str = "Xenova";
 
-/// Longest run of tokens a translation decode may emit before it is cut off.
+/// A pair a run can reach, named in `--translate-model`'s refusal message when the
+/// value is empty or unrecognisable. Not a default: a run derives its direction
+/// from the decoding language plus `--translate`, because there is no correct pair
+/// to compile in, and under a multilingual export there is no pair at all.
 ///
-/// This is a repetition-loop guard, not a quality limit: a Marian output is a
-/// sentence or two, and measured runs emit 6 to 14 tokens. The cap is small
-/// because the decode cannot use the KV cache (see `translate::Translator::run_step`),
-/// which makes it **O(n²) in output length** — 6 to 14 tokens measures 61 to
-/// 128 ms on four threads, while 256 passes would extrapolate to roughly 40 s on
-/// one utterance. 96 keeps the quadratic tail inside a second.
-pub(crate) const TRANSLATE_MAX_NEW_TOKENS: usize = 96;
+/// Lives here beside the other CLI-facing names rather than in `translator_store`
+/// because it is a string for a human, not a spec the resolver knows.
+pub(crate) const TRANSLATE_EXAMPLE_PAIR: &str = "pl-en";
 
 /// Token budget for one translated piece: over this the ids are truncated (see
-/// `translate::Translator::translate`). Marian takes raw text, so no prompt
-/// shares the budget. Matches the tokenizer's own `model_max_length` of 512, so
-/// cutting past it is a quality choice rather than a shape requirement.
+/// `translate::Translator::translate`).
+///
+/// No prompt shares the budget in either family — Marian takes raw text and NLLB
+/// takes a language code — but NLLB spends three of its ids on the source code, the
+/// text and the closing `</s>`, so the *text* budget is three smaller than the
+/// window. Matches the tokenizer's own `model_max_length`, so cutting past it is a
+/// quality choice rather than a shape requirement.
 pub(crate) const TRANSLATE_MAX_INPUT_TOKENS: usize = 512;
 
 #[cfg(test)]
@@ -698,24 +702,33 @@ mod tests {
         assert!(WHISPER_MAX_NEW_TOKENS < MAX_UTTERANCE_SAMPLES / FRAME_16K);
     }
 
-    /// The compiled-in default pair must name a row of the translator catalog:
-    /// anything that resolves a pair from it would otherwise send a run to a
-    /// model upstream does not publish.
+    /// The example pair named in `--translate-model`'s own refusal must name a row
+    /// of the translator catalog: a message that suggests an unresolvable value is
+    /// worse than no message.
     #[test]
-    fn translate_default_pair_is_in_the_catalog() {
-        let (src, tgt) = TRANSLATE_DEFAULT_PAIR
+    fn the_example_pair_is_in_the_catalog() {
+        let (src, tgt) = TRANSLATE_EXAMPLE_PAIR
             .split_once('-')
             .expect("a pair is written src-tgt");
         assert!(
             crate::translator_store::CATALOG
                 .iter()
                 .any(|p| p.src == src && p.tgt == tgt),
-            "the default pair must resolve via the translator catalog"
+            "the example pair must resolve via the translator catalog"
         );
-        // Pinned because the cap is a performance bound, not a taste call: the
-        // decode cannot use the KV cache, so it is O(n^2) in output length. See
-        // the constant's doc comment for the measurements behind 96.
-        assert_eq!(TRANSLATE_MAX_NEW_TOKENS, 96);
         assert_eq!(TRANSLATE_MAX_INPUT_TOKENS, 512);
+        // The decode cap is per family, not one number, and both are pinned here
+        // because they are performance bounds rather than taste calls: the decode
+        // cannot use the KV cache, so it is O(n^2) in output length. See
+        // `translator_store::Family::max_new_tokens` for the measurements.
+        use crate::translator_store::Family;
+        assert_eq!(Family::Marian.max_new_tokens(), 96);
+        assert_eq!(Family::Nllb.max_new_tokens(), 48);
+        // And the multilingual spec must be one the store can resolve, since
+        // `--translate-model` names it.
+        assert!(crate::translator_store::resolve(
+            crate::translator_store::NLLB_SPEC
+        )
+        .is_ok());
     }
 }

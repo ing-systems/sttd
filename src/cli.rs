@@ -277,10 +277,18 @@ pub(crate) struct Cli {
     /// and stdout receive changes. A translation that fails or comes back empty
     /// warns and emits the source text.
     ///
-    /// The pair comes from `--language` plus this flag, and only the pairs
-    /// published as ONNX exports exist: `--language pl --translate en` is the
-    /// primary path, because Polish has exactly one exported pair upstream.
-    /// `--language auto --translate en` uses the many-sources-into-English model.
+    /// The direction comes from `--language` plus this flag. With the default
+    /// MarianMT translator only the pairs published as ONNX exports exist, and
+    /// Polish has exactly one upstream: `--language pl --translate en` is the
+    /// primary path, `--language auto --translate en` uses the
+    /// many-sources-into-English model, and `--language pl --translate de` fails
+    /// naming what Polish can reach.
+    ///
+    /// `--translate-model nllb-200-distilled-600M` removes that limit: one
+    /// multilingual model translates every direction, so `--translate` may name
+    /// any of ~200 languages. It needs a **named** `--language` (its source is an
+    /// input, not a property of the weights), takes ~870 MiB against a pair's
+    /// ~114 MiB, and translates about 8x slower per utterance.
     #[arg(
         long,
         env = "STTD_TRANSLATE",
@@ -289,13 +297,18 @@ pub(crate) struct Cli {
     )]
     pub(crate) translate: Option<String>,
 
-    /// Translator to translate with, overriding the pair `--translate` and
-    /// `--language` resolve to: a catalog spec (`opus-mt-mul-en`) or a path to a
-    /// translator directory already on disk, downloaded on first use into
-    /// `<models>/translators/<spec>/`. Needs `--translate`; ignored (and not
-    /// downloaded) without it.
+    /// Translator to translate with, overriding the direction `--translate` and
+    /// `--language` resolve to: a catalog spec (`opus-mt-mul-en`,
+    /// `nllb-200-distilled-600M`) or a path to a translator directory already on
+    /// disk, downloaded on first use into `<models>/translators/<spec>/`. Needs
+    /// `--translate`; ignored (and not downloaded) without it.
     ///
-    /// No default: the pair is derived from the run's own languages, and a
+    /// A directory names no family and no direction: which model it holds is read
+    /// out of its own `config.json`, and the direction still comes from
+    /// `--language` and `--translate`. So a directory holding an NLLB export is
+    /// told which way to translate exactly like the catalog spec is.
+    ///
+    /// No default: the direction is derived from the run's own languages, and a
     /// compiled-in value would both be wrong for most runs and read in `--help` as
     /// though it were in effect.
     #[arg(

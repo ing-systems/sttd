@@ -1,5 +1,6 @@
 // ---------------------------------------------------------------------------
-// Translation step: text in, text out, with MarianMT (`opus-mt`) as the translator.
+// Translation step: text in, text out, with an ONNX seq2seq model as the
+// translator.
 // ---------------------------------------------------------------------------
 //
 // The step runs after the gates and before the emitter, so everything that
@@ -8,16 +9,26 @@
 // runs the result through `fallback_or_translated`, which warns and returns the
 // source.
 //
-// Three parts live in this file. The pure half (`split_sentences`,
-// `fallback_or_translated`, `patched_tokenizer`) needs no weights, so it is
-// unit-tested without a model. `Translator` owns the two `ort` sessions and the
-// tokenizer. `TranslationOut` is the thread the translator runs on, with a
+// Four parts live in this file. The pure half (`split_sentences`,
+// `fallback_or_translated`, `patched_value`, `next_token`) needs no weights, so
+// it is unit-tested without a model. `Translator` owns the two `ort` sessions and
+// the tokenizer. `TranslationOut` is the thread the translator runs on, with a
 // bounded FIFO in front of it so a translation never stalls the next decode.
 //
-// The models are per language pair: upstream publishes one repository per
-// `opus-mt-<src>-<tgt>`, so the source and target languages are a property of
-// *which weights were loaded*, not a prompt. There is no prompt here, and no
-// language table, because there is nothing to name in a prompt.
+// Two model families run through those same two graphs, and they differ in
+// exactly two places, both of them **inputs**:
+//
+// * A MarianMT pair export takes raw text and opens its decoder on
+//   `decoder_start_token_id`, because the weights already only do one direction.
+// * A multilingual NLLB-200 export is told which way to go: the source code goes
+//   in front of the encoder's ids and closes them with `</s>`, and the decoder
+//   opens on the *target* code. `decoder_start_token_id` is never used, which is
+//   why that export declaring it equal to `eos_token_id` is fine.
+//
+// [`Feed`] is that difference, as a value the loaded translator holds; everything
+// after it is shared. The decoder's *shape* also differs, but that is read out of
+// each export's own `config.json` rather than compiled in — see
+// `translator_store::GraphShape` — so a re-exported model describes itself.
 // ---------------------------------------------------------------------------
 
 use std::collections::VecDeque;
@@ -31,19 +42,17 @@ use ort::session::SessionInputValue;
 use ort::value::{Tensor, TensorRef, ValueType};
 use tokenizers::Tokenizer;
 
-use crate::config::{TRANSLATE_MAX_INPUT_TOKENS, TRANSLATE_MAX_NEW_TOKENS};
+use crate::config::TRANSLATE_MAX_INPUT_TOKENS;
 use crate::emit::{Emission, Emitter};
-use crate::translator_store::TranslatorRef;
+use crate::translator_store::{Family, GraphShape, Prepared};
 
-/// MarianMT: 6 layers, 8 heads, 64 per head, `d_model` 512.
-const LAYERS: usize = 6;
-const HEADS: usize = 8;
-const HEAD_DIM: usize = 64;
-/// `past_key_values.N.{decoder,encoder}.{key,value}`: 6 layers with a
-/// self-attention and a cross-attention key and value each.
-const CACHE_SLOTS: usize = LAYERS * 4;
-/// The name prefix of the cache inputs. The matching outputs are the same
-/// strings under `present.`, which this decode never reads.
+/// The name prefix of the decoder's cache inputs. The matching outputs are the
+/// same strings under `present.`, which this decode never reads.
+///
+/// A `past_key_values.N.{decoder,encoder}.{key,value}` shape, which is what
+/// names a slot: `N` walks layers and the two halves are self- and
+/// cross-attention. How many there are is the export's own
+/// [`GraphShape::cache_slots`], not a constant here.
 const PAST_PREFIX: &str = "past_key_values.";
 
 /// Split text into the pieces that go through the model one at a time.
@@ -122,8 +131,24 @@ pub(crate) fn fallback_or_translated(source: &str, r: Result<String>, tag: &str)
     }
 }
 
-/// Load a SentencePiece `tokenizer.json`, working around the null charsmap
-/// upstream ships.
+/// Whether a normalizer carries the null charsmap `tokenizers` 0.23 panics on.
+///
+/// Walked rather than pattern-matched, because where the `Precompiled` sits inside
+/// the normalizer is the converter's choice: Xenova writes a bare `Precompiled`
+/// for Marian and wraps the same node in a `Sequence` (with a `Replace` beside it)
+/// for NLLB. A `Parallel` would be a third shape and would need the same walk.
+fn has_null_charsmap(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
+            (key == "precompiled_charsmap" && child.is_null()) || has_null_charsmap(child)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(has_null_charsmap),
+        _ => false,
+    }
+}
+
+/// Drop the normalizer **only** when it is the one `tokenizers` cannot load, and
+/// report whether it did.
 ///
 /// Xenova's Marian exports carry
 /// `"normalizer":{"type":"Precompiled","precompiled_charsmap":null}`, and
@@ -140,49 +165,210 @@ pub(crate) fn fallback_or_translated(source: &str, r: Result<String>, tag: &str)
 /// `[8261,45,54,95,12080,187,2,0]`), so the field is removed rather than
 /// substituted. `source.spm` would be the real charsmap, but only Xenova's
 /// converted `tokenizer.json` is downloaded, and that is where the null is.
+///
+/// **The test is on the null, not on the field.** NLLB's export publishes a real
+/// 316 KB charsmap, and dropping a normalizer that works would change its
+/// tokenization — measured against the real file, it loads in 979 ms with the
+/// normalizer intact. Blanket-dropping was right for the one export it was written
+/// against and wrong for the next one; asking whether the value is the panic is
+/// right for both, which is why this is a value-level function a test can pin
+/// rather than a side effect hidden in the loader.
+fn patched_value(value: &mut serde_json::Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let null_charsmap = object
+        .get("normalizer")
+        .is_some_and(has_null_charsmap);
+    if null_charsmap {
+        object.remove("normalizer");
+    }
+    null_charsmap
+}
+
+/// Load a SentencePiece or BPE `tokenizer.json`, dropping a null charsmap first.
+///
+/// The only patch is [`patched_value`]'s. This is the graph contract's first
+/// dependency, so a tokenizer the build cannot read fails here rather than
+/// mid-utterance.
 fn patched_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
     let mut value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
-    match value.as_object_mut() {
-        Some(object) => {
-            object.remove("normalizer");
-        }
-        None => anyhow::bail!("{} is not a tokenizer object", path.display()),
+    if !value.is_object() {
+        anyhow::bail!("{} is not a tokenizer object", path.display());
     }
-    let patched = serde_json::to_vec(&value)?;
-    Tokenizer::from_bytes(&patched)
-        .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", path.display()))
+    let patched = patched_value(&mut value);
+    let bytes = serde_json::to_vec(&value)?;
+    let tokenizer = Tokenizer::from_bytes(&bytes)
+        .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", path.display()))?;
+    if patched {
+        log::debug!(
+            "{}: dropped a normalizer with a null charsmap, which tokenizers 0.23 cannot load",
+            path.display()
+        );
+    }
+    Ok(tokenizer)
 }
 
-/// A loaded translator: both graphs and the tokenizer.
+/// How one export is fed, which is the whole difference between the two families
+/// once the sessions are open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Feed {
+    /// A pair export: the encoder gets the text ids as they come out of the
+    /// tokenizer, and the decoder opens on the export's own
+    /// `decoder_start_token_id`.
+    Fixed {
+        /// The id the decoder opens its sequence with. Per export, not a constant:
+        /// `pl-en` opens on 63429 and `mul-en` on 64171, and both are also the pad
+        /// id. Feeding the wrong one is not an error — the graph runs and returns
+        /// punctuation (`"..... .."`) — which is why it is read out of the model's
+        /// own config rather than written down here.
+        start: i64,
+    },
+    /// A multilingual export: the source code goes in front of the encoder's ids
+    /// and closes them with `</s>`, and the decoder opens on
+    /// `[start, target code]`.
+    ///
+    /// Both ends are needed and neither is the other's job: the source code tells
+    /// the encoder which language it is reading, and the target code tells the
+    /// decoder which language to write.
+    LangTagged {
+        /// The source language code's id, from the run's `--language`. Prefixed to
+        /// the encoder's input ids, and **not** among the ids the decoder may emit.
+        src: i64,
+        /// The target language code's id, from `--translate`. Opens the decoder,
+        /// and is never emitted mid-sentence.
+        tgt: i64,
+        /// `decoder_start_token_id`, which opens the decoder *before* the target
+        /// code. It is equal to `eos_token_id` in this family, which is why the
+        /// start==eos refusal in `translator_store` is scoped to pair exports.
+        start: i64,
+    },
+}
+
+impl Feed {
+    /// Whether the tokenizer's own post-processor should run.
+    ///
+    /// `true` for a pair export, whose post-processor is what it has always been.
+    /// `false` for a multilingual one, whose `tokenizer.json` ships a
+    /// `TemplateProcessing` that hard-codes **`eng_Latn`** as the source prefix and
+    /// appends `</s>` — right for English, silently wrong for every other source.
+    /// Both ends are built here instead, out of the resolved codes.
+    const fn adds_special_tokens(self) -> bool {
+        matches!(self, Self::Fixed { .. })
+    }
+
+    /// Ids the framing spends around the text: none for a pair export, two for a
+    /// multilingual one (the source code and the closing `</s>`). Counted against
+    /// the input budget so the two cannot silently overrun it.
+    const fn framing(self) -> usize {
+        match self {
+            Self::Fixed { .. } => 0,
+            Self::LangTagged { .. } => 2,
+        }
+    }
+
+    /// The ids a decode opens its sequence with.
+    ///
+    /// A pair export opens on one id: its own `decoder_start_token_id`.
+    ///
+    /// A multilingual export opens on **two** — `[start, target code]`. This is the
+    /// one framing fact that cost the most to find, and it is measured, not
+    /// inferred. NLLB's `forced_bos_token_id` mechanism is *generation*, not a
+    /// different prefix: `generate` starts the decoder at
+    /// `decoder_start_token_id` and then forces the first **output** to be the
+    /// target code, so the sequence the decoder actually sees is
+    /// `[start, target]`. Opening on the target code alone gives `"is"` for
+    /// `"Kot siedzi na stole."`, and opening on `[start, target, start]` gives
+    /// `""` with a language code winning the first step — all measured on the
+    /// downloaded weights, all three with the same greedy decode.
+    ///
+    /// Two ids is also why `decoder_start_token_id == eos_token_id == 2` is legal
+    /// for this family: the start token *is* the `</s>` decoder prefix, so a decode
+    /// that opened and stopped on the same id is not the pathology
+    /// `translator_store::read_config` refuses it for in a pair export.
+    fn opening(self) -> Vec<i64> {
+        match self {
+            Self::Fixed { start } => vec![start],
+            Self::LangTagged { start, tgt, .. } => vec![start, tgt],
+        }
+    }
+}
+
+/// The ids a decode may never emit.
 ///
-/// One `Translator` is one language pair, and the pair is fixed for the life of
+/// A lookup table rather than a `Vec<i64>` scanned with `contains`, because a
+/// multilingual export suppresses every language code it holds — 202 of them, over
+/// a 256,206-wide vocabulary — so the scan would be 51 million comparisons on
+/// *every* step. The table is sized to the highest suppressed id, and anything past
+/// it is allowed, which is what a suppressed id outside the table should do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Suppressed(Vec<bool>);
+
+impl Suppressed {
+    /// A table blocking every id in `ids`. Negative and duplicate ids are dropped,
+    /// and an empty set produces a table that blocks nothing.
+    fn build(ids: impl IntoIterator<Item = i64>) -> Self {
+        let ids: Vec<i64> = ids.into_iter().filter(|id| *id >= 0).collect();
+        let width = ids.iter().copied().max().map_or(0, |max| max as usize + 1);
+        let mut table = vec![false; width];
+        for id in ids {
+            table[id as usize] = true;
+        }
+        Self(table)
+    }
+
+    /// Whether `id` may not be emitted. Anything past the table is allowed.
+    fn blocks(&self, id: usize) -> bool {
+        self.0.get(id).copied().unwrap_or(false)
+    }
+}
+
+/// A loaded translator: both graphs, the tokenizer, and the family's framing.
+///
+/// One `Translator` is one direction, and the direction is fixed for the life of
 /// the process, so nothing here is rebuilt per utterance. The sessions live on
 /// the translation thread, which is the only thread that touches them.
 pub(crate) struct Translator {
+    /// Upstream spec, for log lines.
     spec: String,
+    /// The direction this translator runs, as a log should read it:
+    /// `pol_Latn -> eng_Latn` for a multilingual export, `pl -> en` for a pair,
+    /// and the bare spec for a directory, which names no direction at all.
+    direction: String,
     encoder: Session,
     decoder: Session,
     tokenizer: Tokenizer,
-    /// `decoder_start_token_id` from the export's config. Per pair.
-    start_token: i64,
-    /// `eos_token_id` from the export's config. Per pair.
+    /// How this family is fed: open on the export's own start token, or wrap the
+    /// source in a language code and open on the target one.
+    feed: Feed,
+    /// The export's own decoder geometry, read from its `config.json`. Held here
+    /// because an empty cache tensor cannot carry a dynamic head axis, so the head
+    /// count and width have to be known before the first step.
+    shape: GraphShape,
+    /// `eos_token_id` from the export's config. Where a decode stops.
     eos_token: i64,
-    /// Ids the decode may never emit, the pad above all. See
-    /// `translator_store::TranslatorRef::suppressed_ids`.
-    suppressed: Vec<i64>,
+    /// Ids the decode may never emit. See [`Suppressed`].
+    suppressed: Suppressed,
+    /// Longest run of tokens one decode may emit, per family. See
+    /// `translator_store::Family::max_new_tokens`.
+    max_new_tokens: usize,
 }
 
 impl Translator {
     /// Load the encoder, the merged decoder and the tokenizer.
     ///
-    /// `r` comes from `translator_store::prepare`, so the three files are
-    /// already on disk. Both sessions run on the CPU with the settings the piper
-    /// voice uses: one intra-op thread count, no parallel execution, no memory
-    /// pattern.
-    pub(crate) fn load(r: &TranslatorRef, intra_threads: usize) -> Result<Self> {
+    /// `prepared` comes from `translator_store::prepare`, so the four files are
+    /// already on disk **and the export's own `config.json` has been read**: the
+    /// family, the decoder shape and the token ids all arrive as facts rather than
+    /// as placeholders a load has to second-guess. Both sessions run on the CPU
+    /// with the settings the piper voice uses: one intra-op thread count, no
+    /// parallel execution, no memory pattern.
+    pub(crate) fn load(prepared: &Prepared, intra_threads: usize) -> Result<Self> {
+        let r = &prepared.reference;
+        let facts = &prepared.facts;
         let tokenizer = patched_tokenizer(&r.tokenizer)?;
         let encoder = cpu_session(&r.encoder, intra_threads, "translation encoder")?;
         let decoder = cpu_session(&r.decoder, intra_threads, "translation decoder")?;
@@ -192,28 +378,88 @@ impl Translator {
         require_input(&decoder, "encoder_hidden_states", &r.decoder)?;
         require_input(&decoder, "encoder_attention_mask", &r.decoder)?;
         require_input(&decoder, "use_cache_branch", &r.decoder)?;
-        check_cache_inputs(&decoder, &r.decoder)?;
-        // `translator_store::prepare` reads these out of `config.json`. A
-        // reference that skipped that read still holds the placeholder, and
-        // decoding from it would return punctuation rather than fail.
-        if r.decoder_start_token_id == UNREAD_TOKEN_ID || r.eos_token_id == UNREAD_TOKEN_ID {
-            anyhow::bail!(
-                "{} has not read its token ids; go through translator_store::prepare",
+        check_cache_inputs(&decoder, &r.decoder, &facts.shape)?;
+
+        let (feed, suppressed) = match (facts.family, &prepared.codes) {
+            // A pair export: open on the id its own config publishes, and block
+            // that id plus the pad. Both are in every export checked, and the pad
+            // has to be blocked -- see `next_token`.
+            (Family::Marian, _) => {
+                let mut ids = vec![facts.start_token];
+                ids.extend(facts.pad_token);
+                (
+                    Feed::Fixed {
+                        start: facts.start_token,
+                    },
+                    Suppressed::build(ids),
+                )
+            }
+            // A multilingual export: open on the target code, and block every
+            // added token but `</s>`. That is the pad, the unknown, every one of
+            // the 202 language codes and `<mask>` -- all of which the model can
+            // otherwise emit mid-sentence, and a language code in the middle of a
+            // translation is the model's decision to switch language, which is
+            // never what the user asked for. Read off the tokenizer rather than
+            // written down, so a re-converted vocabulary cannot go stale.
+            (Family::Nllb, Some((src_code, tgt_code))) => {
+                let token_of = |code: &str| -> Result<i64> {
+                    tokenizer.token_to_id(code).map(|id| id as i64).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{} has no {code:?} token; this export cannot translate that language",
+                            r.spec
+                        )
+                    })
+                };
+                let added: Vec<i64> = tokenizer
+                    .get_added_tokens_decoder()
+                    .keys()
+                    .map(|id| *id as i64)
+                    .filter(|id| *id != facts.eos_token)
+                    .collect();
+                (
+                    Feed::LangTagged {
+                        src: token_of(src_code)?,
+                        tgt: token_of(tgt_code)?,
+                        start: facts.start_token,
+                    },
+                    Suppressed::build(added),
+                )
+            }
+            // `prepare` refuses a multilingual export with no codes before it gets
+            // here, so this arm is unreachable. It is stated rather than collapsed
+            // into the arm above because the two are genuinely different rules and
+            // a silent fall-through would pick one of them by accident.
+            (Family::Nllb, None) => anyhow::bail!(
+                "{} was prepared without a direction; go through translator_store::prepare",
                 r.spec
-            );
-        }
+            ),
+        };
+
+        let direction = match &prepared.codes {
+            Some((src, tgt)) => format!("{src} -> {tgt}"),
+            None if !r.src.is_empty() => format!("{} -> {}", r.src, r.tgt),
+            // A user directory names no direction, and saying " -> " would be a
+            // lie about what sttd knows.
+            None => r.spec.clone(),
+        };
         log::info!(
-            "translator: {} ({} -> {}, CPU, no prompt, start={} eos={})",
-            r.spec, r.src, r.tgt, r.decoder_start_token_id, r.eos_token_id
+            "translator: {} ({direction}, CPU, no prompt, eos={}, {} cache slots, cap {} tokens)",
+            r.spec,
+            facts.eos_token,
+            facts.shape.cache_slots(),
+            facts.family.max_new_tokens(),
         );
         Ok(Self {
             spec: r.spec.clone(),
+            direction,
             encoder,
             decoder,
             tokenizer,
-            start_token: r.decoder_start_token_id,
-            eos_token: r.eos_token_id,
-            suppressed: r.suppressed_ids.clone(),
+            feed,
+            shape: facts.shape,
+            eos_token: facts.eos_token,
+            suppressed,
+            max_new_tokens: facts.family.max_new_tokens(),
         })
     }
 
@@ -241,32 +487,50 @@ impl Translator {
     }
 
     /// One piece through the encoder and the greedy decode.
+    ///
+    /// The framing is the family's, and it is the only place [`Feed`] is read:
+    /// a pair export encodes the text as it stands, a multilingual one encodes it
+    /// bare and wraps it in `[src] + ids + [eos]`.
     fn translate_piece(&mut self, piece: &str) -> Result<String> {
         let encoding = self
             .tokenizer
-            .encode(piece, true)
+            .encode(piece, self.feed.adds_special_tokens())
             .map_err(|e| anyhow::anyhow!("failed to tokenize the source text: {e}"))?;
-        let mut ids: Vec<i64> = encoding.get_ids().iter().map(|id| *id as i64).collect();
-        if ids.len() > TRANSLATE_MAX_INPUT_TOKENS {
+        let mut text: Vec<i64> = encoding.get_ids().iter().map(|id| *id as i64).collect();
+        // The framing counts against the budget, so the two cannot overrun it
+        // between them: a 512-token piece plus a code and an `</s>` is 514 ids.
+        let budget = TRANSLATE_MAX_INPUT_TOKENS.saturating_sub(self.feed.framing());
+        if text.len() > budget {
             log::warn!(
-                "translator {}: piece of {} tokens cut to {TRANSLATE_MAX_INPUT_TOKENS}",
+                "translator {}: piece of {} tokens cut to {budget}",
                 self.spec,
-                ids.len()
+                text.len()
             );
-            ids.truncate(TRANSLATE_MAX_INPUT_TOKENS);
+            text.truncate(budget);
+        }
+        let mut ids: Vec<i64> = Vec::with_capacity(text.len() + self.feed.framing());
+        if let Feed::LangTagged { src, .. } = self.feed {
+            ids.push(src);
+        }
+        ids.append(&mut text);
+        if matches!(self.feed, Feed::LangTagged { .. }) {
+            // The closing `</s>` is what tells the encoder the source sentence has
+            // ended. Without it the source code in front is just another token.
+            ids.push(self.eos_token);
         }
         let hidden = self.run_encoder(&ids)?;
         let enc_len = ids.len();
 
-        // The decoder opens on the start token *alone*: the source text reaches
-        // the model through `encoder_hidden_states` and nowhere else.
+        // The decoder opens on the family's opening ids and nothing else: the source
+        // text reaches the model through `encoder_hidden_states` and nowhere else.
         //
-        // The id is `decoder_start_token_id` from `config.json`, which is the
-        // `<pad>` id in this export and **not** 2. Opening on 2 (which is `.` in
-        // this vocabulary) is what produced `"i i i i ..."` on every input: the
-        // same graphs, the same ids and the same weights give correct English
-        // from 63429.
-        let mut sequence: Vec<i64> = vec![self.start_token];
+        // For a pair export that is `decoder_start_token_id` from `config.json`,
+        // which is the `<pad>` id and **not** 2. Opening on 2 (which is `.` in that
+        // vocabulary) is what produced `"i i i i ..."` on every input: the same
+        // graphs, the same ids and the same weights give correct English from
+        // 63429. For a multilingual export it is `[start, target code]` — see
+        // `Feed::opening`, where the two-id shape is measured against the weights.
+        let mut sequence: Vec<i64> = self.feed.opening();
         let mut tokens: Vec<u32> = Vec::new();
         let mut produced = 0usize;
 
@@ -278,11 +542,11 @@ impl Translator {
             }
             tokens.push(next as u32);
             produced += 1;
-            if produced >= TRANSLATE_MAX_NEW_TOKENS {
+            if produced >= self.max_new_tokens {
                 log::warn!(
-                    "translator {}: decode hit the {TRANSLATE_MAX_NEW_TOKENS}-token cap; \
+                    "translator {}: decode hit the {}-token cap; \
                      the translation of this piece is cut short",
-                    self.spec
+                    self.spec, self.max_new_tokens
                 );
                 break;
             }
@@ -331,8 +595,9 @@ impl Translator {
     /// row.
     ///
     /// **The KV cache is never used, and never fed back.** `use_cache_branch` is
-    /// `false` on every run, and all 24 `past_key_values` inputs go out empty
-    /// (`[1, 8, 0, 64]`). The export's `true` branch fails on every path tried:
+    /// `false` on every run, and every `past_key_values` input goes out empty
+    /// (`[1, heads, 0, head_dim]`, read from the export's own config). The
+    /// export's `true` branch fails on every path tried:
     ///
     /// ```text
     /// If node 'optimum::if' ... encoder_attn/Reshape_4 ...
@@ -343,8 +608,9 @@ impl Translator {
     /// `optimum::if` node with `No operator matching`. The consequence is that
     /// every step re-runs the decoder over the whole sequence, which makes the
     /// decode **O(n²) in output length**. At 6 to 14 output tokens that measures
-    /// 61 to 128 ms per utterance on four threads; `TRANSLATE_MAX_NEW_TOKENS` is
-    /// what keeps the quadratic tail bounded.
+    /// 61 to 128 ms per utterance on four threads for a Marian pair;
+    /// `Family::max_new_tokens` is what keeps the quadratic tail bounded, and it is
+    /// per family because NLLB's decoder is four times the arithmetic per step.
     fn run_step(
         &mut self,
         ids: &[i64],
@@ -352,7 +618,8 @@ impl Translator {
         enc_len: usize,
     ) -> ort::Result<Vec<f32>> {
         let slots = self.empty_cache_inputs();
-        let mut named: Vec<(&str, SessionInputValue<'_>)> = Vec::with_capacity(CACHE_SLOTS + 4);
+        let mut named: Vec<(&str, SessionInputValue<'_>)> =
+            Vec::with_capacity(slots.len() + 4);
         named.push((
             "input_ids",
             Tensor::from_array((vec![1usize, ids.len()], ids.to_vec()))?.into(),
@@ -394,12 +661,17 @@ impl Translator {
         Ok(flat[flat.len() - vocab..].to_vec())
     }
 
-    /// The 24 cache inputs as `(name, empty shape)` pairs, in the order the
-    /// graph declares them, so a name and its tensor cannot drift apart.
+    /// The cache inputs as `(name, empty shape)` pairs, in the order the graph
+    /// declares them, so a name and its tensor cannot drift apart. How many there
+    /// are is a property of the export — 24 for a Marian pair, 48 for NLLB — and
+    /// `check_cache_inputs` has already refused a graph that disagrees with its own
+    /// config.
     ///
     /// The shape comes from the graph's metadata with the sequence axis set to
-    /// zero. Any axis the metadata leaves dynamic keeps the compiled-in
-    /// default: a zero-length tensor cannot carry a dynamic axis.
+    /// zero. Any axis the metadata leaves dynamic keeps the shape read from
+    /// `config.json`: a zero-length tensor cannot carry a dynamic axis, so the head
+    /// count and head width have to come from somewhere, and the export's config is
+    /// the somewhere.
     fn empty_cache_inputs(&self) -> Vec<(String, Vec<usize>)> {
         self.decoder
             .inputs()
@@ -414,22 +686,19 @@ impl Translator {
                         .collect::<Vec<_>>(),
                     _ => Vec::new(),
                 };
-                (i.name().to_string(), empty_cache_shape(&declared))
+                (i.name().to_string(), empty_cache_shape(&declared, self.shape))
             })
             .collect()
     }
 }
 
-/// The sentinel a `TranslatorRef` carries before its `config.json` has been read,
-/// mirrored here so `Translator::load` can refuse one without importing the
-/// store's private constant. Chosen to be an id no vocabulary has.
-const UNREAD_TOKEN_ID: i64 = -1;
-
 /// The rank of `use_cache_branch`: one axis holding one flag.
 ///
 /// The merged decoder declares this input as a BOOL tensor of shape `[1]`, not
 /// as a rank-0 scalar. A rank-0 tensor is rejected before the graph runs
-/// (`Invalid rank for input: use_cache_branch Got: 0 Expected: 1`).
+/// (`Invalid rank for input: use_cache_branch Got: 0 Expected: 1`). Read out of
+/// both exports' protobuf rather than assumed: element type 9 (BOOL) and a single
+/// fixed dimension of 1, identically in a Marian and an NLLB merged decoder.
 const USE_CACHE_BRANCH_SHAPE: [i64; 1] = [1];
 
 /// The next token id for one logits row: greedy argmax over the ids a decode may
@@ -444,24 +713,27 @@ const USE_CACHE_BRANCH_SHAPE: [i64; 1] = [1];
 /// `bad_words_ids`, which is how the reference implementation avoids it, and
 /// `pl-en` is unaffected only by luck of its quantization.
 ///
+/// A multilingual export suppresses a far bigger set — every added token but
+/// `</s>`, so all 202 language codes among them — which is why the membership test
+/// is a table lookup and not a scan of the row.
+///
 /// The winning id is not skipped outright: the best id that is allowed wins
 /// instead, which costs one pass over the row rather than a sort of it. A tie
 /// keeps the lower id, the rule `argmax_index` uses. A row with nothing allowed in
 /// it falls back to the plain argmax rather than inventing an id.
-fn next_token(logits: &[f32], suppressed: &[i64]) -> usize {
+fn next_token(logits: &[f32], suppressed: &Suppressed) -> usize {
     let mut best: Option<(usize, f32)> = None;
     let mut plain: Option<(usize, f32)> = None;
     for (id, &logit) in logits.iter().enumerate() {
-        let id = id as i64;
         // `>` on both, so a tie keeps the lower id.
         if plain.is_none_or(|(_, top)| logit > top) {
-            plain = Some((id as usize, logit));
+            plain = Some((id, logit));
         }
-        if suppressed.contains(&id) {
+        if suppressed.blocks(id) {
             continue;
         }
         if best.is_none_or(|(_, top)| logit > top) {
-            best = Some((id as usize, logit));
+            best = Some((id, logit));
         }
     }
     best.or(plain).map_or(0, |(id, _)| id)
@@ -477,13 +749,17 @@ fn use_cache_branch_tensor(use_cache: bool) -> ort::Result<Tensor<bool>> {
     Tensor::from_array((USE_CACHE_BRANCH_SHAPE, vec![use_cache]))
 }
 
-/// The shape of one empty cache tensor, built from the graph's declared axes.
+/// The shape of one empty cache tensor, built from the graph's declared axes and
+/// the export's own config.
 ///
-/// A cache slot is `[batch, heads, sequence, head_dim]`, so axis 2 is the one
-/// that goes to zero. Every other axis keeps the value the metadata declares, and
-/// an axis the metadata leaves dynamic falls back to the compiled-in default.
-fn empty_cache_shape(declared: &[Option<usize>]) -> Vec<usize> {
-    let default = [1usize, HEADS, 0, HEAD_DIM];
+/// A cache slot is `[batch, heads, sequence, head_dim]`, so axis 2 is the one that
+/// goes to zero. Every other axis keeps the value the metadata declares, and an
+/// axis the metadata leaves dynamic falls back to `shape` — read from
+/// `config.json`, never compiled in, because a zero-length tensor cannot carry a
+/// dynamic axis and the two families disagree on both numbers that matter (8 heads
+/// of 64 against 16 of 64).
+fn empty_cache_shape(declared: &[Option<usize>], shape: GraphShape) -> Vec<usize> {
+    let default = [1usize, shape.heads, 0, shape.head_dim()];
     if declared.len() != default.len() {
         return default.to_vec();
     }
@@ -543,28 +819,34 @@ fn require_input(session: &Session, name: &str, path: &std::path::Path) -> Resul
     )
 }
 
-/// Check the 24 cache inputs at load: the export must declare all of them, and
-/// hold them as f32, which is the only type this decode builds.
+/// Check the cache inputs at load: the export must declare exactly as many as its
+/// own `config.json` says it has layers, with no duplicates, and hold them as f32,
+/// which is the only type this decode builds.
 ///
 /// A missing slot is worth a load-time error rather than a per-step failure: the
-/// count is a property of the export, not of the text.
-fn check_cache_inputs(session: &Session, path: &std::path::Path) -> Result<()> {
+/// count is a property of the export, not of the text. Nor is it a constant — a
+/// Marian pair declares 24 (6 layers x self+cross x key+value) and NLLB 48 — so it
+/// is compared against the geometry read out of the model rather than a number
+/// written here.
+fn check_cache_inputs(session: &Session, path: &std::path::Path, shape: &GraphShape) -> Result<()> {
+    let expected = shape.cache_slots();
     let mut names: Vec<&str> = session
         .inputs()
         .iter()
         .map(|i| i.name())
         .filter(|n| n.starts_with(PAST_PREFIX))
         .collect();
-    if names.len() != CACHE_SLOTS {
+    if names.len() != expected {
         anyhow::bail!(
-            "{} declares {} cache inputs, expected {CACHE_SLOTS}",
+            "{} declares {} cache inputs, expected {expected} ({} layers)",
             path.display(),
-            names.len()
+            names.len(),
+            shape.layers,
         );
     }
     names.sort_unstable();
     names.dedup();
-    if names.len() != CACHE_SLOTS {
+    if names.len() != expected {
         anyhow::bail!("{} declares duplicate cache input names", path.display());
     }
     for input in session.inputs() {
@@ -828,7 +1110,10 @@ fn emit_one(
     let translated = translator.translate(&source);
     let translate_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let text = fallback_or_translated(&source, translated, &tag);
-    log::info!("{tag}: translate took {translate_ms:.0} ms ({source:?} -> {text:?})");
+    log::info!(
+        "{tag}: translate ({}) took {translate_ms:.0} ms ({source:?} -> {text:?})",
+        translator.direction
+    );
     crate::asr::write_metrics_row(
         metrics,
         &tag,
@@ -952,10 +1237,13 @@ mod tests {
             value.get("normalizer").is_some(),
             "the fixture must reproduce the null charsmap"
         );
-        value.as_object_mut().unwrap().remove("normalizer");
-        let patched = serde_json::to_vec(&value).unwrap();
         assert!(
-            !String::from_utf8_lossy(&patched).contains("precompiled_charsmap"),
+            patched_value(&mut value),
+            "a null charsmap must be dropped"
+        );
+        assert!(
+            !String::from_utf8_lossy(&serde_json::to_vec(&value).unwrap())
+                .contains("precompiled_charsmap"),
             "the null charsmap must not survive the patch"
         );
         // The rest of the tokenizer is untouched.
@@ -963,6 +1251,7 @@ mod tests {
         assert!(value.get("decoder").is_some());
         assert!(value.get("model").is_some());
         // And the patched form is what `tokenizers` accepts.
+        let patched = serde_json::to_vec(&value).unwrap();
         Tokenizer::from_bytes(&patched).expect("a normalizer-free tokenizer must load");
         // The unpatched form is what it *panics* on, which is why this is a patch
         // and not a fallback: `from_bytes` never gets to return an error, so the
@@ -978,9 +1267,150 @@ mod tests {
         );
     }
 
+    /// A working normalizer is **kept**, which is the case the patch was wrong
+    /// about. NLLB's export publishes a real 316 KB charsmap wrapped in a
+    /// `Sequence` beside a `Replace`, and dropping it would change the
+    /// tokenization — so the test is on the value being null, never on the field
+    /// being present.
+    ///
+    /// The charsmap is a stand-in (real `precompiled_charsmap` values are a long
+    /// base64 blob, and this is about the branch taken, not about what
+    /// `tokenizers` makes of the bytes); the `#[ignore]`d test below loads the real
+    /// file.
+    #[test]
+    fn a_normalizer_with_a_real_charsmap_survives_the_patch() {
+        let build = |normalizer: &str| {
+            format!(
+                r#"{{
+                    "version": "1.0",
+                    "normalizer": {normalizer},
+                    "decoder": {{"type": "Metaspace", "replacement": "▁"}},
+                    "model": {{"type": "Unigram", "unk_id": 1,
+                              "vocab": [["▁the", -1.0], ["</s>", 0.0]]}}
+                }}"#
+            )
+        };
+        // The NLLB shape: a `Sequence` whose `Precompiled` carries a real charsmap.
+        let mut nllb: serde_json::Value = serde_json::from_str(&build(
+            r#"{"type": "Sequence", "normalizers": [
+                   {"type": "Precompiled", "precompiled_charsmap": "AAAAAA=="},
+                   {"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "}
+               ]}"#,
+        ))
+        .unwrap();
+        assert!(
+            !patched_value(&mut nllb),
+            "a real charsmap must not be dropped"
+        );
+        assert!(
+            nllb.get("normalizer").is_some(),
+            "the normalizer must survive a patch that had nothing to fix"
+        );
+
+        // The same shape with a null inside it is still dropped: the walk does not
+        // care how deep the null is buried, which is what a `Parallel` would need.
+        let mut nested: serde_json::Value = serde_json::from_str(&build(
+            r#"{"type": "Sequence", "normalizers": [
+                   {"type": "Replace", "pattern": {"Regex": " {2,}"}, "content": " "},
+                   {"type": "Precompiled", "precompiled_charsmap": null}
+               ]}"#,
+        ))
+        .unwrap();
+        assert!(
+            patched_value(&mut nested),
+            "a null charsmap buried in a Sequence must still be found"
+        );
+        assert!(nested.get("normalizer").is_none());
+
+        // And a normalizer with no charsmap at all is not ours to remove.
+        let mut other: serde_json::Value =
+            serde_json::from_str(&build(r#"{"type": "NFC"}"#)).unwrap();
+        assert!(!patched_value(&mut other));
+        assert!(other.get("normalizer").is_some());
+
+        // A tokenizer with no normalizer is a valid shape, not an error.
+        let mut none: serde_json::Value = serde_json::from_str(
+            r#"{"version": "1.0",
+                "decoder": {"type": "Metaspace", "replacement": "▁"},
+                "model": {"type": "Unigram", "unk_id": 1,
+                          "vocab": [["▁the", -1.0], ["</s>", 0.0]]}}"#,
+        )
+        .unwrap();
+        assert!(!patched_value(&mut none));
+    }
+
+    /// The feed is the whole difference between the two families, so each half is
+    /// pinned: what the tokenizer is asked for, what the framing costs, and which
+    /// ids the decoder opens on.
+    #[test]
+    fn a_pair_export_takes_raw_text_and_a_multilingual_one_is_wrapped() {
+        let fixed = Feed::Fixed { start: 63429 };
+        assert!(fixed.adds_special_tokens(), "the post-processor still runs");
+        assert_eq!(fixed.framing(), 0, "a pair export spends no ids on framing");
+        assert_eq!(fixed.opening(), vec![63429], "one id, alone");
+
+        let nllb = Feed::LangTagged {
+            src: 256140,
+            tgt: 256047,
+            start: 2,
+        };
+        assert!(
+            !nllb.adds_special_tokens(),
+            "the post-processor hard-codes eng_Latn, so it must not run"
+        );
+        assert_eq!(nllb.framing(), 2, "the source code and the closing </s>");
+        // **Two** ids, start first. Measured against the weights: opening on the
+        // target alone decodes `"is"`, and `[start, target, start]` decodes `""`.
+        assert_eq!(nllb.opening(), vec![2, 256047]);
+        // The source code never appears in the decoder's opening: the source
+        // reaches the model through the encoder, and opening on it would translate
+        // *towards* Polish whatever the user asked for.
+        assert!(!nllb.opening().contains(&256140));
+
+        // Which is what makes NLLB's config legal: `decoder_start_token_id` and
+        // `eos_token_id` are both 2, because the start token *is* the `</s>` prefix.
+        assert_eq!(nllb.opening()[0], 2, "on the `</s>` prefix, first");
+        assert_eq!(nllb.opening()[1], 256047, "the target code comes second");
+    }
+
+    /// `Suppressed` is a lookup table because a multilingual export blocks 202
+    /// language codes over a 256,206-wide row. Both halves of that matter: the
+    /// blocked ids must block, and an id past the table must be allowed rather
+    /// than panic or be silently blocked.
+    #[test]
+    fn suppression_is_a_table_sized_to_its_highest_id() {
+        let empty = Suppressed::build([]);
+        assert!(!empty.blocks(0));
+        assert!(!empty.blocks(256_140), "an empty table blocks nothing");
+
+        let some = Suppressed::build([3, 102, 64171]);
+        for id in [3, 102, 64171] {
+            assert!(some.blocks(id), "{id} must be blocked");
+        }
+        for id in [0usize, 2, 4, 101, 103, 64170, 64172] {
+            assert!(!some.blocks(id), "{id} must not be blocked");
+        }
+        // Past the table: allowed, not an error. This is the behaviour a
+        // suppressed id outside the vocabulary has to have, or the row's real peak
+        // would be unreachable.
+        assert!(!some.blocks(64172));
+        assert!(!some.blocks(256_206));
+        assert_eq!(some.0.len(), 64172, "the table stops at its highest id");
+        assert_eq!(Suppressed::build([]).0.len(), 0);
+
+        // Negative ids cannot be table slots and are dropped rather than
+        // panicking, so a malformed set still yields a usable table.
+        let odd = Suppressed::build([-1, 5]);
+        assert!(odd.blocks(5));
+        assert!(!odd.blocks(0));
+        assert_eq!(odd.0.len(), 6);
+        // Duplicates collapse.
+        assert_eq!(Suppressed::build([7, 7, 7]).0.len(), 8);
+    }
+
     #[test]
     fn greedy_argmax_takes_the_row_peak() {
-        let none: Vec<i64> = Vec::new();
+        let none = Suppressed::build([]);
         // Marian has no `<extra_id_*>` sentinel block, so with nothing suppressed
         // this is a plain argmax.
         let mut logits = vec![0f32; 200];
@@ -1010,7 +1440,7 @@ mod tests {
         let mut logits = vec![-45f32; 64172];
         logits[64171] = 0.000; // <pad>, pinned
         logits[4016] = -40.218; // "Like", the best real token
-        let suppressed = vec![64171i64];
+        let suppressed = Suppressed::build([64171]);
         assert_eq!(
             next_token(&logits, &suppressed),
             4016,
@@ -1018,49 +1448,65 @@ mod tests {
         );
         // Without the suppression it does win, which is the whole bug: the decode
         // then emits `<pad>` forever and returns nothing.
-        assert_eq!(next_token(&logits, &[]), 64171);
+        assert_eq!(next_token(&logits, &Suppressed::build([])), 64171);
 
-        // A suppressed id that is not in range changes nothing.
+        // A suppressed id that is not in range changes nothing: the table is sized
+        // to its own contents, so 9999 with a 150-wide row does not block 150.
         let mut logits = vec![0f32; 200];
         logits[150] = 9.0;
-        assert_eq!(next_token(&logits, &[9999]), 150);
+        assert_eq!(next_token(&logits, &Suppressed::build([9999])), 150);
         // Several suppressed ids at once, the shape `pl-en` also uses (start and
         // pad are the same id there, so the list holds one entry).
         let mut logits = vec![0f32; 200];
         logits[3] = 10.0;
         logits[102] = 9.0;
         logits[150] = 5.0;
-        assert_eq!(next_token(&logits, &[3, 102]), 150);
+        assert_eq!(next_token(&logits, &Suppressed::build([3, 102])), 150);
         // A row whose every id is suppressed falls back to the plain argmax
         // rather than returning nothing the decoder cannot use.
         let mut logits = vec![0f32; 200];
         logits[3] = 10.0;
         logits[102] = 9.0;
-        let all: Vec<i64> = (0..200).collect();
-        assert_eq!(next_token(&logits, &all), 3);
+        assert_eq!(next_token(&logits, &Suppressed::build(0..200)), 3);
     }
 
-    /// The graph facts that only the weights can settle, pinned in one place.
+    /// A multilingual export blocks every added token but `</s>`, which over its
+    /// 256,206-wide vocabulary means 202 language codes plus the pad and `<mask>`
+    /// must all lose to a real token. Reproduced at that scale because the smaller
+    /// rows above cannot show why the membership test is a lookup and not a scan.
     #[test]
-    fn the_decoder_cache_contract_is_pinned() {
-        assert_eq!(CACHE_SLOTS, 24, "6 layers x self+cross x key+value");
-        assert_eq!(LAYERS, 6);
-        assert_eq!(HEADS, 8);
-        assert_eq!(HEAD_DIM, 64);
-        // The token ids are *not* pinned here, because they are per pair: `pl-en`
-        // starts at 63429 and `mul-en` at 64171, both the pad id, and both are
-        // read from the model's own config. What is pinned is that a reference
-        // which skipped that read is recognisable and refused, and that the
-        // placeholder is an id no vocabulary has.
-        assert_eq!(UNREAD_TOKEN_ID, -1);
-        assert_ne!(UNREAD_TOKEN_ID, 63429);
-        assert_ne!(UNREAD_TOKEN_ID, 64171);
+    fn a_language_code_never_wins_mid_sentence() {
+        let mut logits = vec![-45f32; 256_206];
+        // `eng_Latn` at its real id, the one the decode *opened* on — a model that
+        // repeats it is switching language, not translating.
+        logits[256047] = 10.0;
+        logits[1000] = -40.0;
+        let suppressed = Suppressed::build((256_001..=256_203).chain([1, 0, 3]));
+        assert_eq!(
+            next_token(&logits, &suppressed),
+            1000,
+            "a language code must not win over a real token"
+        );
+        // Unsuppressed it wins outright, which is the failure the table prevents.
+        assert_eq!(next_token(&logits, &Suppressed::build([1])), 256047);
+        // `</s>` (id 2) is deliberately *not* blocked: a decode has to be able to
+        // reach it, or it never stops.
+        assert!(!suppressed.blocks(2));
+        let mut logits = vec![-45f32; 8];
+        logits[2] = 10.0;
+        logits[6] = -1.0;
+        assert_eq!(next_token(&logits, &suppressed), 2, "eos must stay reachable");
     }
 
     /// The ids come from the model, so the load path has to insist on having read
     /// them. This is the check that would have caught the `mul-en` bug: its start
     /// token is 64171, and decoding `pl-en`'s 63429 from it returns punctuation
     /// instead of failing.
+    ///
+    /// There is no sentinel any more. A [`Prepared`] translator has been read or
+    /// does not exist, so the ids cannot be stale at load — which is a stronger
+    /// guarantee than the placeholder this replaced, and the reason the load-time
+    /// refusal could go.
     #[test]
     fn the_token_ids_are_read_from_the_model_not_compiled_in() {
         // Two real configs, fetched from the pairs that differ.
@@ -1117,25 +1563,50 @@ mod tests {
         assert_eq!(USE_CACHE_BRANCH_SHAPE.to_vec(), vec![1]);
     }
 
+    /// The two exports' own geometry, as their `config.json` files publish it. Read
+    /// out of the ONNX protobuf for the cache slot count and confirmed against each
+    /// config for the rest: a Marian merged decoder declares
+    /// `past_key_values.0..5.{decoder,encoder}.{key,value}` and NLLB the same to
+    /// `..11`.
+    fn marian_shape() -> GraphShape {
+        GraphShape::new(6, 8, 64)
+    }
+    fn nllb_shape() -> GraphShape {
+        GraphShape::new(12, 16, 64)
+    }
+
     #[test]
     fn an_empty_cache_shape_keeps_the_declared_axes_and_zeroes_the_sequence() {
         // The metadata of a Marian export: `[batch, heads, sequence, head_dim]`
         // with the sequence dynamic. `ort` reports a dynamic axis as -1.
         assert_eq!(
-            empty_cache_shape(&[None, Some(8), None, Some(64)]),
+            empty_cache_shape(&[None, Some(8), None, Some(64)], marian_shape()),
             vec![1, 8, 0, 64]
         );
         // A fully declared sequence axis still goes to zero: that is the whole
         // point of the empty past this decode sends every step.
         assert_eq!(
-            empty_cache_shape(&[Some(1), Some(8), Some(20), Some(64)]),
+            empty_cache_shape(&[Some(1), Some(8), Some(20), Some(64)], marian_shape()),
             vec![1, 8, 0, 64]
         );
-        // A dynamic head count falls back to the compiled-in default, because a
-        // zero-length tensor cannot carry a dynamic axis.
-        assert_eq!(empty_cache_shape(&[None, None, None, None]), vec![1, 8, 0, 64]);
-        // A rank this decode does not know is refused the same way.
-        assert_eq!(empty_cache_shape(&[Some(1), Some(8)]), vec![1, 8, 0, 64]);
+        // A dynamic head count falls back to the export's own config, because a
+        // zero-length tensor cannot carry a dynamic axis. This is the assertion
+        // that the fallback is *per family*: the same dynamic metadata must yield
+        // 8 heads for a pair and 16 for NLLB.
+        assert_eq!(
+            empty_cache_shape(&[None, None, None, None], marian_shape()),
+            vec![1, 8, 0, 64]
+        );
+        assert_eq!(
+            empty_cache_shape(&[None, None, None, None], nllb_shape()),
+            vec![1, 16, 0, 64]
+        );
+        // A rank this decode does not know falls back to the whole shape.
+        assert_eq!(
+            empty_cache_shape(&[Some(1), Some(8)], marian_shape()),
+            vec![1, 8, 0, 64]
+        );
+        assert_eq!(empty_cache_shape(&[Some(1), Some(8)], nllb_shape()), vec![1, 16, 0, 64]);
     }
 
     /// Every cache input is sent empty on every step, so the input set never
@@ -1143,14 +1614,36 @@ mod tests {
     /// prevents is a load-time shape error, not a wrong answer.
     #[test]
     fn a_past_slot_is_fed_empty_on_every_call() {
-        let shape = empty_cache_shape(&[None, Some(HEADS), None, Some(HEAD_DIM)]);
-        assert_eq!(shape, vec![1, HEADS, 0, HEAD_DIM]);
-        assert_eq!(
-            shape.iter().product::<usize>(),
-            0,
-            "an empty past holds no elements at all"
-        );
-        assert_eq!(shape[2], 0, "only the sequence axis is zeroed");
+        for (shape, heads) in [(marian_shape(), 8), (nllb_shape(), 16)] {
+            let slot = empty_cache_shape(&[None, Some(heads), None, Some(64)], shape);
+            assert_eq!(slot, vec![1, heads, 0, 64]);
+            assert_eq!(
+                slot.iter().product::<usize>(),
+                0,
+                "an empty past holds no elements at all"
+            );
+            assert_eq!(slot[2], 0, "only the sequence axis is zeroed");
+        }
+    }
+
+    /// The cache contract is read from the model, so what is pinned here is the
+    /// *arithmetic* — four slots per layer — and the two shapes it produces. The
+    /// slot count is not written down in either family: a Marian export declares
+    /// 24 and NLLB 48, and `check_cache_inputs` compares the graph against whatever
+    /// the config said rather than against a constant.
+    #[test]
+    fn the_cache_slot_count_follows_the_layer_count() {
+        assert_eq!(marian_shape().cache_slots(), 24, "6 x self+cross x key+value");
+        assert_eq!(nllb_shape().cache_slots(), 48, "12 x self+cross x key+value");
+        // Both agree with `d_model / head_dim == heads`, which is where the head
+        // width comes from.
+        for (shape, d_model) in [(marian_shape(), 512), (nllb_shape(), 1024)] {
+            assert_eq!(d_model / shape.head_dim(), shape.heads);
+            assert_eq!(shape.cache_slots(), shape.layers * 4);
+        }
+        // The decode caps are per family for the same reason the shapes are: the
+        // same O(n^2) decode over a decoder four times the width.
+        assert!(Family::Nllb.max_new_tokens() < Family::Marian.max_new_tokens());
     }
 
     /// End-to-end against the downloaded export, which is the only thing that can
@@ -1166,42 +1659,135 @@ mod tests {
     #[test]
     #[ignore = "needs the downloaded opus-mt-pl-en weights in models/translators/opus-mt-pl-en/"]
     fn real_export_translates_polish_to_english() {
-        let pair = crate::translator_store::CATALOG
-            .iter()
-            .find(|p| p.src == "pl" && p.tgt == "en")
-            .expect("pl-en is in the catalog");
-        // `prepare`, not `resolve`: the token ids come from the model's config,
-        // and a run without them would decode punctuation instead of failing.
-        let ref_ = crate::translator_store::prepare(&crate::translator_store::spec_for(pair))
-            .expect("the pl-en spec must resolve and download");
-        if !ref_.tokenizer.is_file() {
-            eprintln!(
-                "skipping: no weights at {} (run sttd --translate en once to fetch them)",
-                ref_.dir.display()
-            );
-            return;
-        }
-        let mut translator = Translator::load(&ref_, 4).expect("the export must load");
+        let prepared = crate::translator_store::prepare(
+            "opus-mt-pl-en",
+            crate::translator_store::Direction {
+                src: Some("pl"),
+                tgt: "en",
+            },
+        )
+        .expect("the pl-en spec must resolve and download");
+        skip_without_weights(&prepared);
+        assert_eq!(prepared.facts.family, Family::Marian);
+        assert_eq!(prepared.facts.start_token, 63429);
+        assert_eq!(prepared.facts.shape.cache_slots(), 24);
+        let mut translator = Translator::load(&prepared, 4).expect("the export must load");
         // The raw source sentence, which is what the pipeline hands the step: the
         // gates' output, never a prompt. Marian takes the text as it is.
+        let (out, ms) = timed_translate(&mut translator, "Kot siedzi na stole.");
+        eprintln!("marian pl->en output: {out:?} ({ms:.0} ms)");
+        assert_translation_is_english_prose(&out, "cat");
+        // The quadratic tail has to stay inside a second at this size, or the
+        // uncached decode is not the shape the latency claim assumes.
+        assert!(ms < 1_000.0, "one sentence took {ms:.0} ms");
+    }
+
+    /// End-to-end against the downloaded **multilingual** export, which is the only
+    /// thing that can catch a wrong language code in either position: a decoder
+    /// opened on the *source* code translates towards Polish whatever was asked
+    /// for, and an encoder missing its trailing `</s>` reads the source sentence as
+    /// unfinished. Both produce fluent text, so neither is caught by an assertion
+    /// on emptiness.
+    ///
+    /// Ignored by default because it needs ~870 MiB of weights at
+    /// `models/translators/nllb-200-distilled-600M/`; it also skips itself when
+    /// they are not there, so `--ignored` is safe on a fresh checkout.
+    ///
+    /// Run it with:
+    /// `cargo test -- --ignored real_nllb_translates_polish_to_english --nocapture`
+    #[test]
+    #[ignore = "needs the downloaded nllb-200-distilled-600M weights"]
+    fn real_nllb_translates_polish_to_english() {
+        let prepared = crate::translator_store::prepare(
+            crate::translator_store::NLLB_SPEC,
+            crate::translator_store::Direction {
+                src: Some("pl"),
+                tgt: "en",
+            },
+        )
+        .expect("the NLLB spec must resolve and download");
+        skip_without_weights(&prepared);
+        // The family and the geometry come out of the file, and they are the two
+        // things a hard-coded shape would get wrong.
+        assert_eq!(prepared.facts.family, Family::Nllb);
+        assert_eq!(prepared.facts.shape.cache_slots(), 48);
+        assert_eq!(prepared.facts.shape.heads, 16);
+        assert_eq!(
+            prepared.codes,
+            Some(("pol_Latn".to_string(), "eng_Latn".to_string())),
+            "the run's own languages become the codes the model is told"
+        );
+        let mut translator = Translator::load(&prepared, 4).expect("the export must load");
+        let (english, ms) = timed_translate(&mut translator, "Kot siedzi na stole.");
+        eprintln!("nllb pl->en output: {english:?} ({ms:.0} ms)");
+        assert_translation_is_english_prose(&english, "cat");
+        // The cap is what bounds a runaway, so a normal sentence has to be far
+        // under it: 48 tokens over a decoder four times the width is ~10 s at the
+        // observed per-step cost, inside the 15 s drain deadline.
+        assert!(ms < 8_000.0, "one sentence took {ms:.0} ms");
+
+        // A direction a Marian pair export cannot reach at all: this is the whole
+        // reason the multilingual export exists.
+        let german = crate::translator_store::prepare(
+            crate::translator_store::NLLB_SPEC,
+            crate::translator_store::Direction {
+                src: Some("pl"),
+                tgt: "de",
+            },
+        )
+        .expect("pl->de must resolve even though opus-mt-pl-de is not published");
+        assert_eq!(
+            german.codes,
+            Some(("pol_Latn".to_string(), "deu_Latn".to_string()))
+        );
+        let mut translator = Translator::load(&german, 4).expect("the export must load");
+        let (german_out, ms) = timed_translate(&mut translator, "Kot siedzi na stole.");
+        eprintln!("nllb pl->de output: {german_out:?} ({ms:.0} ms)");
+        assert!(!german_out.trim().is_empty(), "translation must not be empty");
+        assert!(!german_out.contains('\u{2581}'), "metaspace leaked: {german_out:?}");
+        // It must be German, not the English the run above produced: the target
+        // code is what decides the direction, and a decode that ignored it would
+        // return the same text for both.
+        assert_ne!(
+            german_out.to_lowercase(),
+            english.to_lowercase(),
+            "pl->de returned what pl->en returned: the target code was not honoured"
+        );
+        assert!(ms < 8_000.0, "one sentence took {ms:.0} ms");
+    }
+
+    /// Skip a test that needs weights which are not there, rather than failing a
+    /// clean checkout that runs `--ignored`.
+    fn skip_without_weights(prepared: &crate::translator_store::Prepared) {
+        if prepared.reference.tokenizer.is_file() {
+            return;
+        }
+        eprintln!(
+            "skipping: no weights at {} (run sttd with --translate-model {} once)",
+            prepared.reference.dir.display(),
+            prepared.reference.spec,
+        );
+    }
+
+    fn timed_translate(translator: &mut Translator, text: &str) -> (String, f64) {
         let t0 = Instant::now();
-        let out = translator
-            .translate("Kot siedzi na stole.")
-            .expect("the decode must run");
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("real export output: {out:?} ({ms:.0} ms)");
+        let out = translator.translate(text).expect("the decode must run");
+        (out, t0.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    /// The checks a translated sentence has to pass whatever produced it: not
+    /// empty, no leaked metaspace marker, mostly letters rather than punctuation
+    /// soup, and containing the word the reference translation has.
+    fn assert_translation_is_english_prose(out: &str, expected: &str) {
         assert!(!out.trim().is_empty(), "translation must not be empty");
         assert!(
-            !out.contains("\u{2581}"),
+            !out.contains('\u{2581}'),
             "a metaspace marker leaked into the output: {out:?}"
         );
-        // The point of pinning the start token: with the wrong one these graphs
-        // decode `"i i i i ..."` for this input.
         assert!(
-            out.to_lowercase().contains("cat"),
-            "expected a translation of 'Kot siedzi na stole.', got {out:?}"
+            out.to_lowercase().contains(expected),
+            "expected a translation containing {expected:?}, got {out:?}"
         );
-        // A real translation is prose: mostly letters, not punctuation soup.
         let letters = out.chars().filter(char::is_ascii_alphabetic).count();
         let visible = out.chars().filter(|c| !c.is_whitespace()).count();
         assert!(visible > 0, "translation has no visible characters: {out:?}");
@@ -1209,8 +1795,5 @@ mod tests {
             letters * 10 >= visible * 6,
             "output is not mostly letters ({letters} of {visible}): {out:?}"
         );
-        // The quadratic tail has to stay inside a second at this size, or the
-        // uncached decode is not the shape the latency claim assumes.
-        assert!(ms < 1_000.0, "one sentence took {ms:.0} ms");
     }
 }

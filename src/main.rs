@@ -1238,18 +1238,26 @@ fn make_speech(cli: &Cli) -> Result<Option<SpeechOut>> {
 }
 
 /// The translation step (`--translate`), resolved once from `Cli` on the main
-/// thread: the pair, the download, and the two `ort` sessions. `None` when the
-/// flag is absent, so nothing is resolved and nothing is downloaded.
+/// thread: the spec, the download, the `config.json` read and the two `ort`
+/// sessions. `None` when the flag is absent, so nothing is resolved and nothing is
+/// downloaded.
 ///
 /// A `--translate-model` without `--translate` warns, mirroring the
-/// `--voice`-without-`--speak` rule — a flag that silently pulled ~114 MiB nobody
+/// `--voice`-without-`--speak` rule — a flag that silently pulled ~870 MiB nobody
 /// asked for is worse than one that does nothing.
 ///
 /// The source language is the one Whisper was told to decode in, because that is
-/// what the transcript is. Under MarianMT the pair **is** the direction, so there
-/// is no prompt to degrade: `Auto` picks the many-sources-into-English model when
-/// the target is English, and refuses otherwise rather than translating with a
-/// pair the user did not ask for.
+/// what the transcript is. What happens next is the **store's** decision, not this
+/// function's, and it differs by model family: a pair export is a fixed direction,
+/// so `Auto` picks the many-sources-into-English model when the target is English
+/// and refuses otherwise; a multilingual export is told which way to go, so `Auto`
+/// has no answer at all and is refused. Neither rule is written here, so the two
+/// paths cannot disagree about which families exist.
+///
+/// One thing this function does own: the code the *voice* check compares against.
+/// It is the code the user typed, not the code the model ended up using — under a
+/// multilingual export those differ (`eng_Latn` against a `en_US-*` voice), and
+/// comparing the model's spelling would warn that no such voice exists.
 fn make_translator(cli: &Cli) -> Result<Option<Translator>> {
     let Some(target) = cli
         .translate
@@ -1268,78 +1276,65 @@ fn make_translator(cli: &Cli) -> Result<Option<Translator>> {
         }
         return Ok(None);
     };
-    let r = match cli.translate_model.as_deref().map(str::trim) {
-        Some(spec) if !spec.is_empty() => crate::translator_store::prepare(spec)
-            .with_context(|| format!("failed to prepare translator {spec}"))?,
-        _ => resolve_pair_for_run(cli, target)?,
+    let language = cli.language();
+    let source = match &language {
+        Language::Explicit(code) | Language::System(code) => Some(code.as_str()),
+        Language::Auto => None,
     };
-    if r.src.is_empty() {
-        // A user directory names no pair, so there is no direction to log.
-        log::info!(
-            "translate: emitting every transcript in {target} (translator {})",
-            r.spec
-        );
-    } else {
-        log::info!(
-            "translate: emitting every transcript as {} -> {target} (translator {})",
-            r.src, r.spec
-        );
-    }
+    let direction = crate::translator_store::Direction {
+        src: source,
+        tgt: target,
+    };
+    let prepared = match cli.translate_model.as_deref().map(str::trim) {
+        Some(spec) if !spec.is_empty() => crate::translator_store::prepare(spec, direction)
+            .with_context(|| format!("failed to prepare translator {spec}"))?,
+        _ => crate::translator_store::prepare_from_direction(direction)?,
+    };
+    log_translator_direction(&prepared, target);
     if cli.speak {
         warn_on_voice_language_mismatch(cli, target);
     }
     let intra_threads = resolve_n_threads(cli.threads, auto_threads()).max(1) as usize;
-    let translator =
-        Translator::load(&r, intra_threads).context("failed to load the translator")?;
+    let translator = Translator::load(&prepared, intra_threads)
+        .context("failed to load the translator")?;
     Ok(Some(translator))
 }
 
-/// The pair a run translates with, from `--language` and `--translate`, downloaded
-/// if it is not on disk yet.
+/// Log the direction a run translates in, and warn when the engine does not decode
+/// in the language that direction assumes.
 ///
-/// `--language auto` is the one case that needs a rule rather than a lookup: the
-/// source is unknown per utterance, and a MarianMT model is a fixed direction, so
-/// there is no pair to name. Into English the answer is `opus-mt-mul-en`, upstream's
-/// many-sources-into-English model. Into anything else there is no honest answer —
-/// `opus-mt-<src>-<tgt>` would have to guess the source — so it refuses and says
-/// which targets have a many-source model.
+/// A **multilingual** export is the only case with an assumption to state: it is
+/// told which language the source is, so under an engine that decides for itself
+/// the flag names what the *translator* should read, not what the engine should
+/// hear. Parakeet detects the spoken language per utterance and ignores
+/// `--language` for transcription, so without this line `--language pl` alongside
+/// a multilingual model reads as "transcribe Polish" — and a Polish sentence
+/// spoken in German would be translated as Polish.
 ///
-/// Coverage is thin in one direction and the message says so: Polish has exactly
-/// one exported pair upstream, so `--language pl --translate de` is an error naming
-/// `en`, not a mistranslation. The store owns the wording.
-fn resolve_pair_for_run(cli: &Cli, target: &str) -> Result<crate::translator_store::TranslatorRef> {
-    match cli.language() {
-        Language::Explicit(code) | Language::System(code) => {
-            let t = crate::translator_store::prepare_pair(&code, target)?;
-            Ok(t)
-        }
-        Language::Auto => {
-            if crate::translator_store::has_pair("mul", target) {
-                log::info!(
-                    "--language auto leaves the source unknown; using the many-source \
-                     model (opus-mt-mul-{target}). Pass --language CODE for a pair \
-                     specific to your language"
-                );
-                Ok(crate::translator_store::prepare_pair("mul", target)?)
-            } else {
-                // No many-source model into this target: the direction is the
-                // model's identity, so there is nothing to fall back to. Name the
-                // sources that do work, since one of them is probably the answer.
-                let sources = crate::translator_store::sources_for(target);
-                let named = if sources.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Languages that can be translated into {target}: {}.", sources.join(", "))
-                };
-                anyhow::bail!(
-                    "--language auto cannot translate into {target}: the only model covering \
-                     an unknown source is opus-mt-mul-en.{named} Or pass --language CODE to \
-                     name the source (e.g. --language pl --translate en)"
-                )
-            }
-        }
-    }
+/// A **pair** export has no such gap: its weights only do one direction, so
+/// `--language auto` picks a many-source model and a named code picks the matching
+/// pair, and either way the direction was already resolved rather than assumed.
+/// Nothing is warned about, which is the point of keeping the check on `codes`
+/// rather than on the translator existing.
+fn log_translator_direction(prepared: &crate::translator_store::Prepared, target: &str) {
+    log::info!(
+        "translate: emitting every accepted transcript into {target} (translator {})",
+        prepared.reference.spec
+    );
+    let Some((src, _)) = &prepared.codes else {
+        return;
+    };
+    log::warn!(
+        "the selected engine detects the spoken language per utterance and ignores \
+         --language for transcription, but {NLLB_SPEC_IN_LOG} is told to read every \
+         transcript as {src}; speech in any other language will be mistranslated"
+    );
 }
+
+/// The spec name, spelled once here rather than interpolated into the format
+/// string above: `translator_store` owns the constant and a renamed spec must not
+/// leave a stale copy in a warning.
+const NLLB_SPEC_IN_LOG: &str = crate::translator_store::NLLB_SPEC;
 
 /// Warn when the `--speak` voice speaks a different language than the one being
 /// written to the clipboard. Not an error: a translation can still be read aloud
