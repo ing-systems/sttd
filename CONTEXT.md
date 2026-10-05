@@ -172,6 +172,14 @@ same rule the partial transcript follows: without it a backlog is stale by the
 time it would be read aloud.
 _Avoid_: speech buffer, TTS queue
 
+**Speech cut**:
+What Ctrl-C does to the spoken channel: the deadline the speak thread reads is
+moved into the past, so the sentence playing is cut and the queued one is
+dropped before it is synthesized. It also marks the teardown, which otherwise
+arms a fresh drain window and waits the sentence out. Distinct from the **stop
+flag**, which only ends the capture loop.
+_Avoid_: abort (that is the inference skip), stop flag (that is `running`)
+
 ### Speech models
 
 **Speech model**:

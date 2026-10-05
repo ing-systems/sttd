@@ -104,14 +104,25 @@ pub(crate) struct SpeechOut {
     slot: Arc<(Mutex<Option<SpeechJob>>, Condvar)>,
     /// Raised from just before playback starts until the tail has played out.
     speaking: Arc<AtomicBool>,
-    /// Deadline for the final utterance, set by `drop`, in milliseconds since
-    /// the thread started — a monotonic `u64` rather than an `Instant` so it
-    /// can cross the thread boundary. Zero means "no deadline".
-    finish_by_ms: Arc<AtomicU64>,
+    /// The deadline the speak thread reads, plus the mark that tells `drop` an
+    /// interrupted run must not arm a fresh drain window.
+    cut: Arc<SpeechCut>,
     /// Set when espeak goes away, so the emit side stops queueing into a thread
     /// that will never speak again.
     disabled: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+/// The speak thread's deadline, and who may move it.
+///
+/// `finish_by_ms` is milliseconds since the thread started — a monotonic `u64`
+/// rather than an `Instant` so it can cross the thread boundary. Zero means "no
+/// deadline". Two owners, and telling them apart is the whole point: `drop` arms
+/// a fresh window for a run that reached its end, `abort` moves the deadline
+/// into the past for one the user interrupted.
+pub(crate) struct SpeechCut {
+    finish_by_ms: Arc<AtomicU64>,
+    aborted: AtomicBool,
 }
 
 /// How long `SpeechOut::drop` waits for the utterance already queued to be
@@ -123,7 +134,44 @@ pub(crate) struct SpeechOut {
 /// itself. Bounded because a device that never drains, or a synthesis that
 /// never returns, must not hang the process — past this the playback is cut and
 /// the utterance is lost, which a log line says.
+///
+/// The case it exists for is `--file`, the only path that transcribes to the
+/// end. A live run never reaches it with a new utterance: `running` is false by
+/// then, so the engine's shutdown check rejects the trailing decode
+/// (`main.rs`, `parakeet.rs`, `whisper.rs`) and nothing new is queued. What the
+/// drain waits for there is the queue already built — the sentence playing, plus
+/// whatever the emit worker hands over while it closes — which is exactly what
+/// Ctrl-C must not wait 15 s for. See `SpeechCut`.
+///
+/// Not the bound for an interrupted run: `SpeechCut::abort` replaces it with the
+/// current instant, so Ctrl-C cuts speech instead of waiting this out.
 const SPEAK_DRAIN_MS: u64 = 15_000;
+
+/// The deadline `SpeechOut::drop` arms: a fresh drain window for a run that
+/// reached its end, the current instant for one that was cut.
+///
+/// A pure function of its inputs, so the rule is testable without a speak
+/// thread — the threading around it is untested glue, like the espeak call.
+fn drop_deadline(aborted: bool, now: u64) -> u64 {
+    if aborted {
+        now
+    } else {
+        now + SPEAK_DRAIN_MS
+    }
+}
+
+impl SpeechCut {
+    /// Stop speaking now: cut the playback, skip the queued utterance, and mark
+    /// the drop path so it arms no drain window. Idempotent, and safe from any
+    /// thread; the capture loop's owner calls it on the way out.
+    pub(crate) fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        // `.max(1)` because `past_deadline` reads a deadline of 0 as "no
+        // deadline", and `now_ms()` returns 0 when it is the process's first
+        // call — an abort that stored 0 would cut nothing at all.
+        self.finish_by_ms.store(now_ms().max(1), Ordering::Release);
+    }
+}
 
 impl SpeechOut {
     /// Spawn the speak thread around a loaded voice.
@@ -131,28 +179,37 @@ impl SpeechOut {
         let slot: Arc<(Mutex<Option<SpeechJob>>, Condvar)> =
             Arc::new((Mutex::new(None), Condvar::new()));
         let speaking = Arc::new(AtomicBool::new(false));
-        let finish_by_ms = Arc::new(AtomicU64::new(0));
+        let cut = Arc::new(SpeechCut {
+            finish_by_ms: Arc::new(AtomicU64::new(0)),
+            aborted: AtomicBool::new(false),
+        });
         let disabled = Arc::new(AtomicBool::new(false));
 
         let handle = {
-            let (slot, speaking, finish_by_ms, disabled) = (
+            let (slot, speaking, cut, disabled) = (
                 Arc::clone(&slot),
                 Arc::clone(&speaking),
-                Arc::clone(&finish_by_ms),
+                Arc::clone(&cut),
                 Arc::clone(&disabled),
             );
             std::thread::Builder::new()
                 .name("speak".into())
-                .spawn(move || speak_loop(&slot, &speaking, &finish_by_ms, &disabled, voice))
+                .spawn(move || speak_loop(&slot, &speaking, &cut, &disabled, voice))
                 .ok()
         };
         Self {
             slot,
             speaking,
-            finish_by_ms,
+            cut,
             disabled,
             handle,
         }
+    }
+
+    /// The cut handle, cloned while the `SpeechOut` is still here: it is moved
+    /// onto the emit worker thread, which is what drops it.
+    pub(crate) fn cut_handle(&self) -> Arc<SpeechCut> {
+        Arc::clone(&self.cut)
     }
 
     /// The flag the capture side reads to hold the pipeline while sttd talks.
@@ -184,8 +241,15 @@ impl Drop for SpeechOut {
         // left alone and the thread is woken, so the trailing utterance is
         // heard. `finish_by_ms` is the bound it must respect, so this join
         // cannot hang the process on a device that never drains.
-        self.finish_by_ms
-            .store(now_ms() + SPEAK_DRAIN_MS, Ordering::Release);
+        //
+        // An interrupted run (`SpeechCut::abort`) has already moved the deadline
+        // into the past, and this must not arm a fresh window over it: the user
+        // asked sttd to stop, so speaking the trailing utterance anyway is the
+        // thing the abort exists to prevent.
+        let aborted = self.cut.aborted.load(Ordering::Acquire);
+        self.cut
+            .finish_by_ms
+            .store(drop_deadline(aborted, now_ms()), Ordering::Release);
         let (_lock, wakeup) = &*self.slot;
         wakeup.notify_all();
         if let Some(h) = self.handle.take() {
@@ -237,10 +301,11 @@ fn sleep_until_deadline(total: Duration, finish_by_ms: &AtomicU64) -> bool {
 fn speak_loop(
     slot: &Arc<(Mutex<Option<SpeechJob>>, Condvar)>,
     speaking: &AtomicBool,
-    finish_by_ms: &AtomicU64,
+    cut: &SpeechCut,
     disabled: &AtomicBool,
     mut voice: PiperVoice,
 ) {
+    let finish_by_ms = &cut.finish_by_ms;
     let rate = voice.sample_rate();
     loop {
         let job = {
@@ -269,6 +334,11 @@ fn speak_loop(
         // takes its hold immediately, so by the time the first sample reaches
         // the speakers the pipeline is already discarding. The wait doubles as
         // the last chance for a deadline to cut this utterance off.
+        //
+        // It is also the only thing that keeps an aborted run from
+        // *synthesizing* a queued utterance: `play_mono` would cut the audio
+        // anyway, but only after paying for the synthesis. Do not move the
+        // synthesis above this check.
         speaking.store(true, Ordering::Release);
         if sleep_until_deadline(Duration::from_millis(crate::config::SPEAK_LEAD_MS), finish_by_ms) {
             speaking.store(false, Ordering::Release);
@@ -353,6 +423,10 @@ pub(crate) struct SystemEmitter {
     /// thread (it owns the channel end), so this is the only handle left on
     /// this side — and the flag is an `Arc`, so both observe the same bit.
     worker_speaking: Option<Arc<AtomicBool>>,
+    /// The same deal for the cut handle: the `SpeechOut` that owns it has moved
+    /// onto the emit worker thread, so this is the only handle through which
+    /// the capture loop can stop speech on Ctrl-C. `None` when `--speak` is off.
+    worker_cut: Option<Arc<SpeechCut>>,
 }
 
 /// Bounded `rtrb` capacity for the emission queue. Emissions are seconds
@@ -372,7 +446,13 @@ struct EmitterWorker {
     stdout_enabled: bool,
     /// Utterances handled since the last `prune_dump_dir` scan.
     since_prune: usize,
-    /// The spoken channel, when `--speak` is on.
+    //// The spoken channel, when `--speak` is on.
+    ///
+    /// It is dropped on the emit worker thread, which is what ends the speak
+    /// thread. Its trailing-utterance drain is real only on the paths that
+    /// transcribe to the end (`--file`): in a live run the engine's shutdown
+    /// check rejects the trailing decode, so what the drain waits for is the
+    /// queue that is already there — and Ctrl-C cuts that instead of waiting.
     speech: Option<SpeechOut>,
 }
 
@@ -424,6 +504,9 @@ impl SystemEmitter {
         // The capture-side flag is read out before the `SpeechOut` moves onto
         // the worker thread; it is an `Arc`, so both sides share one bit.
         let worker_speaking = worker_speech_flag(worker.speech.as_ref());
+        // The cut handle is read out for the same reason, so Ctrl-C reaches the
+        // deadline even though the `SpeechOut` lives on the worker thread.
+        let worker_cut = worker_speech_cut(worker.speech.as_ref());
         if !copy_enabled {
             log::info!("clipboard copy disabled (--copy=false)");
         }
@@ -466,6 +549,7 @@ impl SystemEmitter {
             owns_queue: true,
             dump_dir,
             worker_speaking,
+            worker_cut,
         })
     }
 
@@ -490,6 +574,10 @@ impl SystemEmitter {
             // no business pruning it, and `Drop` returns before that anyway.
             dump_dir: None,
             worker_speaking: None,
+            // No cut handle: a sharing handle does not own the speech channel,
+            // and the capture loop always takes the handle from the owner
+            // before it moves onto the worker thread.
+            worker_cut: None,
         }
     }
 }
@@ -501,6 +589,12 @@ fn worker_speech_flag(speech: Option<&SpeechOut>) -> Option<Arc<AtomicBool>> {
     speech.map(SpeechOut::speaking_flag)
 }
 
+/// The cut handle, taken while the `SpeechOut` is still owned here. `None` when
+/// `--speak` is off, so a caller without `--speak` needs no "is speech on" case.
+fn worker_speech_cut(speech: Option<&SpeechOut>) -> Option<Arc<SpeechCut>> {
+    speech.map(SpeechOut::cut_handle)
+}
+
 impl SystemEmitter {
     /// The flag the capture side reads to hold the pipeline while sttd is
     /// speaking. A permanently-clear flag when `--speak` is off, so the main
@@ -509,6 +603,13 @@ impl SystemEmitter {
         self.worker_speaking
             .clone()
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+    }
+
+    /// The handle that stops speech when a run is interrupted, or `None` without
+    /// `--speak`. Taken before the emitter moves into the ASR worker, because the
+    /// `SpeechOut` that owns it ends up on the emit worker thread.
+    pub(crate) fn speech_cut(&self) -> Option<Arc<SpeechCut>> {
+        self.worker_cut.clone()
     }
 }
 
@@ -1290,9 +1391,65 @@ mod tests {
         );
         // The deadline arithmetic `drop` uses: now + bound, which must land in
         // the future rather than in the past (an overflow would).
-        let deadline = now_ms() + SPEAK_DRAIN_MS;
-        assert!(!crate::sound::past_deadline(&AtomicU64::new(deadline), now_ms()));
-        assert!(crate::sound::past_deadline(&AtomicU64::new(deadline), deadline));
+        let deadline = drop_deadline(false, 100);
+        assert_eq!(deadline, 100 + SPEAK_DRAIN_MS);
+        assert!(!crate::sound::past_deadline(
+            &AtomicU64::new(deadline),
+            100
+        ));
+        assert!(crate::sound::past_deadline(
+            &AtomicU64::new(deadline),
+            deadline
+        ));
+    }
+
+    #[test]
+    fn an_aborted_run_drops_with_a_deadline_already_past() {
+        // What Ctrl-C buys: `drop` must not arm a fresh 15 s window over the
+        // abort, or the join waits out the sentence the user just cancelled.
+        // Literals, never `now_ms()`, which returns 0 on a first call and 0
+        // reads as "no deadline".
+        assert_eq!(drop_deadline(true, 100), 100);
+        assert!(crate::sound::past_deadline(
+            &AtomicU64::new(drop_deadline(true, 7)),
+            7
+        ));
+    }
+
+    #[test]
+    fn abort_marks_the_cut_and_never_stores_the_no_deadline_sentinel() {
+        // The other half of the same contract: `abort` must leave the deadline
+        // already expired, so `play_mono` cuts the playback and the speak loop
+        // skips the queued utterance — and never store 0, which `past_deadline`
+        // reads as "no deadline" and would cut nothing.
+        let cut = SpeechCut {
+            finish_by_ms: Arc::new(AtomicU64::new(0)),
+            aborted: AtomicBool::new(false),
+        };
+        cut.abort();
+        assert!(cut.aborted.load(Ordering::Acquire));
+        let stored = cut.finish_by_ms.load(Ordering::Acquire);
+        assert_ne!(
+            stored, 0,
+            "0 means no deadline, so the abort would do nothing"
+        );
+        // `past_deadline` is `now >= deadline`, and the guard in `abort` can
+        // store 1 while the clock still reads 0, so the cut is expired once the
+        // clock passes that instant rather than the same millisecond. A bounded
+        // wait, not a sleep: the assert is what decides.
+        let t0 = Instant::now();
+        while !crate::sound::past_deadline(&cut.finish_by_ms, now_ms())
+            && t0.elapsed() < Duration::from_millis(200)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(crate::sound::past_deadline(&cut.finish_by_ms, now_ms()));
+        // Idempotent: a second abort cannot clear the mark, and it may not reset
+        // the deadline to the no-deadline sentinel.
+        cut.abort();
+        assert!(cut.aborted.load(Ordering::Acquire));
+        assert_ne!(cut.finish_by_ms.load(Ordering::Acquire), 0);
+        assert!(crate::sound::past_deadline(&cut.finish_by_ms, now_ms()));
     }
 
     #[test]

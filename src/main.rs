@@ -530,6 +530,10 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // does not exist.
     let emitter = make_emitter(cli)?;
     let speaking = emitter.speaking_flag();
+    // The same reasoning for the Ctrl-C speech cut: taken here, while the
+    // emitter is still on this thread and the `SpeechOut` has not moved onto
+    // the emit worker. `None` without `--speak`, so the block below is inert.
+    let speech_cut = emitter.speech_cut();
     // The translator is loaded here, on the main thread, before the worker
     // starts: it is ~114 MiB of weights and a setup problem (no file, no write
     // access) that should fail fast rather than on the first utterance.
@@ -749,6 +753,15 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         );
     }
 
+    // Stop speaking first. The user asked to stop, so the trailing utterance must
+    // not be read aloud after the fact: `SpeechOut::drop` would otherwise hold
+    // the join for up to `SPEAK_DRAIN_MS` while the speak thread finished the
+    // queued sentence, and Ctrl-C would look like it was ignored. The abort
+    // marks the drop path, so it arms no drain window.
+    if let Some(cut) = &speech_cut {
+        cut.abort();
+    }
+
     // Stop capture before the trailing flush so no new audio races teardown.
     // Dropping the stream drops the raw producer; the consumer is drained
     // below only for full frames already accumulated.
@@ -762,11 +775,16 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
         push_live_utterance,
         &partials,
     );
-    // Flush trailing speech, then wait for the ASR thread to actually
-    // finish transcribing it (and any earlier backlog) before the process
-    // exits — otherwise the last utterance can be silently dropped, and an
-    // in-flight CUDA op can race process teardown the same way an early `?`
-    // above used to.
+    // Flush trailing speech, then wait for the ASR thread to finish with it (and
+    // any earlier backlog) before the process exits, so an in-flight CUDA op
+    // cannot race process teardown the same way an early `?` above used to.
+    //
+    // The flush buys the *opportunity*, not a transcript: `running` is already
+    // false here, so both engines' pre-call check (`parakeet.rs`, `whisper.rs`)
+    // rejects the decode and the utterance ends at an info line. That is the
+    // right trade for an interrupted live run — the user asked to stop — but it
+    // means the trailing utterance reaches no channel here. `--file` is the
+    // path that really transcribes to the end, because it never clears `running`.
     if let Some(utterance) = fp.flush_trailing_speech() {
         push_utterance(&mut asr_tx, utterance, Backpressure::Drop);
     }
