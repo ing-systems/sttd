@@ -722,7 +722,10 @@ mod tests {
     fn cli_speak_and_voice_parse() {
         let cli = Cli::try_parse_from(["sttd", "--speak"]).expect("bare flag must parse");
         assert!(cli.speak);
-        assert_eq!(cli.voice, DEFAULT_VOICE, "the default voice with --speak alone");
+        assert_eq!(
+            cli.voice, DEFAULT_VOICE,
+            "the default voice with --speak alone"
+        );
         let cli = Cli::try_parse_from(["sttd", "--speak", "--voice", "en_US-amy-medium"])
             .expect("must parse");
         assert!(cli.speak);
@@ -739,7 +742,10 @@ mod tests {
     fn cli_translate_and_translate_model_parse() {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         assert_eq!(cli.translate, None, "the step is off unless asked for");
-        assert_eq!(cli.translate_model, None, "no translator until one is asked for");
+        assert_eq!(
+            cli.translate_model, None,
+            "no translator until one is asked for"
+        );
 
         let cli = Cli::try_parse_from(["sttd", "--translate", "en"]).expect("must parse");
         assert_eq!(cli.translate.as_deref(), Some("en"));
@@ -755,8 +761,8 @@ mod tests {
         let cli = Cli::try_parse_from(["sttd", "--translate-model", "opus-mt-mul-en"])
             .expect("spec must parse");
         assert_eq!(cli.translate_model.as_deref(), Some("opus-mt-mul-en"));
-        let cli =
-            Cli::try_parse_from(["sttd", "--translate-model", "/opt/marian"]).expect("path must parse");
+        let cli = Cli::try_parse_from(["sttd", "--translate-model", "/opt/marian"])
+            .expect("path must parse");
         assert_eq!(cli.translate_model.as_deref(), Some("/opt/marian"));
 
         // Neither flag conflicts with the other input paths: translation is a

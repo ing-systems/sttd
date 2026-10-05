@@ -201,7 +201,10 @@ pub(crate) fn resample_mono(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f
     let flush = vec![0.0f32; (resampler.delay() + 2048).max(2048)];
     let drained = resample_all(&mut resampler, &flush);
     if drained.iter().any(|s| *s != 0.0) {
-        log::trace!("playback resampler drain produced {} samples", drained.len());
+        log::trace!(
+            "playback resampler drain produced {} samples",
+            drained.len()
+        );
     }
     out
 }

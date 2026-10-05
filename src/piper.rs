@@ -557,10 +557,7 @@ pub(crate) fn phonemes_to_ids(map: &BTreeMap<String, Vec<i64>>, phonemes: &[char
 pub(crate) fn normalize_peak(audio: &[f32]) -> Vec<f32> {
     let peak = audio.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     let gain = 1.0 / peak.max(0.01);
-    audio
-        .iter()
-        .map(|s| (s * gain).clamp(-1.0, 1.0))
-        .collect()
+    audio.iter().map(|s| (s * gain).clamp(-1.0, 1.0)).collect()
 }
 
 /// One espeak run for a list of clauses, one clause per line.
@@ -661,7 +658,8 @@ fn espeak_available(voice: &str) -> Result<()> {
 #[allow(dead_code)]
 pub(crate) fn read_config(path: &Path) -> Result<VoiceConfig> {
     serde_json::from_str(
-        &std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?,
+        &std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?,
     )
     .with_context(|| format!("{} is not a piper voice config", path.display()))
 }
@@ -709,12 +707,18 @@ mod tests {
             body: body.to_string(),
             terminator,
         };
-        assert_eq!(split_clauses("Dzień dobry."), vec![clause("Dzień dobry", Some('.'))]);
+        assert_eq!(
+            split_clauses("Dzień dobry."),
+            vec![clause("Dzień dobry", Some('.'))]
+        );
         // A comma is a clause boundary too: espeak splits on it, so the mapping
         // back to one line per clause only holds if it is cut here as well.
         assert_eq!(
             split_clauses("Idę do sklepu, potem do domu"),
-            vec![clause("Idę do sklepu", Some(',')), clause("potem do domu", None)]
+            vec![
+                clause("Idę do sklepu", Some(',')),
+                clause("potem do domu", None)
+            ]
         );
         assert_eq!(
             split_clauses("A? B! C: D;"),
@@ -726,7 +730,10 @@ mod tests {
             ]
         );
         // No terminator: the whole text is one clause with none.
-        assert_eq!(split_clauses("  bez kropki  "), vec![clause("bez kropki", None)]);
+        assert_eq!(
+            split_clauses("  bez kropki  "),
+            vec![clause("bez kropki", None)]
+        );
         // Nothing speakable.
         assert!(split_clauses("").is_empty());
         assert!(split_clauses("   . , ").is_empty());
@@ -795,7 +802,10 @@ mod tests {
             vec!['t', '\u{0361}', 's', '.']
         );
         // A precomposed form decomposes the same way.
-        assert_eq!(clause_phonemes("\u{00e9}", Some('.')), vec!['e', '\u{0301}', '.']);
+        assert_eq!(
+            clause_phonemes("\u{00e9}", Some('.')),
+            vec!['e', '\u{0301}', '.']
+        );
         // IPA letters that do not decompose stay single phonemes: `ɨ` is one
         // code point and one phoneme, which is why the real output above is
         // usable against a per-code-point id map at all.

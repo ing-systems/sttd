@@ -340,7 +340,10 @@ fn speak_loop(
         // anyway, but only after paying for the synthesis. Do not move the
         // synthesis above this check.
         speaking.store(true, Ordering::Release);
-        if sleep_until_deadline(Duration::from_millis(crate::config::SPEAK_LEAD_MS), finish_by_ms) {
+        if sleep_until_deadline(
+            Duration::from_millis(crate::config::SPEAK_LEAD_MS),
+            finish_by_ms,
+        ) {
             speaking.store(false, Ordering::Release);
             continue;
         }
@@ -1393,10 +1396,7 @@ mod tests {
         // the future rather than in the past (an overflow would).
         let deadline = drop_deadline(false, 100);
         assert_eq!(deadline, 100 + SPEAK_DRAIN_MS);
-        assert!(!crate::sound::past_deadline(
-            &AtomicU64::new(deadline),
-            100
-        ));
+        assert!(!crate::sound::past_deadline(&AtomicU64::new(deadline), 100));
         assert!(crate::sound::past_deadline(
             &AtomicU64::new(deadline),
             deadline

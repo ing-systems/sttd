@@ -406,7 +406,10 @@ mod tests {
         let flushed = fp
             .flush_on_speaking()
             .expect("the open utterance must be cut, not discarded");
-        assert!(!flushed.pcm.is_empty(), "the words before the speech are kept");
+        assert!(
+            !flushed.pcm.is_empty(),
+            "the words before the speech are kept"
+        );
         assert!(
             !flushed.pause_flush,
             "speaking is not a pause, so the worker's held-pause policy must not claim it"

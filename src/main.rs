@@ -222,9 +222,7 @@ fn print_available_voices(cli: &Cli, filter: &str) -> Result<()> {
         println!("* multi-speaker: listed, but --speak refuses one (it has no speaker to pick)");
     }
     if refs.iter().all(|v| !v.is_installed()) {
-        println!(
-            "none downloaded yet; `sttd --speak --voice <spec>` fetches one (~60 MiB)"
-        );
+        println!("none downloaded yet; `sttd --speak --voice <spec>` fetches one (~60 MiB)");
     }
     Ok(())
 }

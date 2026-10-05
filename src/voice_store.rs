@@ -133,12 +133,9 @@ impl VoiceIndex {
         if let Some(index) = Self::read(&path) {
             return Ok(index);
         }
-        log::info!(
-            "fetching the piper voice index from huggingface.co/{PIPER_VOICES_REPO}...",
-        );
-        std::fs::create_dir_all(voices_dir()).with_context(|| {
-            format!("failed to create {}", voices_dir().display())
-        })?;
+        log::info!("fetching the piper voice index from huggingface.co/{PIPER_VOICES_REPO}...",);
+        std::fs::create_dir_all(voices_dir())
+            .with_context(|| format!("failed to create {}", voices_dir().display()))?;
         let url = repo_url(VOICES_INDEX_FILE);
         crate::model_store::download(&url, &path)
             .with_context(|| format!("failed to download the voice index from {url}"))?;
@@ -269,10 +266,9 @@ pub(crate) fn resolve_voice(input: &str, index: &VoiceIndex) -> Result<VoiceRef>
              (upstream: https://huggingface.co/{PIPER_VOICES_REPO}/tree/main)"
         )
     })?;
-    let (onnx_repo, config_repo) =
-        row.onnx_path()
-            .zip(row.config_path())
-            .ok_or_else(|| anyhow::anyhow!("voice {}: index row names no .onnx + .onnx.json", row.key))?;
+    let (onnx_repo, config_repo) = row.onnx_path().zip(row.config_path()).ok_or_else(|| {
+        anyhow::anyhow!("voice {}: index row names no .onnx + .onnx.json", row.key)
+    })?;
     let dir = voice_dir(&row.key);
     Ok(VoiceRef {
         key: row.key.clone(),
@@ -294,8 +290,8 @@ pub(crate) fn resolve_voice(input: &str, index: &VoiceIndex) -> Result<VoiceRef>
 fn voice_files_in(dir: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
     let mut onnx: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("failed to list {}", dir.display()))?
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))?
     {
         let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
         let path = entry.path();
@@ -377,7 +373,11 @@ fn install_hint(dir: &Path) -> String {
 /// `QUALITY` / `SIZE` / `SPK`, with a two-character leading marker — `*` when
 /// the row is what `--voice` selects, `I` when both its files are on disk, `*I`
 /// for both.
-pub(crate) fn render_table(rows: &[&VoiceRow], refs: &[VoiceRef], selected: Option<&str>) -> String {
+pub(crate) fn render_table(
+    rows: &[&VoiceRow],
+    refs: &[VoiceRef],
+    selected: Option<&str>,
+) -> String {
     let selected = selected.map(str::trim);
     let spk_w = rows
         .iter()
@@ -538,7 +538,8 @@ mod tests {
     }"#;
 
     fn index() -> VoiceIndex {
-        let rows: BTreeMap<String, VoiceRow> = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let rows: BTreeMap<String, VoiceRow> =
+            serde_json::from_str(FIXTURE).expect("fixture parses");
         VoiceIndex { rows }
     }
 
@@ -561,17 +562,29 @@ mod tests {
             Some("pl/pl_PL/gosia/medium/pl_PL-gosia-medium.onnx.json")
         );
         assert_eq!(row.onnx_size(), 63_201_294);
-        assert!(index.row("de_DE-thorsten_emotional-medium").unwrap().multi_speaker());
+        assert!(index
+            .row("de_DE-thorsten_emotional-medium")
+            .unwrap()
+            .multi_speaker());
     }
 
     #[test]
     fn lookup_accepts_a_key_and_an_upstream_alias() {
         let index = index();
-        assert_eq!(index.row("pl_PL-mls_6892-low").unwrap().key, "pl_PL-mls_6892-low");
+        assert_eq!(
+            index.row("pl_PL-mls_6892-low").unwrap().key,
+            "pl_PL-mls_6892-low"
+        );
         // The old-style alias the repo still publishes for this voice.
-        assert_eq!(index.row("pl-mls_6892-low").unwrap().key, "pl_PL-mls_6892-low");
+        assert_eq!(
+            index.row("pl-mls_6892-low").unwrap().key,
+            "pl_PL-mls_6892-low"
+        );
         // Surrounding whitespace is the user's, not the key's.
-        assert_eq!(index.row("  pl_PL-gosia-medium \n").unwrap().key, "pl_PL-gosia-medium");
+        assert_eq!(
+            index.row("  pl_PL-gosia-medium \n").unwrap().key,
+            "pl_PL-gosia-medium"
+        );
         assert!(index.row("pl_PL-nonexistent-medium").is_none());
     }
 
@@ -668,7 +681,10 @@ mod tests {
         );
         assert_eq!(voice.onnx, dir.join("custom.onnx"));
         assert_eq!(voice.config, dir.join("custom.onnx.json"));
-        assert!(voice.assets.is_empty(), "a path is validated, never fetched");
+        assert!(
+            voice.assets.is_empty(),
+            "a path is validated, never fetched"
+        );
         assert!(voice.is_installed());
         // Nothing to download, so validation passes.
         ensure_available(&voice).expect("a complete directory must validate");
@@ -726,7 +742,11 @@ mod tests {
         // `*` for selected; `I` depends on what is on this machine, so only the
         // selected half is asserted.
         assert!(selected.starts_with('*'), "row={selected:?}");
-        assert_eq!(selected.trim_end().len(), selected.len(), "no trailing space");
+        assert_eq!(
+            selected.trim_end().len(),
+            selected.len(),
+            "no trailing space"
+        );
         // Size is rendered from the index, not the file system.
         assert!(selected.contains("60.3 MiB"), "row={selected:?}");
         let other = lines

@@ -726,9 +726,6 @@ mod tests {
         assert_eq!(Family::Nllb.max_new_tokens(), 48);
         // And the multilingual spec must be one the store can resolve, since
         // `--translate-model` names it.
-        assert!(crate::translator_store::resolve(
-            crate::translator_store::NLLB_SPEC
-        )
-        .is_ok());
+        assert!(crate::translator_store::resolve(crate::translator_store::NLLB_SPEC).is_ok());
     }
 }
