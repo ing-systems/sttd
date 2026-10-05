@@ -52,6 +52,11 @@
 //! reloaded eagerly on resume.
 //! `--autopause` re-pauses after each emitted transcript (single-shot
 //! resume: every `SIGUSR2`/`SIGHUP` arms one sentence).
+//! On the session bus (unless `--no-dbus`, and never in `--file` mode) one name,
+//! `org.sttd.Daemon`, carries three interfaces: pause at `/org/sttd/Daemon`, the
+//! live word list at `/org/sttd/Dictionary`, and the translation step at
+//! `/org/sttd/Translation` — where `Enable`, `Disable` and `SetTargetLanguage`
+//! turn the step on, off or into another language while the run continues.
 //! Every tunable is a CLI flag with `STTD_*` env
 //! fallback (see `--help`); CLI wins over env.
 
@@ -105,7 +110,7 @@ mod parakeet;
 mod parakeet_core;
 mod piper;
 mod translate;
-use translate::{Translator, TranslationOut};
+use translate::{TranslationOut, TranslationPlan, TranslationState};
 mod translator_store;
 mod voice_store;
 mod whisper;
@@ -482,11 +487,9 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     );
     let (hooked_dict, live_dict) = crate::asr::LiveDictionary::new(dict_state);
     let paused = pause_state.paused_flag();
-    // No service with `--no-dbus`; signals and the pipeline still work. One
-    // flag governs both interfaces.
-    if !cli.no_dbus {
-        crate::dbus::spawn(pause_state.clone(), hooked_dict.clone());
-    }
+    // No service with `--no-dbus`; signals and the pipeline still work.
+    // (The D-Bus service itself starts further down, once the translation state
+    // has loaded what `--translate` asked for.)
 
     // ---- capture is running (callback does NOT unwrap) ----------------------
     let running = Arc::new(AtomicBool::new(true));
@@ -521,7 +524,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
     // Capture is already running above and the drain loop below sheds (counted)
     // while it loads.
-    let mut asr_config = asr_config(cli, true, live_dict);
+    let asr_config = asr_config(cli, true, live_dict);
     // The capture loop fills this, the worker drains it (partial transcripts).
     let partials = asr_config.partials.clone();
     // The emitter owns the speak thread; its flag is how the capture loop below
@@ -534,33 +537,45 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // emitter is still on this thread and the `SpeechOut` has not moved onto
     // the emit worker. `None` without `--speak`, so the block below is inert.
     let speech_cut = emitter.speech_cut();
-    // The translator is loaded here, on the main thread, before the worker
-    // starts: it is ~114 MiB of weights and a setup problem (no file, no write
-    // access) that should fail fast rather than on the first utterance.
-    let translator = make_translator(cli)?;
-    // With the step on, the translation thread becomes the writer of every
-    // metrics row: its `text` column has to hold what the emitter received, which
-    // after translation is not what this thread knows. The worker keeps the
-    // writer only when there is no translation, so exactly one of the two threads
-    // ever opens the file.
-    let translation = match translator {
-        None => None,
-        Some(translator) => {
-            let metrics = asr::open_metrics_log(asr_config.metrics_path.as_deref());
-            asr_config.metrics_path = None;
-            Some(TranslationOut::spawn(
-                translator,
-                Box::new(emitter.sharing()),
-                metrics,
-            ))
-        }
-    };
+    // The translation step's shared state, resolved once from the flags. The
+    // `--metrics` writer moves out of the config and into one slot both the
+    // worker and the translation thread write through, because the worker writes
+    // a row for every utterance it does not hand over and the thread writes the
+    // rows whose `text` column is a translation.
+    let metrics = asr::MetricsSlot::new(asr::open_metrics_log(cli.metrics.as_deref()));
+    let translation_state =
+        TranslationState::new(TranslationPlan::from_cli(cli), translate::RealTranslator);
+    // With `--translate`, the translator is loaded here, on the main thread,
+    // before the worker starts: it is ~114 MiB of weights and a setup problem
+    // (no file, no write access) that should fail fast rather than on the first
+    // utterance. A run without the flag loads nothing until the bus asks.
+    translation_state.load_startup()?;
+    // No service with `--no-dbus`; signals and the pipeline still work. One
+    // flag governs all three interfaces. Spawned after the startup load so the
+    // served state is never behind what the run is doing.
+    if !cli.no_dbus {
+        crate::dbus::spawn(
+            pause_state.clone(),
+            hooked_dict.clone(),
+            translation_state.clone(),
+        );
+    }
+    // The lane exists even with no translator: a switch arrives on the bus thread
+    // and the worker cannot be handed one after it started. It is fed only when a
+    // translation will really happen, so this costs a parked thread and nothing
+    // else.
+    let translation = TranslationOut::spawn(
+        translation_state,
+        Box::new(emitter.sharing()),
+        metrics.clone(),
+    );
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
         asr_config,
         emitter,
-        translation,
+        Some(translation),
+        metrics,
         Arc::clone(&paused),
         Arc::clone(&running),
     );
@@ -978,37 +993,37 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     // offline: no pause/resume transitions exist to cue. Autopause is forced off
     // for the same reason: file input must never flip the (unread) pause flag into
     // an unload mid-file.
-    let mut config = AsrConfig {
+    let config = AsrConfig {
         auto_unload: false,
         sound: false,
         autopause: false,
         ..asr_config(cli, false, live_dict)
     };
-    // The emitter is built before the translator because the translation thread
-    // emits through a sharing handle onto the same queue.
+    // The emitter is built before the translation step because the translation
+    // thread emits through a sharing handle onto the same queue.
     let emitter = make_emitter(cli)?;
-    // File mode builds the translator exactly as the microphone path does, so an
-    // offline `--file ... --translate en` prints English.
-    let translation = match make_translator(cli)? {
-        None => None,
-        Some(translator) => {
-            // Same rule as the live path: with translation on, the metrics rows
-            // belong to the thread that knows the translated text.
-            let metrics = asr::open_metrics_log(config.metrics_path.as_deref());
-            config.metrics_path = None;
-            Some(TranslationOut::spawn(
-                translator,
-                Box::new(emitter.sharing()),
-                metrics,
-            ))
-        }
-    };
+    // File mode builds the translation step exactly as the microphone path does,
+    // so an offline `--file ... --translate en` prints English. There is no bus
+    // here, so nothing can switch it later: the lane exists only when a
+    // translator did, and the worker emits inline when it does not.
+    let metrics = asr::MetricsSlot::new(asr::open_metrics_log(cli.metrics.as_deref()));
+    let translation_state =
+        TranslationState::new(TranslationPlan::from_cli(cli), translate::RealTranslator);
+    translation_state.load_startup()?;
+    let translation = translation_state.is_loaded().then(|| {
+        TranslationOut::spawn(
+            translation_state,
+            Box::new(emitter.sharing()),
+            metrics.clone(),
+        )
+    });
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
         config,
         emitter,
         translation,
+        metrics,
         Arc::new(AtomicBool::new(false)),
         // File input runs to completion; inference is never aborted.
         Arc::new(AtomicBool::new(true)),
@@ -1123,7 +1138,6 @@ fn asr_config(cli: &Cli, shed_stale: bool, dictionary: crate::asr::LiveDictionar
         dictionary,
         shed_stale,
         partials: crate::asr::PartialSlot::default(),
-        metrics_path: cli.metrics.clone(),
         auto_unload: cli.auto_unload,
         auto_unload_after: Duration::from_secs(cli.auto_unload_after),
         sound: cli.sound,
@@ -1255,139 +1269,6 @@ fn make_speech(cli: &Cli) -> Result<Option<SpeechOut>> {
     Ok(Some(SpeechOut::spawn(loaded)))
 }
 
-/// The translation step (`--translate`), resolved once from `Cli` on the main
-/// thread: the spec, the download, the `config.json` read and the two `ort`
-/// sessions. `None` when the flag is absent, so nothing is resolved and nothing is
-/// downloaded.
-///
-/// A `--translate-model` without `--translate` warns, mirroring the
-/// `--voice`-without-`--speak` rule — a flag that silently pulled ~870 MiB nobody
-/// asked for is worse than one that does nothing.
-///
-/// The source language is the one Whisper was told to decode in, because that is
-/// what the transcript is. What happens next is the **store's** decision, not this
-/// function's, and it differs by model family: a pair export is a fixed direction,
-/// so `Auto` picks the many-sources-into-English model when the target is English
-/// and refuses otherwise; a multilingual export is told which way to go, so `Auto`
-/// has no answer at all and is refused. Neither rule is written here, so the two
-/// paths cannot disagree about which families exist.
-///
-/// One thing this function does own: the code the *voice* check compares against.
-/// It is the code the user typed, not the code the model ended up using — under a
-/// multilingual export those differ (`eng_Latn` against a `en_US-*` voice), and
-/// comparing the model's spelling would warn that no such voice exists.
-fn make_translator(cli: &Cli) -> Result<Option<Translator>> {
-    let Some(target) = cli
-        .translate
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    else {
-        // Warned rather than silently ignored, and only when the user actually
-        // typed one: the default is not a thing they asked for. Same rule as
-        // `--voice` without `--speak`.
-        if cli.translate.is_some() {
-            log::warn!("--translate needs a language code (e.g. en); the step is off");
-        }
-        if cli.translate_model.is_some() {
-            log::warn!("--translate-model is ignored without --translate");
-        }
-        return Ok(None);
-    };
-    let language = cli.language();
-    let source = match &language {
-        Language::Explicit(code) | Language::System(code) => Some(code.as_str()),
-        Language::Auto => None,
-    };
-    let direction = crate::translator_store::Direction {
-        src: source,
-        tgt: target,
-    };
-    let prepared = match cli.translate_model.as_deref().map(str::trim) {
-        Some(spec) if !spec.is_empty() => crate::translator_store::prepare(spec, direction)
-            .with_context(|| format!("failed to prepare translator {spec}"))?,
-        _ => crate::translator_store::prepare_from_direction(direction)?,
-    };
-    log_translator_direction(&prepared, target);
-    if cli.speak {
-        warn_on_voice_language_mismatch(cli, target);
-    }
-    let intra_threads = resolve_n_threads(cli.threads, auto_threads()).max(1) as usize;
-    let translator = Translator::load(&prepared, intra_threads)
-        .context("failed to load the translator")?;
-    Ok(Some(translator))
-}
-
-/// Log the direction a run translates in, and warn when the engine does not decode
-/// in the language that direction assumes.
-///
-/// A **multilingual** export is the only case with an assumption to state: it is
-/// told which language the source is, so under an engine that decides for itself
-/// the flag names what the *translator* should read, not what the engine should
-/// hear. Parakeet detects the spoken language per utterance and ignores
-/// `--language` for transcription, so without this line `--language pl` alongside
-/// a multilingual model reads as "transcribe Polish" — and a Polish sentence
-/// spoken in German would be translated as Polish.
-///
-/// A **pair** export has no such gap: its weights only do one direction, so
-/// `--language auto` picks a many-source model and a named code picks the matching
-/// pair, and either way the direction was already resolved rather than assumed.
-/// Nothing is warned about, which is the point of keeping the check on `codes`
-/// rather than on the translator existing.
-fn log_translator_direction(prepared: &crate::translator_store::Prepared, target: &str) {
-    log::info!(
-        "translate: emitting every accepted transcript into {target} (translator {})",
-        prepared.reference.spec
-    );
-    let Some((src, _)) = &prepared.codes else {
-        return;
-    };
-    log::warn!(
-        "the selected engine detects the spoken language per utterance and ignores \
-         --language for transcription, but {NLLB_SPEC_IN_LOG} is told to read every \
-         transcript as {src}; speech in any other language will be mistranslated"
-    );
-}
-
-/// The spec name, spelled once here rather than interpolated into the format
-/// string above: `translator_store` owns the constant and a renamed spec must not
-/// leave a stale copy in a warning.
-const NLLB_SPEC_IN_LOG: &str = crate::translator_store::NLLB_SPEC;
-
-/// Warn when the `--speak` voice speaks a different language than the one being
-/// written to the clipboard. Not an error: a translation can still be read aloud
-/// in the wrong language, which is bad but not fatal, and the user may know
-/// their voice speaks it.
-///
-/// The check is on the voice key's language prefix (`pl_PL-...`, `en_US-...`),
-/// which is the only place a piper voice states its language. Split out so the
-/// rule is testable without a voice or a translator.
-fn voice_language(key: &str) -> Option<&str> {
-    let key = key.trim();
-    if key.contains('/') || key.contains('\\') {
-        return None;
-    }
-    let lang = key.split(['_', '-']).next()?;
-    (!lang.is_empty()).then_some(lang)
-}
-
-/// Warn when the voice speaks a different language than the one being written to
-/// the clipboard.
-fn warn_on_voice_language_mismatch(cli: &Cli, target: &str) {
-    let key = cli.voice.trim();
-    let Some(voice_lang) = voice_language(key) else {
-        return;
-    };
-    if voice_lang.eq_ignore_ascii_case(target) {
-        return;
-    }
-    log::warn!(
-        "--voice {key} is a {voice_lang} voice but --translate writes {target}: \
-         sttd will read the translation aloud in {voice_lang} \
-         (pick a {target} voice with --voice)"
-    );
-}
-
 /// The capture-side tunables, resolved once from `Cli` and shared by both
 /// input paths: the microphone opens a `FrameProcessor` per device open (and
 /// per rebuild), file mode opens one, and the same thresholds reach the ASR
@@ -1445,18 +1326,6 @@ mod tests {
             assets: &[],
             kind,
         }
-    }
-
-    #[test]
-    fn a_voice_key_states_its_language_and_a_path_states_nothing() {
-        assert_eq!(voice_language("pl_PL-gosia-medium"), Some("pl"));
-        assert_eq!(voice_language("en_US-amy-medium"), Some("en"));
-        assert_eq!(voice_language("de_DE-thorsten"), Some("de"));
-        // A path is a directory, not a key: no language to compare against.
-        assert_eq!(voice_language("/opt/voices/amy"), None);
-        assert_eq!(voice_language("C:\\voices\\amy"), None);
-        // Nothing before the first separator.
-        assert_eq!(voice_language("-medium"), None);
     }
 
     #[test]

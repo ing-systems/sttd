@@ -284,6 +284,12 @@ pub(crate) const CATALOG: &[TranslatorPair] = &[
 /// `translate::Translator`.
 pub(crate) const NLLB_SPEC: &str = "nllb-200-distilled-600M";
 
+/// The one pair export the tests that need real weights can rely on being present
+/// on a machine that has them: the Polish-to-English path `--language pl
+/// --translate en` resolves to, and the one pair the README calls primary.
+#[cfg(test)]
+pub(crate) const PL_EN_SPEC: &str = "opus-mt-pl-en";
+
 /// Every spec a run may name, multilingual exports included, sorted. The one
 /// place the set of downloadable translators is written down, so `--help`,
 /// a refusal message and [`resolve`] cannot disagree about it.
@@ -891,6 +897,13 @@ const REQUIRED_FILES: [&str; 5] = [
     CONFIG_FILE,
 ];
 
+/// Whether `spec`'s directory is on disk and complete, without touching the
+/// network. What a weights-gated test asks before it would download anything.
+#[cfg(test)]
+pub(crate) fn translator_is_present(spec: &str) -> bool {
+    missing_in(&translator_dir(spec)).is_none()
+}
+
 /// The first required file that is not in `dir`, or `None` when the directory is
 /// a complete translator.
 fn missing_in(dir: &Path) -> Option<PathBuf> {
@@ -1080,8 +1093,27 @@ pub(crate) fn prepare(input: &str, direction: Direction<'_>) -> Result<Prepared>
     finish(resolve(input)?, direction)
 }
 
-/// The translator for a run that named no spec: the pair `--language` and
-/// `--translate` resolve to, downloaded if it is not on disk yet.
+/// Which translator files a direction names, resolved **without fetching
+/// anything**.
+///
+/// Split out of [`prepare_from_direction`] so a caller that only needs to know
+/// whether a direction is possible can get the very same refusal the startup
+/// path prints, without touching the network: the bus asks, and a load takes
+/// seconds to minutes. Pure apart from the existence check a
+/// `--translate-model` **directory** needs, so a run pointing at one still hears
+/// about a missing file here rather than after a download.
+pub(crate) fn reference_for(
+    direction: Direction<'_>,
+    model: Option<&str>,
+) -> Result<TranslatorRef> {
+    match model.map(str::trim).filter(|spec| !spec.is_empty()) {
+        Some(spec) => resolve(spec),
+        None => default_reference_for(direction),
+    }
+}
+
+/// The translator a run that named no spec resolves to: the pair `--language`
+/// and `--translate` resolve to.
 ///
 /// `--language auto` is the one case that needs a rule rather than a lookup: the
 /// source is unknown per utterance, and a pair export is a fixed direction, so
@@ -1093,9 +1125,9 @@ pub(crate) fn prepare(input: &str, direction: Direction<'_>) -> Result<Prepared>
 /// Coverage is thin in one direction and the message says so: Polish has exactly
 /// one exported pair upstream, so `--language pl --translate de` is an error naming
 /// `en`, not a mistranslation.
-pub(crate) fn prepare_from_direction(direction: Direction<'_>) -> Result<Prepared> {
-    let reference = match direction.src {
-        Some(src) => resolve_pair(src, direction.tgt)?,
+fn default_reference_for(direction: Direction<'_>) -> Result<TranslatorRef> {
+    match direction.src {
+        Some(src) => resolve_pair(src, direction.tgt),
         None => {
             if has_pair("mul", direction.tgt) {
                 log::info!(
@@ -1104,7 +1136,7 @@ pub(crate) fn prepare_from_direction(direction: Direction<'_>) -> Result<Prepare
                      to your language, or --translate-model {NLLB_SPEC} for any direction",
                     direction.tgt
                 );
-                resolve_pair("mul", direction.tgt)?
+                resolve_pair("mul", direction.tgt)
             } else {
                 // No many-source model into this target: the direction is the
                 // model's identity, so there is nothing to fall back to. Name the
@@ -1129,8 +1161,13 @@ pub(crate) fn prepare_from_direction(direction: Direction<'_>) -> Result<Prepare
                 )
             }
         }
-    };
-    finish(reference, direction)
+    }
+}
+
+/// The translator for a run that named no spec, downloaded if it is not on disk
+/// yet: the startup-time entry point beside [`prepare`].
+pub(crate) fn prepare_from_direction(direction: Direction<'_>) -> Result<Prepared> {
+    finish(default_reference_for(direction)?, direction)
 }
 
 #[cfg(test)]

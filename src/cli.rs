@@ -289,6 +289,15 @@ pub(crate) struct Cli {
     /// any of ~200 languages. It needs a **named** `--language` (its source is an
     /// input, not a property of the weights), takes ~870 MiB against a pair's
     /// ~114 MiB, and translates about 8x slower per utterance.
+    ///
+    /// The step can also be switched while the run continues, over the session bus
+    /// (`org.sttd.Translation`: `Enable`, `Disable`, `SetTargetLanguage`), and
+    /// `--translate-model` applies to a switch as well. The **source** language
+    /// stays the one `--language` fixed at startup, so only the target moves; a
+    /// switch loads on its own thread and reports through `TranslationChanged`,
+    /// and the language that was live keeps serving until the new one is ready.
+    /// With `--no-dbus`, or in `--file` mode, this flag is only used by
+    /// `--translate`.
     #[arg(
         long,
         env = "STTD_TRANSLATE",
@@ -300,8 +309,12 @@ pub(crate) struct Cli {
     /// Translator to translate with, overriding the direction `--translate` and
     /// `--language` resolve to: a catalog spec (`opus-mt-mul-en`,
     /// `nllb-200-distilled-600M`) or a path to a translator directory already on
-    /// disk, downloaded on first use into `<models>/translators/<spec>/`. Needs
-    /// `--translate`; ignored (and not downloaded) without it.
+    /// disk, downloaded on first use into `<models>/translators/<spec>/`.
+    ///
+    /// Applies to every translation in the run, including one asked for at runtime
+    /// over the session bus. Without `--translate` it is only used by such a
+    /// request, so it is ignored (and not downloaded) when there is no bus to ask
+    /// with: microphone mode with `--no-dbus`, and `--file` mode.
     ///
     /// A directory names no family and no direction: which model it holds is read
     /// out of its own `config.json`, and the direction still comes from

@@ -53,7 +53,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -1206,6 +1206,768 @@ fn cache_slots(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Runtime control
+// ---------------------------------------------------------------------------
+//
+// Everything above loads a translator once; everything here decides *which* one
+// is live, and swaps it while the run continues.
+//
+// The state lives in this module rather than in `dbus` because it owns the
+// weights and the loader threads, and `translator_store` plus three `ort`
+// sessions are not a bus concern: `dbus` holds this handle and forwards calls,
+// the way `asr` holds `dbus::DictionaryState`. The dependency therefore points
+// one way, `dbus -> translate`.
+//
+// Two rules hold the whole thing together:
+//
+// * **One copy of the weights, behind one lock.** The translation thread looks
+//   the translator up per job instead of caching it, because a second copy is
+//   exactly what would make `Disable(true)` unable to free the weights at once.
+//   The cost is that a mutating call waits for a translation already running
+//   (60 to 130 ms for a pair, ~700 ms for a multilingual export) and never for a
+//   load.
+// * **The generation rides in that same lock.** A load that finished after its
+//   request was superseded must not install itself, and a `Disable` that promised
+//   to free the weights must not be raced by one still arriving, so the check and
+//   the write are one critical section rather than two steps.
+
+/// The run's own translation settings, resolved once from the CLI.
+///
+/// A load needs all four, and at runtime only the bus is left to ask with — so
+/// they are captured here rather than re-read from `Cli` on the bus thread. The
+/// source language is the one Whisper was told to decode in, because that is what
+/// the transcript is; it is fixed for the run, so a runtime switch changes the
+/// target only.
+pub(crate) struct TranslationPlan {
+    /// `--language`, or `None` under `--language auto`: the source is then
+    /// unknown per utterance, which a pair export can answer for and a
+    /// multilingual one cannot.
+    source: Option<String>,
+    /// `--translate-model`, overriding which translator a direction resolves to.
+    model: Option<String>,
+    /// The language `--translate` asked for, if any. What `Enable` reloads when
+    /// nothing is loaded.
+    configured: Option<String>,
+    intra_threads: usize,
+    /// `--voice`, kept only under `--speak`, so a runtime switch can warn about
+    /// the same voice/language mismatch the startup path warns about.
+    voice: Option<String>,
+}
+
+impl TranslationPlan {
+    /// The warnings are the startup ones: a `--translate` with no code cannot name
+    /// a direction, and a `--translate-model` with nothing asking for a
+    /// translation downloads nothing.
+    ///
+    /// The second is only *unused* when no one can ask at runtime, which is why the
+    /// session bus counts as an asker: the override now applies to a
+    /// `SetTargetLanguage` too, not only to a `--translate` named at startup. So
+    /// `--translate-model` on its own warns under `--no-dbus` and in file mode, and
+    /// stays quiet in microphone mode with the bus, where it does something.
+    /// A plan for a test: one named source, no override, nothing configured and no
+    /// load. Every direction it can resolve is a catalog lookup, so a bus test
+    /// exercises the refusals without weights and without a network.
+    #[cfg(test)]
+    pub(crate) fn for_tests(source: &str) -> Self {
+        Self {
+            source: Some(source.to_string()),
+            model: None,
+            configured: None,
+            intra_threads: 1,
+            voice: None,
+        }
+    }
+
+    /// A plan whose translator is named outright, so the catalog's pair table is
+    /// bypassed: `reference_for` then validates the spec alone and any target is
+    /// accepted. That is what lets a test drive the *load* half — a switch, a
+    /// failure — against targets the real catalog would refuse before a thread ever
+    /// started.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_model(source: &str, model: &str) -> Self {
+        Self {
+            model: Some(model.to_string()),
+            ..Self::for_tests(source)
+        }
+    }
+
+    /// A plan as `--translate <target>` makes it, so the startup path is drivable
+    /// without weights.
+    #[cfg(test)]
+    pub(crate) fn for_tests_configured(source: &str, target: &str) -> Self {
+        Self {
+            configured: Some(target.to_string()),
+            ..Self::for_tests_with_model(source, "nllb-200-distilled-600M")
+        }
+    }
+
+    /// Read the plan out of the flags, warning about the combinations that
+    /// cannot work. See the type for what each field is.
+    pub(crate) fn from_cli(cli: &crate::cli::Cli) -> Self {
+        let configured = cli
+            .translate
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_ascii_lowercase());
+        let model = cli
+            .translate_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if configured.is_none() {
+            if cli.translate.is_some() {
+                log::warn!("--translate needs a language code (e.g. en); the step is off");
+            }
+            if model.is_some() && !can_ask_at_runtime(cli) {
+                log::warn!("--translate-model is ignored without --translate");
+            }
+        }
+        let source = match cli.language() {
+            crate::whisper_core::types::Language::Explicit(code)
+            | crate::whisper_core::types::Language::System(code) => Some(code),
+            crate::whisper_core::types::Language::Auto => None,
+        };
+        Self {
+            source,
+            model,
+            configured,
+            intra_threads: crate::asr::resolve_n_threads(cli.threads, crate::asr::auto_threads())
+                .max(1) as usize,
+            voice: cli.speak.then(|| cli.voice.clone()),
+        }
+    }
+
+    /// The direction this run translates `target` in.
+    fn direction<'a>(&'a self, target: &'a str) -> crate::translator_store::Direction<'a> {
+        crate::translator_store::Direction {
+            src: self.source.as_deref(),
+            tgt: target,
+        }
+    }
+
+    /// The source language as a log or a spec reads it.
+    #[cfg(test)]
+    fn source_label(&self) -> &str {
+        self.source.as_deref().unwrap_or("auto")
+    }
+}
+
+/// Whether this run has any way to ask for a translation other than `--translate`:
+/// the session bus in microphone mode.
+fn can_ask_at_runtime(cli: &crate::cli::Cli) -> bool {
+    !cli.no_dbus && cli.file.is_none()
+}
+
+/// Resolve, download and load the translator for `target`, on the calling thread.
+///
+/// The whole startup path for one language, and the whole runtime path too: the
+/// direction comes from the plan, which the flags fixed. Whether a direction is
+/// even possible is answered before anything is fetched — see
+/// [`crate::translator_store::reference_for`] — so a refusal costs nothing.
+pub(crate) fn load_for(plan: &TranslationPlan, target: &str) -> Result<Translator> {
+    let direction = plan.direction(target);
+    let prepared = match plan.model.as_deref() {
+        Some(spec) => crate::translator_store::prepare(spec, direction)
+            .with_context(|| format!("failed to prepare translator {spec}"))?,
+        None => crate::translator_store::prepare_from_direction(direction)?,
+    };
+    log_translator_direction(&prepared, target);
+    if let Some(voice) = plan.voice.as_deref() {
+        warn_on_voice_language_mismatch(voice, target);
+    }
+    Translator::load(&prepared, plan.intra_threads).context("failed to load the translator")
+}
+
+/// Log the direction a run translates in, and warn when the engine does not decode
+/// in the language that direction assumes.
+///
+/// A **multilingual** export is the only case with an assumption to state: it is
+/// told which language the source is, so under an engine that decides for itself
+/// the flag names what the *translator* should read, not what the engine should
+/// hear. Parakeet detects the spoken language per utterance and ignores
+/// `--language` for transcription, so without this line `--language pl` alongside
+/// a multilingual model reads as "transcribe Polish" — and a Polish sentence
+/// spoken in German would be translated as Polish.
+///
+/// A **pair** export has no such gap: its weights only do one direction, so
+/// `--language auto` picks a many-source model and a named code picks the matching
+/// pair, and either way the direction was already resolved rather than assumed.
+/// Nothing is warned about, which is the point of keeping the check on `codes`
+/// rather than on the translator existing.
+fn log_translator_direction(prepared: &Prepared, target: &str) {
+    log::info!(
+        "translate: emitting every accepted transcript into {target} (translator {})",
+        prepared.reference.spec
+    );
+    let Some((src, _)) = &prepared.codes else {
+        return;
+    };
+    log::warn!(
+        "the selected engine detects the spoken language per utterance and ignores \
+         --language for transcription, but {NLLB_SPEC_IN_LOG} is told to read every \
+         transcript as {src}; speech in any other language will be mistranslated"
+    );
+}
+
+/// The spec name, spelled once here rather than interpolated into the format
+/// string above: `translator_store` owns the constant and a renamed spec must not
+/// leave a stale copy in a warning.
+const NLLB_SPEC_IN_LOG: &str = crate::translator_store::NLLB_SPEC;
+
+/// The language part of a piper voice key (`pl_PL-...`, `en_US-...`), which is
+/// the only place a piper voice states its language. Split out so the rule is
+/// testable without a voice or a translator.
+pub(crate) fn voice_language(key: &str) -> Option<&str> {
+    let key = key.trim();
+    if key.contains('/') || key.contains('\\') {
+        return None;
+    }
+    let lang = key.split(['_', '-']).next()?;
+    (!lang.is_empty()).then_some(lang)
+}
+
+/// Warn when the `--speak` voice speaks a different language than the one being
+/// written to the clipboard. Not an error: a translation can still be read aloud
+/// in the wrong language, which is bad but not fatal, and the user may know
+/// their voice speaks it.
+fn warn_on_voice_language_mismatch(voice: &str, target: &str) {
+    let Some(voice_lang) = voice_language(voice) else {
+        return;
+    };
+    if voice_lang.eq_ignore_ascii_case(target) {
+        return;
+    }
+    log::warn!(
+        "--voice {voice} is a {voice_lang} voice but translation writes {target}: \
+         sttd will read the translation aloud in {voice_lang} \
+         (pick a {target} voice with --voice)"
+    );
+}
+
+/// How a state of `L` produces one: from a plan and a target language.
+///
+/// A trait so the pipeline that loads, installs and announces can be driven in a
+/// test without weights, and so production's one implementation is named in the
+/// type rather than picked inside the body.
+pub(crate) trait Loads<L>: Clone + Send + Sync + 'static {
+    /// Resolve, download and load. The real one is [`load_for`].
+    fn load(&self, plan: &TranslationPlan, target: &str) -> Result<L>;
+}
+
+/// The production loader: the real translator, built from the run's own flags.
+#[derive(Clone, Copy)]
+pub(crate) struct RealTranslator;
+
+impl Loads<Translator> for RealTranslator {
+    fn load(&self, plan: &TranslationPlan, target: &str) -> Result<Translator> {
+        load_for(plan, target)
+    }
+}
+
+/// What the state needs from a loaded translator: translate one string, and name
+/// itself in a log line.
+///
+/// A trait rather than `Translator` directly so the state is testable. A
+/// `Translator` is two or three `ort` sessions and a tokenizer, so no unit test
+/// can build one, and the bookkeeping around a load — refusals, the generation
+/// that cancels one, which field each switch clears — is exactly what needs
+/// testing. Production uses the one implementor below.
+pub(crate) trait Loaded: Send + 'static {
+    /// Translate one utterance. A failure is not fatal: the caller falls back to
+    /// the source text.
+    fn translate(&mut self, source: &str) -> Result<String>;
+
+    /// The upstream spec, for log lines and the `Model` property.
+    fn spec(&self) -> &str;
+
+    /// The direction, as a log should read it.
+    fn direction(&self) -> &str;
+}
+
+impl Loaded for Translator {
+    fn translate(&mut self, source: &str) -> Result<String> {
+        Translator::translate(self, source)
+    }
+
+    fn spec(&self) -> &str {
+        &self.spec
+    }
+
+    fn direction(&self) -> &str {
+        &self.direction
+    }
+}
+
+/// The one copy of the loaded weights, and the generation that names it.
+///
+/// `generation` moves with the translator on purpose: comparing a request's
+/// generation against this one *while holding the lock that guards the
+/// translator* is what makes "a superseded load must not install" and "`Disable`
+/// frees the weights at once" true rather than nearly true.
+pub(crate) struct TranslatorSlot<T> {
+    pub(crate) translator: Option<T>,
+    pub(crate) generation: u64,
+}
+
+/// What the bus reads. A snapshot of the truth, written by whoever holds the
+/// slot, because a property read must not queue behind a running translation.
+#[derive(Default, Clone)]
+struct Cached {
+    enabled: bool,
+    target: String,
+    model: String,
+}
+
+/// The translation step as the rest of the program and the bus see it: on or
+/// off, writing which language, with which translator, and loading one now.
+///
+/// A cheap `Clone`, so the bus thread, the ASR worker and the translation thread
+/// all hold the same state.
+pub(crate) struct TranslationState<T = Translator, L = RealTranslator> {
+    slot: Arc<Mutex<TranslatorSlot<T>>>,
+    /// What the user asked for. `Enabled` is this **and** a loaded translator, so
+    /// intent and capability never disagree in a report.
+    wanted: Arc<AtomicBool>,
+    /// The language of the load in flight, empty when nothing is loading.
+    requested: Arc<RwLock<String>>,
+    /// The language to write, remembered across a disable and an unload so
+    /// `Enable` knows what to reload. The wanted language, which is not always
+    /// the live one: a switch keeps the old translator serving until the new one
+    /// is ready, and an unload leaves this behind on purpose.
+    target: Arc<RwLock<String>>,
+    /// The language the **loaded** translator writes, empty when none is loaded.
+    /// Kept apart from `target` because that gap is what makes a switch atomic
+    /// from the reader's side: a client asking mid-switch sees the old language
+    /// still being written, which is true.
+    live: Arc<RwLock<String>>,
+    /// The spec of the loaded translator. Reported beside `live`, and cleared
+    /// with it.
+    model_spec: Arc<RwLock<String>>,
+    cached: Arc<RwLock<Cached>>,
+    plan: Arc<TranslationPlan>,
+    /// How a request becomes a translator. `Copy`, so every clone can start a load
+    /// without sharing anything.
+    loader: L,
+    /// One load at a time: a superseded load cannot be cancelled, so this is what
+    /// keeps two sets of weights from being built side by side beyond the pair
+    /// already held and the one arriving.
+    loading: Arc<Mutex<()>>,
+}
+
+/// A poisoned lock must not kill transcription: take the value and continue.
+fn lock_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
+    /// A step that is off, with nothing loaded and nothing to load until a
+    /// target is named.
+    pub(crate) fn new(plan: TranslationPlan, loader: L) -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(TranslatorSlot {
+                translator: None::<T>,
+                generation: 0,
+            })),
+            wanted: Arc::new(AtomicBool::new(false)),
+            requested: Arc::new(RwLock::new(String::new())),
+            target: Arc::new(RwLock::new(String::new())),
+            live: Arc::new(RwLock::new(String::new())),
+            model_spec: Arc::new(RwLock::new(String::new())),
+            cached: Arc::new(RwLock::new(Cached::default())),
+            plan: Arc::new(plan),
+            loader,
+            loading: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// The slot guard. Poison-tolerant, because a poisoned step must still emit
+    /// the source text rather than stop the pipeline.
+    pub(crate) fn lock_slot(&self) -> std::sync::MutexGuard<'_, TranslatorSlot<T>> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ---- reads, all of which the bus serves without waiting on a translation --
+
+    /// Whether the step is translating right now: asked for **and** loaded.
+    pub(crate) fn is_enabled(&self) -> bool {
+        lock_read(&self.cached).enabled
+    }
+
+    /// The language the live translator writes, empty when none is loaded. It
+    /// survives a disable, because the translator does, and it does **not** follow
+    /// a switch until the new translator lands.
+    pub(crate) fn target_language(&self) -> String {
+        lock_read(&self.cached).target.clone()
+    }
+
+    /// The spec of the live translator, empty when none is loaded.
+    pub(crate) fn model(&self) -> String {
+        lock_read(&self.cached).model.clone()
+    }
+
+    /// The language of the load in flight, empty when nothing is loading. Its
+    /// being non-empty is the whole "please wait" signal, so there is no separate
+    /// `Loading` property to fall out of step with it.
+    pub(crate) fn requested_language(&self) -> String {
+        lock_read(&self.requested).clone()
+    }
+
+    /// `(enabled, target, requested, model)` in one round trip.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn state(&self) -> (bool, String, String, String) {
+        let cached = lock_read(&self.cached);
+        (
+            cached.enabled,
+            cached.target.clone(),
+            lock_read(&self.requested).clone(),
+            cached.model.clone(),
+        )
+    }
+
+    /// Whether the *next* utterance will be translated, which is what the ASR
+    /// worker asks before handing a job over. Cheap on purpose: an `AtomicBool`
+    /// and a lock that is never held across a decode.
+    pub(crate) fn will_translate(&self) -> bool {
+        self.wanted.load(Ordering::Acquire) && self.lock_slot().translator.is_some()
+    }
+
+    /// The intent flag alone. The lane reads it per job while it holds the slot,
+    /// so it must not need a lock of its own.
+    pub(crate) fn wanted_now(&self) -> bool {
+        self.wanted.load(Ordering::Acquire)
+    }
+
+    /// Whether a translator is loaded, whatever the switch says.
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.lock_slot().translator.is_some()
+    }
+
+    /// The panic a `catch_unwind` caught, as text.
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".to_string())
+    }
+
+    // ---- writes ----
+
+    /// Recompute what the bus reads. Idempotent, and called by every path that
+    /// changes the truth, so the snapshot cannot drift from the slot.
+    fn refresh_cached(&self) {
+        let loaded = self.lock_slot().translator.is_some();
+        let snapshot = Cached {
+            enabled: loaded && self.wanted.load(Ordering::Acquire),
+            target: if loaded {
+                lock_read(&self.live).clone()
+            } else {
+                String::new()
+            },
+            model: if loaded {
+                lock_read(&self.model_spec).clone()
+            } else {
+                String::new()
+            },
+        };
+        *lock_write(&self.cached) = snapshot;
+    }
+
+    /// Turn the step on, returning `(enabled, message)`.
+    ///
+    /// With a translator loaded this is a flag. Without one it asks for the
+    /// remembered target, which is `--translate` on a fresh run and whatever was
+    /// live before an unload since. With nothing remembered it refuses, because
+    /// there is no language to write and inventing one would be a lie — hence the
+    /// message, which is empty on every other path.
+    ///
+    /// The announcement is the caller's: a bus method has a `SignalEmitter` to hand
+    /// and the loader thread has not, so this only reports.
+    pub(crate) fn enable(&self) -> (bool, String) {
+        self.wanted.store(true, Ordering::Release);
+        if self.is_loaded() {
+            self.refresh_cached();
+            return (true, String::new());
+        }
+        let remembered = lock_read(&self.target).clone();
+        if remembered.is_empty() {
+            self.wanted.store(false, Ordering::Release);
+            self.refresh_cached();
+            return (
+                false,
+                "no target language is set; call SetTargetLanguage first \
+                 (or start with --translate LANG)"
+                    .to_string(),
+            );
+        }
+        self.start_load(&remembered);
+        (self.is_enabled(), String::new())
+    }
+
+    /// Turn the step off. `unload` also frees the weights, before this returns.
+    ///
+    /// Either way a load in flight is cancelled: a run that was told to stop
+    /// translating must not end up downloading a translator afterwards. The
+    /// remembered target stays either way, so `Enable` is instant without an
+    /// unload and a reload from the local cache with one.
+    pub(crate) fn disable(&self, unload: bool) -> bool {
+        self.cancel_pending();
+        self.wanted.store(false, Ordering::Release);
+        if unload {
+            let mut slot = self.lock_slot();
+            slot.translator = None;
+            *lock_write(&self.live) = String::new();
+            *lock_write(&self.model_spec) = String::new();
+        }
+        self.refresh_cached();
+        self.is_enabled()
+    }
+
+    /// `Disable(false)` when on, `Enable` when off. Never unloads: the point of a
+    /// toggle is the state, and dropping a gigabyte of weights is a decision of
+    /// its own, which `Disable(true)` is for.
+    pub(crate) fn toggle(&self) -> bool {
+        if self.is_enabled() {
+            self.disable(false)
+        } else {
+            self.enable().0
+        }
+    }
+
+    /// Write `lang` from now on, loading whatever that needs.
+    ///
+    /// Returns `(accepted, target, message)`. A direction the catalog cannot
+    /// serve is refused here, before any thread starts: the caller gets the same
+    /// message the startup path prints, immediately. An accepted target is not
+    /// yet a loaded one — the previous translator keeps serving until the new one
+    /// is ready, and `TranslationChanged` says when the swap happened.
+    ///
+    /// No announcement here: the caller holds the bus emitter. What this returns is
+    /// the whole report.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn set_target_language(&self, lang: &str) -> (bool, String, String) {
+        let target = lang.trim().to_ascii_lowercase();
+        if target.is_empty() {
+            let message = "empty target language".to_string();
+            return (false, self.target_language(), message);
+        }
+        let direction = self.plan.direction(&target);
+        if let Err(e) =
+            crate::translator_store::reference_for(direction, self.plan.model.as_deref())
+        {
+            let message = format!("{e:#}");
+            return (false, self.target_language(), message);
+        }
+        // The same language, already loaded: this is a switch on, not a load.
+        if lock_read(&self.live).eq(target.as_str()) && self.is_loaded() {
+            self.wanted.store(true, Ordering::Release);
+            self.refresh_cached();
+            return (true, target, String::new());
+        }
+        *lock_write(&self.target) = target.clone();
+        self.wanted.store(true, Ordering::Release);
+        self.refresh_cached();
+        self.start_load(&target);
+        (true, target, String::new())
+    }
+
+    // ---- the load pipeline ----
+
+    /// Load the language `--translate` named, on the calling thread, failing the
+    /// run when it cannot: startup is where a missing model should stop everything
+    /// rather than wait for the first utterance.
+    ///
+    /// Naming the language at startup is also the intent to use it, so the step is
+    /// wanted from the first utterance: the worker asks `will_translate` before
+    /// every hand-off, and a translator loaded but not wanted is never used.
+    pub(crate) fn load_startup(&self) -> Result<()> {
+        let Some(target) = self.plan.configured.clone() else {
+            return Ok(());
+        };
+        *lock_write(&self.target) = target.clone();
+        self.wanted.store(true, Ordering::Release);
+        let generation = self.begin_request(&target);
+        let translator = self.loader.load(&self.plan, &target)?;
+        self.install(generation, &target, translator);
+        Ok(())
+    }
+
+    /// Register a request and hand back the generation that will name it.
+    fn begin_request(&self, target: &str) -> u64 {
+        let generation = {
+            let mut slot = self.lock_slot();
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.generation
+        };
+        *lock_write(&self.requested) = target.to_string();
+        generation
+    }
+
+    /// Abandon whatever was loading. The generation bump is what makes an arriving
+    /// load stale rather than installed; clearing the request is what stops a
+    /// client from waiting out a load that will now do nothing.
+    fn cancel_pending(&self) {
+        {
+            let mut slot = self.lock_slot();
+            slot.generation = slot.generation.wrapping_add(1);
+        }
+        *lock_write(&self.requested) = String::new();
+    }
+
+    /// Put the translator in place, if this request is still the current one.
+    ///
+    /// The generation is compared and the translator written under one lock, so
+    /// a `Disable` cannot slip between the two and be followed by weights it
+    /// promised to free.
+    fn install(&self, generation: u64, target: &str, translator: T) -> bool {
+        let mut slot = self.lock_slot();
+        if slot.generation != generation {
+            log::debug!("translate: the {target} load was superseded before it landed; dropped");
+            return false;
+        }
+        let spec = translator.spec().to_string();
+        slot.translator = Some(translator);
+        slot.generation = generation;
+        // Still under the slot, so a client cannot read a loaded translator whose
+        // language and spec have not been written yet.
+        *lock_write(&self.live) = target.to_string();
+        *lock_write(&self.model_spec) = spec.clone();
+        *lock_write(&self.requested) = String::new();
+        drop(slot);
+        self.refresh_cached();
+        log::info!("translate: writing {target} (translator {spec})");
+        self.announce(true, "");
+        true
+    }
+
+    /// Report a load that failed. The previous translator keeps serving: a
+    /// refused switch must not cost the language the run already had.
+    fn fail_request(&self, generation: u64, message: &str) {
+        {
+            let slot = self.lock_slot();
+            if slot.generation != generation {
+                log::debug!("translate: a superseded load failed; its error is stale");
+                return;
+            }
+            if slot.translator.is_none() {
+                // Nothing to fall back on, so the step is off rather than on with
+                // no translator: `Enabled` must never claim work that cannot
+                // happen.
+                self.wanted.store(false, Ordering::Release);
+            }
+        }
+        *lock_write(&self.requested) = String::new();
+        self.refresh_cached();
+        self.announce(false, message);
+    }
+
+    /// Load `target` on a helper thread, through `load`.
+    ///
+    /// Off the bus thread on purpose: a first use downloads 114 MiB to 1.3 GiB and
+    /// then builds three `ort` sessions. `Pause` and the dictionary have to keep
+    /// working while that happens, and the blocking zbus API serves one thread.
+    ///
+    /// `load` is a parameter rather than a direct [`load_for`] call so a test can
+    /// drive the whole pipeline — request, serialize, install or fail, announce —
+    /// without weights and without a network.
+    fn start_load(&self, target: &str) {
+        let generation = self.begin_request(target);
+        let state = self.clone();
+        let target = target.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("translate-load".into())
+            .spawn(move || {
+                // Held across the load, so a superseded request waits its turn
+                // instead of building a second set of weights beside the first.
+                let _serialized = state.loading.lock().unwrap_or_else(|e| e.into_inner());
+                match state.loader.load(&state.plan, &target) {
+                    Ok(translator) => {
+                        state.install(generation, &target, translator);
+                    }
+                    Err(e) => {
+                        let message = format!("{e:#}");
+                        log::warn!("translate: cannot write {target}: {message}");
+                        state.fail_request(generation, &message);
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            let message = format!("failed to start the translator load: {e}");
+            log::error!("translate: {message}");
+            self.fail_request(generation, &message);
+        }
+    }
+
+    /// Emit `TranslationChanged` from outside an interface method: the loader
+    /// thread, and every refusal, which have no emitter to hand.
+    /// A load that was superseded before it landed, reported as a debug line
+    /// rather than a failure: it did its work, and a newer request wants the slot.
+    #[cfg(test)]
+    pub(crate) fn report_stale_install(&self, generation: u64, target: &str) {
+        if self.lock_slot().generation != generation {
+            log::debug!("translate: the {target} load was superseded; dropped");
+        }
+    }
+
+    fn announce(&self, ok: bool, message: &str) {
+        let cached = lock_read(&self.cached);
+        crate::dbus::emit_translation_changed(
+            cached.enabled,
+            &cached.target,
+            &cached.model,
+            ok,
+            message,
+        );
+    }
+
+    /// The translation thread's half: run one decode under the slot lock, so a
+    /// disable cannot free a translator mid-decode, and report a panicking decode
+    /// as a failed translation instead of a dead thread.
+    ///
+    /// A panic drops the translator rather than keeping it: the sessions take
+    /// `&mut self` and their state after a panic is not something to keep
+    /// decoding with. The step then reports itself off, the ASR worker goes back
+    /// to emitting source text, and `Enable` loads a fresh one.
+    pub(crate) fn translate_locked(&self, slot: &mut TranslatorSlot<T>, source: &str) -> Attempt {
+        let Some(translator) = slot.translator.as_mut() else {
+            return Attempt::Failed("no translator is loaded".to_string());
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            translator.translate(source)
+        })) {
+            Ok(Ok(text)) => Attempt::Translated(text),
+            Ok(Err(e)) => Attempt::Failed(format!("{e:#}")),
+            Err(payload) => Attempt::Panicked(Self::panic_message(payload)),
+        }
+    }
+
+    /// Free the weights of a translator that panicked, taking the slot itself.
+    ///
+    /// Not a `&mut TranslatorSlot` argument: the caller holds that lock while it
+    /// decodes, and a lock that tries to take itself again deadlocks the thread
+    /// that has to be rescued. So the lane releases it first and calls this.
+    pub(crate) fn drop_panicked_translator(&self) {
+        {
+            let mut slot = self.lock_slot();
+            slot.translator = None;
+            *lock_write(&self.live) = String::new();
+            *lock_write(&self.model_spec) = String::new();
+        }
+        self.refresh_cached();
+        self.announce(
+            false,
+            "the translator panicked and was dropped; call Enable to load it again",
+        );
+    }
+}
+
 /// One accepted transcript on its way to the translation thread.
 ///
 /// The `samples` and `infer_ms` travel with the job because the metrics row is
@@ -1220,6 +1982,30 @@ pub(crate) struct TranslationJob {
     pub(crate) evidence: crate::utterance::Evidence,
     pub(crate) samples: usize,
     pub(crate) infer_ms: f64,
+    /// Which translator was live when this job was queued, so a language switch
+    /// mid-queue is visible in the log rather than a silent change of output
+    /// language. Filled by [`TranslationOut::enqueue`], which is the only
+    /// producer, so it cannot be forgotten at a call site.
+    pub(crate) generation: u64,
+}
+
+/// The clone is what lets the bus thread, the ASR worker, the translation thread
+/// and every loader hold one state; `T` sits behind an `Arc` and is never copied.
+impl<T, L: Clone> Clone for TranslationState<T, L> {
+    fn clone(&self) -> Self {
+        Self {
+            slot: Arc::clone(&self.slot),
+            wanted: Arc::clone(&self.wanted),
+            requested: Arc::clone(&self.requested),
+            target: Arc::clone(&self.target),
+            live: Arc::clone(&self.live),
+            model_spec: Arc::clone(&self.model_spec),
+            cached: Arc::clone(&self.cached),
+            plan: Arc::clone(&self.plan),
+            loader: self.loader.clone(),
+            loading: Arc::clone(&self.loading),
+        }
+    }
 }
 
 /// Bounded depth of the translation queue.
@@ -1243,26 +2029,32 @@ pub(crate) const TRANSLATION_QUEUE_DEPTH: usize = 4;
 /// waiting for all of it. Dropping the oldest is the honest choice when the
 /// translator cannot keep up: the newest transcript is the one the user just
 /// said and still cares about.
-pub(crate) struct TranslationOut {
+///
+/// The thread exists from startup in microphone mode even with nothing loaded,
+/// because the switch that turns the step on arrives on the bus thread and the
+/// ASR worker cannot be handed a lane after it started. It is fed **only** when a
+/// translation will actually happen (see [`TranslationState::will_translate`]),
+/// so a run that never translates keeps today's path: the worker emits inline and
+/// this queue never fills.
+pub(crate) struct TranslationOut<T = Translator, L = RealTranslator> {
     /// `(queue, wakeup)`: the pending jobs in order, and the signal to look.
     queue: Arc<(Mutex<VecDeque<TranslationJob>>, Condvar)>,
     /// Set by `drop`, so the thread finishes the queue and exits.
     closed: Arc<AtomicBool>,
+    state: TranslationState<T, L>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl TranslationOut {
-    /// Spawn the translation thread around a loaded translator, an emitter handle
+impl<T: Loaded, L: Loads<T>> TranslationOut<T, L> {
+    /// Spawn the translation thread around the shared state, an emitter handle
     /// onto the shared emission queue, and the `--metrics` writer.
     ///
-    /// The metrics writer moves here with the text it describes: its `text` column
-    /// has to hold what the emitter received, which after this step is the
-    /// translation. It is opened once on the ASR side (see `asr::open_metrics_log`)
-    /// so a broken path cannot fail transcription mid-run.
+    /// The translator is not an argument: it arrives in the state's slot, loaded
+    /// at startup by `--translate` or later over the bus.
     pub(crate) fn spawn(
-        translator: Translator,
+        state: TranslationState<T, L>,
         mut emitter: Box<dyn Emitter + Send>,
-        metrics: Option<std::io::BufWriter<std::fs::File>>,
+        metrics: crate::asr::MetricsSlot,
     ) -> Self {
         let queue: Arc<(Mutex<VecDeque<TranslationJob>>, Condvar)> =
             Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
@@ -1270,26 +2062,40 @@ impl TranslationOut {
 
         let handle = {
             let (queue, closed) = (Arc::clone(&queue), Arc::clone(&closed));
+            let thread_state = state.clone();
             std::thread::Builder::new()
                 .name("translate".into())
                 .spawn(move || {
-                    translate_loop(&queue, &closed, translator, emitter.as_mut(), metrics)
+                    translate_loop(&thread_state, &queue, &closed, emitter.as_mut(), &metrics)
                 })
                 .ok()
         };
         Self {
             queue,
             closed,
+            state,
             handle,
         }
+    }
+
+    /// Whether the next job would be translated, which is what the ASR worker asks
+    /// before handing one over: false means the utterance stays on the worker's
+    /// inline path, so a run with the step off never enters this queue.
+    pub(crate) fn will_translate(&self) -> bool {
+        self.state.will_translate()
     }
 
     /// Queue one transcript for translation. Never blocks and never fails: a
     /// dead thread or a full queue costs one utterance, never the transcript.
     ///
+    /// The job is stamped with the translator that is live now, so a language
+    /// switch while it waits is visible in the log rather than a silent change of
+    /// output language.
+    ///
     /// A full queue drops the **oldest** waiting job and warns, naming the tag,
     /// so the log says which transcript was lost rather than only that one was.
-    pub(crate) fn enqueue(&self, job: TranslationJob) {
+    pub(crate) fn enqueue(&self, mut job: TranslationJob) {
+        job.generation = self.state.lock_slot().generation;
         let dropped = {
             let (lock, wakeup) = &*self.queue;
             let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1317,7 +2123,7 @@ impl TranslationOut {
     }
 }
 
-impl Drop for TranslationOut {
+impl<T, L> Drop for TranslationOut<T, L> {
     fn drop(&mut self) {
         // Close the queue, then join: the thread finishes what is waiting and
         // exits, and the join is what waits for that. No more jobs can arrive,
@@ -1355,15 +2161,15 @@ impl Drop for TranslationOut {
 /// the queue depth and the transcript's length. A wall-clock deadline would have
 /// to interrupt a translation already in flight to be any tighter, which is not
 /// something a flag can do.
-fn translate_loop(
+fn translate_loop<T: Loaded, L: Loads<T>>(
+    state: &TranslationState<T, L>,
     queue: &(Mutex<VecDeque<TranslationJob>>, Condvar),
     closed: &AtomicBool,
-    mut translator: Translator,
     emitter: &mut dyn Emitter,
-    mut metrics: Option<std::io::BufWriter<std::fs::File>>,
+    metrics: &crate::asr::MetricsSlot,
 ) {
     while let Some(job) = next_job(queue, closed) {
-        emit_one(&mut translator, emitter, &mut metrics, job);
+        emit_one(state, emitter, metrics, job);
     }
 }
 
@@ -1393,52 +2199,899 @@ fn next_job(
 /// `text` column has to be what the emitter received. A dropped queue entry never
 /// reaches this function, so it never reaches the metrics log either — which is
 /// why the queue drop warns with the tag.
-fn emit_one(
-    translator: &mut Translator,
+///
+/// One lock is held across the decode, which is what lets `Disable(true)` promise
+/// the weights are gone when it returns: it waits for a translation already
+/// running instead of pulling the translator out from under one. Every other
+/// utterance still takes the inline path on the worker, so nothing waits behind
+/// this lock except the switch that asked for it.
+fn emit_one<T: Loaded, L: Loads<T>>(
+    state: &TranslationState<T, L>,
     emitter: &mut dyn Emitter,
-    metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
+    metrics: &crate::asr::MetricsSlot,
     job: TranslationJob,
 ) {
-    let TranslationJob {
-        tag,
-        pcm,
-        source,
-        verdict,
-        evidence,
-        samples,
-        infer_ms,
-    } = job;
-    let t0 = Instant::now();
-    let translated = translator.translate(&source);
-    let translate_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let text = fallback_or_translated(&source, translated, &tag);
+    let mut panicked = false;
+    let attempt = {
+        let mut slot = state.lock_slot();
+        if job.generation != slot.generation {
+            log::info!(
+                "{}: the target language changed while this waited; translating with the \
+                 live one",
+                job.tag
+            );
+        }
+        let t0 = Instant::now();
+        let attempt = if state.wanted_now() {
+            state.translate_locked(&mut slot, &job.source)
+        } else {
+            // Disabled between the enqueue and here. The source text is what the
+            // step would have emitted anyway, and saying so is the failure policy
+            // rather than losing the utterance.
+            Attempt::Failed("the translation step was disabled".to_string())
+        };
+        let took = t0.elapsed().as_secs_f64() * 1000.0;
+        let direction = slot
+            .translator
+            .as_ref()
+            .map(|t| t.direction().to_string())
+            .unwrap_or_else(|| "no translator".to_string());
+        if let Attempt::Panicked(what) = &attempt {
+            log::error!("{}: the decoder panicked: {what}", job.tag);
+            panicked = true;
+        }
+        (attempt, direction, took)
+    };
+    let (attempt, direction, translate_ms) = attempt;
+    // After the guard is released: dropping the weights takes the same lock.
+    if panicked {
+        state.drop_panicked_translator();
+    }
+    let ran = matches!(attempt, Attempt::Translated(_));
+    let text = fallback_or_translated(&job.source, attempt.into_result(), &job.tag);
     log::info!(
-        "{tag}: translate ({}) took {translate_ms:.0} ms ({source:?} -> {text:?})",
-        translator.direction
+        "{}: translate ({direction}) took {translate_ms:.0} ms ({:?} -> {text:?})",
+        job.tag,
+        job.source
     );
+    // `src_text` only when a translation ran for *this* utterance, so a log from a
+    // run with the step off stays comparable with one from before it existed.
+    let mut writer = metrics.lock();
     crate::asr::write_metrics_row(
-        metrics,
-        &tag,
-        samples,
-        &evidence,
-        verdict,
+        &mut writer,
+        &job.tag,
+        job.samples,
+        &job.evidence,
+        job.verdict,
         &text,
-        infer_ms,
-        Some(&source),
+        job.infer_ms,
+        ran.then_some(job.source.as_str()),
     );
+    // The writer is released before the emission: the emit queue has its own lock,
+    // and nothing should hold two at once.
+    drop(writer);
     emitter.emit(Emission {
-        tag: &tag,
-        pcm: &pcm,
+        tag: &job.tag,
+        pcm: &job.pcm,
         text: &text,
-        verdict,
-        evidence: &evidence,
+        verdict: job.verdict,
+        evidence: &job.evidence,
     });
+}
+
+/// What one decode attempt produced.
+///
+/// `Panicked` is separate from `Failed` because the two need different
+/// afterwards: a failed decode leaves a translator worth keeping, while a panicked
+/// one leaves sessions that took `&mut self` and are not worth decoding with again.
+pub(crate) enum Attempt {
+    Translated(String),
+    Failed(String),
+    Panicked(String),
+}
+
+impl Attempt {
+    /// The shape [`fallback_or_translated`] takes: every failure is the same to it,
+    /// because every failure emits the source text.
+    fn into_result(self) -> Result<String> {
+        match self {
+            Self::Translated(text) => Ok(text),
+            Self::Failed(what) | Self::Panicked(what) => Err(anyhow::anyhow!(what)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asr::MetricsSlot;
+    use crate::emit::{Emission, Emitter};
+    use crate::gate::TranscriptVerdict;
     use anyhow::anyhow;
+    use std::time::Duration;
+
+    // -- the queue, with a stand-in translator ------------------------------
+    //
+    // `TranslationOut` takes a `Box<dyn Emitter>`, so a lane can be driven with the
+    // same recording emitter the `asr` tests use, and with a translator that needs
+    // no weights. What is under test is the queue contract and the two policies
+    // that hang off it: the source text is what an untranslated or failed utterance
+    // emits, and the drain at shutdown keeps the trailing utterance.
+
+    /// What a lane test reads back: `(tag, text)` per emission, in order.
+    type Sink = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// An emitter that records into a shared sink, because the lane owns its
+    /// emitter as a `'static` box (production hands it to a thread) and a test still
+    /// has to read the result afterwards.
+    struct Recorder(Sink);
+
+    impl Emitter for Recorder {
+        fn emit(&mut self, emission: Emission<'_>) {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((emission.tag.to_string(), emission.text.to_string()));
+        }
+    }
+
+    /// A lane over `state`, recording into a fresh sink.
+    fn recording_lane<T: Loaded, L: Loads<T>>(
+        state: TranslationState<T, L>,
+    ) -> (TranslationOut<T, L>, Sink) {
+        let sink: Sink = Arc::new(Mutex::new(Vec::new()));
+        let lane = TranslationOut::spawn(
+            state,
+            Box::new(Recorder(Arc::clone(&sink))),
+            MetricsSlot::default(),
+        );
+        (lane, sink)
+    }
+
+    /// The `(tag, text)` pairs a sink collected, once the lane has been dropped.
+    fn recorded(sink: &Sink) -> Vec<(String, String)> {
+        sink.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn job(tag: &str, source: &str) -> TranslationJob {
+        TranslationJob {
+            tag: tag.to_string(),
+            pcm: vec![0.0; 160],
+            source: source.to_string(),
+            verdict: TranscriptVerdict::Emit,
+            evidence: crate::utterance::Evidence {
+                speech_frames: 1,
+                total_frames: 2,
+                rms: 0.01,
+            },
+            samples: 16_000,
+            infer_ms: 12.0,
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn the_lane_translates_a_job_through_the_shared_state() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let (lane, sink) = recording_lane(s);
+        lane.enqueue(job("utt_000001", "Dzień dobry"));
+        drop(lane); // the drain is what waits for it
+        assert_eq!(
+            recorded(&sink),
+            vec![(
+                "utt_000001".to_string(),
+                "translated|Dzień dobry".to_string()
+            )],
+            "the emitter receives the translation, under the job's own tag"
+        );
+    }
+
+    #[test]
+    fn a_disabled_step_emits_the_source_text_rather_than_losing_it() {
+        // The job was queued while the step was on and disabled before the lane
+        // reached it. Losing the utterance would be the failure; the source text is
+        // what the step emits anyway.
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let (lane, sink) = recording_lane(s.clone());
+        s.disable(false);
+        lane.enqueue(job("utt_000001", "Dzień dobry"));
+        drop(lane);
+        assert_eq!(
+            recorded(&sink),
+            vec![("utt_000001".to_string(), "Dzień dobry".to_string())],
+            "the utterance must still arrive, untranslated"
+        );
+    }
+
+    #[test]
+    fn the_drain_keeps_the_trailing_utterance() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let (lane, sink) = recording_lane(s);
+        // Fewer than the queue depth, so the drain is what is under test and the
+        // drop-oldest policy is not.
+        for i in 1..=TRANSLATION_QUEUE_DEPTH - 1 {
+            lane.enqueue(job(&format!("utt_{i:06}"), "tekst"));
+        }
+        drop(lane);
+        let tags: Vec<String> = recorded(&sink).into_iter().map(|(tag, _)| tag).collect();
+        assert_eq!(
+            tags,
+            vec!["utt_000001", "utt_000002", "utt_000003"],
+            "shutdown drains the queue in order rather than dropping the tail"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_oldest_and_keeps_the_newest() {
+        // The documented policy for a translator that cannot keep up: the newest
+        // transcript is the one the user just said.
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let (lane, sink) = recording_lane(s);
+        for i in 1..=TRANSLATION_QUEUE_DEPTH + 2 {
+            lane.enqueue(job(&format!("utt_{i:06}"), "tekst"));
+        }
+        drop(lane);
+        let tags: Vec<String> = recorded(&sink).into_iter().map(|(tag, _)| tag).collect();
+        assert!(
+            tags.len() < TRANSLATION_QUEUE_DEPTH + 3,
+            "a full queue sheds rather than growing without bound: {tags:?}"
+        );
+        assert_eq!(
+            tags.last().map(String::as_str),
+            Some(format!("utt_{:06}", TRANSLATION_QUEUE_DEPTH + 2).as_str()),
+            "the newest survives"
+        );
+    }
+
+    #[test]
+    fn a_panicking_decode_emits_the_source_text_and_drops_the_translator() {
+        // A dead lane would lose every later utterance, because the worker had
+        // already handed them over. So a panic becomes a failed translation: the
+        // source text is emitted, and the translator is dropped so `Enable` loads
+        // a fresh one.
+        struct Panicking;
+        impl Loaded for Panicking {
+            fn translate(&mut self, _source: &str) -> Result<String> {
+                panic!("the decoder exploded");
+            }
+            fn spec(&self) -> &str {
+                "panicking"
+            }
+            fn direction(&self) -> &str {
+                "pl -> en"
+            }
+        }
+        #[derive(Clone)]
+        struct PanicLoad;
+        impl Loads<Panicking> for PanicLoad {
+            fn load(&self, _plan: &TranslationPlan, _target: &str) -> Result<Panicking> {
+                Ok(Panicking)
+            }
+        }
+        let s: TranslationState<Panicking, PanicLoad> = TranslationState::new(
+            TranslationPlan::for_tests_with_model("pl", "nllb-200-distilled-600M"),
+            PanicLoad,
+        );
+        let mut slot = s.lock_slot();
+        slot.generation += 1;
+        let generation = slot.generation;
+        slot.translator = Some(Panicking);
+        drop(slot);
+        *lock_write(&s.live) = "en".to_string();
+        *lock_write(&s.model_spec) = "panicking".to_string();
+        s.wanted.store(true, Ordering::Release);
+        assert!(s.install(generation, "en", Panicking));
+
+        let (lane, sink) = recording_lane(s.clone());
+        lane.enqueue(job("utt_000001", "Dzień dobry"));
+        drop(lane);
+        assert_eq!(
+            recorded(&sink),
+            vec![("utt_000001".to_string(), "Dzień dobry".to_string())],
+            "a panicking decode must not cost the utterance"
+        );
+        assert!(!s.is_loaded(), "and the translator is dropped");
+        assert!(
+            !s.will_translate(),
+            "so the worker goes back to the inline path"
+        );
+    }
+
+    // -- runtime state ------------------------------------------------------
+    //
+    // No weights anywhere below: a `Translator` is two or three `ort` sessions, so
+    // a unit test cannot build one. What is under test is the bookkeeping around
+    // the load — refusals, the generation that cancels one, and which fields each
+    // switch clears — none of which needs a model. Every path that would fetch one
+    // is asserted to refuse *before* it starts, so no test here touches the
+    // network.
+
+    /// A translator that needs no weights: it records what it was asked and returns
+    /// a fixed string. Enough for the state machine, since none of it touches an
+    /// `ort` session.
+    #[derive(Clone)]
+    struct FakeTranslator {
+        spec: String,
+        direction: String,
+        answer: String,
+    }
+
+    impl Loaded for FakeTranslator {
+        fn translate(&mut self, source: &str) -> Result<String> {
+            Ok(format!("{}|{source}", self.answer))
+        }
+        fn spec(&self) -> &str {
+            &self.spec
+        }
+        fn direction(&self) -> &str {
+            &self.direction
+        }
+    }
+
+    fn fake(spec: &str) -> FakeTranslator {
+        FakeTranslator {
+            spec: spec.to_string(),
+            direction: "pl -> en".to_string(),
+            answer: "translated".to_string(),
+        }
+    }
+
+    /// A load that blocks until the test releases it, so "waiting for a load" is a
+    /// state a test can observe rather than a race. `None` means load at once.
+    type Gate = Option<Arc<Gate2>>;
+
+    /// An open/closed flag with a wakeup: a load waits on it, a test opens it.
+    struct Gate2 {
+        open: Mutex<bool>,
+        wakeup: Condvar,
+    }
+
+    #[derive(Clone)]
+    struct FakeLoad {
+        gate: Gate,
+    }
+
+    impl FakeLoad {
+        /// Wait for the test to open the gate, if there is one. The load runs on
+        /// its own thread, so this is the seam that makes "a load in flight" a state
+        /// a test can observe instead of a race.
+        fn wait(&self) {
+            let Some(gate) = &self.gate else {
+                return;
+            };
+            let mut open = gate.open.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                open = gate.wakeup.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+
+    /// Release every load blocked on this gate.
+    fn release(gate: &Gate) {
+        let Some(gate) = gate else {
+            return;
+        };
+        *gate.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        gate.wakeup.notify_all();
+    }
+
+    impl Loads<FakeTranslator> for FakeLoad {
+        fn load(&self, plan: &TranslationPlan, target: &str) -> Result<FakeTranslator> {
+            self.wait();
+            if target == "unobtainable" {
+                anyhow::bail!("no translator for {} -> {target}", plan.source_label());
+            }
+            Ok(FakeTranslator {
+                spec: format!("opus-mt-{}-{target}", plan.source_label()),
+                direction: format!("{} -> {target}", plan.source_label()),
+                answer: "translated".to_string(),
+            })
+        }
+    }
+
+    /// The state these tests drive: a stand-in translator behind the real
+    /// bookkeeping.
+    type TestState = TranslationState<FakeTranslator, FakeLoad>;
+
+    /// A state over a Polish source, so `en` resolves and `de` does not, with loads
+    /// that land at once.
+    fn state(source: &str) -> TestState {
+        gated_state(source, None)
+    }
+
+    /// The same, with every load blocked until [`release`] is called: what a client
+    /// sees while a first-time download runs.
+    fn gated_state(source: &str, gate: Gate) -> TestState {
+        TranslationState::new(TranslationPlan::for_tests(source), FakeLoad { gate })
+    }
+
+    /// A state that accepts any target, because the load half is under test rather
+    /// than the catalog: the translator is named outright, which is the one path
+    /// `reference_for` resolves without consulting the pair table.
+    fn any_target_state(gate: Gate) -> TestState {
+        TranslationState::new(
+            TranslationPlan::for_tests_with_model("pl", "nllb-200-distilled-600M"),
+            FakeLoad { gate },
+        )
+    }
+
+    /// A fresh gate to hand to [`gated_state`].
+    fn new_gate() -> Gate {
+        Some(Arc::new(Gate2 {
+            open: Mutex::new(false),
+            wakeup: Condvar::new(),
+        }))
+    }
+
+    /// Wait until `what` reads `expected`, so a test observes the state instead of
+    /// racing the loader thread.
+    fn wait_until<T: PartialEq + std::fmt::Debug>(
+        what: &str,
+        mut read: impl FnMut() -> T,
+        expected: T,
+    ) {
+        for _ in 0..400 {
+            if read() == expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("{what} never became {expected:?}");
+    }
+
+    /// Put a translator in the slot the way a successful load would, so every
+    /// read below turns on a real occupant without any weights.
+    fn with_fake_translator(s: &TestState, target: &str, spec: &str) {
+        let mut slot = s.lock_slot();
+        slot.generation += 1;
+        let generation = slot.generation;
+        slot.translator = Some(fake(spec));
+        drop(slot);
+        *lock_write(&s.live) = target.to_string();
+        *lock_write(&s.model_spec) = spec.to_string();
+        *lock_write(&s.target) = target.to_string();
+        s.wanted.store(true, Ordering::Release);
+        assert!(
+            s.install(generation, target, fake(spec)),
+            "a current generation must install"
+        );
+    }
+
+    #[test]
+    fn the_startup_load_is_wanted_from_the_first_utterance() {
+        // `--translate en` at startup: the translator is loaded *and* the step is
+        // wanted, because the worker asks `will_translate` before every hand-off. A
+        // translator loaded but not wanted would silently never run.
+        let s: TestState = TranslationState::new(
+            TranslationPlan::for_tests_configured("pl", "en"),
+            FakeLoad { gate: None },
+        );
+        s.load_startup().expect("the startup load must succeed");
+        assert!(s.is_enabled(), "a run that asked for translation is on");
+        assert!(
+            s.will_translate(),
+            "and the worker must hand utterances over from the first one"
+        );
+        assert_eq!(s.target_language(), "en");
+        assert_eq!(s.requested_language(), "", "nothing is loading any more");
+    }
+
+    #[test]
+    fn a_startup_load_that_cannot_be_produced_fails_the_run() {
+        // Startup is the one place a missing translator is fatal, rather than a warn
+        // on a later utterance.
+        let s: TestState = TranslationState::new(
+            TranslationPlan::for_tests_configured("pl", "unobtainable"),
+            FakeLoad { gate: None },
+        );
+        assert!(
+            s.load_startup().is_err(),
+            "the caller must see the failure and stop"
+        );
+        assert!(!s.is_loaded(), "and nothing half-loaded is left behind");
+    }
+
+    #[test]
+    fn no_translate_flag_loads_nothing_at_all() {
+        let s = state("pl");
+        s.load_startup().expect("no flag is not a failure");
+        assert!(
+            !s.is_loaded(),
+            "nothing is downloaded for a run that did not ask"
+        );
+        assert!(!s.is_enabled());
+        assert_eq!(s.target_language(), "");
+    }
+
+    #[test]
+    fn a_fresh_state_is_off_with_nothing_loaded() {
+        let s = state("pl");
+        assert!(!s.is_enabled(), "nothing asked and nothing loaded");
+        assert!(!s.is_loaded());
+        assert_eq!(s.target_language(), "");
+        assert_eq!(s.model(), "");
+        assert_eq!(
+            s.requested_language(),
+            "",
+            "an empty request is what says nothing is loading"
+        );
+        assert!(
+            !s.will_translate(),
+            "so nothing reaches the translation thread"
+        );
+    }
+
+    #[test]
+    fn an_empty_target_language_is_refused_without_a_load() {
+        let s = state("pl");
+        let (accepted, target, message) = s.set_target_language("   ");
+        assert!(!accepted);
+        assert_eq!(message, "empty target language");
+        assert_eq!(target, "");
+        assert_eq!(
+            s.requested_language(),
+            "",
+            "a refusal must not register a request, or a loader would start"
+        );
+    }
+
+    #[test]
+    fn a_direction_the_catalog_cannot_serve_is_refused_with_the_startup_message() {
+        let s = state("pl");
+        let (accepted, target, message) = s.set_target_language("de");
+        assert!(!accepted, "Polish has no exported pair into German");
+        assert!(
+            message.contains("no translator for pl -> de"),
+            "the caller gets the message the startup path prints: {message}"
+        );
+        // It names what Polish *can* reach, which is the useful half.
+        assert!(message.contains("en"), "{message}");
+        assert_eq!(target, "", "the live target is unchanged by a refusal");
+        assert_eq!(s.requested_language(), "");
+    }
+
+    #[test]
+    fn an_unknown_source_language_is_refused_too() {
+        let s = state("qq");
+        let (accepted, _, message) = s.set_target_language("en");
+        assert!(!accepted);
+        assert!(message.contains("qq"), "{message}");
+    }
+
+    #[test]
+    fn a_refusal_leaves_a_loaded_translator_serving() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        assert!(s.is_enabled(), "the fake load enables the step");
+        let (accepted, target, _) = s.set_target_language("de");
+        assert!(!accepted);
+        assert_eq!(target, "en", "a refused switch costs the language it had");
+        assert_eq!(s.model(), "opus-mt-pl-en");
+        assert!(s.will_translate());
+    }
+
+    #[test]
+    fn enable_with_no_translator_and_no_target_refuses() {
+        let s = state("pl");
+        let (enabled, message) = s.enable();
+        assert!(!enabled);
+        assert!(
+            message.contains("no target language is set"),
+            "the caller is told why nothing happened: {message}"
+        );
+        assert!(!s.will_translate());
+        assert_eq!(s.requested_language(), "", "and no load was started");
+    }
+
+    #[test]
+    fn enable_after_an_unload_reports_off_until_the_load_lands() {
+        // `Enabled` is false while the reload runs: it claims work that is not
+        // happening yet, and the client waits on `RequestedLanguage` instead.
+        let gate = new_gate();
+        let s = gated_state("pl", gate.clone());
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        s.disable(true);
+
+        let (enabled, message) = s.enable();
+        assert!(!enabled, "the reload has not finished");
+        assert!(message.is_empty(), "this is not a refusal, only a load");
+        wait_until(
+            "RequestedLanguage",
+            || s.requested_language(),
+            "en".to_string(),
+        );
+        assert!(!s.will_translate(), "still nothing to translate with");
+
+        release(&gate);
+        wait_until("Enabled", || s.is_enabled(), true);
+        assert_eq!(
+            s.model(),
+            "opus-mt-pl-en",
+            "a fresh translator, reported by spec"
+        );
+        assert_eq!(s.requested_language(), "", "and the request is cleared");
+    }
+
+    #[test]
+    fn a_first_switch_from_nothing_loads_before_it_reports_enabled() {
+        // The one case with no translator to fall back on, so this is the window in
+        // which utterances come out untranslated.
+        let gate = new_gate();
+        let s = any_target_state(gate.clone());
+        let (accepted, target, message) = s.set_target_language("en");
+        assert!(accepted);
+        assert_eq!(target, "en");
+        assert!(message.is_empty());
+        wait_until(
+            "RequestedLanguage",
+            || s.requested_language(),
+            "en".to_string(),
+        );
+        assert!(!s.is_enabled(), "not yet: nothing is loaded");
+        assert_eq!(s.target_language(), "", "so no language is claimed");
+        assert!(!s.will_translate(), "and the worker stays inline");
+
+        release(&gate);
+        wait_until("Enabled", || s.is_enabled(), true);
+        assert_eq!(s.target_language(), "en");
+    }
+
+    #[test]
+    fn a_switch_keeps_the_old_translator_serving_until_the_new_one_lands() {
+        // The property that makes a switch atomic from the reader's side.
+        let gate = new_gate();
+        let s = any_target_state(gate.clone());
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        assert!(s.is_enabled());
+
+        assert!(s.set_target_language("de").0);
+        wait_until(
+            "RequestedLanguage",
+            || s.requested_language(),
+            "de".to_string(),
+        );
+        assert_eq!(
+            s.target_language(),
+            "en",
+            "the old translator still serves, and that is what is reported"
+        );
+        assert_eq!(s.model(), "opus-mt-pl-en");
+        assert!(s.will_translate(), "so nothing comes out untranslated");
+    }
+
+    #[test]
+    fn a_load_that_cannot_be_produced_leaves_the_step_off() {
+        let s = any_target_state(None);
+        assert!(s.set_target_language("unobtainable").0);
+        // The load runs on its own thread and fails there.
+        wait_until(
+            "RequestedLanguage",
+            || s.requested_language(),
+            "".to_string(),
+        );
+        assert!(
+            !s.is_enabled(),
+            "`Enabled` never claims work that cannot happen"
+        );
+        assert!(!s.is_loaded());
+        assert!(!s.will_translate());
+    }
+
+    #[test]
+    fn a_load_that_cannot_be_produced_keeps_the_language_the_run_had() {
+        let s = any_target_state(None);
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        assert!(s.set_target_language("unobtainable").0);
+        wait_until(
+            "RequestedLanguage",
+            || s.requested_language(),
+            "".to_string(),
+        );
+        assert!(
+            s.is_enabled(),
+            "the old translator is untouched by a failed switch"
+        );
+        assert_eq!(s.target_language(), "en");
+        assert_eq!(s.model(), "opus-mt-pl-en");
+    }
+
+    #[test]
+    fn a_disable_cancels_the_load_in_flight() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let generation = s.lock_slot().generation;
+        // Stand in for a request: the generation the loader would carry.
+        let stale = s.begin_request("en");
+        assert!(stale > generation);
+
+        s.disable(false);
+        // The load is stale now, so its result cannot install.
+        assert_ne!(
+            s.lock_slot().generation,
+            stale,
+            "a disable must bump the generation, or an arriving load would still land"
+        );
+        assert_eq!(s.requested_language(), "", "and clear the request");
+    }
+
+    #[test]
+    fn a_superseded_load_never_installs() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let stale = s.begin_request("de");
+        s.disable(false);
+        // `install` with a stale generation returns without touching the slot.
+        let before = s.model();
+        s.report_stale_install(stale, "de");
+        assert_eq!(s.model(), before, "the live translator is untouched");
+        assert_eq!(s.target_language(), "en");
+    }
+
+    #[test]
+    fn disable_without_unload_keeps_the_weights_for_an_instant_enable() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        assert!(!s.disable(false), "off, and it returns the new state");
+        assert!(!s.is_enabled(), "off");
+        assert!(s.is_loaded(), "but still loaded, so Enable costs nothing");
+        assert_eq!(
+            s.target_language(),
+            "en",
+            "and it still says what it would write"
+        );
+        assert_eq!(s.model(), "opus-mt-pl-en");
+
+        let (enabled, message) = s.enable();
+        assert!(enabled, "no reload: the translator is right there");
+        assert!(message.is_empty());
+        assert!(s.will_translate());
+    }
+
+    #[test]
+    fn disable_with_unload_frees_the_weights_and_the_reported_state() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        assert!(!s.disable(true));
+        assert!(!s.is_loaded(), "the weights are gone");
+        assert_eq!(s.target_language(), "", "nothing is being written");
+        assert_eq!(s.model(), "", "so there is no translator to name");
+        assert!(
+            !s.will_translate(),
+            "and the worker stays on the inline path"
+        );
+    }
+
+    #[test]
+    fn an_unload_keeps_the_remembered_target_so_enable_can_reload_it() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        s.disable(true);
+        // `Enable` finds the remembered `en`, so it asks for a load rather than
+        // refusing the way a run that never named a language does.
+        let (enabled, message) = s.enable();
+        assert!(!enabled, "the reload is in flight");
+        assert!(message.is_empty(), "not a refusal");
+        assert_eq!(
+            s.requested_language(),
+            "en",
+            "and it asks for the right one"
+        );
+    }
+
+    #[test]
+    fn toggle_flips_the_step_without_unloading() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        assert!(!s.toggle(), "on -> off");
+        assert!(
+            s.is_loaded(),
+            "a toggle is a state change, not a memory decision"
+        );
+        assert!(s.toggle(), "off -> on, with no reload");
+    }
+
+    #[test]
+    fn the_same_language_again_is_a_switch_on_not_a_load() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        s.disable(false);
+        let (accepted, target, message) = s.set_target_language("en");
+        assert!(accepted);
+        assert_eq!(target, "en");
+        assert!(message.is_empty());
+        assert!(s.is_enabled(), "the same language turns the step back on");
+        assert_eq!(
+            s.requested_language(),
+            "",
+            "and nothing is loaded, because the translator was already there"
+        );
+    }
+
+    #[test]
+    fn the_target_language_is_normalized_the_way_the_catalog_compares_it() {
+        let s = state("pl");
+        // Trimmed and lowercased, so ` EN ` and `en` are one language and the
+        // reported value matches what the catalog resolved.
+        let (accepted, target, _) = s.set_target_language(" EN ");
+        assert!(accepted);
+        assert_eq!(target, "en");
+    }
+
+    #[test]
+    fn a_failed_first_load_leaves_the_step_off() {
+        let s = state("pl");
+        let generation = s.begin_request("en");
+        s.wanted.store(true, Ordering::Release);
+        s.fail_request(generation, "the decoder ran out of cache slots");
+        assert!(
+            !s.is_enabled(),
+            "`Enabled` must never claim work that cannot happen"
+        );
+        assert_eq!(s.requested_language(), "");
+        assert!(!s.will_translate());
+    }
+
+    #[test]
+    fn a_failed_switch_keeps_the_language_the_run_had() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let generation = s.begin_request("de");
+        s.fail_request(generation, "the directory is missing a graph");
+        assert!(s.is_enabled(), "the old translator still serves");
+        assert_eq!(s.target_language(), "en");
+        assert_eq!(s.model(), "opus-mt-pl-en");
+        assert_eq!(s.requested_language(), "", "the failed request is cleared");
+    }
+
+    #[test]
+    fn a_superseded_failure_is_not_reported() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let stale = s.begin_request("de");
+        let live = s.begin_request("en");
+        assert!(live > stale);
+        // The first load fails after the second was asked for: its message is
+        // about a language nobody wants any more, so it is dropped.
+        s.fail_request(stale, "stale failure");
+        assert_eq!(
+            s.requested_language(),
+            "en",
+            "the live request is untouched"
+        );
+    }
+
+    #[test]
+    fn get_state_reports_the_snapshot_the_properties_read() {
+        let s = state("pl");
+        with_fake_translator(&s, "en", "opus-mt-pl-en");
+        let (enabled, target, requested, model) = s.state();
+        assert!(enabled);
+        assert_eq!(target, "en");
+        assert_eq!(requested, "");
+        assert_eq!(model, "opus-mt-pl-en");
+        // The four reads must agree, or a client stitching them together sees a
+        // state no single moment had.
+        assert_eq!(enabled, s.is_enabled());
+        assert_eq!(target, s.target_language());
+        assert_eq!(requested, s.requested_language());
+        assert_eq!(model, s.model());
+    }
+
+    #[test]
+    fn a_voice_key_states_its_language_and_a_path_states_nothing() {
+        assert_eq!(voice_language("pl_PL-gosia-medium"), Some("pl"));
+        assert_eq!(voice_language("en_US-amy-medium"), Some("en"));
+        assert_eq!(voice_language("de_DE-thorsten"), Some("de"));
+        // A path is a directory, not a key: no language to compare against.
+        assert_eq!(voice_language("/opt/voices/amy"), None);
+        assert_eq!(voice_language("C:\\voices\\amy"), None);
+        // Nothing before the first separator.
+        assert_eq!(voice_language("-medium"), None);
+    }
 
     #[test]
     fn split_cuts_after_a_terminator() {

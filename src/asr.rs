@@ -12,7 +12,6 @@
 // genuinely engine-specific — the actual inference call, and enough of a
 // description to log — behind the `SpeechModel` trait.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -258,10 +257,9 @@ pub(crate) struct AsrConfig {
     pub(crate) partials: PartialSlot,
 
     // ---- observability ----
-    /// Append per-utterance JSON metrics here when `Some` (see `--metrics`).
-    /// Opened once by `AsrWorker::new`; open errors only warn, never fail
-    /// transcription.
-    pub(crate) metrics_path: Option<PathBuf>,
+    // The `--metrics` writer itself is not here: `spawn_asr_worker` takes an
+    // already-opened `MetricsSlot`, because the translation thread writes rows
+    // too and one file cannot be opened twice.
 
     // ---- runtime policy ----
     /// `--auto-unload`: free VRAM while paused, reload eagerly on resume.
@@ -335,6 +333,7 @@ pub(crate) fn spawn_asr_worker(
     config: AsrConfig,
     mut emitter: impl Emitter + Send + 'static,
     translation: Option<TranslationOut>,
+    metrics: MetricsSlot,
     paused: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 ) -> (
@@ -352,6 +351,7 @@ pub(crate) fn spawn_asr_worker(
                 &ready_tx,
                 &mut emitter,
                 translation,
+                metrics,
                 &paused,
                 &running,
             );
@@ -493,19 +493,23 @@ struct AsrWorker<'a> {
     config: AsrConfig,
     ready: &'a std::sync::mpsc::Sender<Result<(), String>>,
     emitter: &'a mut dyn Emitter,
-    /// The translation step (`--translate`), owned by the worker like the engine.
-    /// `None` = the step is off, and every utterance is emitted as transcribed.
+    /// The translation step, owned by the worker like the engine. `None` (file
+    /// mode without `--translate`) = the step cannot run at all and every utterance
+    /// is emitted as transcribed.
     ///
-    /// This is the *queue*, not the translator: the `ort` sessions live on the
-    /// translation thread inside, because translating inline would add 60 to
-    /// 130 ms of CPU to every gap between utterances. The worker only ever
-    /// submits jobs (see `TranslationOut::enqueue`).
+    /// This is the *queue*, not the translator: the `ort` sessions live in the
+    /// state the lane and the bus share, because a value that appears on the bus
+    /// thread after the worker started could not reach an `Option` here. The worker
+    /// only submits jobs, and only when the step will actually translate
+    /// (`TranslationState::will_translate`), so a run that never translates keeps
+    /// the inline path and this queue's drop-oldest policy never applies to it.
     translation: Option<TranslationOut>,
     paused: &'a Arc<AtomicBool>,
     running: &'a Arc<AtomicBool>,
-    /// `--metrics` JSONL writer, disabled on any open/write error. Opened once
-    /// in `new`, so a broken path cannot fail transcription mid-run.
-    metrics: Option<std::io::BufWriter<std::fs::File>>,
+    /// `--metrics` JSONL writer, shared with the translation thread. Disabled on
+    /// any open/write error. Opened once before the worker starts (see
+    /// `open_metrics_log`), so a broken path cannot fail transcription mid-run.
+    metrics: MetricsSlot,
     first_load: bool,
     /// Tag counter, owned here so numbering stays monotonic across reloads.
     utterance_no: u64,
@@ -537,12 +541,10 @@ impl<'a> AsrWorker<'a> {
         ready: &'a std::sync::mpsc::Sender<Result<(), String>>,
         emitter: &'a mut dyn Emitter,
         translation: Option<TranslationOut>,
+        metrics: MetricsSlot,
         paused: &'a Arc<AtomicBool>,
         running: &'a Arc<AtomicBool>,
     ) -> Self {
-        // Observability only: a broken metrics path must never take down
-        // transcription, so open errors warn once and disable the log.
-        let metrics = open_metrics_log(config.metrics_path.as_deref());
         Self {
             rx,
             model_ref,
@@ -701,7 +703,7 @@ impl AsrWorker<'_> {
             self.running,
             &mut *self.emitter,
             &mut self.translation,
-            &mut self.metrics,
+            &self.metrics,
             &words,
             self.config.remove_hesitations,
             &mut self.prev_emit_text,
@@ -966,6 +968,36 @@ pub(crate) fn open_metrics_log(
     }
 }
 
+/// The one `--metrics` writer, shared by the ASR worker and the translation
+/// thread.
+///
+/// Shared rather than moved, and that is a correction of an earlier shape: the
+/// worker writes a row for every utterance it does **not** hand over (each drop,
+/// and every utterance while the translation step is off), so a writer that lived
+/// only on the translation thread would silently lose exactly those rows. One
+/// value in one place, guarded, keeps every row and keeps the lane from needing a
+/// second file handle.
+///
+/// The lock is held across one row and its flush, which is what keeps two threads
+/// from interleaving bytes in one `BufWriter`. A poisoned lock is taken anyway: a
+/// metrics problem must never take transcription down with it.
+#[derive(Clone, Default)]
+pub(crate) struct MetricsSlot(Arc<Mutex<Option<std::io::BufWriter<std::fs::File>>>>);
+
+impl MetricsSlot {
+    /// Wrap an already-opened writer (`None` when `--metrics` is off).
+    pub(crate) fn new(writer: Option<std::io::BufWriter<std::fs::File>>) -> Self {
+        Self(Arc::new(Mutex::new(writer)))
+    }
+
+    /// The writer, for one row. `None` when `--metrics` is off or the open failed.
+    pub(crate) fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<std::io::BufWriter<std::fs::File>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Machine-readable verdict for the `--metrics` log (human-readable
 /// `DROPPED(...)` strings stay in the dump dir via `dump_reason`).
 pub(crate) const fn verdict_slug(verdict: crate::gate::TranscriptVerdict) -> &'static str {
@@ -1188,7 +1220,7 @@ fn transcribe_and_emit(
     running: &Arc<AtomicBool>,
     emitter: &mut dyn Emitter,
     translation: &mut Option<TranslationOut>,
-    metrics: &mut Option<std::io::BufWriter<std::fs::File>>,
+    metrics: &MetricsSlot,
     dictionary: &[String],
     remove_hesitations: bool,
     prev_emit_text: &mut String,
@@ -1281,16 +1313,19 @@ fn transcribe_and_emit(
             // `fallback_or_translated` owns the failure policy, so a failed or
             // empty translation emits the source text with a warn rather than
             // losing the utterance.
-            // The translation step runs last, after every gate, and only for an
-            // utterance that is actually emitted: a drop is never translated.
             //
             // With the step on, the job is handed to the translation thread and
             // this function does not emit: the thread owns the translated text,
-            // so it owns the emission and the metrics row too. The `pcm` copy is
-            // what the queue needs, since the utterance is gone by the time the
-            // thread gets to it.
+            // so it owns the emission too. The `pcm` copy is what the queue needs,
+            // since the utterance is gone by the time the thread gets to it.
+            //
+            // `will_translate` is what keeps a run that never translates on the
+            // inline path below: the lane exists from startup (a switch arrives on
+            // the bus thread, which cannot reach into this worker), but an
+            // utterance is only handed over when a translation will really happen.
+            // So the lane's drop-oldest queue never applies to untranslated text.
             if let Some(out) = translation.as_ref() {
-                if emitted {
+                if emitted && out.will_translate() {
                     out.enqueue(TranslationJob {
                         tag: tag.clone(),
                         pcm: utterance.pcm.clone(),
@@ -1299,6 +1334,9 @@ fn transcribe_and_emit(
                         evidence: utterance.evidence,
                         samples: decoded_samples,
                         infer_ms,
+                        // Stamped by `enqueue`, the only producer: a job cannot
+                        // be queued without recording which translator was live.
+                        generation: 0,
                     });
                     return true;
                 }
@@ -1306,8 +1344,9 @@ fn transcribe_and_emit(
             // No step, or a drop: the transcript is its own emission. A drop is
             // never translated, so nothing is spent on text the pipeline decided
             // not to emit.
+            let mut writer = metrics.lock();
             write_metrics_row(
-                metrics,
+                &mut writer,
                 &tag,
                 decoded_samples,
                 &utterance.evidence,
@@ -1316,6 +1355,9 @@ fn transcribe_and_emit(
                 infer_ms,
                 None,
             );
+            // Released before the emission: the emit queue has its own lock, and
+            // nothing should hold two at once.
+            drop(writer);
             emitter.emit(Emission {
                 tag: &tag,
                 pcm: &utterance.pcm,
@@ -1836,7 +1878,6 @@ mod tests {
             dictionary: empty_live_dictionary(),
             shed_stale: false,
             partials: PartialSlot::default(),
-            metrics_path: None,
             auto_unload: false,
             auto_unload_after: Duration::from_secs(0),
             sound: false,
@@ -2081,6 +2122,7 @@ mod tests {
             config,
             crate::emit::RecordingEmitter::new(),
             None,
+            MetricsSlot::default(),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
@@ -2256,6 +2298,7 @@ mod tests {
             &mut emitter,
             // No translation step: these tests drive the source-text pipeline.
             None,
+            MetricsSlot::default(),
             &paused,
             &running,
         );
@@ -2489,7 +2532,7 @@ mod tests {
             &mut emitter,
             // No translation step: these tests pin the source-text pipeline.
             &mut None,
-            &mut None,
+            &MetricsSlot::default(),
             &[],
             remove_hesitations,
             prev_emit_text,

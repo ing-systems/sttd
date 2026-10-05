@@ -82,23 +82,30 @@ seam; the ASR worker hands it one emission per utterance — tag, raw audio,
 trimmed text, verdict, acoustic evidence — and gets back nothing. When the
 translation step ran, the translation thread is the caller and the text it
 receives is the translation, so the source text is no longer what leaves the
-pipeline.
+pipeline. That is per utterance, not per run: with the step switched on and off
+mid-session, an utterance the step did not translate is emitted by the worker as
+transcribed.
 _Avoid_: output, sink, side effects (as a name)
 
 **Translation**:
 The optional step between the gates and the emission, enabled by
-`--translate <LANG>`. It rewrites the text of an already accepted transcript and
+`--translate <LANG>` at startup or by `org.sttd.Translation.Enable` over the
+session bus, and pointed at a language by the same flag or by
+`SetTargetLanguage`. It rewrites the text of an already accepted transcript and
 hands the result to the emitter. The gates, the dictionary and the hesitation
 stripping act on the source text, never on the translation. A failure does not
-drop the utterance: sttd warns and emits the source text instead.
+drop the utterance: sttd warns and emits the source text instead — and so does a
+step that is off, or that has no translator loaded yet.
 _Avoid_: post-processing, output translation (it happens before emission),
 machine translation (as a name for the step)
 
 **Translator**:
 The loaded, ready-to-run translation model a transcript is handed to when the
 translation step runs — three `ort` sessions (the encoder, the merged decoder for
-the prompt step and the cached decoder for the rest) and its tokenizer, chosen once
-at startup and fixed for the process's lifetime. It is not a speech model: it
+the prompt step and the cached decoder for the rest) and its tokenizer. Exactly
+one is live at a time, in one place: it is loaded at startup by `--translate`, or
+at runtime when a bus request asks for a language, and the one that was live keeps
+serving until the new one is ready. It is not a speech model: it
 never sees audio, and it is stored beside the models rather than inside them, so
 the model catalog cannot name one. A pair translator is small (~165 MiB) and fast;
 a multilingual one is neither. A long or technical piece of text translates worse
@@ -149,7 +156,34 @@ work in order rather than something stale. Shutdown drains it: the trailing
 utterance is translated rather than dropped, and what bounds the wait is the
 decode's own token cap rather than a deadline, because a flag cannot interrupt a
 translation already running.
+
+The thread exists from startup in microphone mode, with or without a
+translator, because the request that turns the step on arrives on the bus thread
+and the ASR worker cannot be handed one after it started. It is **fed only** when a
+translation will really happen, so a run that never translates keeps the worker's
+own emission path and this queue's drop-oldest policy never applies to it. The
+translator is looked up per job rather than cached here, which is what lets
+`Disable(true)` free the weights at once: the price is that a switch waits for a
+translation already running, bounded by one utterance.
 _Avoid_: translation worker, translator thread, async translation
+
+**Translation switch**:
+Whether the **translation** step runs, and which language it writes, as one piece
+of state the session bus can change while the run continues. Three fields, and the
+distinction between them is the whole design: what the user **wants** (the flag, or
+an `Enable`), what the loaded translator **writes** (a language, or none), and what
+a load in flight is **for**. "Enabled" is the first *and* the second, so it never
+reports work that is not happening: it reads false during the very first load, and
+after a failed one.
+
+The wanted language is **remembered** across a switch and an unload, so `Enable`
+knows what to reload; the live language is not, so a disable that freed the weights
+reports no language at all. A switch keeps the old translator serving until the new
+one is ready, which is why the live language can lag the wanted one — and that lag
+is what makes a switch atomic from a reader's side. **Unloading** is a separate
+decision from being off: turning the step off keeps the weights, so `Enable` is
+instant, and freeing them costs a reload from the local cache.
+_Avoid_: translation mode, language setting, translator switch
 
 **Voice**:
 A piper TTS voice: a VITS `.onnx` graph plus the `.onnx.json` config beside it,

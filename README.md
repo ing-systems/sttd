@@ -191,7 +191,8 @@ Four properties are worth knowing:
 
 - **The step runs after the gates.** A dropped utterance is never translated, and a hallucination or repetition gate judges the source text, never the translation.
 - **A failure emits the source.** If the model returns nothing or the decode fails, sttd warns and emits the source text unchanged, so a translation fault never costs you the sentence.
-- **Translation runs on its own thread**, behind a 4-deep FIFO, so it never adds its 60–150 ms (or ~700 ms) to the gap between utterances. A full queue drops the *oldest* waiting transcript and says so, rather than the newest.
+- **Translation runs on its own thread**, behind a 4-deep FIFO, so it never adds its 60–150 ms (or ~700 ms) to the gap between utterances. A full queue drops the *oldest* waiting transcript and says so, rather than the newest. The queue only ever holds work that will really be translated: with the step off, the ASR worker emits inline exactly as it did before, so this queue's drop-oldest rule never applies to untranslated text.
+- **The step can be switched while the run continues**, on and off and to another language, over `org.sttd.Translation` — see *Runtime control*. Only one translator is live at a time, and a switch keeps the old one serving until the new one is ready.
 - **512 tokens is a quality window, not a shape limit.** Text is split on sentence terminators (`.` `!` `?` `;` newline, not `:`) and each piece is truncated to 512 tokens, so quality falls off past that. Text with no terminator stays one piece.
 
 **Eval runs must not use `--translate`.** `tools/eval.py` scores sttd's `--stdout` lines against each reference `.txt`, and with `--translate` those lines hold the translation. The WER then measures the translation model, not the speech model. If you do run with `--translate`, the source transcript is in the `src_text` column of the `--metrics` rows, not in the scored text.
@@ -331,16 +332,16 @@ Key tunables:
 | `--stdout` / `STTD_STDOUT` | off | Print one line per accepted utterance. |
 | `--speak` / `STTD_SPEAK` | off | Read each accepted transcript aloud through the default output device (needs `espeak-ng`). Holds the microphone while it speaks, so what you say during playback is discarded — pair it with `--autopause`, or use headphones. Ctrl-C cuts playback at once and does not read the last sentence aloud. Independent of `--sound`. |
 | `--voice` / `STTD_VOICE` | `pl_PL-gosia-medium` | Piper voice key or a voice directory. Downloaded on first use (~60 MiB). Ignored, and not downloaded, without `--speak`. |
-| `--translate` / `STTD_TRANSLATE` | unset | Translate each accepted transcript into `<LANG>` before emission. Unset: no translation step and no translator download. Every emission channel then receives the translation. The direction comes from `--language` plus this flag; with the default pair translator only exported pairs exist (see *Translation*). |
-| `--translate-model` / `STTD_TRANSLATE_MODEL` | unset | Override the resolved direction: a catalog spec (`opus-mt-mul-en`, or `nllb-200-distilled-600M` for every direction at ~1.3 GiB), or a directory holding `encoder_model_quantized.onnx`, `decoder_model_merged_quantized.onnx`, `decoder_with_past_model_quantized.onnx`, `tokenizer.json` and `config.json`. Downloaded on first use. Ignored, and not downloaded, without `--translate`. |
+| `--translate` / `STTD_TRANSLATE` | unset | Translate each accepted transcript into `<LANG>` before emission. Unset: no translation step and no translator download — but `org.sttd.Translation.SetTargetLanguage` can turn it on at runtime (see *Runtime control*). Every emission channel then receives the translation. The direction comes from `--language` plus this flag; with the default pair translator only exported pairs exist (see *Translation*). |
+| `--translate-model` / `STTD_TRANSLATE_MODEL` | unset | Override the resolved direction: a catalog spec (`opus-mt-mul-en`, or `nllb-200-distilled-600M` for every direction at ~1.3 GiB), or a directory holding `encoder_model_quantized.onnx`, `decoder_model_merged_quantized.onnx`, `decoder_with_past_model_quantized.onnx`, `tokenizer.json` and `config.json`. Downloaded on first use. Applies to a runtime `SetTargetLanguage` too; without `--translate` it is used only by such a request, and is ignored (and not downloaded) where there is no bus to ask with. |
 | `--copy` / `STTD_COPY` | off | Copy each emission via `wl-copy`. |
 | `--paste` / `STTD_PASTE` | off | Paste via `ydotool`. Runs only when copy runs on fresh text. |
 | `--paste-mode` / `STTD_PASTE_MODE` | `ctrl-v` | `ctrl-v`, `ctrl-shift-v`, or `type`. |
 | `--dump-dir` / `STTD_DUMP_DIR` (`-o`) | unset | Write WAV+TXT per utterance; keeps newest 100 pairs. TXT for drops starts with `DROPPED(<reason>)`. |
-| `--metrics` / `STTD_METRICS` | unset | Append JSONL per utterance (timing, RTF, evidence, verdict, text). With `--translate`, `text` holds the translation and `src_text` the source. |
+| `--metrics` / `STTD_METRICS` | unset | Append JSONL per utterance (timing, RTF, evidence, verdict, text). When the translation step ran for that utterance, `text` holds the translation and `src_text` the source; when it did not — the step off, or no translator loaded yet — there is no `src_text` column. |
 | `--start-paused` / `STTD_START_PAUSED` | on | Start paused; file mode ignores it. |
 | `--autopause` / `STTD_AUTOPAUSE` | off | Pause again after each emission; each resume arms one sentence. The pause flushes the utterance buffer first, so speech made while the model was decoding is not lost. |
-| `--no-dbus` / `STTD_NO_DBUS` | off | Skip the session-bus service (both interfaces). Signals and `--stop` keep working. File mode never starts it. |
+| `--no-dbus` / `STTD_NO_DBUS` | off | Skip the session-bus service (all three interfaces). Signals and `--stop` keep working. File mode never starts it. |
 | `--auto-unload` / `STTD_AUTO_UNLOAD` | off | Unload model while paused to free VRAM. |
 | `--auto-unload-after` / `STTD_AUTO_UNLOAD_AFTER` | `180` s | Pause duration before unload; `0` = immediate. |
 | `--sound` / `STTD_SOUND` | on | Pause/resume/ready tones on default output. |
@@ -383,12 +384,13 @@ systemctl --user kill -s SIGUSR1 sttd   # pause
 
 The unit runs foreground (`ExecStart=/usr/bin/sttd --autopause --copy 1 --paste 1`). It starts paused by default. It needs `WAYLAND_DISPLAY` for copy/paste (`systemctl --user import-environment WAYLAND_DISPLAY`).
 
-D-Bus (microphone mode, unless `--no-dbus`): one bus name `org.sttd.Daemon` with two interfaces on separate object paths. A missing session bus is not fatal: the service retries in the background and the signals above keep working. File mode (`--file`) never starts the service.
+D-Bus (microphone mode, unless `--no-dbus`): one bus name `org.sttd.Daemon` with three interfaces on separate object paths. A missing session bus is not fatal: the service retries in the background and the signals above keep working. File mode (`--file`) never starts the service.
 
 | Interface | Object path | Members |
 | --- | --- | --- |
 | `org.sttd.Daemon` | `/org/sttd/Daemon` | `Pause`, `Resume`, `Toggle`, property `Paused`, signal `StateChanged` |
 | `org.sttd.Dictionary` | `/org/sttd/Dictionary` | `LoadFile`, `ReplaceWords`, `AddWords`, `RemoveWords`, `GetWords`, `Contains`, properties `Count` and `Dirty`, signal `DictionaryChanged` |
+| `org.sttd.Translation` | `/org/sttd/Translation` | `Enable`, `Disable`, `Toggle`, `SetTargetLanguage`, `GetState`, properties `Enabled`, `TargetLanguage`, `RequestedLanguage` and `Model`, signal `TranslationChanged` |
 
 Pause control (`Pause` and `Toggle` flush the utterance buffer, same as
 `SIGUSR1`/`SIGHUP` above):
@@ -426,6 +428,28 @@ busctl --user monitor org.sttd.Daemon
 
 Any process running as the same user can call these methods, so the dictionary is only as trustworthy as the session. `Count` is uncapped, because the caps apply in post-correction and not at swap time. Dictionary rules and caps are unchanged from `--dictionary` (see `src/dictionary.rs`): above `POSTCORR_WARN_DICT_WORDS` (50) false positives grow, and at `POSTCORR_MAX_DICT_WORDS` (100) fuzzy correction is off while exact casing restore stays on.
 
+Translation (`--translate` needs nothing here; the step can be switched at runtime with or without the flag):
+
+```sh
+busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation SetTargetLanguage s en
+busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation Enable
+busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation Disable b false   # off, keep the weights
+busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation Disable b true    # off, free them now
+busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation GetState
+busctl --user get-property org.sttd.Daemon /org/sttd/Translation org.sttd.Translation TargetLanguage
+busctl --user monitor org.sttd.Daemon
+```
+
+`SetTargetLanguage <LANG>` also turns the step on, and returns `(ok, target, message)`. It refuses immediately, before anything is downloaded, when the direction cannot be served — an empty language gives `(false, "", "empty target language")`, and a pair that does not exist gives `(false, "", "no translator for pl -> de; pl can be translated into: en…")`, the same message `--translate` would print at startup. Only the pairs published as ONNX exports exist, so `--translate-model nllb-200-distilled-600M` is what makes any of ~200 languages reachable.
+
+An accepted target is not a loaded one. The load runs on its own thread — a first use downloads 114 MiB to 1.3 GiB, and `Pause` and the dictionary keep working throughout — so `RequestedLanguage` holds the language being loaded while it runs, and `TranslationChanged(enabled, target, model, ok, message)` reports the outcome. The translator that was live keeps serving until the new one is ready, so a switch has no window where text comes out untranslated; the one exception is the very first switch in a run started without `--translate`, where there is no translator to fall back on and utterances are emitted as transcribed until the load lands. A failed load leaves the language the run already had.
+
+`Enabled` is true only when the step is wanted *and* a translator is loaded, so it reads false during the very first load and after a failed one. `TargetLanguage` is what the loaded translator writes, `Model` is its spec (empty when none is loaded, and worth reading under a multilingual override, where the spec names no direction), and `RequestedLanguage` is empty when nothing is loading — its being non-empty is the "please wait" signal, so there is no separate `Loading` property to fall out of step with it.
+
+`Disable(false)` stops the step and keeps the weights, so `Enable` right after is instant. `Disable(true)` frees them before the call returns, emptying `TargetLanguage` and `Model`; the wanted language is remembered, so `Enable` then reloads it from the local cache — seconds, not a download. Either way a load in flight is cancelled, and `Toggle` behaves like `Disable(false)`: freeing memory is its own decision, not part of a toggle.
+
+The **source** language is fixed at startup by `--language`, so a switch moves the target only; a multilingual translator keeps reading every transcript as the language `--language` named. A mutating call waits for a translation already running (60 to 130 ms for a pair, ~700 ms for a multilingual export), because the weights are freed under the lock the translation thread holds; it never waits for a load.
+
 ## Gates
 
 Acoustic gates run before the model (`src/gate.rs`, `src/utterance.rs`):
@@ -462,10 +486,11 @@ src/gate.rs          acoustic/transcript verdicts
 src/emit.rs          stdout/clipboard/paste/speak/dump/last-text
 src/piper.rs         piper voice: config, espeak phonemes, ort VITS run
 src/voice_store.rs   voice index, --voice resolution, voice download
-src/translate.rs     seq2seq translator (both families) + the translation thread
+src/translate.rs     seq2seq translator (both families) + the translation thread, and the runtime switch
 src/translator_store.rs  translator catalog and families, resolution, download, config read
 src/dictionary.rs    custom vocabulary
 src/clean.rs         filler stripping
+src/dbus.rs          session bus: pause, live dictionary, translation switch
 src/daemon.rs        start/stop/status
 src/dsp.rs, src/hp.rs, src/agc.rs, src/denoise.rs, src/sound.rs, src/wav.rs
 tools/eval.py        WER batch eval + threshold sweep
