@@ -40,9 +40,14 @@
 //! `--device`/`STTD_DEVICE`).
 //! `sttd --list-models` prints known Parakeet models as an aligned table
 //! with a leading marker (`*` = currently selected via `--model`/`STTD_MODEL`,
-//! `I` = installed on disk). `sttd --start` forks microphone mode into the
+//! `I` = installed on disk). `sttd --list-voices [FILTER]` does the same for
+//! the piper voices `--speak` can read with (`FILTER` is a substring of the
+//! voice key or its language; the catalog is ~1300 rows). `sttd --start` forks
+//! microphone mode into the
 //! (pid file, combined log); `--stop`/`--status` manage it via the pid
-//! file. With `--auto-unload`, while paused longer than
+//! file. With `--speak` an accepted transcript is also spoken aloud through the
+//! default output device, and the microphone is held while it is, so sttd does
+//! not transcribe itself. With `--auto-unload`, while paused longer than
 //! `--auto-unload-after` the model is unloaded to free VRAM and
 //! reloaded eagerly on resume.
 //! `--autopause` re-pauses after each emitted transcript (single-shot
@@ -75,7 +80,7 @@ mod denoise;
 mod dictionary;
 mod dsp;
 mod emit;
-use emit::SystemEmitter;
+use emit::{EmissionPolicy, SpeechOut, SystemEmitter};
 mod agc;
 mod frame;
 mod gate;
@@ -98,6 +103,8 @@ mod device;
 mod mel;
 mod parakeet;
 mod parakeet_core;
+mod piper;
+mod voice_store;
 mod whisper;
 mod whisper_core;
 use whisper_core::types::{Language, DEFAULT_WINDOW_FRAMES};
@@ -122,6 +129,9 @@ fn main() -> Result<()> {
     if cli.list_models {
         print_available_models(&cli);
         return Ok(());
+    }
+    if let Some(filter) = cli.list_voices.as_deref() {
+        return print_available_voices(&cli, filter);
     }
     if cli.paste_last {
         return run_paste_last(&cli);
@@ -167,6 +177,48 @@ fn print_available_models(cli: &Cli) {
             println!("selected: {trimmed} (not in catalog)");
         }
     }
+}
+
+/// Print piper voices as an aligned table: `SPEC` / `LANG` / `QUALITY` /
+/// `SIZE` / `SPK`, with the same leading marker as `--list-models` (`*` =
+/// selected via `--voice`/`STTD_VOICE`, `I` = downloaded to disk).
+///
+/// An optional substring filters on the voice key or its language, because the
+/// catalog is ~1300 rows — unfiltered it is a reference dump, not a listing.
+/// The index comes from upstream's own `voices.json`, so the first call needs
+/// the network; after that it is read from the cache beside the voices.
+fn print_available_voices(cli: &Cli, filter: &str) -> Result<()> {
+    let index = crate::voice_store::VoiceIndex::load()?;
+    let rows = index.filtered(Some(filter));
+    if rows.is_empty() {
+        println!("no piper voice matches {filter:?}");
+        return Ok(());
+    }
+    // Resolving is what knows where a row's two files live, and it is the same
+    // path `--voice` takes, so the `I` markers cannot disagree with it.
+    let refs: Vec<crate::voice_store::VoiceRef> = rows
+        .iter()
+        .filter_map(|row| crate::voice_store::resolve_voice(&row.key, &index).ok())
+        .collect();
+    println!(
+        "piper voices ({} of {}), from https://huggingface.co/{}/tree/main:",
+        rows.len(),
+        index.filtered(None).len(),
+        crate::config::PIPER_VOICES_REPO
+    );
+    print!(
+        "{}",
+        crate::voice_store::render_table(&rows, &refs, Some(cli.voice.trim()))
+    );
+    if rows.iter().any(|r| r.multi_speaker()) {
+        println!("* multi-speaker: listed, but --speak refuses one (it has no speaker to pick)");
+    }
+    if refs.iter().all(|v| !v.is_installed()) {
+        println!(
+            "none downloaded yet; `sttd --speak --voice <spec>` fetches one (~60 MiB)"
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -469,11 +521,17 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let asr_config = asr_config(cli, true, live_dict);
     // The capture loop fills this, the worker drains it (partial transcripts).
     let partials = asr_config.partials.clone();
+    // The emitter owns the speak thread; its flag is how the capture loop below
+    // knows to hold. Taken from the emitter rather than built here so there is
+    // exactly one of each and no path can hold the pipeline for a thread that
+    // does not exist.
+    let emitter = make_emitter(cli)?;
+    let speaking = emitter.speaking_flag();
     let (asr_handle, asr_ready) = spawn_asr_worker(
         asr_rx,
         model,
         asr_config,
-        make_emitter(cli)?,
+        emitter,
         Arc::clone(&paused),
         Arc::clone(&running),
     );
@@ -484,6 +542,9 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     let mut last_drop_report = (0usize, 0usize);
     let mut rebuild_attempts: u32 = 0;
     let mut was_paused = paused.load(Ordering::Acquire);
+    // Edge state for the speaking hold, tracked beside `was_paused` rather than
+    // folded into it: one flag raises the hold, the other says whose it is.
+    let mut was_speaking = speaking.load(Ordering::Acquire);
     if was_paused {
         // Start-paused: drop any callback audio that raced stream start. Not
         // `flush_on_pause`: nothing has been spoken yet, so there is no open
@@ -590,9 +651,33 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
             }
         }
         was_paused = now_paused;
-        if now_paused {
+        // Speaking hold (`--speak`): sttd's own voice must not be transcribed.
+        // The same pipeline hold as a pause, on the same drain-and-drop path,
+        // but a *separate* flag — the pause flag is the user's, and setting it
+        // would trigger an unload or an autopause that has nothing to do with
+        // this.
+        //
+        // The rising edge cuts the open utterance first, exactly as the pause
+        // edge does: what was said just before sttd started talking is real
+        // speech and gets transcribed like any other. It is not marked as a
+        // pause flush, because the pause flag is not set and so the worker's
+        // held-pause queue policy never sees it (`FrameProcessor::flush_on_speaking`).
+        let now_speaking = speaking.load(Ordering::Acquire);
+        if now_speaking && !was_speaking {
+            if let Some(utterance) = fp.flush_on_speaking() {
+                push_utterance(&mut asr_tx, utterance, Backpressure::Wait);
+            }
+            partials.clear();
+        }
+        was_speaking = now_speaking;
+        if now_paused || now_speaking {
             // Drain-and-drop without feeding SignalPath; park briefly so resume
             // is noticed within ~50 ms while idle CPU stays negligible.
+            //
+            // While speaking, the park also paces the loop: sttd talks for
+            // seconds, and 50 ms of parking costs nothing to detect the end of
+            // it. The `hold_pipeline` itself was already taken on the rising
+            // edge, so no resampling or VAD happens in here.
             drain_raw_into(&mut raw_rx, &mut accumulator);
             accumulator.clear();
             if !raw_rx.is_abandoned() {
@@ -1052,17 +1137,58 @@ fn load_dictionary_or_warn(cli: &Cli) -> Vec<String> {
     }
 }
 
-/// Emission policy (dump dir, clipboard, paste, stdout), resolved once from
-/// `Cli`. Runs on the main thread before the worker spawns, so a bad dump
-/// dir fails fast like the model load it precedes.
+/// Emission policy (dump dir, clipboard, paste, stdout, spoken transcripts),
+/// resolved once from `Cli`. Runs on the main thread before the worker spawns,
+/// so a bad dump dir, voice key or voice download fails fast like the model load
+/// it precedes.
 fn make_emitter(cli: &Cli) -> Result<SystemEmitter> {
-    SystemEmitter::new(
-        cli.dump_dir.clone(),
-        cli.copy,
-        cli.paste,
-        cli.paste_mode,
-        cli.stdout,
-    )
+    SystemEmitter::new(EmissionPolicy {
+        dump_dir: cli.dump_dir.clone(),
+        copy: cli.copy,
+        paste: cli.paste,
+        paste_mode: cli.paste_mode,
+        stdout: cli.stdout,
+        speech: make_speech(cli)?,
+    })
+}
+
+/// The spoken-emission channel, when `--speak` is on: resolve the voice key,
+/// download what is missing and load the graph, then hand it to its own thread.
+///
+/// Off by default, and inert without `--speak`: `--voice` is never resolved and
+/// nothing is downloaded, because a flag that silently pulled 60 MiB nobody
+/// asked for is worse than one that does nothing. The voice load is a few
+/// hundred milliseconds, on the main thread, before the worker starts — the same
+/// place and cost profile as the speech model's own load.
+fn make_speech(cli: &Cli) -> Result<Option<SpeechOut>> {
+    if !cli.speak {
+        // Warned rather than silently ignored, and only when the user actually
+        // typed one: the default is not a thing they asked for.
+        if cli.voice != crate::config::DEFAULT_VOICE {
+            log::warn!("--voice is ignored without --speak");
+        }
+        return Ok(None);
+    }
+    let voice = crate::voice_store::prepare_voice(&cli.voice)
+        .with_context(|| format!("failed to prepare voice {}", cli.voice))?;
+    log::info!("speak: reading every emitted transcript aloud (voice={voice})");
+    if !cli.autopause {
+        // The capture side holds itself while sttd speaks, so a second utterance
+        // cannot even be recorded during playback. That is right for
+        // single-shot dictation and wrong for a continuous run, where it eats
+        // the user's own words; `--autopause` is the pairing that works.
+        log::warn!(
+            "--speak without --autopause discards everything you say while sttd is speaking \
+             (use --autopause, or headphones)"
+        );
+    }
+    // One thread for the voice, half of `--threads` at most: a sentence is a
+    // few seconds of audio and the graph is small, so it must not take the
+    // whole machine away from the speech model decoding the next utterance.
+    let speech_threads = (resolve_n_threads(cli.threads, 1) / 2).max(1) as usize;
+    let loaded = crate::piper::PiperVoice::load(&voice, speech_threads)
+        .context("failed to load the piper voice")?;
+    Ok(Some(SpeechOut::spawn(loaded)))
 }
 
 /// The capture-side tunables, resolved once from `Cli` and shared by both

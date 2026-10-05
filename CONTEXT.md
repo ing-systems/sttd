@@ -76,10 +76,32 @@ _Avoid_: false positive, noise, garbage
 
 **Emission**:
 What happens after the transcript gate emits: opt-in stdout print
-(`--stdout`), clipboard copy, auto-paste, and WAV/TXT dump. Owned by the emitter module behind a
+(`--stdout`), clipboard copy, auto-paste, spoken transcript (`--speak`), and
+WAV/TXT dump. Owned by the emitter module behind a
 seam; the ASR worker hands it one emission per utterance — tag, raw audio,
 trimmed text, verdict, acoustic evidence — and gets back nothing.
 _Avoid_: output, sink, side effects (as a name)
+
+**Voice**:
+A piper TTS voice: a VITS `.onnx` graph plus the `.onnx.json` config beside it,
+named by its key in `rhasspy/piper-voices` (`pl_PL-gosia-medium`). Downloaded on
+first use into `<models>/voices/<key>/`, so `--voice` takes any key upstream
+publishes rather than a curated table.
+_Avoid_: model (that is a speech model), speaker, TTS model
+
+**Speaking hold**:
+The capture-side discard that runs while sttd speaks, so it cannot transcribe
+itself through the microphone. The same pipeline hold as a pause, on its own
+flag: the pause flag is the user's, and setting it would trigger an unload or an
+autopause that has nothing to do with speaking. What is said during the hold is
+discarded, not queued — which is why `--speak` pairs with `--autopause`.
+_Avoid_: echo guard, ducking, duck (that is a level change, not a hold)
+
+**Speech queue**:
+The one utterance `--speak` will still speak, newest replacing what waited. The
+same rule the partial transcript follows: without it a backlog is stale by the
+time it would be read aloud.
+_Avoid_: speech buffer, TTS queue
 
 ### Speech models
 

@@ -21,6 +21,10 @@ makedepends=('cargo')
 optdepends=(
   'wl-clipboard: --copy (Wayland clipboard emission)'
   'ydotool: --paste auto-paste (requires ydotoold running)'
+  # --speak shells out to espeak-ng rather than linking it: GPL-3.0 stays out
+  # of the MIT binary, and cmake/bindgen stay off the build. The voice itself
+  # is downloaded on first use into /usr/share/sttd/models/voices/.
+  'espeak-ng: --speak spoken transcripts (piper voice)'
 )
 # !lto is load-bearing. makepkg's `lto` option appends -flto=auto to
 # CFLAGS/CXXFLAGS/LDFLAGS (/usr/share/makepkg/buildenv/lto.sh), and the

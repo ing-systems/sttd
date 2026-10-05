@@ -11,18 +11,22 @@
 // This module owns verdict → action mapping plus every emission side effect,
 // so the ASR loop hands it one `Emission` per utterance and gets back
 // nothing. `SystemEmitter` is the prod adapter (opt-in stdout, `wl-copy`,
-// `ydotool`, dump dir); `RecordingEmitter` is the in-memory adapter tests drive the
-// gate → emission composition through. Inference never sees either.
+// `ydotool`, spoken transcripts, dump dir); `RecordingEmitter` is the in-memory
+// adapter tests drive the gate → emission composition through. Inference never
+// sees either.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::config::{DUMP_KEEP_FILES, SAMPLE_RATE};
+use crate::config::{DUMP_KEEP_FILES, SAMPLE_RATE, SPEAK_TAIL_MS};
 use crate::gate::{TranscriptDropKind, TranscriptVerdict};
+use crate::piper::PiperVoice;
 use crate::utterance::Evidence;
 use crate::wav::write_wav_mono16;
 
@@ -72,7 +76,252 @@ pub(crate) trait Emitter {
     fn emit(&mut self, emission: Emission<'_>);
 }
 
-/// Prod adapter: opt-in stdout, Wayland clipboard, auto-paste, dump dir.
+/// One utterance's text, on its way to the speakers.
+struct SpeechJob {
+    tag: String,
+    text: String,
+}
+
+/// The spoken emission: hand it text, a dedicated thread speaks it.
+///
+/// Off the emit worker on purpose. Speaking is seconds of wall clock (the
+/// synthesis plus the audio playing out), and the emit worker still has the
+/// clipboard, the paste and the dump of every later utterance to do — speaking
+/// in line would make a transcript arrive minutes late.
+///
+/// The queue holds **one** utterance and the newest replaces what is waiting.
+/// That is the same rule the partial transcript follows (only the latest is
+/// kept, see `asr::PartialSlot`): with `--autopause` there is never a second
+/// utterance while one is being spoken, and without it a backlog of speech is
+/// already stale by the time it would be read — reading it aloud would put words
+/// in the user's mouth that they have already moved on from.
+///
+/// `speaking` is the flag the capture side watches: the whole point of speaking
+/// through the microphone's own room is that sttd must not transcribe itself,
+/// so it is raised for the lead window, the playback and the tail.
+pub(crate) struct SpeechOut {
+    /// `(slot, wakeup)`: the pending job and the signal to look at it.
+    slot: Arc<(Mutex<Option<SpeechJob>>, Condvar)>,
+    /// Raised from just before playback starts until the tail has played out.
+    speaking: Arc<AtomicBool>,
+    /// Deadline for the final utterance, set by `drop`, in milliseconds since
+    /// the thread started — a monotonic `u64` rather than an `Instant` so it
+    /// can cross the thread boundary. Zero means "no deadline".
+    finish_by_ms: Arc<AtomicU64>,
+    /// Set when espeak goes away, so the emit side stops queueing into a thread
+    /// that will never speak again.
+    disabled: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// How long `SpeechOut::drop` waits for the utterance already queued to be
+/// spoken before cutting it off.
+///
+/// The trailing utterance has to be spoken, not dropped: `--file --speak` with
+/// the last transcript swallowed would be the channel silently losing work, and
+/// it is the same reasoning `asr`'s shutdown flush uses for the transcript
+/// itself. Bounded because a device that never drains, or a synthesis that
+/// never returns, must not hang the process — past this the playback is cut and
+/// the utterance is lost, which a log line says.
+const SPEAK_DRAIN_MS: u64 = 15_000;
+
+impl SpeechOut {
+    /// Spawn the speak thread around a loaded voice.
+    pub(crate) fn spawn(voice: PiperVoice) -> Self {
+        let slot: Arc<(Mutex<Option<SpeechJob>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let speaking = Arc::new(AtomicBool::new(false));
+        let finish_by_ms = Arc::new(AtomicU64::new(0));
+        let disabled = Arc::new(AtomicBool::new(false));
+
+        let handle = {
+            let (slot, speaking, finish_by_ms, disabled) = (
+                Arc::clone(&slot),
+                Arc::clone(&speaking),
+                Arc::clone(&finish_by_ms),
+                Arc::clone(&disabled),
+            );
+            std::thread::Builder::new()
+                .name("speak".into())
+                .spawn(move || speak_loop(&slot, &speaking, &finish_by_ms, &disabled, voice))
+                .ok()
+        };
+        Self {
+            slot,
+            speaking,
+            finish_by_ms,
+            disabled,
+            handle,
+        }
+    }
+
+    /// The flag the capture side reads to hold the pipeline while sttd talks.
+    pub(crate) fn speaking_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.speaking)
+    }
+
+    /// Queue `text` to be spoken, replacing anything still waiting. Never
+    /// blocks and never fails: a dead or disabled speak thread costs one
+    /// utterance of audio, never the transcript.
+    fn enqueue(&self, tag: &str, text: &str) {
+        if self.disabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let (lock, wakeup) = &*self.slot;
+        if let Ok(mut pending) = lock.lock() {
+            *pending = Some(SpeechJob {
+                tag: tag.to_string(),
+                text: text.to_string(),
+            });
+            wakeup.notify_one();
+        }
+    }
+}
+
+impl Drop for SpeechOut {
+    fn drop(&mut self) {
+        // Let whatever is queued be spoken, within a bound: the pending slot is
+        // left alone and the thread is woken, so the trailing utterance is
+        // heard. `finish_by_ms` is the bound it must respect, so this join
+        // cannot hang the process on a device that never drains.
+        self.finish_by_ms
+            .store(now_ms() + SPEAK_DRAIN_MS, Ordering::Release);
+        let (_lock, wakeup) = &*self.slot;
+        wakeup.notify_all();
+        if let Some(h) = self.handle.take() {
+            if h.join().is_err() {
+                log::warn!("speak thread panicked");
+            }
+        }
+    }
+}
+
+/// Milliseconds since an arbitrary fixed instant, for the finish deadline.
+///
+/// `Instant` cannot cross the thread boundary as a shared value, and
+/// `SystemTime` can jump. A monotonic counter derived from a process-start
+/// `Instant` is the cheap monotonic clock this needs.
+pub(crate) fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Whether the finish deadline has passed. Zero means no deadline, so a thread
+/// that was never asked to finish never sees one. Delegates to the same rule
+/// `sound` applies while it waits.
+fn past_deadline(finish_by_ms: &AtomicU64) -> bool {
+    crate::sound::past_deadline(finish_by_ms, now_ms())
+}
+
+/// Sleep `total`, giving up early once the finish deadline passes. Returns
+/// whether the sleep was cut short, so the caller can skip the work it was
+/// about to start.
+fn sleep_until_deadline(total: Duration, finish_by_ms: &AtomicU64) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if past_deadline(finish_by_ms) {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_millis(20).min(left));
+    }
+    past_deadline(finish_by_ms)
+}
+
+/// The speak thread: take the pending utterance, synthesize it, play it.
+///
+/// Never propagates anything. A voice that cannot speak (espeak gone, a graph
+/// that rejects its input) disables the channel with one warning and the
+/// thread idles, because a transcription tool that stops transcribing because
+/// its speaker broke is worse than a silent one.
+fn speak_loop(
+    slot: &Arc<(Mutex<Option<SpeechJob>>, Condvar)>,
+    speaking: &AtomicBool,
+    finish_by_ms: &AtomicU64,
+    disabled: &AtomicBool,
+    mut voice: PiperVoice,
+) {
+    let rate = voice.sample_rate();
+    loop {
+        let job = {
+            let (lock, wakeup) = &**slot;
+            let Ok(mut pending) = lock.lock() else {
+                return;
+            };
+            loop {
+                if let Some(job) = pending.take() {
+                    break job;
+                }
+                // A deadline that has passed with nothing queued means the drop
+                // is over: nothing left to speak, so the thread ends here.
+                if past_deadline(finish_by_ms) {
+                    return;
+                }
+                let (again, _) = wakeup
+                    .wait_timeout(pending, Duration::from_millis(100))
+                    .unwrap_or_else(|e| e.into_inner());
+                pending = again;
+            }
+        };
+
+        // Raise the flag first, then wait out the lead window, then synthesize:
+        // the capture side reacts to the flag within its ~2 ms loop cadence and
+        // takes its hold immediately, so by the time the first sample reaches
+        // the speakers the pipeline is already discarding. The wait doubles as
+        // the last chance for a deadline to cut this utterance off.
+        speaking.store(true, Ordering::Release);
+        if sleep_until_deadline(Duration::from_millis(crate::config::SPEAK_LEAD_MS), finish_by_ms) {
+            speaking.store(false, Ordering::Release);
+            continue;
+        }
+        let t0 = Instant::now();
+        let synth = voice.synthesize(&job.text);
+        let audio = match synth {
+            Ok(a) => a,
+            Err(e) => {
+                let missing = e.kind() == std::io::ErrorKind::NotFound;
+                disabled.store(true, Ordering::Release);
+                log::warn!(
+                    "{}: spoken emission disabled ({e:?}); transcripts still reach the other \
+                     channels",
+                    job.tag
+                );
+                if missing {
+                    log::warn!("espeak-ng was not found on PATH, so text cannot be phonemized");
+                }
+                // Clear the flag before idling: the capture side must not stay
+                // held for a channel that is now off.
+                speaking.store(false, Ordering::Release);
+                if missing {
+                    return;
+                }
+                continue;
+            }
+        };
+        let synth_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if !audio.is_empty() {
+            let audio_sec = audio.len() as f64 / rate as f64;
+            let played = crate::sound::play_mono(&audio, rate, finish_by_ms);
+            if played {
+                log::info!(
+                    "{}: spoke {audio_sec:.1} s in {synth_ms:.0} ms (synthesis rtf={:.2})",
+                    job.tag,
+                    synth_ms / 1000.0 / audio_sec.max(0.001)
+                );
+            } else {
+                log::warn!("{}: cut off at shutdown before it could be spoken", job.tag);
+            }
+        }
+        // The tail is inside the raised flag too: the device still holds the
+        // last samples, and the capture side must stay held until it has let
+        // them out.
+        let _ = sleep_until_deadline(Duration::from_millis(SPEAK_TAIL_MS), finish_by_ms);
+        speaking.store(false, Ordering::Release);
+    }
+}
+
+/// Prod adapter: opt-in stdout, Wayland clipboard, auto-paste, spoken
+/// transcripts, dump dir.
 ///
 /// Async by design: `emit()` only clones into an `OwnedEmission` and does a
 /// non-blocking `rtrb` push, so a stuck `wl-copy`/`ydotool`/disk never
@@ -88,6 +337,11 @@ pub(crate) struct SystemEmitter {
     /// Kept for the final prune in `Drop` (the worker thread owns the only
     /// other copy).
     dump_dir: Option<PathBuf>,
+    /// The speak thread's "currently talking" flag, kept here so the capture
+    /// loop can read it. The `SpeechOut` itself has moved onto the emit worker
+    /// thread (it owns the channel end), so this is the only handle left on
+    /// this side — and the flag is an `Arc`, so both observe the same bit.
+    worker_speaking: Option<Arc<AtomicBool>>,
 }
 
 /// Bounded `rtrb` capacity for the emission queue. Emissions are seconds
@@ -107,6 +361,21 @@ struct EmitterWorker {
     stdout_enabled: bool,
     /// Utterances handled since the last `prune_dump_dir` scan.
     since_prune: usize,
+    /// The spoken channel, when `--speak` is on.
+    speech: Option<SpeechOut>,
+}
+
+/// One `SystemEmitter::new` argument per emission channel. A struct because
+/// the bare form had grown to six positional parameters, which is exactly where
+/// a caller starts transposing two of them.
+pub(crate) struct EmissionPolicy {
+    pub(crate) dump_dir: Option<PathBuf>,
+    pub(crate) copy: bool,
+    pub(crate) paste: bool,
+    pub(crate) paste_mode: crate::cli::PasteMode,
+    pub(crate) stdout: bool,
+    /// The loaded voice plus its thread, from `SpeechOut::spawn`.
+    pub(crate) speech: Option<SpeechOut>,
 }
 
 impl SystemEmitter {
@@ -114,13 +383,15 @@ impl SystemEmitter {
     /// model load it precedes on the main thread) and settle clipboard/paste
     /// availability with one warning each instead of one per utterance.
     /// Then spawn the worker thread that owns the side effects.
-    pub(crate) fn new(
-        dump_dir: Option<PathBuf>,
-        copy_enabled: bool,
-        paste_enabled: bool,
-        paste_mode: crate::cli::PasteMode,
-        stdout_enabled: bool,
-    ) -> Result<Self> {
+    pub(crate) fn new(policy: EmissionPolicy) -> Result<Self> {
+        let EmissionPolicy {
+            dump_dir,
+            copy: copy_enabled,
+            paste: paste_enabled,
+            paste_mode,
+            stdout: stdout_enabled,
+            speech: policy_speech,
+        } = policy;
         if let Some(dir) = &dump_dir {
             ensure_owner_only_dir(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
@@ -137,7 +408,11 @@ impl SystemEmitter {
             paste_mode,
             stdout_enabled,
             since_prune: 0,
+            speech: policy_speech,
         };
+        // The capture-side flag is read out before the `SpeechOut` moves onto
+        // the worker thread; it is an `Arc`, so both sides share one bit.
+        let worker_speaking = worker_speech_flag(worker.speech.as_ref());
         if !copy_enabled {
             log::info!("clipboard copy disabled (--copy=false)");
         }
@@ -178,7 +453,26 @@ impl SystemEmitter {
             tx: Some(tx),
             worker: Some(handle),
             dump_dir,
+            worker_speaking,
         })
+    }
+}
+
+/// The speak thread's flag, taken while the `SpeechOut` is still owned here.
+/// `None` when `--speak` is off, which the caller turns into a permanently-clear
+/// flag so the capture loop needs no separate "is speech on" case.
+fn worker_speech_flag(speech: Option<&SpeechOut>) -> Option<Arc<AtomicBool>> {
+    speech.map(SpeechOut::speaking_flag)
+}
+
+impl SystemEmitter {
+    /// The flag the capture side reads to hold the pipeline while sttd is
+    /// speaking. A permanently-clear flag when `--speak` is off, so the main
+    /// loop needs no separate "is speech on" case.
+    pub(crate) fn speaking_flag(&self) -> Arc<AtomicBool> {
+        self.worker_speaking
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
     }
 }
 
@@ -198,6 +492,9 @@ impl Drop for SystemEmitter {
         if let Some(dir) = &self.dump_dir {
             prune_dump_dir(dir);
         }
+        // The speak thread dies with the emit worker that owns it, so a
+        // trailing utterance is spoken (or cut short by `SpeechOut::drop`)
+        // before this returns.
     }
 }
 
@@ -368,6 +665,12 @@ impl EmitterWorker {
             if let Err(e) = write_owner_only_text(&txt_path, text) {
                 log::warn!("failed to write {}: {e:?}", txt_path.display());
             }
+        }
+        // Last, because it is the only channel that takes seconds: the
+        // clipboard, the paste and the dump of this utterance and of everything
+        // behind it must not wait on a voice.
+        if let Some(speech) = &self.speech {
+            speech.enqueue(tag, text);
         }
     }
 }
@@ -616,6 +919,23 @@ fn write_last_text(text: &str) {
     }
 }
 
+/// Emission policy with every channel off — the shape most tests want.
+///
+/// Spoken emission is absent rather than disabled: it has no in-memory stand-in
+/// (it would need a loaded voice and an output device), so `RecordingEmitter`
+/// mirrors it with a flag and the real thread is asserted elsewhere.
+#[cfg(test)]
+pub(crate) fn policy_off() -> EmissionPolicy {
+    EmissionPolicy {
+        dump_dir: None,
+        copy: false,
+        paste: false,
+        paste_mode: crate::cli::PasteMode::CtrlV,
+        stdout: false,
+        speech: None,
+    }
+}
+
 /// In-memory adapter: records what would reach the user instead of printing,
 /// copying, pasting, or touching the filesystem. Tests drive the gate →
 /// emission composition through this.
@@ -628,6 +948,9 @@ pub(crate) struct RecordingEmitter {
     /// Mirror of `--stdout`: when false (the default, like prod),
     /// an emitted transcript is recorded without printing.
     pub stdout_enabled: bool,
+    /// Mirror of `--speak`: when false (the default, like prod), nothing is
+    /// handed to the speak thread.
+    pub speak_enabled: bool,
 }
 
 /// What one `emit` call would have done.
@@ -645,6 +968,10 @@ pub(crate) struct RecordedEmission {
     pub copied: bool,
     pub pasted: bool,
     pub printed: bool,
+    /// Mirror of `--speak`: whether this utterance was handed to the speak
+    /// thread. Recorded rather than performed — speech needs a loaded voice and
+    /// an output device.
+    pub spoken: bool,
     pub wav_samples: usize,
 }
 
@@ -655,6 +982,7 @@ impl RecordingEmitter {
             records: Vec::new(),
             fail_copy: false,
             stdout_enabled: false,
+            speak_enabled: false,
         }
     }
 }
@@ -672,6 +1000,7 @@ impl Emitter for RecordingEmitter {
             copied: false,
             pasted: false,
             printed: false,
+            spoken: false,
             wav_samples,
         };
         if let TranscriptVerdict::Emit = emission.verdict {
@@ -686,6 +1015,9 @@ impl Emitter for RecordingEmitter {
             // fresh clipboard content, never after a failed copy.
             record.pasted = record.copied;
             record.printed = self.stdout_enabled;
+            // Prod enqueues speech past the empty-text guard too, so an emitted
+            // utterance is spoken regardless of whether the clipboard ran.
+            record.spoken = self.speak_enabled;
         } else if let TranscriptVerdict::Drop { kind, .. } = emission.verdict {
             record.drop_kind = Some(kind);
         }
@@ -759,6 +1091,162 @@ mod tests {
         assert!(r.pasted);
         assert!(!r.printed);
         assert_eq!(r.wav_samples, 1600);
+    }
+
+    #[test]
+    fn a_disabled_speak_channel_stops_accepting_and_clears_the_flag() {
+        // The espeak-gone path: the thread warns once, raises `disabled`, and
+        // clears `speaking` so the capture side is not left held for a channel
+        // that is now off.
+        let speaking = Arc::new(AtomicBool::new(true));
+        let disabled = Arc::new(AtomicBool::new(false));
+        // Model the loop's own bookkeeping on the failure branch.
+        speaking.store(false, Ordering::Release);
+        disabled.store(true, Ordering::Release);
+        assert!(!speaking.load(Ordering::Acquire));
+        assert!(disabled.load(Ordering::Acquire));
+        // An empty voice name is refused at load with the reason, which is what
+        // stops this state being reached silently.
+        let json = r#"{"audio": {"sample_rate": 22050}, "phoneme_type": "espeak",
+                        "phoneme_id_map": {"_": [0], "^": [1], "$": [2]}, "num_symbols": 256}"#;
+        let config: crate::piper::VoiceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.espeak.voice, "");
+    }
+
+    #[test]
+    fn speech_is_opt_in_and_follows_the_same_emit_rules() {
+        // The channel mirrors stdout: off by default, and only ever handed an
+        // utterance the gate actually emitted.
+        let evidence = strong_evidence();
+        let pcm = vec![0.01f32; 1600];
+        let mut emitter = RecordingEmitter::new();
+        emit(
+            &mut emitter,
+            "utt_000001",
+            &pcm,
+            "Dzień dobry",
+            gate().decide_transcript("Dzień dobry"),
+            &evidence,
+        );
+        assert!(emitter.records[0].emitted);
+        assert!(!emitter.records[0].spoken, "--speak is off by default");
+
+        let mut emitter = RecordingEmitter::new();
+        emitter.speak_enabled = true;
+        emit(
+            &mut emitter,
+            "utt_000002",
+            &pcm,
+            "Dzień dobry",
+            gate().decide_transcript("Dzień dobry"),
+            &evidence,
+        );
+        assert!(emitter.records[0].spoken);
+        // A failed clipboard copy does not stop the voice: prod enqueues speech
+        // after the copy step and neither depends on the other.
+        emitter.fail_copy = true;
+        emit(
+            &mut emitter,
+            "utt_000003",
+            &pcm,
+            "Dzień dobry",
+            gate().decide_transcript("Dzień dobry"),
+            &evidence,
+        );
+        assert!(emitter.records[1].emitted);
+        assert!(!emitter.records[1].copied);
+        assert!(emitter.records[1].spoken);
+
+        // Drops never speak: a hallucination and an empty-cleaned utterance
+        // both reach no channel at all.
+        for (text, expected) in [
+            ("Napisy stworzone przez społeczność Amara.org", false),
+            ("   ", false),
+        ] {
+            emit(
+                &mut emitter,
+                "utt_000004",
+                &pcm,
+                text,
+                gate().decide_transcript(text),
+                &evidence,
+            );
+            let r = emitter.records.last().unwrap();
+            assert!(!r.emitted, "text={text:?}");
+            assert_eq!(r.spoken, expected, "text={text:?}");
+        }
+    }
+
+    #[test]
+    fn the_speaking_flag_is_clear_without_the_channel() {
+        // The capture loop reads this flag unconditionally, so with `--speak`
+        // off it must exist and stay false rather than the loop needing a
+        // separate "is speech on" case.
+        let emitter = SystemEmitter::new(policy_off()).unwrap();
+        let flag = emitter.speaking_flag();
+        assert!(!flag.load(Ordering::Acquire));
+        // Every call returns a flag that can be read; two calls must not share
+        // state, or a stale one would leak between runs in one process (tests).
+        let other = emitter.speaking_flag();
+        assert!(!Arc::ptr_eq(&flag, &other) || !flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_past_deadline_cuts_the_wait_short() {
+        // `SpeechOut::drop` must not block for the length of a playback: the
+        // wait polls the deadline every 20 ms. Asserted on the helpers rather
+        // than a real playback, since there is no voice or device here.
+        let deadline = AtomicU64::new(1);
+        assert!(
+            crate::sound::past_deadline(&deadline, 1),
+            "a deadline at or before now is past"
+        );
+        assert!(crate::sound::past_deadline(&deadline, 2));
+        assert!(
+            !crate::sound::past_deadline(&deadline, 0),
+            "not yet, a millisecond before"
+        );
+        let t0 = Instant::now();
+        assert!(sleep_until_deadline(Duration::from_secs(30), &deadline));
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "waited {:?} on an already-past deadline",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn no_deadline_means_never_cut_off() {
+        // Zero is "no deadline", so a thread that was never asked to finish
+        // waits its whole course out. (Otherwise every speak would cut itself
+        // off at once, since the clock is always past zero.)
+        let none = AtomicU64::new(0);
+        assert!(!crate::sound::past_deadline(&none, u64::MAX / 2));
+        assert!(!crate::sound::past_deadline(&none, 0));
+        let t0 = Instant::now();
+        assert!(!sleep_until_deadline(Duration::from_millis(50), &none));
+        assert!(
+            t0.elapsed() >= Duration::from_millis(50),
+            "no deadline must let the sleep run: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_finish_deadline_is_what_drop_sets_and_it_is_bounded() {
+        // The drop path's whole contract: the trailing utterance is spoken
+        // within a bound, so a device that never drains cannot hang the
+        // process on the way out.
+        assert!(SPEAK_DRAIN_MS > 0, "a zero deadline would cut at once");
+        assert!(
+            SPEAK_DRAIN_MS < 60_000,
+            "a drain this long is a hang in disguise: {SPEAK_DRAIN_MS} ms"
+        );
+        // The deadline arithmetic `drop` uses: now + bound, which must land in
+        // the future rather than in the past (an overflow would).
+        let deadline = now_ms() + SPEAK_DRAIN_MS;
+        assert!(!crate::sound::past_deadline(&AtomicU64::new(deadline), now_ms()));
+        assert!(crate::sound::past_deadline(&AtomicU64::new(deadline), deadline));
     }
 
     #[test]
@@ -874,13 +1362,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let evidence = strong_evidence();
         {
-            let mut emitter = SystemEmitter::new(
-                Some(dir.clone()),
-                false,
-                false,
-                crate::cli::PasteMode::CtrlV,
-                false,
-            )
+            let mut emitter = SystemEmitter::new(EmissionPolicy {
+                dump_dir: Some(dir.clone()),
+                ..policy_off()
+            })
             .unwrap();
             let pcm = vec![0.01f32; 1600];
             emitter.emit(Emission {
@@ -938,13 +1423,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sttd-emit-nb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let evidence = strong_evidence();
-        let mut emitter = SystemEmitter::new(
-            Some(dir.clone()),
-            false,
-            false,
-            crate::cli::PasteMode::CtrlV,
-            false,
-        )
+        let mut emitter = SystemEmitter::new(EmissionPolicy {
+            dump_dir: Some(dir.clone()),
+            ..policy_off()
+        })
         .unwrap();
         let pcm = vec![0.01f32; 1600];
         let t0 = std::time::Instant::now();
@@ -1023,13 +1505,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         let evidence = strong_evidence();
         {
-            let mut emitter = SystemEmitter::new(
-                Some(dir.clone()),
-                false,
-                false,
-                crate::cli::PasteMode::CtrlV,
-                false,
-            )
+            let mut emitter = SystemEmitter::new(EmissionPolicy {
+                dump_dir: Some(dir.clone()),
+                ..policy_off()
+            })
             .unwrap();
             let pcm = vec![0.01f32; 1600];
             for i in 0..(DUMP_KEEP_FILES + 5) {
@@ -1076,13 +1555,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         let evidence = strong_evidence();
         {
-            let mut emitter = SystemEmitter::new(
-                Some(dir.clone()),
-                false,
-                false,
-                crate::cli::PasteMode::CtrlV,
-                false,
-            )
+            let mut emitter = SystemEmitter::new(EmissionPolicy {
+                dump_dir: Some(dir.clone()),
+                ..policy_off()
+            })
             .unwrap();
             let pcm = vec![0.01f32; 1600];
             emitter.emit(Emission {

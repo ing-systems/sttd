@@ -2790,9 +2790,12 @@ dependencies = [
  "regex",
  "resampler",
  "rtrb",
+ "serde",
+ "serde_json",
  "signal-hook",
  "thiserror 2.0.20",
  "tokenizers",
+ "unicode-normalization",
  "ureq 2.12.1",
  "zbus",
 ]

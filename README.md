@@ -13,7 +13,7 @@ Single Rust binary. No server. No network at runtime except first model download
 - Utterance buffering with 300 ms pre-roll, 800 ms hangover, interim and early splits.
 - Acoustic gates (RMS, speech density) and transcript gates (hallucination, repetition).
 - Parakeet-TDT-0.6B-v3 (`int8` default, `fp32` optional) through `ort`, with Rust mel frontend.
-- Emission to stdout, Wayland clipboard (`wl-copy`), auto-paste (`ydotool`), WAV+TXT dump, last-text file, JSONL metrics.
+- Emission to stdout, Wayland clipboard (`wl-copy`), auto-paste (`ydotool`), spoken transcript (`--speak`, piper), WAV+TXT dump, last-text file, JSONL metrics.
 - Offline file mode, daemon mode, systemd user unit, pause/resume signals.
 - Optional VAD-branch denoiser (DeepFilterNet3, `denoise` feature).
 - Custom dictionary for post-gate correction.
@@ -41,7 +41,7 @@ See `src/main.rs:1-51` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdic
 
 - Linux x86_64, Rust stable, `alsa-lib`.
 - ~638 MiB disk for the default Parakeet `int8` model, or ~1443 MiB for Whisper.
-- Optional: `wl-clipboard` (`wl-copy`) for `--copy`, `ydotool` + `ydotoold` for `--paste` (Wayland only), PipeWire/WirePlumber for capture, Python 3 stdlib for `tools/`.
+- Optional: `wl-clipboard` (`wl-copy`) for `--copy`, `ydotool` + `ydotoold` for `--paste` (Wayland only), `espeak-ng` (+ its voice data package) for `--speak`, PipeWire/WirePlumber for capture, Python 3 stdlib for `tools/`.
 
 ## Models
 
@@ -101,13 +101,34 @@ Resolution (`src/model_store.rs`):
 - Models directory is baked at compile time from `STTD_MODELS_DIR` (see `build.rs:10-18`). Default is `models` (dev checkout). Packaged builds use `/usr/share/sttd/models`.
 - Setting `STTD_MODELS_DIR` at runtime does nothing. Use `--model <path>` to override.
 
-List models and devices:
+List models, voices and devices:
 
 ```sh
 sttd --list-models
 sttd --list-devices
 sttd --list-devices --device usb
+sttd --list-voices              # every piper voice (~1300 rows)
+sttd --list-voices pl_PL        # filtered by key or language
+sttd --list-voices german
 ```
+
+## Spoken emission
+
+`--speak` reads every accepted transcript aloud through the default output device, using a [piper](https://github.com/rhasspy/piper) voice. It is a fourth emission channel next to stdout, the clipboard and the paste, and it runs on its own thread so the emit queue behind it keeps draining.
+
+```sh
+sttd --speak --autopause                 # single-shot: speak, wait, speak
+sttd --speak --voice en_US-amy-medium
+sttd --speak --voice /opt/voices/my-voice   # a voice directory already on disk
+```
+
+The voice is fetched on first use from `huggingface.co/rhasspy/piper-voices` into `<models>/voices/<key>/` (the `.onnx` and its `.onnx.json`, ~60 MiB for a `medium`). `--voice` takes any key that repository publishes, and any of its older aliases (`pl-mls_6892-low` for `pl_PL-mls_6892-low`); `--list-voices` prints them all with sizes and an `I` marker for the ones already downloaded. Two requirements and one limit:
+
+- **`espeak-ng` must be installed** (with its voice data package). sttd shells out to `espeak-ng -v <voice> --ipa -q`, which is what piper's own bundled phonemizer calls; keeping the binary outside the process leaves espeak-ng's GPL-3.0 out of this MIT binary and keeps cmake and bindgen off the build. A missing binary is a startup error, not a silent no-op.
+- **`phoneme_type: "text"` voices are refused.** They take raw text with no espeak voice, so there is nothing to phonemize. Multi-speaker voices are refused too (they need a speaker choice `--voice` does not offer); `--list-voices` marks them with `*` after the speaker count.
+- **The microphone is held while sttd speaks.** Otherwise it transcribes itself, and on a laptop mic that becomes a loop. The hold is the same pipeline hold as a pause, on its own flag (the pause flag is yours — setting it would trigger an unload or an autopause that has nothing to do with this). The cost is explicit: **what you say during playback is discarded, not queued.** So `--speak` pairs with `--autopause` (each resume arms one sentence), or with headphones. Without either, dictation and playback eat each other — sttd warns about this at startup.
+
+Implementation (`src/piper.rs`, `src/voice_store.rs`): one `ort` session per voice, run directly, the same pattern as `parakeet_core` and `whisper_core`. No TTS framework sits in between, because none fits this build — `piper-rs` and `dengjen-piper-rs` pin `ort` to an exact older release, `piper-tts-rs` is GPL-3.0, and `piper-plus` is a fork with its own phonemizer and model extensions. The graph is small and fixed (`input`, `input_lengths`, `scales` = noise/length/noise_w, plus `sid` on multi-speaker models), so the work is the phoneme string and the contract, both of which follow upstream piper exactly: one clause per espeak line, the clause terminator re-attached (espeak's `--ipa` drops it, and it is what carries the intonation), `(lang)` switches stripped, the NFD code-point split, the `[BOS, PAD, (ids…, PAD)*, EOS]` id layout, and piper's peak normalize with its `0.01` floor.
 
 ## Build
 
@@ -134,9 +155,11 @@ cargo test
 cargo test --release --frozen
 ```
 
-No clippy/rustfmt config. No CI config. Tests live inline (`#[cfg(test)]`, 316 tests).
+No clippy/rustfmt config. No CI config. Tests live inline (`#[cfg(test)]`, 392 tests).
 
 Five Whisper tests read the downloaded model's `tokenizer.json` and skip themselves when it is absent, so they cover the byte-level BPE handling and the compiled prompt token ids on a machine that has the weights, and leave `cargo test` runnable on a clean checkout.
+
+The piper tests are the same kind: pure over their inputs. The espeak phoneme string is asserted against output read off this machine (espeak 1.52.0), the id layout against upstream's, and the voice index against a trimmed fixture of the real `voices.json`. The `espeak-ng` process and the ORT session are the untested glue, as the speech engines' device I/O is.
 
 ## Use
 
@@ -160,6 +183,7 @@ Offline file (same pipeline, fixed WAV input; ignores pause flags):
 
 ```sh
 sttd --file speech.wav --stdout
+sttd --file speech.wav --speak              # transcribe a recording aloud
 ```
 
 Daemon:
@@ -228,6 +252,8 @@ Key tunables:
 | `--dictionary` / `STTD_DICTIONARY` | unset | Custom vocabulary file, one phrase per line. Applies only to accepted transcripts. |
 | `--remove-hesitations` / `STTD_REMOVE_HESITATIONS` | off | Strip fillers (`yyy`, `eee`, `um`, ...). Language-agnostic. |
 | `--stdout` / `STTD_STDOUT` | off | Print one line per accepted utterance. |
+| `--speak` / `STTD_SPEAK` | off | Read each accepted transcript aloud through the default output device (needs `espeak-ng`). Holds the microphone while it speaks, so what you say during playback is discarded — pair it with `--autopause`, or use headphones. Independent of `--sound`. |
+| `--voice` / `STTD_VOICE` | `pl_PL-gosia-medium` | Piper voice key or a voice directory. Downloaded on first use (~60 MiB). Ignored, and not downloaded, without `--speak`. |
 | `--copy` / `STTD_COPY` | off | Copy each emission via `wl-copy`. |
 | `--paste` / `STTD_PASTE` | off | Paste via `ydotool`. Runs only when copy runs on fresh text. |
 | `--paste-mode` / `STTD_PASTE_MODE` | `ctrl-v` | `ctrl-v`, `ctrl-shift-v`, or `type`. |
@@ -354,7 +380,9 @@ src/whisper_core/    ONNX engine, log-mel frontend, KV-cached decode, in-memory 
 src/mel.rs           Slaney mel filterbank, shared by both frontends
 src/decode.rs        argmax/softmax/word confidences, shared by both engines
 src/gate.rs          acoustic/transcript verdicts
-src/emit.rs          stdout/clipboard/paste/dump/last-text
+src/emit.rs          stdout/clipboard/paste/speak/dump/last-text
+src/piper.rs         piper voice: config, espeak phonemes, ort VITS run
+src/voice_store.rs   voice index, --voice resolution, voice download
 src/dictionary.rs    custom vocabulary
 src/clean.rs         filler stripping
 src/daemon.rs        start/stop/status
@@ -363,6 +391,7 @@ tools/eval.py        WER batch eval + threshold sweep
 tools/dump2corpus.py build eval corpus from --dump-dir
 packaging/           PKGBUILD, sttd.service
 models/              gitignored weights (default int8 + silero legacy file)
+models/voices/       downloaded piper voices + the cached voices.json index
 CONTEXT.md           domain vocabulary
 ```
 

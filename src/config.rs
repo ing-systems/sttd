@@ -292,6 +292,46 @@ fn locale_code(locale: &str) -> Option<String> {
 pub(crate) const DEFAULT_MODELS_DIR: &str = env!("STTD_MODELS_DIR");
 pub(crate) const DEFAULT_MODEL_SPEC: &str = "parakeet";
 
+/// Default `--voice`: a Polish piper voice (`rhasspy/piper-voices`), picked
+/// because sttd is Polish-first and this one is a single-speaker `medium`
+/// export (~60 MiB). Any key in `voices.json` resolves; see
+/// `voice_store`.
+pub(crate) const DEFAULT_VOICE: &str = "pl_PL-gosia-medium";
+
+// ---------------------------------------------------------------------------
+// Piper voices (spoken emission, `--speak`)
+// ---------------------------------------------------------------------------
+
+/// Hugging Face repository the piper voices and their `voices.json` index are
+/// published under.
+pub(crate) const PIPER_VOICES_REPO: &str = "rhasspy/piper-voices";
+
+/// Directory under `DEFAULT_MODELS_DIR` every `--voice` resolves into, and
+/// where the cached `voices.json` lives. Kept beside the speech models rather
+/// than in them: a voice is one engine's weights, not a transcript source, and
+/// `model_store`'s engine detection must never see one.
+pub(crate) const VOICES_SUBDIR: &str = "voices";
+
+/// Cached `voices.json` file name inside `VOICES_SUBDIR`. ~245 KiB; delete it
+/// to force a refresh against upstream.
+pub(crate) const VOICES_INDEX_FILE: &str = "voices.json";
+
+/// Silence the capture side discards *after* the last spoken sample, covering
+/// the output device's own drain latency. Same reason `CUE_QUIET_MS` exists for
+/// the cue tones.
+pub(crate) const SPEAK_TAIL_MS: u64 = 150;
+
+/// Silence between the speak thread raising the speaking flag and the first
+/// spoken sample reaching the speakers.
+///
+/// Without it the pipeline's own reaction to the flag — cut the open utterance,
+/// hold, discard — races the output device's open latency, and the cut takes
+/// 300 ms of pre-roll with it, so the first tens of milliseconds of TTS can
+/// land *inside* the utterance that is being flushed and be transcribed. This
+/// is the `cue_guard` window applied to speech, which has the same leak the
+/// tones already needed it for.
+pub(crate) const SPEAK_LEAD_MS: u64 = 150;
+
 /// Short alias for `--model parakeet`, resolving to the default int8 variant,
 /// `parakeet-ultra-int8`. Read by `model_store`'s Parakeet catalog; it lives
 /// here with the other CLI defaults rather than beside the catalog because

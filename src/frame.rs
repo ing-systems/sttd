@@ -219,9 +219,30 @@ impl FrameProcessor {
     /// buffer. The caller queues the result (see `asr::keep_while_paused`),
     /// because the worker drops untagged backlog while a pause is held.
     pub(crate) fn flush_on_pause(&mut self) -> Option<Utterance> {
+        self.flush_and_hold(true)
+    }
+
+    /// Speaking edge (`--speak`): the same cut and hold as the pause edge, but
+    /// **not** marked as a pause flush.
+    ///
+    /// The distinction matters because the mark is about the *worker's* policy
+    /// for a held pause (`asr::keep_while_paused` keeps a pause flush and drops
+    /// an untagged backlog). Speaking holds the pipeline without setting the
+    /// pause flag, so the worker is not in that branch at all and an untagged
+    /// utterance here is an ordinary one — it is transcribed and emitted like
+    /// any other, which is what the user wants: their last words before sttd
+    /// started talking still get transcribed.
+    pub(crate) fn flush_on_speaking(&mut self) -> Option<Utterance> {
+        self.flush_and_hold(false)
+    }
+
+    /// Cut the open utterance, optionally mark it a pause flush, then hold.
+    fn flush_and_hold(&mut self, mark_pause: bool) -> Option<Utterance> {
         let mut flushed = self.flush_trailing_speech();
-        if let Some(utterance) = flushed.as_mut() {
-            utterance.mark_pause_flush();
+        if mark_pause {
+            if let Some(utterance) = flushed.as_mut() {
+                utterance.mark_pause_flush();
+            }
         }
         self.hold_pipeline();
         flushed
@@ -370,6 +391,30 @@ mod tests {
         // has nothing to hand back.
         assert!(!fp.has_open_utterance());
         assert!(fp.flush_on_pause().is_none());
+    }
+
+    #[test]
+    fn the_speaking_edge_cuts_the_utterance_without_marking_it_a_pause() {
+        // Same cut as the pause edge — what was said before sttd started
+        // talking is real speech — but **not** marked. The mark means "keep this
+        // while a pause is held" (`asr::keep_while_paused`), and speaking holds
+        // the pipeline without setting the pause flag, so the mark would claim
+        // a policy that is not in force.
+        let mut fp = processor_without_gates();
+        speak(&mut fp, 30);
+        assert!(fp.has_open_utterance());
+        let flushed = fp
+            .flush_on_speaking()
+            .expect("the open utterance must be cut, not discarded");
+        assert!(!flushed.pcm.is_empty(), "the words before the speech are kept");
+        assert!(
+            !flushed.pause_flush,
+            "speaking is not a pause, so the worker's held-pause policy must not claim it"
+        );
+        assert!(flushed.evidence.speech_frames >= MIN_SPEECH_FRAMES);
+        // The hold ran, so nothing is left open.
+        assert!(!fp.has_open_utterance());
+        assert!(fp.flush_on_speaking().is_none());
     }
 
     #[test]

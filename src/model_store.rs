@@ -581,7 +581,7 @@ pub(crate) fn format_download_progress(downloaded: u64, total: Option<u64>) -> S
 /// the next `ensure_available` call (`.part` is recreated with
 /// `File::create` every attempt). This bites on the 619 MiB encoder; not
 /// fixed here.
-fn download(url: &str, dest: &Path) -> Result<()> {
+pub(crate) fn download(url: &str, dest: &Path) -> Result<()> {
     let tmp = dest.with_extension("part");
     let resp = ureq::get(url)
         .call()

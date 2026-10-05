@@ -6,7 +6,7 @@ use crate::config::{
     parse_bool, parse_fraction, parse_hangover_ms, parse_linear_rms, parse_threads,
     system_language, DEFAULT_AUTO_UNLOAD, DEFAULT_AUTO_UNLOAD_AFTER_SECS, DEFAULT_HANGOVER_MS,
     DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_MODEL_SPEC, DEFAULT_TARGET_RMS,
-    DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD,
+    DEFAULT_USE_GPU, DEFAULT_VAD_ADAPT, DEFAULT_VAD_THRESHOLD, DEFAULT_VOICE,
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
@@ -43,7 +43,7 @@ pub(crate) enum PasteMode {
 )]
 pub(crate) struct Cli {
     /// Transcribe a WAV file offline instead of the microphone.
-    #[arg(short, long, value_name = "PATH", help_heading = "Input", conflicts_with_all = ["list_devices", "list_models", "start", "stop", "status"])]
+    #[arg(short, long, value_name = "PATH", help_heading = "Input", conflicts_with_all = ["list_devices", "list_models", "list_voices", "start", "stop", "status"])]
     pub(crate) file: Option<PathBuf>,
 
     /// Substring match (case-insensitive) against an input device name.
@@ -52,7 +52,7 @@ pub(crate) struct Cli {
 
     /// List available input devices as an aligned table (`*` = system
     /// default, `>` = matches `--device`) and exit.
-    #[arg(long, help_heading = "Input", conflicts_with_all = ["file", "list_models", "start", "stop", "status"])]
+    #[arg(long, help_heading = "Input", conflicts_with_all = ["file", "list_models", "list_voices", "start", "stop", "status"])]
     pub(crate) list_devices: bool,
 
     /// Input channel to transcribe: `0` = first channel, `1` = second, ...;
@@ -76,7 +76,7 @@ pub(crate) struct Cli {
     pub(crate) model: Option<String>,
 
     /// List known models (with installed/default markers) and exit.
-    #[arg(long, help_heading = "Model", conflicts_with_all = ["file", "list_devices", "start", "stop", "status"])]
+    #[arg(long, help_heading = "Model", conflicts_with_all = ["file", "list_devices", "list_voices", "start", "stop", "status"])]
     pub(crate) list_models: bool,
 
     /// Custom vocabulary file for post-gate transcript correction (one phrase
@@ -235,7 +235,7 @@ pub(crate) struct Cli {
     #[arg(
         long,
         help_heading = "Emission",
-        conflicts_with_all = ["file", "list_devices", "list_models", "start", "stop", "status"]
+        conflicts_with_all = ["file", "list_devices", "list_models", "list_voices", "start", "stop", "status"]
     )]
     pub(crate) paste_last: bool,
 
@@ -251,6 +251,51 @@ pub(crate) struct Cli {
         help_heading = "Emission"
     )]
     pub(crate) stdout: bool,
+
+    /// Speak each accepted transcript aloud through the default output device
+    /// (a downloaded piper voice, `--voice`). Independent of `--sound`, which
+    /// is only the pause/resume cues.
+    ///
+    /// The microphone is held while sttd speaks, so it cannot transcribe
+    /// itself: what you say during playback is discarded, not queued. Pair it
+    /// with `--autopause`, or use headphones, or dictation and playback will
+    /// eat each other.
+    #[arg(
+        long,
+        env = "STTD_SPEAK",
+        default_value_t = false,
+        value_parser = parse_bool,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help_heading = "Emission"
+    )]
+    pub(crate) speak: bool,
+
+    /// Piper voice to speak with: any key from `rhasspy/piper-voices` (e.g.
+    /// `pl_PL-gosia-medium`, `en_US-amy-medium`), downloaded on first use into
+    /// `<models>/voices/<key>/`, or a path to a voice directory already on
+    /// disk. Needs `--speak`; ignored (and not downloaded) without it.
+    #[arg(
+        long,
+        env = "STTD_VOICE",
+        value_name = "KEY|PATH",
+        default_value = DEFAULT_VOICE,
+        help_heading = "Emission"
+    )]
+    pub(crate) voice: String,
+
+    /// List piper voices as an aligned table and exit. An optional substring
+    /// filters on the voice key or its language (`pl_PL`, `german`); the
+    /// catalog is ~1300 voices, so a filter is what makes it readable.
+    #[arg(
+        long,
+        value_name = "FILTER",
+        num_args = 0..=1,
+        default_missing_value = "",
+        help_heading = "Emission",
+        conflicts_with_all = ["file", "list_devices", "list_models", "paste_last", "start", "stop", "status"]
+    )]
+    pub(crate) list_voices: Option<String>,
 
     /// Write each utterance as WAV+TXT into this directory (TXT written
     /// for dropped utterances too, prefixed with the drop reason).
@@ -310,7 +355,7 @@ pub(crate) struct Cli {
         num_args = 0..=1,
         default_missing_value = "true",
         help_heading = "Runtime",
-        conflicts_with_all = ["file", "list_devices", "list_models", "stop", "status"]
+        conflicts_with_all = ["file", "list_devices", "list_models", "list_voices", "stop", "status"]
     )]
     pub(crate) start: bool,
 
@@ -341,7 +386,7 @@ pub(crate) struct Cli {
     #[arg(
         long,
         help_heading = "Runtime",
-        conflicts_with_all = ["file", "list_devices", "list_models", "start", "status"]
+        conflicts_with_all = ["file", "list_devices", "list_models", "list_voices", "start", "status"]
     )]
     pub(crate) stop: bool,
 
@@ -350,7 +395,7 @@ pub(crate) struct Cli {
     #[arg(
         long,
         help_heading = "Runtime",
-        conflicts_with_all = ["file", "list_devices", "list_models", "start", "stop"]
+        conflicts_with_all = ["file", "list_devices", "list_models", "list_voices", "start", "stop"]
     )]
     pub(crate) status: bool,
 
@@ -499,6 +544,9 @@ mod tests {
         assert!(!cli.paste_last);
         assert!(!cli.remove_hesitations);
         assert!(!cli.stdout);
+        assert!(!cli.speak);
+        assert_eq!(cli.voice, DEFAULT_VOICE);
+        assert_eq!(cli.list_voices, None);
         assert!(cli.start_paused);
         assert!(!cli.autopause);
         assert!(!cli.no_dbus);
@@ -601,6 +649,53 @@ mod tests {
         let cli =
             Cli::try_parse_from(["sttd", "--model", "models/custom.bin"]).expect("path must parse");
         assert_eq!(cli.model.as_deref(), Some("models/custom.bin"));
+    }
+
+    #[test]
+    fn cli_speak_and_voice_parse() {
+        let cli = Cli::try_parse_from(["sttd", "--speak"]).expect("bare flag must parse");
+        assert!(cli.speak);
+        assert_eq!(cli.voice, DEFAULT_VOICE, "the default voice with --speak alone");
+        let cli = Cli::try_parse_from(["sttd", "--speak", "--voice", "en_US-amy-medium"])
+            .expect("must parse");
+        assert!(cli.speak);
+        assert_eq!(cli.voice, "en_US-amy-medium");
+        // A path is the other accepted form, so it must survive parsing intact.
+        let cli = Cli::try_parse_from(["sttd", "--voice", "/opt/voices/amy"]).expect("must parse");
+        assert_eq!(cli.voice, "/opt/voices/amy");
+        // `--speak=off` like every other bool.
+        let cli = Cli::try_parse_from(["sttd", "--speak", "off"]).expect("must parse");
+        assert!(!cli.speak);
+    }
+
+    #[test]
+    fn cli_list_voices_takes_an_optional_filter() {
+        let cli = Cli::try_parse_from(["sttd", "--list-voices"]).expect("bare must parse");
+        assert_eq!(cli.list_voices.as_deref(), Some(""));
+        let cli = Cli::try_parse_from(["sttd", "--list-voices", "pl_PL"]).expect("must parse");
+        assert_eq!(cli.list_voices.as_deref(), Some("pl_PL"));
+        let cli =
+            Cli::try_parse_from(["sttd", "--list-voices", "german"]).expect("language name too");
+        assert_eq!(cli.list_voices.as_deref(), Some("german"));
+        // Mutually exclusive with every other one-shot listing and with a run.
+        for other in [
+            "--list-models",
+            "--list-devices",
+            "--file a.wav",
+            "--paste-last",
+            "--start",
+            "--stop",
+            "--status",
+        ] {
+            assert!(
+                Cli::try_parse_from(["sttd", "--list-voices", other]).is_err(),
+                "must reject --list-voices {other}"
+            );
+            assert!(
+                Cli::try_parse_from(["sttd", other, "--list-voices"]).is_err(),
+                "must reject {other} --list-voices"
+            );
+        }
     }
 
     #[test]
