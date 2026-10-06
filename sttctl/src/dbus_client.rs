@@ -167,21 +167,40 @@ impl SttdClient {
 
             if filter.is_empty() || filter.contains(&member) {
                 let body = msg.body();
-                let args: Vec<String> = body.deserialize::<Vec<String>>().unwrap_or_default();
-                if json {
-                    print_json(&serde_json::json!({
-                        "interface": interface,
-                        "member": member,
-                        "args": args,
-                    }));
-                } else {
-                    println!(
-                        "[{}] {}.{}({})",
-                        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
-                        interface,
-                        member,
-                        args.join(", ")
-                    );
+                match body.deserialize::<Vec<String>>() {
+                    Ok(args) => {
+                        if json {
+                            print_json(&serde_json::json!({
+                                "interface": interface,
+                                "member": member,
+                                "args": args,
+                            }));
+                        } else {
+                            println!(
+                                "[{}] {}.{}({})",
+                                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
+                                interface,
+                                member,
+                                args.join(", ")
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if json {
+                            print_json(&serde_json::json!({
+                                "interface": interface,
+                                "member": member,
+                                "error": format!("{e}"),
+                            }));
+                        } else {
+                            println!(
+                                "[{}] {}.{} (deserialization failed: {e})",
+                                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
+                                interface,
+                                member,
+                            );
+                        }
+                    }
                 }
             }
         }
