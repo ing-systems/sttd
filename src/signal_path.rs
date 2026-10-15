@@ -12,11 +12,8 @@
 // filtering and verdict pairing internally. Callers feed hw-rate chunks and
 // receive ready `PairedFrames` (already 80 Hz HP'd); they never see
 // `FirStream`, the denoiser's 48 kHz intermediate, or how pairing stays in
-// lockstep. `feed`/`flush`/`clear` each have one body per topology; only the
-// resampler call differs between feeding a chunk and flushing the tail.
-
-use std::collections::VecDeque;
-use std::sync::Arc;
+// lockstep. `feed`/`flush` share one body per topology; only the resampler
+// call differs between feeding a chunk and flushing the tail.
 
 use anyhow::{Context, Result};
 
@@ -29,68 +26,39 @@ use crate::denoise::DenoiserKind;
 use crate::dsp::FirStream;
 use crate::hp::Hp;
 
-/// A queued 16 kHz frame, shared cheaply between the two branch queues. The
-/// default (`Direct`) path decodes one frame and queues it for both the VAD
-/// verdict and the utterance buffer; `Arc::new(Vec)` moves the buffer without
-/// copying elements and the second queue entry costs one atomic increment.
-pub(crate) type SharedFrame = Arc<Vec<f32>>;
-
-/// One completed 10 ms frame pair, handed to the caller as owned buffers
-/// (always `FRAME_16K` samples each).
+/// One completed 10 ms frame pair, lent to the caller's callback (always
+/// `FRAME_16K` samples each, already 80 Hz high-passed). The frames are
+/// mutable so the Agc can gain them in place; they live in `SignalPath`'s own
+/// buffers, so no frame is allocated or copied on the way out.
 ///
-/// `Shared` is the default (`Direct`) topology: the two branch queues held
-/// `Arc` clones of one allocation, so the caller gets that single buffer back
-/// — the Agc applies the shared gain once and both roles read the same
+/// `Shared` is the default (`Direct`) topology: one frame serves both roles,
+/// so the Agc applies the shared gain once and both roles read the same
 /// samples. `Split` is the opt-in `Denoised` topology, where the VAD branch
-/// (denoised) and the model branch (raw) come from independent resamplers and
-/// own independent buffers.
-pub(crate) enum PairedFrames {
-    Shared(Vec<f32>),
-    Split(Vec<f32>, Vec<f32>),
+/// (denoised) and the model branch (raw) come from independent resamplers.
+pub(crate) enum PairedFrames<'a> {
+    Shared(&'a mut [f32]),
+    #[cfg_attr(not(feature = "denoise"), allow(dead_code))]
+    Split(&'a mut [f32], &'a mut [f32]),
 }
 
-/// One pass over the branch topology: `Feed` consumes a raw hw-rate chunk,
-/// `Flush` zero-pads each resampler's trailing partial chunk so tail audio
-/// still reaches the utterance. Both end in the same queue-then-pair step, so
-/// `feed`/`flush` share one body.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Cadence {
-    Feed,
-    Flush,
-}
-
-impl Cadence {
-    /// Run `resampler` for this cadence into the caller's reused `scratch`.
-    /// `input` is unused on `Flush`: the resampler drains its own FIR state.
-    fn drain(self, resampler: &mut FirStream, input: &[f32], scratch: &mut Vec<Vec<f32>>) {
-        match self {
-            Cadence::Feed => resampler.feed_into(input, scratch),
-            Cadence::Flush => resampler.flush_into(scratch),
-        }
-    }
-}
-
-/// Warn threshold for unpaired frames waiting in `SignalPath` queues (see
+/// Warn threshold for unpaired frames waiting in `SignalPath` (see
 /// `pending_depths`). Both branches average 100 frames/s, so steady state is
 /// 0-2; anything above means resamplers diverged or the consumer stalled.
 pub(crate) const SIGNAL_PENDING_WARN: usize = 8;
 
 /// Owns all resampling / denoising state. Fed one raw hw-rate chunk at a
-/// time; returns the completed VAD/model pairs in order, so the VAD verdict
-/// always describes the model audio it is attached to.
+/// time; hands the completed VAD/model pairs to a callback in order, so the
+/// VAD verdict always describes the model audio it is attached to.
 pub(crate) struct SignalPath {
     vad_path: VadPath,
-    pending_vad: VecDeque<SharedFrame>,
-    pending_model: VecDeque<SharedFrame>,
+    /// Model-branch 16 kHz output not yet handed out (in `Direct`, also the
+    /// VAD branch). Whole frames are cut from its front, so between calls it
+    /// holds less than one frame in `Direct`, and in `Denoised` whatever the
+    /// model branch ran ahead of the VAD branch.
+    model16: Vec<f32>,
     fed_chunks: u64,
     paired_frames: u64,
     max_pending: usize,
-    /// Reused outer container for `FirStream::feed_into` / `flush_into`:
-    /// cleared (capacity kept) on every resampler call so the 100 fps hot
-    /// path doesn't reallocate the `Vec<Vec<_>>` wrapper per hw chunk. The
-    /// inner per-frame `Vec`s are moved out (`drain(..)`) into `Arc`s and
-    /// become queue entries — no element copy.
-    scratch: Vec<Vec<f32>>,
 }
 
 /// The VAD branch's signal path, chosen once at startup from `--denoiser`
@@ -108,16 +76,20 @@ enum VadPath {
     /// denoiser, which is fixed at 48 kHz, can run for the VAD branch).
     #[cfg(feature = "denoise")]
     Denoised {
-        // hw_rate -> 48 kHz (the denoiser's required rate). Its resampler's
-        // fixed FFT chunks complete on their own cadence, so drained
-        // 480-frames are denoised one by one as they arrive rather than one
-        // per input chunk.
+        // hw_rate -> 48 kHz (the denoiser's required rate). Its output
+        // completes on its own cadence, so whole 480-frames are denoised one
+        // by one as they arrive rather than one per input chunk.
         resampler_hw48: FirStream,
         // 48 kHz -> 16 kHz, VAD branch only (post-denoise).
         resampler_vad: FirStream,
         resampler_model: FirStream,
         denoiser: Denoiser,
+        /// hw -> 48 kHz output not yet denoised (less than one `FRAME_48K`
+        /// between calls).
+        buf48: Vec<f32>,
         clean48_vad: Vec<f32>,
+        /// Denoised 16 kHz VAD-branch output not yet paired.
+        vad16: Vec<f32>,
         hp_vad: Hp,
         hp_model: Hp,
     },
@@ -155,7 +127,9 @@ impl SignalPath {
                     resampler_vad,
                     resampler_model,
                     denoiser,
+                    buf48: Vec::new(),
                     clean48_vad: vec![0.0f32; FRAME_48K],
+                    vad16: Vec::new(),
                     hp_vad: Hp::new(),
                     hp_model: Hp::new(),
                 }
@@ -163,64 +137,72 @@ impl SignalPath {
         };
         Ok(Self {
             vad_path,
-            pending_vad: VecDeque::new(),
-            pending_model: VecDeque::new(),
+            model16: Vec::new(),
             fed_chunks: 0,
             paired_frames: 0,
             max_pending: 0,
-            scratch: Vec::new(),
         })
     }
 
-    /// Frames currently waiting unpaired per branch: `(vad, model)`. After
-    /// every `feed`/`flush` one side is empty (see `drain_paired`); a growing
-    /// non-zero side means the branches diverged.
+    /// Whole frames currently waiting unpaired per branch: `(vad, model)`.
+    /// After every `feed`/`flush` one side is zero; a growing non-zero side
+    /// means the branches diverged.
     pub(crate) fn pending_depths(&self) -> (usize, usize) {
-        (self.pending_vad.len(), self.pending_model.len())
+        let model = self.model16.len() / FRAME_16K;
+        match &self.vad_path {
+            VadPath::Direct { .. } => (model, model),
+            #[cfg(feature = "denoise")]
+            VadPath::Denoised { vad16, .. } => (vad16.len() / FRAME_16K, model),
+        }
     }
 
     /// Totals for lockstep monitoring: `(fed_chunks, paired_frames,
-    /// max_pending)`. `max_pending` is the largest pre-drain queue seen so
-    /// far (either branch). Test-only reader; prod uses `pending_depths`.
+    /// max_pending)`. `max_pending` is the most whole frames either branch
+    /// held before pairing. Test-only reader; prod uses `pending_depths`.
     #[allow(dead_code)]
     pub(crate) const fn stats(&self) -> (u64, u64, usize) {
         (self.fed_chunks, self.paired_frames, self.max_pending)
     }
 
-    /// Feed one raw hw-rate chunk; returns every completed pair in order. Each
-    /// branch's `FirStream` may complete zero, one, or (on catch-up) several
-    /// 10 ms frames per call; a branch running ahead waits in its queue. Both
-    /// average 100 frames/s, so the queues stay bounded at a frame or two.
-    pub(crate) fn feed(&mut self, frame_hw_raw: &[f32]) -> Vec<PairedFrames> {
+    /// Feed one raw hw-rate chunk and hand every completed pair to `on_pair`,
+    /// in order. Each branch's `FirStream` may complete zero, one, or (on
+    /// catch-up) several 10 ms frames per call; a branch running ahead waits
+    /// in its buffer. Both average 100 frames/s, so that stays at a frame or
+    /// two.
+    pub(crate) fn feed(&mut self, frame_hw_raw: &[f32], on_pair: impl FnMut(PairedFrames<'_>)) {
         self.fed_chunks += 1;
-        self.run(frame_hw_raw, Cadence::Feed)
+        self.run(Some(frame_hw_raw), on_pair);
     }
 
     /// Zero-pad each resampler's trailing partial chunk so tail audio stuck
-    /// in an incomplete FFT chunk still reaches the utterance instead of
-    /// being lost at shutdown, then return every paired frame left buffered.
-    pub(crate) fn flush(&mut self) -> Vec<PairedFrames> {
-        self.run(&[], Cadence::Flush)
+    /// in the FIR still reaches the utterance instead of being lost at
+    /// shutdown, then hand every pair left buffered to `on_pair`.
+    pub(crate) fn flush(&mut self, on_pair: impl FnMut(PairedFrames<'_>)) {
+        self.run(None, on_pair);
     }
 
     /// One pass over the branch topology — resample (and denoise, opt-in),
-    /// high-pass, queue — then hand every completed pair to the caller.
-    /// `feed` and `flush` differ only in `cadence`.
-    fn run(&mut self, frame_hw_raw: &[f32], cadence: Cadence) -> Vec<PairedFrames> {
-        match &mut self.vad_path {
+    /// then high-pass and hand out every completed pair. `input` is `None`
+    /// for `flush`.
+    fn run(&mut self, input: Option<&[f32]>, mut on_pair: impl FnMut(PairedFrames<'_>)) {
+        let Self {
+            vad_path,
+            model16,
+            paired_frames,
+            max_pending,
+            ..
+        } = self;
+        let paired = match vad_path {
             VadPath::Direct { resampler, hp } => {
-                self.scratch.clear();
-                cadence.drain(resampler, frame_hw_raw, &mut self.scratch);
-                for mut frame in self.scratch.drain(..) {
-                    hp.process(&mut frame);
-                    // One allocation for both branches: the queue entries are
-                    // `Arc` clones, and `drain_paired` recognizes the pair by
-                    // pointer and hands the buffer back untouched (no 640 B
-                    // memcpy, no second alloc per 10 ms frame).
-                    let shared: SharedFrame = Arc::new(frame);
-                    self.pending_model.push_back(Arc::clone(&shared));
-                    self.pending_vad.push_back(shared);
+                resample(resampler, input, model16);
+                let whole = model16.len() / FRAME_16K * FRAME_16K;
+                for frame in model16[..whole].chunks_exact_mut(FRAME_16K) {
+                    hp.process(frame);
+                    on_pair(PairedFrames::Shared(frame));
                 }
+                model16.drain(..whole);
+                *max_pending = (*max_pending).max(whole / FRAME_16K);
+                whole / FRAME_16K
             }
             #[cfg(feature = "denoise")]
             VadPath::Denoised {
@@ -228,56 +210,69 @@ impl SignalPath {
                 resampler_vad,
                 resampler_model,
                 denoiser,
+                buf48,
                 clean48_vad,
+                vad16,
                 hp_vad,
                 hp_model,
             } => {
-                self.scratch.clear();
-                cadence.drain(resampler_hw48, frame_hw_raw, &mut self.scratch);
-                for frame48 in self.scratch.drain(..) {
-                    debug_assert_eq!(frame48.len(), FRAME_48K);
-                    denoiser.denoise_frame(&frame48, clean48_vad);
-                    // Opt-in path only: outer `Vec` alloc per denoised frame
-                    // is acceptable here; the default `Direct` path above is
-                    // the 100 fps hotspot and uses `feed_into` + sharing.
-                    for mut vad_frame in resampler_vad.feed(&clean48_vad[..]) {
-                        hp_vad.process(&mut vad_frame);
-                        self.pending_vad.push_back(Arc::new(vad_frame));
-                    }
+                resample(resampler_hw48, input, buf48);
+                let whole48 = buf48.len() / FRAME_48K * FRAME_48K;
+                for frame48 in buf48[..whole48].chunks_exact(FRAME_48K) {
+                    denoiser.denoise_frame(frame48, clean48_vad);
+                    resampler_vad.feed(clean48_vad, vad16);
                 }
-                if cadence == Cadence::Flush {
-                    // The two 16 kHz branches still hold their own partial
-                    // chunks; zero-pad them before pairing.
-                    for mut vad_frame in resampler_vad.flush() {
-                        hp_vad.process(&mut vad_frame);
-                        self.pending_vad.push_back(Arc::new(vad_frame));
+                buf48.drain(..whole48);
+                if input.is_none() {
+                    // The VAD branch's own FIR still holds a partial chunk;
+                    // zero-pad it before pairing.
+                    resampler_vad.flush(vad16);
+                }
+                resample(resampler_model, input, model16);
+                let frames = (vad16.len() / FRAME_16K).min(model16.len() / FRAME_16K);
+                *max_pending = (*max_pending)
+                    .max(vad16.len() / FRAME_16K)
+                    .max(model16.len() / FRAME_16K);
+                let whole = frames * FRAME_16K;
+                for (vad, model) in vad16[..whole]
+                    .chunks_exact_mut(FRAME_16K)
+                    .zip(model16[..whole].chunks_exact_mut(FRAME_16K))
+                {
+                    hp_vad.process(vad);
+                    hp_model.process(model);
+                    on_pair(PairedFrames::Split(vad, model));
+                }
+                // The pairing loop this replaced popped both queues before
+                // checking either, so a branch left without a partner lost
+                // its oldest (already high-passed) frame. Reproduced here so
+                // this rewrite changes no output.
+                let drop_unpartnered = |buf: &mut Vec<f32>, hp: &mut Hp| {
+                    if buf.len() >= whole + FRAME_16K {
+                        hp.process(&mut buf[whole..whole + FRAME_16K]);
+                        FRAME_16K
+                    } else {
+                        0
                     }
-                    for mut model_frame in resampler_model.flush() {
-                        hp_model.process(&mut model_frame);
-                        self.pending_model.push_back(Arc::new(model_frame));
-                    }
+                };
+                let (vad_drop, model_drop) = if vad16.len() < whole + FRAME_16K {
+                    (0, drop_unpartnered(model16, hp_model))
                 } else {
-                    self.scratch.clear();
-                    cadence.drain(resampler_model, frame_hw_raw, &mut self.scratch);
-                    for mut frame in self.scratch.drain(..) {
-                        hp_model.process(&mut frame);
-                        self.pending_model.push_back(Arc::new(frame));
-                    }
-                }
+                    (drop_unpartnered(vad16, hp_vad), 0)
+                };
+                vad16.drain(..whole + vad_drop);
+                model16.drain(..whole + model_drop);
+                frames
             }
-        }
-        self.note_pending();
-        self.drain_paired()
+        };
+        *paired_frames += paired as u64;
     }
 
-    /// Drop in-flight audio: paired-frame queues + resampler partial-chunk
+    /// Drop in-flight audio: unpaired output + resampler partial-chunk
     /// state, so the first frames after resume aren't blended from pre-pause
     /// audio. Idempotent. Also resets pairing counters so post-resume
     /// `stats()` start clean.
     pub(crate) fn clear(&mut self) {
-        self.pending_vad.clear();
-        self.pending_model.clear();
-        self.scratch.clear();
+        self.model16.clear();
         self.fed_chunks = 0;
         self.paired_frames = 0;
         self.max_pending = 0;
@@ -292,6 +287,8 @@ impl SignalPath {
                 resampler_vad,
                 resampler_model,
                 denoiser,
+                buf48,
+                vad16,
                 hp_vad,
                 hp_model,
                 ..
@@ -299,51 +296,23 @@ impl SignalPath {
                 resampler_hw48.clear();
                 resampler_vad.clear();
                 resampler_model.clear();
+                buf48.clear();
+                vad16.clear();
                 hp_vad.reset();
                 hp_model.reset();
                 denoiser.reset();
             }
         }
     }
-
-    fn note_pending(&mut self) {
-        let pending = self.pending_vad.len().max(self.pending_model.len());
-        self.max_pending = self.max_pending.max(pending);
-    }
-
-    fn drain_paired(&mut self) -> Vec<PairedFrames> {
-        let mut out = Vec::new();
-        while let (Some(vad16), Some(model16)) =
-            (self.pending_vad.pop_front(), self.pending_model.pop_front())
-        {
-            debug_assert_eq!(vad16.len(), FRAME_16K);
-            debug_assert_eq!(model16.len(), FRAME_16K);
-            if Arc::ptr_eq(&vad16, &model16) {
-                // `Direct` topology: both queue entries are `Arc` clones of one
-                // allocation. Drop the twin handle, then take the buffer.
-                drop(model16);
-                out.push(PairedFrames::Shared(into_buffer(vad16)));
-            } else {
-                out.push(PairedFrames::Split(
-                    into_buffer(vad16),
-                    into_buffer(model16),
-                ));
-            }
-        }
-        self.paired_frames += out.len() as u64;
-        out
-    }
 }
 
-/// Take the owned buffer out of a queued frame.
-///
-/// `drain_paired` drops every other handle to the allocation first (in the
-/// `Direct` topology the twin queue entry is an `Arc` clone of this same
-/// buffer), so the count is 1 here and the move costs nothing. The `Err` arm
-/// only keeps a broken invariant from panicking the audio loop; no code path
-/// reaches it.
-fn into_buffer(shared: SharedFrame) -> Vec<f32> {
-    Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
+/// Run `resampler` on `input`, or zero-drain it when `input` is `None`
+/// (flush), appending the output to `out`.
+fn resample(resampler: &mut FirStream, input: Option<&[f32]>, out: &mut Vec<f32>) {
+    match input {
+        Some(input) => resampler.feed(input, out),
+        None => resampler.flush(out),
+    }
 }
 
 #[cfg(test)]
@@ -351,24 +320,55 @@ mod tests {
     use super::*;
     use crate::dsp::hw_input_frames;
 
+    /// One pair copied out of the callback, so tests can collect and inspect.
+    struct OwnedPair {
+        vad: Vec<f32>,
+        model: Vec<f32>,
+        shared: bool,
+    }
+
+    fn own(pairs: &mut Vec<OwnedPair>) -> impl FnMut(PairedFrames<'_>) + '_ {
+        |pair| {
+            pairs.push(match pair {
+                PairedFrames::Shared(frame) => OwnedPair {
+                    vad: frame.to_vec(),
+                    model: frame.to_vec(),
+                    shared: true,
+                },
+                PairedFrames::Split(vad, model) => OwnedPair {
+                    vad: vad.to_vec(),
+                    model: model.to_vec(),
+                    shared: false,
+                },
+            })
+        }
+    }
+
+    fn feed(signal: &mut SignalPath, input: &[f32]) -> Vec<OwnedPair> {
+        let mut pairs = Vec::new();
+        signal.feed(input, own(&mut pairs));
+        pairs
+    }
+
+    fn flush(signal: &mut SignalPath) -> Vec<OwnedPair> {
+        let mut pairs = Vec::new();
+        signal.flush(own(&mut pairs));
+        pairs
+    }
+
     fn feed_silence(signal: &mut SignalPath, hw_rate: u32, chunks: usize) -> usize {
         let hw_chunk = hw_input_frames(hw_rate);
         let silence = vec![0.0f32; hw_chunk];
         let mut pairs = 0;
         for _ in 0..chunks {
-            pairs += signal.feed(&silence).len();
+            pairs += feed(signal, &silence).len();
         }
-        pairs += signal.flush().len();
+        pairs += flush(signal).len();
         pairs
     }
 
-    /// Both roles of one pair without copying: the `Shared` topology serves
-    /// them from the same allocation.
-    fn roles(pair: &PairedFrames) -> (&[f32], &[f32]) {
-        match pair {
-            PairedFrames::Shared(frame) => (frame, frame),
-            PairedFrames::Split(vad, model) => (vad, model),
-        }
+    fn roles(pair: &OwnedPair) -> (&[f32], &[f32]) {
+        (&pair.vad, &pair.model)
     }
 
     #[test]
@@ -378,7 +378,7 @@ mod tests {
             let hw_chunk = hw_input_frames(hw);
             let silence = vec![0.0f32; hw_chunk];
             for _ in 0..50 {
-                for pair in signal.feed(&silence) {
+                for pair in feed(&mut signal, &silence) {
                     let (vad, model) = roles(&pair);
                     assert_eq!(vad.len(), FRAME_16K, "hw={hw}");
                     assert_eq!(model.len(), FRAME_16K, "hw={hw}");
@@ -389,25 +389,41 @@ mod tests {
     }
 
     #[test]
-    fn direct_shares_one_allocation_between_branches() {
-        // Regression for the per-frame `Vec::clone()` (640 B memcpy + second
-        // alloc at 100 fps): the pair must come back as the one allocation
-        // both branch queues shared.
+    fn direct_serves_both_roles_from_one_frame() {
+        // The default topology must hand out one frame for both roles, so the
+        // Agc gains it once (`Agc::process_shared`), not twice.
         let mut signal = SignalPath::new(48_000, DenoiserKind::Bypass).unwrap();
         let hw_chunk = hw_input_frames(48_000);
         let input = vec![0.1f32; hw_chunk];
         let mut saw_pair = false;
         for _ in 0..50 {
-            for pair in signal.feed(&input) {
+            for pair in feed(&mut signal, &input) {
                 saw_pair = true;
-                let (vad, model) = roles(&pair);
-                assert!(
-                    std::ptr::eq(vad.as_ptr(), model.as_ptr()),
-                    "direct pair must share one allocation"
-                );
+                assert!(pair.shared, "direct pair must be `Shared`");
             }
         }
         assert!(saw_pair, "expected at least one pair in 50 chunks");
+    }
+
+    #[test]
+    fn buffers_stay_bounded_on_a_long_unpaused_run() {
+        // Regression: the old staging ring in `FirStream` compacted only on
+        // flush, so an unpaused run grew it by a frame per 10 ms chunk
+        // (~64 KB/s at 48 kHz). 100 s of input must leave less than one frame
+        // buffered, with no growth in capacity.
+        for hw in [16_000, 22_050, 32_000, 44_100, 48_000] {
+            let mut signal = SignalPath::new(hw, DenoiserKind::Bypass).unwrap();
+            let chunk = vec![0.1f32; hw_input_frames(hw)];
+            for _ in 0..10_000 {
+                signal.feed(&chunk, |_| {});
+                assert!(signal.model16.len() < FRAME_16K, "hw={hw}");
+            }
+            assert!(
+                signal.model16.capacity() <= 8 * FRAME_16K,
+                "hw={hw}: capacity {}",
+                signal.model16.capacity()
+            );
+        }
     }
 
     #[test]
@@ -432,9 +448,9 @@ mod tests {
         let hw_chunk = hw_input_frames(48_000);
         assert_eq!(hw_chunk, 480);
         let fed: usize = (0..2)
-            .map(|_| signal.feed(&vec![0.1f32; hw_chunk]).len())
+            .map(|_| feed(&mut signal, &vec![0.1f32; hw_chunk]).len())
             .sum();
-        let flushed = signal.flush();
+        let flushed = flush(&mut signal);
         assert!(!flushed.is_empty(), "flush must recover the tail");
         assert!(
             (2..=6).contains(&(fed + flushed.len())),
@@ -449,12 +465,12 @@ mod tests {
         let hw_chunk = hw_input_frames(48_000);
         // One feed may or may not complete a pair; either way, after clear
         // flush must find nothing.
-        let _ = signal.feed(&vec![0.1f32; hw_chunk]);
+        let _ = feed(&mut signal, &vec![0.1f32; hw_chunk]);
         signal.clear();
-        assert!(signal.flush().is_empty());
+        assert!(flush(&mut signal).is_empty());
         // And the path still works after clear.
         let silence = vec![0.0f32; hw_chunk];
-        let _ = signal.feed(&silence);
+        let _ = feed(&mut signal, &silence);
     }
 
     #[test]
@@ -464,7 +480,7 @@ mod tests {
             let hw_chunk = hw_input_frames(hw);
             let silence = vec![0.0f32; hw_chunk];
             for _ in 0..200 {
-                let _ = signal.feed(&silence);
+                let _ = feed(&mut signal, &silence);
             }
             let (fed, paired, max_pending) = signal.stats();
             assert_eq!(fed, 200, "hw={hw}");
@@ -490,7 +506,7 @@ mod tests {
     fn clear_resets_counters() {
         let mut signal = SignalPath::new(48_000, DenoiserKind::Bypass).unwrap();
         let hw_chunk = hw_input_frames(48_000);
-        let _ = signal.feed(&vec![0.1f32; hw_chunk]);
+        let _ = feed(&mut signal, &vec![0.1f32; hw_chunk]);
         signal.clear();
         assert_eq!(signal.stats(), (0, 0, 0));
         assert_eq!(signal.pending_depths(), (0, 0));

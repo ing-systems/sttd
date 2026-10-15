@@ -187,7 +187,7 @@ pub(crate) fn resample_mono(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f
     let mut resampler =
         ResamplerFir::new_from_hz(1, in_rate, out_rate, Latency::Sample32, Attenuation::Db90);
     let out: Vec<f32> = resample_all(&mut resampler, input);
-    // Drain the FIR delay and the buffered tail, as `FirStream::flush_into`
+    // Drain the FIR delay and the buffered tail, as `FirStream::flush`
     // does for the capture path. Bounded: zeros in produce zeros out, so a
     // fixed drain cannot synthesize indefinite silence.
     let flush = vec![0.0f32; (resampler.delay() + 2048).max(2048)];
@@ -205,7 +205,7 @@ pub(crate) fn resample_mono(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f
 /// sample.
 ///
 /// One `resample` call consumes only what fits its output slice and buffers the
-/// rest, so this loops — the same reason `dsp::FirStream::feed_into` does, and
+/// rest, so this loops — the same reason `dsp::FirStream::feed` does, and
 /// without it a 1 s buffer would come back a fraction of its length.
 fn resample_all(resampler: &mut ResamplerFir, input: &[f32]) -> Vec<f32> {
     let mut out: Vec<f32> = Vec::with_capacity(input.len() * 2 + 4096);

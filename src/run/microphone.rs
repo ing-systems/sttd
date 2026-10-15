@@ -395,7 +395,7 @@ impl MicLoop<'_> {
     ///
     /// While speaking, the park also paces the loop: sttd talks for seconds,
     /// and 50 ms of parking costs nothing to detect the end of it. The
-    /// `hold_pipeline` itself was already taken on the rising edge, so no
+    /// `discard_pending` hold itself was already taken on the rising edge, so no
     /// resampling or VAD happens in here.
     fn hold(&mut self) {
         drain_raw_into(&mut self.input.raw_rx, &mut self.accumulator);
@@ -482,7 +482,7 @@ impl MicLoop<'_> {
         if self.input.fp.has_open_utterance() {
             return;
         }
-        self.input.fp.hold_pipeline();
+        self.input.fp.discard_pending();
         drain_raw_into(&mut self.input.raw_rx, &mut self.accumulator);
         self.accumulator.clear();
         thread::sleep(Duration::from_millis(crate::sound::CUE_QUIET_MS));

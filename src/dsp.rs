@@ -266,49 +266,6 @@ pub(crate) fn resolve_channel_sel(
     }
 }
 
-/// Copy every complete `frame_out`-sized frame of `src` into `out` and stage
-/// the sub-frame remainder at the tail of the `pending_out` ring, advancing
-/// `out_head` past the drained frames.
-///
-/// Frame `Vec`s are freshly allocated: `SignalPath` moves them into `Arc`s as
-/// queue entries, so they cannot be recycled here. The ring only ever holds
-/// the sub-frame remainder between calls, which is what makes this cheaper
-/// than staging the whole chunk and slicing it out again.
-fn push_complete_frames(
-    src: &[f32],
-    frame_out: usize,
-    pending_out: &mut Vec<f32>,
-    out_head: &mut usize,
-    out: &mut Vec<Vec<f32>>,
-) {
-    let staged = pending_out.len() - *out_head;
-    debug_assert!(staged < frame_out, "ring must hold only a partial frame");
-    let mut rest = src;
-    // Top up a partial frame from previous calls first.
-    if staged > 0 {
-        let take = (frame_out - staged).min(rest.len());
-        pending_out.extend_from_slice(&rest[..take]);
-        rest = &rest[take..];
-        if pending_out.len() - *out_head == frame_out {
-            out.push(pending_out[*out_head..].to_vec());
-            *out_head = pending_out.len();
-        }
-    }
-    while rest.len() >= frame_out {
-        out.push(rest[..frame_out].to_vec());
-        rest = &rest[frame_out..];
-    }
-    // Keep the leftover partial frame live by resetting the head when the
-    // ring is fully drained; otherwise it rides at `out_head`.
-    if !rest.is_empty() {
-        pending_out.extend_from_slice(rest);
-    }
-    if *out_head == pending_out.len() {
-        pending_out.clear();
-        *out_head = 0;
-    }
-}
-
 /// Raw hw-rate samples per ~10 ms chunk: the external framing every caller
 /// feeds `FrameProcessor::process_frame` with. Independent of the resampler's
 /// internal buffering (see `FirStream`) so the capture loop and file mode
@@ -318,18 +275,15 @@ pub(crate) fn hw_input_frames(hw_rate: u32) -> usize {
 }
 
 /// Streaming adapter over `ResamplerFir` (polyphase FIR, 64 taps / 32-sample
-/// delay, 90 dB stopband). Accepts arbitrary input lengths; the FIR consumes
-/// variably and produces as much as its buffered state allows.
+/// delay, 90 dB stopband). Accepts arbitrary input lengths and appends every
+/// output sample the FIR produces to the caller's buffer. Equal in/out rates
+/// bypass entirely (bit-exact passthrough).
 ///
-/// `feed` returns every complete `frame_out`-sized output frame (480 for
-/// 48 kHz, 160 for 16 kHz) completed by this input; remainder stays buffered.
-/// Equal in/out rates bypass entirely (bit-exact passthrough).
-///
-/// `SignalPath` keeps one adapter per branch and pairs up output frames by
-/// order (see `SignalPath::feed`): completions land on a different cadence per
-/// branch, so a strict one-call-one-frame mapping is impossible. Catch-up
-/// bursts are bounded — both branches average 100 frames/s — and the queues
-/// absorb them.
+/// Framing is the caller's: `SignalPath` keeps one contiguous output buffer
+/// per branch and cuts whole 10 ms frames from its front, pairing the branches
+/// by frame index. Completions land on a different cadence per branch, so a
+/// strict one-call-one-frame mapping is impossible; catch-up bursts are
+/// bounded because both branches average 100 frames/s.
 ///
 /// Output lags the input by the FIR delay (`taps/2`, 32 samples; zero when
 /// passing through), flushed by the `flush_zeros` zero-drain; absorbed by
@@ -337,32 +291,21 @@ pub(crate) fn hw_input_frames(hw_rate: u32) -> usize {
 /// own 16 ms prediction window is.
 pub(crate) struct FirStream {
     inner: Option<ResamplerFir>,
-    frame_out: usize,
-    /// Output staging ring: `out_head..` holds the not-yet-drained samples,
-    /// `..out_head` is dead until `maybe_compact_out` shifts the live tail
-    /// back to the front.
-    pending_out: Vec<f32>,
-    out_head: usize,
     scratch_out: Vec<f32>,
-    /// Zero-drain input for `flush_into`, sized once at `new` so the flush
-    /// path never allocates. Read-only: the resampler consumes it.
+    /// Zero-drain input for `flush`, sized once at `new` so the flush path
+    /// never allocates. Read-only: the resampler consumes it.
     flush_zeros: Vec<f32>,
     dirty: bool,
 }
 
-/// Dead prefix length that triggers `maybe_compact_out`. Compaction memmoves
-/// the live tail, so it is amortized over 8192 drained samples (32 KB) instead
-/// of running on most 10 ms chunks.
-const OUT_COMPACT_HEAD: usize = 8192;
-
 impl FirStream {
+    /// `frame_out` is the consumer's frame size (480 at 48 kHz, 160 at
+    /// 16 kHz). It only sizes the output scratch and the flush zero-drain;
+    /// the stream itself is unframed.
     pub(crate) fn new(in_rate: u32, out_rate: u32, frame_out: usize) -> Result<Self> {
         if in_rate == out_rate {
             return Ok(Self {
                 inner: None,
-                frame_out,
-                pending_out: Vec::new(),
-                out_head: 0,
                 scratch_out: Vec::new(),
                 flush_zeros: Vec::new(),
                 dirty: false,
@@ -377,70 +320,38 @@ impl FirStream {
         // Single zero-drain flushes the FIR delay + buffered tail (≈1-2
         // frames). Looping would synthesize indefinite silence: zeros in
         // always produce zeros out. Fixed at construction: `delay()` and
-        // `frame_out` never change, so `flush_into` needs no computation and
-        // no allocation.
+        // `frame_out` never change, so `flush` needs no computation and no
+        // allocation.
         let flush_need = (inner.delay() + frame_out * 2).clamp(256, 2048);
         Ok(Self {
             inner: Some(inner),
-            frame_out,
-            pending_out: Vec::new(),
-            out_head: 0,
             scratch_out,
             flush_zeros: vec![0.0f32; flush_need],
             dirty: false,
         })
     }
 
-    /// Feed arbitrary input samples; returns every complete `frame_out`-sized
-    /// output frame this input completes (usually 0-2 at 10 ms input cadence,
-    /// occasionally more on catch-up).
-    #[cfg_attr(not(feature = "denoise"), allow(dead_code))]
-    pub(crate) fn feed(&mut self, input: &[f32]) -> Vec<Vec<f32>> {
-        let mut out = Vec::new();
-        self.feed_into(input, &mut out);
-        out
-    }
-
-    /// Same as `feed`, but appends into a caller-reused buffer so the outer
-    /// `Vec` container doesn't reallocate on every 10 ms chunk (the inner
-    /// per-frame `Vec`s are still freshly allocated — they become queue
-    /// entries downstream). `SignalPath` reuses one scratch across calls.
-    pub(crate) fn feed_into(&mut self, input: &[f32], out: &mut Vec<Vec<f32>>) {
+    /// Resample `input`, appending every output sample it completes to `out`.
+    /// The FIR consumes variably, so this loops until `input` is used up.
+    pub(crate) fn feed(&mut self, input: &[f32], out: &mut Vec<f32>) {
         if !input.is_empty() {
             self.dirty = true;
         }
-        if self.inner.is_none() {
-            self.push_complete_frames(input, out);
+        let Some(inner) = self.inner.as_mut() else {
+            out.extend_from_slice(input);
             return;
-        }
-        let Self {
-            inner,
-            frame_out,
-            pending_out,
-            out_head,
-            scratch_out,
-            ..
-        } = self;
-        let inner = inner.as_mut().expect("passthrough handled above");
+        };
         let mut offset = 0;
         while offset < input.len() {
-            let (consumed, produced) = match inner.resample(&input[offset..], scratch_out) {
+            let (consumed, produced) = match inner.resample(&input[offset..], &mut self.scratch_out)
+            {
                 Ok((c, p)) => (c, p),
                 Err(e) => {
                     log::warn!("resampler error: {e:?} (skipping chunk)");
                     break;
                 }
             };
-            // Hand complete frames to `out` straight from `scratch_out` and
-            // stage only the sub-frame remainder, so each output sample is
-            // copied once instead of twice (ring -> frame Vec).
-            push_complete_frames(
-                &scratch_out[..produced],
-                *frame_out,
-                pending_out,
-                out_head,
-                out,
-            );
+            out.extend_from_slice(&self.scratch_out[..produced]);
             offset += consumed;
             if consumed == 0 && produced == 0 {
                 break;
@@ -448,70 +359,19 @@ impl FirStream {
         }
     }
 
-    /// Drain internal FIR state at shutdown by feeding zeros until no more
-    /// output appears, then return every complete output frame left buffered.
-    /// A trailing partial frame (< `frame_out` samples) is still dropped.
-    #[cfg_attr(not(feature = "denoise"), allow(dead_code))]
-    pub(crate) fn flush(&mut self) -> Vec<Vec<f32>> {
-        let mut out = Vec::new();
-        self.flush_into(&mut out);
-        out
-    }
-
-    /// Same as `flush`, appending into a caller-reused buffer (see `feed_into`).
-    pub(crate) fn flush_into(&mut self, out: &mut Vec<Vec<f32>>) {
-        if self.dirty {
-            self.dirty = false;
-            if let Some(inner) = self.inner.as_mut() {
-                // Single zero-drain (pre-sized, zero-filled at `new`) to flush
-                // the FIR delay + buffered tail; see the sizing comment there.
-                match inner.resample(&self.flush_zeros, &mut self.scratch_out) {
-                    Ok((_, produced)) => {
-                        let src = &self.scratch_out[..produced];
-                        push_complete_frames(
-                            src,
-                            self.frame_out,
-                            &mut self.pending_out,
-                            &mut self.out_head,
-                            out,
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!("resampler flush error: {e:?} (dropping tail)");
-                    }
-                }
-            }
-        }
-        // A staged partial frame stays in the ring and is dropped with it
-        // (see `flush`); compact so a following `feed` starts at offset 0.
-        self.maybe_compact_out();
-    }
-
-    /// Passthrough drain: `src` is the caller's input verbatim, so complete
-    /// frames come straight out of it with one copy.
-    fn push_complete_frames(&mut self, src: &[f32], out: &mut Vec<Vec<f32>>) {
-        let Self {
-            frame_out,
-            pending_out,
-            out_head,
-            ..
-        } = self;
-        push_complete_frames(src, *frame_out, pending_out, out_head, out);
-    }
-
-    /// Reuse the ring's tail allocation: after a drain the ring holds only the
-    /// sub-frame remainder, so `copy_within` shifts at most `frame_out`
-    /// samples and no per-flush `Vec` is created. Amortized over
-    /// `OUT_COMPACT_HEAD` drained samples.
-    fn maybe_compact_out(&mut self) {
-        if self.out_head == 0 {
+    /// Drain the FIR delay and buffered tail at shutdown with one zero-drain
+    /// (pre-sized at `new`, see the sizing comment there), appending what it
+    /// produces to `out`. A no-op unless something was fed since the last
+    /// flush or `clear`.
+    pub(crate) fn flush(&mut self, out: &mut Vec<f32>) {
+        if !std::mem::take(&mut self.dirty) {
             return;
         }
-        if self.out_head >= OUT_COMPACT_HEAD || self.out_head * 2 >= self.pending_out.len() {
-            self.pending_out.copy_within(self.out_head.., 0);
-            let live = self.pending_out.len() - self.out_head;
-            self.pending_out.truncate(live);
-            self.out_head = 0;
+        if let Some(inner) = self.inner.as_mut() {
+            match inner.resample(&self.flush_zeros, &mut self.scratch_out) {
+                Ok((_, produced)) => out.extend_from_slice(&self.scratch_out[..produced]),
+                Err(e) => log::warn!("resampler flush error: {e:?} (dropping tail)"),
+            }
         }
     }
 
@@ -521,8 +381,6 @@ impl FirStream {
         if let Some(inner) = self.inner.as_mut() {
             inner.reset();
         }
-        self.pending_out.clear();
-        self.out_head = 0;
         self.dirty = false;
     }
 }
@@ -536,6 +394,49 @@ mod tests {
     /// on: a 10 ms slice of the hardware rate.
     fn expected_input_chunk_for(hw_rate: u32) -> usize {
         ((hw_rate as f64 * FRAME_48K as f64 / DENOISE_RATE as f64).round() as usize).max(1)
+    }
+
+    /// A `FirStream` cut into `frame_out` frames the way `SignalPath` cuts
+    /// it, so the tests can assert on whole frames.
+    struct Framed {
+        stream: FirStream,
+        frame_out: usize,
+        buf: Vec<f32>,
+    }
+
+    impl Framed {
+        fn new(in_rate: u32, out_rate: u32, frame_out: usize) -> Self {
+            Self {
+                stream: FirStream::new(in_rate, out_rate, frame_out).unwrap(),
+                frame_out,
+                buf: Vec::new(),
+            }
+        }
+
+        fn take_frames(&mut self) -> Vec<Vec<f32>> {
+            let whole = self.buf.len() / self.frame_out * self.frame_out;
+            let frames = self.buf[..whole]
+                .chunks_exact(self.frame_out)
+                .map(<[f32]>::to_vec)
+                .collect();
+            self.buf.drain(..whole);
+            frames
+        }
+
+        fn feed(&mut self, input: &[f32]) -> Vec<Vec<f32>> {
+            self.stream.feed(input, &mut self.buf);
+            self.take_frames()
+        }
+
+        fn flush(&mut self) -> Vec<Vec<f32>> {
+            self.stream.flush(&mut self.buf);
+            self.take_frames()
+        }
+
+        fn clear(&mut self) {
+            self.stream.clear();
+            self.buf.clear();
+        }
     }
 
     #[test]
@@ -724,7 +625,7 @@ mod tests {
 
     #[test]
     fn passthrough_is_bit_exact() {
-        let mut s = FirStream::new(DENOISE_RATE, DENOISE_RATE, FRAME_48K).unwrap();
+        let mut s = Framed::new(DENOISE_RATE, DENOISE_RATE, FRAME_48K);
         let input: Vec<f32> = (0..960).map(|i| i as f32 / 960.0).collect();
         let frames = s.feed(&input);
         assert_eq!(frames.len(), 2);
@@ -738,7 +639,7 @@ mod tests {
         // 200 input frames of 480 must yield ~200 output frames of 160:
         // FIR streaming may shift the count by a few frames at startup
         // (delay fill), but every drained frame is exactly sized.
-        let mut s = FirStream::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K).unwrap();
+        let mut s = Framed::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K);
         let mut count = 0;
         for _ in 0..200 {
             for f in s.feed(&vec![0.0f32; FRAME_48K]) {
@@ -763,8 +664,8 @@ mod tests {
         // counts within burst tolerance, exact frame sizes always.
         for hw in [16_000, 44_100, 48_000, 96_000] {
             let hw_chunk = hw_input_frames(hw);
-            let mut s48 = FirStream::new(hw, DENOISE_RATE, FRAME_48K).unwrap();
-            let mut s16 = FirStream::new(hw, SAMPLE_RATE, FRAME_16K).unwrap();
+            let mut s48 = Framed::new(hw, DENOISE_RATE, FRAME_48K);
+            let mut s16 = Framed::new(hw, SAMPLE_RATE, FRAME_16K);
             let (mut n48, mut n16) = (0, 0);
             for _ in 0..200 {
                 let input = vec![0.0f32; hw_chunk];
@@ -797,7 +698,7 @@ mod tests {
         // FIR supports any integer rate pair (FFT did not): 8k/11k/24k must
         // construct and track input instead of erroring.
         for hw in [8_000, 11_025, 24_000] {
-            let mut s = FirStream::new(hw, SAMPLE_RATE, FRAME_16K).unwrap();
+            let mut s = Framed::new(hw, SAMPLE_RATE, FRAME_16K);
             let hw_chunk = hw_input_frames(hw);
             let mut n = 0;
             for _ in 0..50 {
@@ -812,7 +713,7 @@ mod tests {
     fn flush_recovers_trailing_audio() {
         // FIR buffers delay + lookahead: fed frames plus zero-drain flush must
         // recover the tail instead of losing it at shutdown.
-        let mut s = FirStream::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K).unwrap();
+        let mut s = Framed::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K);
         let fed: usize = (0..2).map(|_| s.feed(&vec![0.1f32; FRAME_48K]).len()).sum();
         let flushed = s.flush();
         assert!(!flushed.is_empty(), "flush must recover the tail");
@@ -834,7 +735,7 @@ mod tests {
         const FRAME: usize = 160;
         let input: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
         for chunk in [1usize, 7, 159, 160, 161, 333] {
-            let mut s = FirStream::new(SAMPLE_RATE, SAMPLE_RATE, FRAME).unwrap();
+            let mut s = Framed::new(SAMPLE_RATE, SAMPLE_RATE, FRAME);
             let mut got: Vec<f32> = Vec::new();
             for part in input.chunks(chunk) {
                 for f in s.feed(part) {
@@ -850,7 +751,7 @@ mod tests {
 
     #[test]
     fn clear_drops_buffered_state() {
-        let mut s = FirStream::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K).unwrap();
+        let mut s = Framed::new(DENOISE_RATE, SAMPLE_RATE, FRAME_16K);
         let _ = s.feed(&vec![0.1f32; FRAME_48K]);
         s.clear();
         // After clear + only zero-drain, at most delay-fill silence may appear;

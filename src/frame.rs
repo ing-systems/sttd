@@ -17,12 +17,19 @@ use crate::vad::SpeechDetector;
 /// Owns per-frame VAD/buffering state. Fed one raw hw-rate chunk at a time
 /// (`required_input_frames()` samples) by either the microphone loop or file
 /// mode, so both share identical resampling and utterance-detection behavior.
-/// Resampling / denoising / Hp / pairing lives behind `SignalPath`; this module
+/// Resampling / denoising / Hp / pairing lives behind `SignalPath`; `Detect`
 /// applies shared-gain Agc then turns paired frames into VAD verdicts and
 /// utterances.
 pub(crate) struct FrameProcessor {
     hw_input_frames: usize,
     signal: SignalPath,
+    detect: Detect,
+}
+
+/// Everything downstream of the signal path. A separate struct so
+/// `SignalPath` can lend its frames to `absorb_pair` through a callback: the
+/// two are disjoint borrows of `FrameProcessor`.
+struct Detect {
     vad: SpeechDetector,
     utterance: UtteranceBuffer,
     gate: GateConfig,
@@ -44,20 +51,17 @@ impl FrameProcessor {
         target_rms: f32,
         max_gain: f32,
     ) -> Result<Self> {
-        let hw_input_frames = hw_input_frames(hw_rate);
-        let signal = SignalPath::new(hw_rate, denoiser_kind)?;
-
-        // Minimum earshot score for a window to count as speech (see `vad`).
-        let vad = SpeechDetector::new(vad_threshold, vad_adapt);
-
         Ok(Self {
-            hw_input_frames,
-            signal,
-            vad,
-            utterance: UtteranceBuffer::new().with_hangover_frames(hangover_frames),
-            gate,
-            agc: Agc::new(target_rms, max_gain),
-            prev_speech: false,
+            hw_input_frames: hw_input_frames(hw_rate),
+            signal: SignalPath::new(hw_rate, denoiser_kind)?,
+            detect: Detect {
+                // Minimum earshot score for a window to count as speech (see `vad`).
+                vad: SpeechDetector::new(vad_threshold, vad_adapt),
+                utterance: UtteranceBuffer::new().with_hangover_frames(hangover_frames),
+                gate,
+                agc: Agc::new(target_rms, max_gain),
+                prev_speech: false,
+            },
         })
     }
 
@@ -65,7 +69,10 @@ impl FrameProcessor {
     /// `UtteranceBuffer::partial_snapshot`). Call after `process_frame`: an
     /// utterance that frame closed is no longer open, so it yields `None`.
     pub(crate) fn take_partial(&mut self) -> Option<Vec<f32>> {
-        self.utterance.partial_snapshot(self.gate.min_speech_rms)
+        let detect = &mut self.detect;
+        detect
+            .utterance
+            .partial_snapshot(detect.gate.min_speech_rms)
     }
 
     /// The raw hw-rate chunk size every call to `process_frame` must be fed.
@@ -85,14 +92,14 @@ impl FrameProcessor {
     /// `FrameProcessor`, so `discard_pending`'s "floor preserved" guarantee
     /// doesn't apply across that boundary on its own).
     pub(crate) const fn noise_floor(&self) -> f32 {
-        self.vad.noise_floor()
+        self.detect.vad.noise_floor()
     }
 
     /// Whether an utterance is currently buffered (opened, not yet closed).
     /// The beep-leak guard (`run::microphone::MicLoop::cue_guard`) skips its discard when speech
     /// is in flight so a cue never cuts real audio.
     pub(crate) const fn has_open_utterance(&self) -> bool {
-        self.utterance.is_open()
+        self.detect.utterance.is_open()
     }
 
     /// Adopt a floor learned by a previous `FrameProcessor` (device rebuild).
@@ -101,7 +108,7 @@ impl FrameProcessor {
     /// the ~2 s the EMA needs to relearn a noisy room — exactly the window
     /// where false triggers turn into hallucinated utterances.
     pub(crate) const fn adopt_noise_floor(&mut self, floor: f32) {
-        self.vad.set_floor(floor);
+        self.detect.vad.set_floor(floor);
     }
 
     /// Process one raw hw-rate chunk (`required_input_frames()` samples).
@@ -110,106 +117,43 @@ impl FrameProcessor {
     /// call (reopening needs `ONSET_SPEECH_FRAMES` fresh speech frames, which
     /// a chunk's few-pairs surplus past a hangover close can never supply).
     ///
-    /// Keeps iterating past a close instead of returning immediately: `feed`
-    /// occasionally completes two pairs for one hw chunk (non-integer rate
-    /// ratios), and returning early used to silently drop the second pair —
-    /// the first ~10 ms of the *next* utterance's pre-roll, plus its VAD
-    /// verdict and noise-floor update.
+    /// Keeps absorbing pairs past a close: `feed` occasionally completes two
+    /// pairs for one hw chunk (non-integer rate ratios), and stopping early
+    /// used to silently drop the second pair — the first ~10 ms of the *next*
+    /// utterance's pre-roll, plus its VAD verdict and noise-floor update.
     pub(crate) fn process_frame(&mut self, frame_hw_raw: &[f32]) -> Option<Utterance> {
         debug_assert_eq!(frame_hw_raw.len(), self.hw_input_frames);
 
         let mut closed = None;
-        for pair in self.signal.feed(frame_hw_raw) {
-            if let Some(done) = self.absorb_pair(pair) {
+        let detect = &mut self.detect;
+        self.signal.feed(frame_hw_raw, |pair| {
+            if let Some(done) = detect.absorb_pair(pair) {
                 closed = Some(done);
             }
-        }
+        });
         closed
     }
 
-    /// Agc + VAD verdict + buffering for one completed pair. Returns the
-    /// closed utterance when this frame asked for a flush.
-    ///
-    /// `Shared` is the default topology: one allocation serves both roles, so
-    /// the Agc applies the shared gain once and a single post-gain RMS serves
-    /// both the VAD floor and the utterance buffer. `evidence_rms` stays the
-    /// pre-AGC measurement either way — evidence must describe what the
-    /// microphone heard, not what the AGC did to it (see
-    /// `UtteranceBuffer::push_frame_evidenced`).
-    fn absorb_pair(&mut self, pair: PairedFrames) -> Option<Utterance> {
-        match pair {
-            PairedFrames::Shared(mut frame) => {
-                let evidence_rms = self.agc.process_shared(&mut frame, self.prev_speech);
-                let loudness = frame_rms(&frame);
-                let is_speech = self.vad.verdict(&frame, loudness);
-                self.prev_speech = is_speech;
-                self.absorb_frame(&frame, is_speech, evidence_rms, loudness)
-            }
-            PairedFrames::Split(mut vad_frame, mut model_frame) => {
-                let evidence_rms =
-                    self.agc
-                        .process_pair(&mut vad_frame, &mut model_frame, self.prev_speech);
-                let is_speech = self.vad.verdict(&vad_frame, frame_rms(&vad_frame));
-                self.prev_speech = is_speech;
-                let loudness = frame_rms(&model_frame);
-                self.absorb_frame(&model_frame, is_speech, evidence_rms, loudness)
-            }
-        }
-    }
-
-    /// Hand one gained frame to the utterance buffer with its two loudness
-    /// measurements: `evidence_rms` (pre-AGC, what the mic heard) and
-    /// `loudness` (post-Agc, what the buffer and the model get).
-    fn absorb_frame(
-        &mut self,
-        model_frame: &[f32],
-        is_speech: bool,
-        evidence_rms: f32,
-        loudness: f32,
-    ) -> Option<Utterance> {
-        if self
-            .utterance
-            .push_frame_evidenced(model_frame, is_speech, evidence_rms, loudness)
-            == FrameAction::Flush
-        {
-            self.close_current()
-        } else {
-            None
-        }
-    }
-
-    /// Close the open utterance and return it if it cleared the acoustic
-    /// gates. Separated from `UtteranceBuffer::close` so the accept/reject
-    /// decision stays testable without a live channel. Stale-backlog
-    /// shedding lives in the ASR worker (see `ASR_SHED_KEEP`), which
-    /// owns the queue's consumer — this side never blocks the processing
-    /// loop.
-    fn close_current(&mut self) -> Option<Utterance> {
-        self.utterance.close(&self.gate)
-    }
-
     /// Discard all in-flight audio for a pause/hold transition: signal-path
-    /// queues + resampler/Hp state, Agc gain, VAD staging/latch, and the
+    /// buffers + resampler/Hp state, Agc gain, VAD staging/latch, and the
     /// utterance buffer including pre-roll. Idempotent; discarding an
     /// already-empty pipeline is a no-op. Noise floor preserved.
+    ///
+    /// This is the full-pipeline hold: no background learning, no resampling,
+    /// frozen floor. The main loop parks (drains and drops raw) after calling
+    /// it once on the pause edge; `flush_on_pause` folds it into the
+    /// pause-edge sequence.
     pub(crate) fn discard_pending(&mut self) {
         self.signal.clear();
-        self.vad.reset();
-        self.utterance.discard();
-        self.agc.reset();
-        self.prev_speech = false;
-    }
-
-    /// Full-pipeline hold (pause): same as `discard_pending` — no background
-    /// learning, no resampling, frozen floor. The main loop parks (drains and
-    /// drops raw) after calling this once on the pause edge; `flush_on_pause`
-    /// folds it into the pause-edge sequence.
-    pub(crate) fn hold_pipeline(&mut self) {
-        self.discard_pending();
+        let detect = &mut self.detect;
+        detect.vad.reset();
+        detect.utterance.discard();
+        detect.agc.reset();
+        detect.prev_speech = false;
     }
 
     /// Pause edge: cut the open utterance and hand it back so the last thing
-    /// said survives the hold, then hold the pipeline as `hold_pipeline` does.
+    /// said survives the hold, then hold the pipeline (`discard_pending`).
     /// Returns the flushed utterance (marked as a pause flush), or `None` when
     /// nothing was buffered or the acoustic gates dropped it.
     ///
@@ -244,25 +188,83 @@ impl FrameProcessor {
                 utterance.mark_pause_flush();
             }
         }
-        self.hold_pipeline();
+        self.discard_pending();
         flushed
     }
 
     /// Flush any trailing speech. Call once at shutdown / end of input, and on
     /// the pause edge (see `flush_on_pause`). Returns the trailing utterance,
-    /// if any. Keeps iterating past a mid-flush close instead of returning
-    /// immediately (see `process_frame`'s doc comment for why).
+    /// if any. Keeps absorbing pairs past a mid-flush close (see
+    /// `process_frame`'s doc comment for why).
     pub(crate) fn flush_trailing_speech(&mut self) -> Option<Utterance> {
         let mut closed = None;
-        for pair in self.signal.flush() {
-            if let Some(done) = self.absorb_pair(pair) {
+        let detect = &mut self.detect;
+        self.signal.flush(|pair| {
+            if let Some(done) = detect.absorb_pair(pair) {
                 closed = Some(done);
             }
-        }
-        if closed.is_none() && self.utterance.is_open() {
-            closed = self.close_current();
+        });
+        if closed.is_none() && detect.utterance.is_open() {
+            closed = detect.utterance.close(&detect.gate);
         }
         closed
+    }
+}
+
+impl Detect {
+    /// Agc + VAD verdict + buffering for one completed pair. Returns the
+    /// closed utterance when this frame asked for a flush.
+    ///
+    /// `Shared` is the default topology: one frame serves both roles, so the
+    /// Agc applies the shared gain once and a single post-gain RMS serves
+    /// both the VAD floor and the utterance buffer. `evidence_rms` stays the
+    /// pre-AGC measurement either way — evidence must describe what the
+    /// microphone heard, not what the AGC did to it (see
+    /// `UtteranceBuffer::push_frame_evidenced`).
+    fn absorb_pair(&mut self, pair: PairedFrames<'_>) -> Option<Utterance> {
+        match pair {
+            PairedFrames::Shared(frame) => {
+                let evidence_rms = self.agc.process_shared(frame, self.prev_speech);
+                let loudness = frame_rms(frame);
+                let is_speech = self.vad.verdict(frame, loudness);
+                self.prev_speech = is_speech;
+                self.absorb_frame(frame, is_speech, evidence_rms, loudness)
+            }
+            PairedFrames::Split(vad_frame, model_frame) => {
+                let evidence_rms = self
+                    .agc
+                    .process_pair(vad_frame, model_frame, self.prev_speech);
+                let is_speech = self.vad.verdict(vad_frame, frame_rms(vad_frame));
+                self.prev_speech = is_speech;
+                let loudness = frame_rms(model_frame);
+                self.absorb_frame(model_frame, is_speech, evidence_rms, loudness)
+            }
+        }
+    }
+
+    /// Hand one gained frame to the utterance buffer with its two loudness
+    /// measurements: `evidence_rms` (pre-AGC, what the mic heard) and
+    /// `loudness` (post-Agc, what the buffer and the model get). On a flush,
+    /// close the utterance and return it if it cleared the acoustic gates.
+    /// Stale-backlog shedding lives in the ASR worker (see `ASR_SHED_KEEP`),
+    /// which owns the queue's consumer — this side never blocks the
+    /// processing loop.
+    fn absorb_frame(
+        &mut self,
+        model_frame: &[f32],
+        is_speech: bool,
+        evidence_rms: f32,
+        loudness: f32,
+    ) -> Option<Utterance> {
+        if self
+            .utterance
+            .push_frame_evidenced(model_frame, is_speech, evidence_rms, loudness)
+            == FrameAction::Flush
+        {
+            self.utterance.close(&self.gate)
+        } else {
+            None
+        }
     }
 }
 
