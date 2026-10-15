@@ -38,7 +38,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -297,21 +296,15 @@ impl PiperVoice {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let audio = self
+        let mut audio = self
             .run(&ids)
             .map_err(|e| std::io::Error::other(format!("piper inference failed: {e}")))?;
-        Ok(normalize_peak(&audio))
+        normalize_peak(&mut audio);
+        Ok(audio)
     }
 
     /// One graph run: the four inputs, and one output waveform.
     fn run(&mut self, ids: &[i64]) -> Result<Vec<f32>> {
-        // The names are cloned out of `self` before the mutable borrow of the
-        // session, so the input list does not keep `self` borrowed.
-        let ids_name = self.inputs.ids.clone();
-        let lengths_name = self.inputs.lengths.clone();
-        let scales_name = self.inputs.scales.clone();
-        let speaker_name = self.inputs.speaker.clone();
-
         let id_tensor = Tensor::from_array(([1usize, ids.len()], ids.to_vec()))
             .context("failed to build the phoneme id tensor")?;
         let length_tensor = Tensor::from_array(([1usize], vec![ids.len() as i64]))
@@ -322,10 +315,12 @@ impl PiperVoice {
         // A named map rather than `inputs!`: the speaker input is conditional,
         // and `inputs!` cannot build a list whose length is decided at runtime.
         let mut named: Vec<(&str, SessionInputValue<'_>)> = Vec::with_capacity(4);
-        named.push((&ids_name, id_tensor.into()));
-        named.push((&lengths_name, length_tensor.into()));
-        named.push((&scales_name, scales_tensor.into()));
-        if let Some(name) = &speaker_name {
+        // The names borrow `self.inputs`, a different field from the session
+        // the run borrows mutably.
+        named.push((&self.inputs.ids, id_tensor.into()));
+        named.push((&self.inputs.lengths, length_tensor.into()));
+        named.push((&self.inputs.scales, scales_tensor.into()));
+        if let Some(name) = &self.inputs.speaker {
             let sid = Tensor::from_array(([1usize], vec![0i64]))
                 .context("failed to build the speaker tensor")?;
             named.push((name, sid.into()));
@@ -338,15 +333,14 @@ impl PiperVoice {
         // One output: `[batch, 1, time]`. Its name is taken from the graph
         // rather than assumed, since a voice exported by a different piper
         // toolchain may call it something else.
-        let mut audio: Option<Vec<f32>> = None;
-        for (_name, value) in outputs {
-            let extracted = value
-                .try_extract_array::<f32>()
-                .context("piper output is not an f32 array")?;
-            audio = Some(extracted.iter().copied().collect());
-            break;
-        }
-        audio.ok_or_else(|| anyhow::anyhow!("piper graph returned no output"))
+        let (_name, value) = outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("piper graph returned no output"))?;
+        let extracted = value
+            .try_extract_array::<f32>()
+            .context("piper output is not an f32 array")?;
+        Ok(extracted.iter().copied().collect())
     }
 }
 
@@ -531,10 +525,11 @@ pub(crate) fn phonemes_to_ids(map: &BTreeMap<String, Vec<i64>>, phonemes: &[char
 /// Peak-normalize, the way piper does, including its `0.01` floor: a quiet
 /// synthesis is amplified to that floor rather than left alone, and the result
 /// is clipped rather than wrapped.
-pub(crate) fn normalize_peak(audio: &[f32]) -> Vec<f32> {
-    let peak = audio.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-    let gain = 1.0 / peak.max(0.01);
-    audio.iter().map(|s| (s * gain).clamp(-1.0, 1.0)).collect()
+fn normalize_peak(audio: &mut [f32]) {
+    let gain = 1.0 / crate::noise::frame_peak(audio).max(0.01);
+    for s in audio.iter_mut() {
+        *s = (*s * gain).clamp(-1.0, 1.0);
+    }
 }
 
 /// One espeak run for a list of clauses, one clause per line.
@@ -628,17 +623,6 @@ fn espeak_available(voice: &str) -> Result<()> {
         anyhow::anyhow!("{hint} ({e})")
     })?;
     Ok(())
-}
-
-/// Read a voice's config without loading its graph, for callers that only want
-/// to describe it.
-#[allow(dead_code)]
-pub(crate) fn read_config(path: &Path) -> Result<VoiceConfig> {
-    serde_json::from_str(
-        &std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?,
-    )
-    .with_context(|| format!("{} is not a piper voice config", path.display()))
 }
 
 #[cfg(test)]
@@ -819,19 +803,24 @@ mod tests {
 
     #[test]
     fn normalize_peak_matches_piper_including_its_floor_and_clip() {
+        let normalized = |audio: &[f32]| {
+            let mut out = audio.to_vec();
+            normalize_peak(&mut out);
+            out
+        };
         // Quiet output is lifted to the 0.01 floor, not left alone.
-        let quiet = normalize_peak(&[0.002, -0.004, 0.001]);
+        let quiet = normalized(&[0.002, -0.004, 0.001]);
         assert!((quiet[0] - 0.2).abs() < 1e-5, "{quiet:?}");
         assert!((quiet[1] + 0.4).abs() < 1e-5, "{quiet:?}");
         // A normal peak reaches 1.0.
-        let loud = normalize_peak(&[0.5, -0.25]);
+        let loud = normalized(&[0.5, -0.25]);
         assert!((loud[0] - 1.0).abs() < 1e-6, "{loud:?}");
         assert!((loud[1] + 0.5).abs() < 1e-6, "{loud:?}");
         // Digital silence stays silent rather than being amplified to noise.
-        assert_eq!(normalize_peak(&[0.0, 0.0]), vec![0.0, 0.0]);
+        assert_eq!(normalized(&[0.0, 0.0]), vec![0.0, 0.0]);
         // Nothing may exceed full scale after the gain.
-        assert!(normalize_peak(&[1.0, -1.0]).iter().all(|s| s.abs() <= 1.0));
-        assert!(normalize_peak(&[]).is_empty());
+        assert!(normalized(&[1.0, -1.0]).iter().all(|s| s.abs() <= 1.0));
+        assert!(normalized(&[]).is_empty());
     }
 
     #[test]
