@@ -14,20 +14,21 @@
 // ---------------------------------------------------------------------------
 
 use ndarray17::{Array, ArrayD, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, IxDyn};
-use once_cell::sync::Lazy;
 use ort::inputs;
 use ort::session::Session;
 use ort::value::TensorRef;
 use regex::Regex;
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use super::boost_tree::{BiasCandidate, BoostTree};
 use super::frontend::{Frontend, PreprocessorConfig};
-use super::helpers::{load_tokenizer, tokenize_word_to_ids, word_confidences, word_variants};
-use super::types::{DecodedTokens, DecoderState, ParakeetError, ParakeetModel};
-use crate::decode::{argmax_index, softmax_prob};
+use super::helpers::{load_tokenizer, tokenize_word_to_ids, word_variants};
+use super::types::{DecoderState, ParakeetError, ParakeetModel};
+use crate::decode::{argmax_index, softmax_prob, word_confidences};
 use crate::device::Device;
 use crate::speech::Transcript;
 
@@ -65,17 +66,17 @@ fn token_divergence(a: &[i32], b: &[i32]) -> f32 {
     if n == 0 {
         return 0.0;
     }
+    // Two rows of the edit-distance table, swapped rather than reallocated.
     let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b.len() + 1];
     for (i, &x) in a.iter().enumerate() {
-        let mut curr = vec![i + 1];
+        curr[0] = i + 1;
         for (j, &y) in b.iter().enumerate() {
-            curr.push(
-                (prev[j + 1] + 1)
-                    .min(curr[j] + 1)
-                    .min(prev[j] + usize::from(x != y)),
-            );
+            curr[j + 1] = (prev[j + 1] + 1)
+                .min(curr[j] + 1)
+                .min(prev[j] + usize::from(x != y));
         }
-        prev = curr;
+        std::mem::swap(&mut prev, &mut curr);
     }
     prev[b.len()] as f32 / n as f32
 }
@@ -150,8 +151,8 @@ fn select_kth_largest(buf: &mut [f32], k: usize) -> &f32 {
     kth
 }
 
-static DECODE_SPACE_RE: Lazy<Result<Regex, regex::Error>> =
-    Lazy::new(|| Regex::new(r"\A\s|\s\B|(\s)\b"));
+static DECODE_SPACE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\A\s|\s\B|(\s)\b").expect("the decode space pattern is valid"));
 
 /// Encoder output `[1, time, features]` -> decoder layout `[1, features, time]`,
 /// owned and in standard (row-major) layout.
@@ -220,15 +221,6 @@ fn argmax_token(logits: &[f32], blank_idx: i32) -> i32 {
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(idx, _)| idx as i32)
         .unwrap_or(blank_idx)
-}
-
-impl Drop for ParakeetModel {
-    fn drop(&mut self) {
-        log::debug!(
-            "Dropping ParakeetModel with {} vocab tokens",
-            self.vocab.len()
-        );
-    }
 }
 
 impl ParakeetModel {
@@ -439,21 +431,15 @@ impl ParakeetModel {
             });
         }
         let (encoder_out, encodings_len) = Self::encode(&mut self.encoder, audio_signal)?;
-        let mut results = Vec::new();
-        for encodings in encoder_out.outer_iter() {
-            let (tokens, probs) = self.decode_sequence(&encodings.view(), encodings_len)?;
-            results.push(self.decode_tokens(tokens, probs));
-        }
-        let decoded = results.into_iter().next().ok_or_else(|| {
+        // A batch of one: the first (only) row is the utterance.
+        let encodings = encoder_out.outer_iter().next().ok_or_else(|| {
             ParakeetError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "No transcription result returned",
             ))
         })?;
-        Ok(Transcript {
-            word_confidences: word_confidences(&decoded),
-            text: decoded.text,
-        })
+        let (tokens, probs) = self.decode_sequence(&encodings, encodings_len)?;
+        Ok(self.transcript(&tokens, &probs))
     }
 
     fn decode_sequence(
@@ -491,35 +477,39 @@ impl ParakeetModel {
         Ok(boosted)
     }
 
-    fn decode_tokens(&self, ids: Vec<i32>, probs: Vec<f32>) -> DecodedTokens {
-        // tokens and kept_probs go through the same filter to stay aligned.
-        let mut tokens: Vec<String> = Vec::with_capacity(ids.len());
-        let mut kept_probs: Vec<f32> = Vec::with_capacity(ids.len());
-        for (i, &id) in ids.iter().enumerate() {
-            let idx = id as usize;
-            if idx < self.vocab.len() {
-                tokens.push(self.vocab[idx].clone());
-                kept_probs.push(probs.get(i).copied().unwrap_or(1.0));
-            }
-        }
-
-        let text = match &*DECODE_SPACE_RE {
-            Ok(regex) => regex
-                .replace_all(&tokens.join(""), |caps: &regex::Captures| {
+    /// Text and per-word confidences of a decoded sequence. The pieces are
+    /// borrowed from the vocab table; ids outside it are dropped together with
+    /// their probabilities, so the two stay aligned.
+    ///
+    /// Per-word confidence is the minimum token probability (weakest link), with
+    /// punctuation-only tokens excluded from the minimum; the grouping lives in
+    /// `crate::decode::word_confidences`, shared with Whisper.
+    fn transcript(&self, ids: &[i32], probs: &[f32]) -> Transcript {
+        let pieces: Vec<(&str, f32)> = ids
+            .iter()
+            .zip(probs)
+            .filter_map(|(&id, &prob)| Some((self.vocab.get(id as usize)?.as_str(), prob)))
+            .collect();
+        let joined: String = pieces.iter().map(|&(piece, _)| piece).collect();
+        let text = DECODE_SPACE_RE
+            .replace_all(
+                &joined,
+                |caps: &regex::Captures| {
                     if caps.get(1).is_some() {
                         " "
                     } else {
                         ""
                     }
-                })
-                .to_string(),
-            Err(_) => tokens.join(""), // Fallback if regex failed to compile
-        };
-
-        DecodedTokens {
+                },
+            )
+            .into_owned();
+        Transcript {
+            word_confidences: word_confidences(
+                pieces
+                    .iter()
+                    .map(|&(piece, prob)| (Cow::Borrowed(piece), prob)),
+            ),
             text,
-            tokens,
-            probs: kept_probs,
         }
     }
 }
@@ -725,6 +715,16 @@ mod tests {
             top_k_thresholds_with_scratch(&logits, &[cand(BOOST_DEEP_DEPTH)], &mut scratch),
             (f32::NEG_INFINITY, deep)
         );
+    }
+
+    #[test]
+    fn token_divergence_is_normalized_edit_distance() {
+        assert_eq!(token_divergence(&[], &[]), 0.0);
+        assert_eq!(token_divergence(&[1, 2, 3], &[1, 2, 3]), 0.0);
+        assert_eq!(token_divergence(&[1, 2, 3], &[4, 5, 6]), 1.0);
+        // One substitution, one insertion: 2 edits over the longer side.
+        assert_eq!(token_divergence(&[1, 2, 3], &[1, 9, 3, 4]), 0.5);
+        assert_eq!(token_divergence(&[], &[1, 2]), 1.0);
     }
 
     #[test]

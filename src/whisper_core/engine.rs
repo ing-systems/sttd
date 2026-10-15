@@ -435,7 +435,7 @@ pub struct TranscriptionResult {
 
 /// Per-word confidences from the generated token run, in the same shape the
 /// dictionary gate expects from Parakeet (see
-/// `parakeet_core::helpers::word_confidences`).
+/// `ParakeetModel::transcript`).
 ///
 /// Whisper's tokens are byte-level BPE, so "starts with a space" is the
 /// decoded piece starting with `' '` — the same test as the Parakeet path,

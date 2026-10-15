@@ -2853,7 +2853,6 @@ dependencies = [
  "ndarray 0.15.6",
  "ndarray 0.17.2",
  "num_cpus",
- "once_cell",
  "ort",
  "realfft",
  "regex",

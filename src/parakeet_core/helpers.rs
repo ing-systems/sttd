@@ -9,11 +9,7 @@
 // spellings (`zolc` for `żółć`), not just French.
 // ---------------------------------------------------------------------------
 
-use std::borrow::Cow;
-
 use tokenizers::Tokenizer;
-
-use super::types::DecodedTokens;
 
 /// Replace accented Latin letters with their ASCII base. Murmure's
 /// French/Latin coverage plus Polish (ą ć ę ł ń ó ś ź ż) via `gate`, so
@@ -108,19 +104,4 @@ pub fn load_tokenizer(tokenizer_path: Option<&std::path::Path>) -> Option<Tokeni
             None
         }
     }
-}
-
-/// Per-word confidence over `result`'s decoded tokens: the minimum token
-/// probability (weakest link), with punctuation-only tokens excluded from the
-/// minimum. The grouping itself lives in `crate::decode::word_confidences`,
-/// shared with Whisper; the pieces here are Parakeet's vocab strings, where
-/// Whisper's are byte-level BPE pieces.
-pub fn word_confidences(result: &DecodedTokens) -> Vec<(String, f32)> {
-    crate::decode::word_confidences(
-        result
-            .tokens
-            .iter()
-            .zip(result.probs.iter())
-            .map(|(token, &prob)| (Cow::Borrowed(token.as_str()), prob)),
-    )
 }
