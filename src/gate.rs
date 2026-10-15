@@ -536,4 +536,62 @@ mod tests {
         ));
         assert!(!is_repetition("nie nie nie"));
     }
+
+    #[test]
+    fn hallucination_filter_catches_known_boilerplate() {
+        assert!(is_hallucination(
+            "Napisy stworzone przez społeczność Amara.org"
+        ));
+        assert!(is_hallucination("  napisy  "));
+        assert!(is_hallucination("..."));
+        assert!(is_hallucination(""));
+        // Observed forced-input decodes: white noise (rms=0.008) at
+        // avg_p=0.890 and 50 Hz hum at avg_p=0.993 — both clear either
+        // confidence floor, so the pattern list is the only gate.
+        assert!(is_hallucination("Wszelkie prawa."));
+        assert!(is_hallucination("Wszelkie prawa zastrzeżone."));
+    }
+
+    #[test]
+    fn hallucination_filter_handles_diacritics() {
+        // "Dziękuje za uwagę." (log-observed hallucination) differs from the
+        // pattern "dziękuję za uwagę" by a single ogonek; without diacritic
+        // folding this exact-match filter let it straight through.
+        assert!(is_hallucination("Dziękuje za uwagę."));
+        assert!(is_hallucination("dziekuje za uwage"));
+    }
+
+    #[test]
+    fn repetition_filter_catches_decode_loops() {
+        // Observed production-shape leak: 300 ms noise burst -> 26 speech
+        // frames -> "Współpraca w ..." at avg_p=0.741, clear of the 0.6
+        // weak floor and absent from the boilerplate list.
+        assert!(is_repetition(
+            "Współpraca w Współpraca w Współpraca w Współpraca w Współpraca."
+        ));
+        assert!(is_repetition("tak tak tak tak tak tak"));
+    }
+
+    #[test]
+    fn repetition_filter_leaves_real_speech_alone() {
+        assert!(!is_repetition(
+            "Zrób commit i wypchnij zmiany do repozytorium."
+        ));
+        assert!(!is_repetition(
+            "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
+        ));
+        // Short emphasis is exempt (< 6 words).
+        assert!(!is_repetition("nie nie nie"));
+        assert!(!is_repetition("tak"));
+    }
+
+    #[test]
+    fn hallucination_filter_leaves_real_sentences_alone() {
+        assert!(!is_hallucination(
+            "Zrób commit i wypchnij zmiany do repozytorium."
+        ));
+        assert!(!is_hallucination(
+            "Dziękuję, że przyszedłeś na spotkanie o dziewiątej."
+        ));
+    }
 }

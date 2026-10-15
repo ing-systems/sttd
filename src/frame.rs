@@ -216,7 +216,7 @@ impl FrameProcessor {
     /// Order is the point: the hold discards the utterance buffer, so the cut
     /// has to happen first. Marking after the trailing flush covers an
     /// utterance that `signal`'s zero-padded tail closed rather than the open
-    /// buffer. The caller queues the result (see `asr::keep_while_paused`),
+    /// buffer. The caller queues the result (see `asr::worker::keep_while_paused`),
     /// because the worker drops untagged backlog while a pause is held.
     pub(crate) fn flush_on_pause(&mut self) -> Option<Utterance> {
         self.flush_and_hold(true)
@@ -226,7 +226,7 @@ impl FrameProcessor {
     /// **not** marked as a pause flush.
     ///
     /// The distinction matters because the mark is about the *worker's* policy
-    /// for a held pause (`asr::keep_while_paused` keeps a pause flush and drops
+    /// for a held pause (`asr::worker::keep_while_paused` keeps a pause flush and drops
     /// an untagged backlog). Speaking holds the pipeline without setting the
     /// pause flag, so the worker is not in that branch at all and an untagged
     /// utterance here is an ordinary one — it is transcribed and emitted like
@@ -397,7 +397,7 @@ mod tests {
     fn the_speaking_edge_cuts_the_utterance_without_marking_it_a_pause() {
         // Same cut as the pause edge — what was said before sttd started
         // talking is real speech — but **not** marked. The mark means "keep this
-        // while a pause is held" (`asr::keep_while_paused`), and speaking holds
+        // while a pause is held" (`asr::worker::keep_while_paused`), and speaking holds
         // the pipeline without setting the pause flag, so the mark would claim
         // a policy that is not in force.
         let mut fp = processor_without_gates();

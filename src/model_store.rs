@@ -326,7 +326,7 @@ pub(crate) struct ModelRef {
     /// at directly (nothing is downloaded, only validated).
     pub(crate) dir: PathBuf,
     pub(crate) assets: &'static [&'static str],
-    /// Which engine opens `dir`. `asr::load_model` dispatches on this.
+    /// Which engine opens `dir`. `asr::worker::load_model` dispatches on this.
     pub(crate) kind: EngineKind,
 }
 

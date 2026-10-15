@@ -55,13 +55,13 @@ pub(crate) struct Utterance {
     /// True when this utterance continues a split prefix (interim 8s, early
     /// 28s, or 30s hard-cap cut) rather than ending on a hangover pause.
     /// The ASR worker uses it to strip text repeated across the split seam
-    /// (see `asr::remove_split_overlap`); hangover closes leave it false so
+    /// (see `asr::condition::remove_split_overlap`); hangover closes leave it false so
     /// distinct sentences are never merged.
     pub(crate) split_continuation: bool,
     /// True when this utterance was cut by the pause edge rather than by a
     /// silence hangover: the last thing said before the run was held, which no
     /// hangover will ever get to close. The worker transcribes it while the
-    /// pause holds (see `asr::keep_while_paused`) instead of dropping it as
+    /// pause holds (see `asr::worker::keep_while_paused`) instead of dropping it as
     /// stale backlog.
     pub(crate) pause_flush: bool,
     /// When the buffer closed this utterance, i.e. when its text started
