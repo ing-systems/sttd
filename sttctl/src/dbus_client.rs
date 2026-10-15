@@ -9,6 +9,13 @@ use sttd_dbus_names::{
     TRANSLATION_PATH,
 };
 
+/// One of the daemon's objects: its path and the interface served there.
+type Object = (&'static str, &'static str);
+
+const DAEMON: Object = (DAEMON_PATH, DAEMON_INTERFACE);
+const DICT: Object = (DICT_PATH, DICT_INTERFACE);
+const TRANSLATION: Object = (TRANSLATION_PATH, TRANSLATION_INTERFACE);
+
 pub struct SttdClient {
     conn: Connection,
 }
@@ -25,136 +32,94 @@ impl SttdClient {
 
     // Daemon methods
     pub fn pause(&self) -> Result<bool> {
-        let proxy = self.daemon_proxy()?;
-        let paused: bool = proxy.call("Pause", &())?;
-        Ok(paused)
+        self.call(DAEMON, "Pause", &())
     }
 
     pub fn resume(&self) -> Result<bool> {
-        let proxy = self.daemon_proxy()?;
-        let paused: bool = proxy.call("Resume", &())?;
-        Ok(paused)
+        self.call(DAEMON, "Resume", &())
     }
 
     pub fn toggle_pause(&self) -> Result<bool> {
-        let proxy = self.daemon_proxy()?;
-        let paused: bool = proxy.call("Toggle", &())?;
-        Ok(paused)
+        self.call(DAEMON, "Toggle", &())
     }
 
     pub fn is_paused(&self) -> Result<bool> {
-        let proxy = self.daemon_proxy()?;
-        let paused: bool = proxy.get_property("Paused")?;
-        Ok(paused)
+        self.property(DAEMON, "Paused")
     }
 
     // Dictionary methods
     pub fn dict_load(&self, path: &str) -> Result<(bool, u32, String)> {
-        let proxy = self.dict_proxy()?;
-        let result: (bool, u32, String) = proxy.call("LoadFile", &(path,))?;
-        Ok(result)
+        self.call(DICT, "LoadFile", &(path,))
     }
 
-    pub fn dict_replace(&self, words: Vec<String>) -> Result<u32> {
-        let proxy = self.dict_proxy()?;
-        let count: u32 = proxy.call("ReplaceWords", &(words,))?;
-        Ok(count)
+    pub fn dict_replace(&self, words: &[String]) -> Result<u32> {
+        self.call(DICT, "ReplaceWords", &(words,))
     }
 
-    pub fn dict_add(&self, words: Vec<String>) -> Result<(u32, u32)> {
-        let proxy = self.dict_proxy()?;
-        let result: (u32, u32) = proxy.call("AddWords", &(words,))?;
-        Ok(result)
+    pub fn dict_add(&self, words: &[String]) -> Result<(u32, u32)> {
+        self.call(DICT, "AddWords", &(words,))
     }
 
-    pub fn dict_remove(&self, words: Vec<String>) -> Result<(u32, u32)> {
-        let proxy = self.dict_proxy()?;
-        let result: (u32, u32) = proxy.call("RemoveWords", &(words,))?;
-        Ok(result)
+    pub fn dict_remove(&self, words: &[String]) -> Result<(u32, u32)> {
+        self.call(DICT, "RemoveWords", &(words,))
     }
 
     pub fn dict_get(&self) -> Result<(Vec<String>, String, u32, bool)> {
-        let proxy = self.dict_proxy()?;
-        let result: (Vec<String>, String, u32, bool) = proxy.call("GetWords", &())?;
-        Ok(result)
+        self.call(DICT, "GetWords", &())
     }
 
     pub fn dict_contains(&self, word: &str) -> Result<bool> {
-        let proxy = self.dict_proxy()?;
-        let contains: bool = proxy.call("Contains", &(word,))?;
-        Ok(contains)
+        self.call(DICT, "Contains", &(word,))
     }
 
     pub fn dict_count(&self) -> Result<u32> {
-        let proxy = self.dict_proxy()?;
-        let count: u32 = proxy.get_property("Count")?;
-        Ok(count)
+        self.property(DICT, "Count")
     }
 
     pub fn dict_dirty(&self) -> Result<bool> {
-        let proxy = self.dict_proxy()?;
-        let dirty: bool = proxy.get_property("Dirty")?;
-        Ok(dirty)
+        self.property(DICT, "Dirty")
     }
 
     // Translation methods
     pub fn trans_enable(&self) -> Result<bool> {
-        let proxy = self.trans_proxy()?;
-        let enabled: bool = proxy.call("Enable", &())?;
-        Ok(enabled)
+        self.call(TRANSLATION, "Enable", &())
     }
 
     pub fn trans_disable(&self, unload: bool) -> Result<bool> {
-        let proxy = self.trans_proxy()?;
-        let enabled: bool = proxy.call("Disable", &(unload,))?;
-        Ok(enabled)
+        self.call(TRANSLATION, "Disable", &(unload,))
     }
 
     pub fn trans_toggle(&self) -> Result<bool> {
-        let proxy = self.trans_proxy()?;
-        let enabled: bool = proxy.call("Toggle", &())?;
-        Ok(enabled)
+        self.call(TRANSLATION, "Toggle", &())
     }
 
     pub fn trans_set_target(&self, lang: &str) -> Result<(bool, String, String)> {
-        let proxy = self.trans_proxy()?;
-        let result: (bool, String, String) = proxy.call("SetTargetLanguage", &(lang,))?;
-        Ok(result)
+        self.call(TRANSLATION, "SetTargetLanguage", &(lang,))
     }
 
     pub fn trans_state(&self) -> Result<(bool, String, String, String)> {
-        let proxy = self.trans_proxy()?;
-        let result: (bool, String, String, String) = proxy.call("GetState", &())?;
-        Ok(result)
+        self.call(TRANSLATION, "GetState", &())
     }
 
     pub fn trans_enabled(&self) -> Result<bool> {
-        let proxy = self.trans_proxy()?;
-        let enabled: bool = proxy.get_property("Enabled")?;
-        Ok(enabled)
+        self.property(TRANSLATION, "Enabled")
     }
 
     pub fn trans_target_language(&self) -> Result<String> {
-        let proxy = self.trans_proxy()?;
-        let target: String = proxy.get_property("TargetLanguage")?;
-        Ok(target)
+        self.property(TRANSLATION, "TargetLanguage")
     }
 
     pub fn trans_requested_language(&self) -> Result<String> {
-        let proxy = self.trans_proxy()?;
-        let requested: String = proxy.get_property("RequestedLanguage")?;
-        Ok(requested)
+        self.property(TRANSLATION, "RequestedLanguage")
     }
 
     pub fn trans_model(&self) -> Result<String> {
-        let proxy = self.trans_proxy()?;
-        let model: String = proxy.get_property("Model")?;
-        Ok(model)
+        self.property(TRANSLATION, "Model")
     }
 
     // Watch signals
     pub fn watch_signals(&self, filter: &[String], json: bool) -> Result<()> {
-        let proxy = self.daemon_proxy()?;
+        let proxy = self.proxy(DAEMON)?;
         let iter = proxy.receive_all_signals()?;
 
         for msg in iter {
@@ -205,23 +170,25 @@ impl SttdClient {
     }
 
     // Proxy helpers
-    fn daemon_proxy(&self) -> Result<zbus::blocking::Proxy<'_>> {
-        zbus::blocking::Proxy::new(&self.conn, SERVICE_NAME, DAEMON_PATH, DAEMON_INTERFACE)
-            .map_err(Into::into)
+    fn proxy(&self, (path, interface): Object) -> Result<zbus::blocking::Proxy<'_>> {
+        zbus::blocking::Proxy::new(&self.conn, SERVICE_NAME, path, interface).map_err(Into::into)
     }
 
-    fn dict_proxy(&self) -> Result<zbus::blocking::Proxy<'_>> {
-        zbus::blocking::Proxy::new(&self.conn, SERVICE_NAME, DICT_PATH, DICT_INTERFACE)
-            .map_err(Into::into)
+    /// Call `method` on one of the daemon's objects and read its reply.
+    fn call<B, R>(&self, object: Object, method: &str, body: &B) -> Result<R>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+        R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
+    {
+        Ok(self.proxy(object)?.call(method, body)?)
     }
 
-    fn trans_proxy(&self) -> Result<zbus::blocking::Proxy<'_>> {
-        zbus::blocking::Proxy::new(
-            &self.conn,
-            SERVICE_NAME,
-            TRANSLATION_PATH,
-            TRANSLATION_INTERFACE,
-        )
-        .map_err(Into::into)
+    /// Read one property of one of the daemon's objects.
+    fn property<T>(&self, object: Object, name: &str) -> Result<T>
+    where
+        T: TryFrom<zbus::zvariant::OwnedValue>,
+        T::Error: Into<zbus::Error>,
+    {
+        Ok(self.proxy(object)?.get_property(name)?)
     }
 }
