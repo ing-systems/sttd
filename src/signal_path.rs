@@ -242,25 +242,8 @@ impl SignalPath {
                     hp_model.process(model);
                     on_pair(PairedFrames::Split(vad, model));
                 }
-                // The pairing loop this replaced popped both queues before
-                // checking either, so a branch left without a partner lost
-                // its oldest (already high-passed) frame. Reproduced here so
-                // this rewrite changes no output.
-                let drop_unpartnered = |buf: &mut Vec<f32>, hp: &mut Hp| {
-                    if buf.len() >= whole + FRAME_16K {
-                        hp.process(&mut buf[whole..whole + FRAME_16K]);
-                        FRAME_16K
-                    } else {
-                        0
-                    }
-                };
-                let (vad_drop, model_drop) = if vad16.len() < whole + FRAME_16K {
-                    (0, drop_unpartnered(model16, hp_model))
-                } else {
-                    (drop_unpartnered(vad16, hp_vad), 0)
-                };
-                vad16.drain(..whole + vad_drop);
-                model16.drain(..whole + model_drop);
+                vad16.drain(..whole);
+                model16.drain(..whole);
                 frames
             }
         };
@@ -403,6 +386,36 @@ mod tests {
             }
         }
         assert!(saw_pair, "expected at least one pair in 50 chunks");
+    }
+
+    #[cfg(feature = "denoise")]
+    #[test]
+    fn denoised_model_branch_loses_no_frame() {
+        // Regression: the old pairing loop popped both queues before checking
+        // either, so whenever the VAD branch had no frame ready the model
+        // branch's oldest frame was discarded — 10 ms gaps in the audio sent
+        // to the model at any rate whose 48 kHz hop lags. The paired model
+        // frames must be exactly the raw hw -> 16 kHz stream, high-passed.
+        for hw in [16_000, 22_050, 44_100] {
+            let mut signal = SignalPath::new(hw, DenoiserKind::DeepFilter).unwrap();
+            let mut reference = FirStream::new(hw, SAMPLE_RATE, FRAME_16K).unwrap();
+            let mut expected = Vec::new();
+            let mut got = Vec::new();
+            let hw_chunk = hw_input_frames(hw);
+            for k in 0..300 {
+                let chunk: Vec<f32> = (0..hw_chunk)
+                    .map(|i| (((k * hw_chunk + i) as f32) * 0.01).sin() * 0.1)
+                    .collect();
+                reference.feed(&chunk, &mut expected);
+                for pair in feed(&mut signal, &chunk) {
+                    assert!(!pair.shared, "hw={hw}: denoised pairs are `Split`");
+                    got.extend_from_slice(&pair.model);
+                }
+            }
+            Hp::new().process(&mut expected);
+            assert!(got.len() >= 290 * FRAME_16K, "hw={hw}: got {}", got.len());
+            assert_eq!(got[..], expected[..got.len()], "hw={hw}");
+        }
     }
 
     #[test]
