@@ -116,37 +116,43 @@ struct Cached {
 /// A cheap `Clone`, so the bus thread, the ASR worker and the translation thread
 /// all hold the same state.
 pub(crate) struct TranslationState<T = Translator, L = RealTranslator> {
-    slot: Arc<Mutex<TranslatorSlot<T>>>,
+    /// Everything every clone shares, behind one `Arc`.
+    shared: Arc<Shared<T>>,
+    /// How a request becomes a translator. `Copy`, so every clone can start a load
+    /// without sharing anything.
+    loader: L,
+}
+
+/// The state behind a [`TranslationState`] and all its clones.
+struct Shared<T> {
+    slot: Mutex<TranslatorSlot<T>>,
     /// What the user asked for. `Enabled` is this **and** a loaded translator, so
     /// intent and capability never disagree in a report.
-    wanted: Arc<AtomicBool>,
+    wanted: AtomicBool,
     /// The language of the load in flight, empty when nothing is loading.
-    requested: Arc<RwLock<String>>,
+    requested: RwLock<String>,
     /// The language to write, remembered across a disable and an unload so
     /// `Enable` knows what to reload. The wanted language, which is not always
     /// the live one: a switch keeps the old translator serving until the new one
     /// is ready, and an unload leaves this behind on purpose.
-    target: Arc<RwLock<String>>,
+    target: RwLock<String>,
     /// The language the **loaded** translator writes, empty when none is loaded.
     /// Kept apart from `target` because that gap is what makes a switch atomic
     /// from the reader's side: a client asking mid-switch sees the old language
     /// still being written, which is true.
-    live: Arc<RwLock<String>>,
+    live: RwLock<String>,
     /// The spec of the loaded translator. Reported beside `live`, and cleared
     /// with it.
-    model_spec: Arc<RwLock<String>>,
-    cached: Arc<RwLock<Cached>>,
-    plan: Arc<TranslationPlan>,
-    /// How a request becomes a translator. `Copy`, so every clone can start a load
-    /// without sharing anything.
-    loader: L,
+    model_spec: RwLock<String>,
+    cached: RwLock<Cached>,
+    plan: TranslationPlan,
     /// One load at a time: a superseded load cannot be cancelled, so this is what
     /// keeps two sets of weights from being built side by side beyond the pair
     /// already held and the one arriving.
-    loading: Arc<Mutex<()>>,
+    loading: Mutex<()>,
     /// Who hears about a change no bus call is waiting on. Set once, after
-    /// construction, and shared by every clone.
-    on_change: Arc<OnceLock<ChangeHook>>,
+    /// construction.
+    on_change: OnceLock<ChangeHook>,
 }
 
 /// The listener for [`TranslationState`] changes: `(enabled, target, model, ok,
@@ -168,27 +174,29 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
     /// target is named.
     pub(crate) fn new(plan: TranslationPlan, loader: L) -> Self {
         Self {
-            slot: Arc::new(Mutex::new(TranslatorSlot {
-                translator: None::<T>,
-                generation: 0,
-            })),
-            wanted: Arc::new(AtomicBool::new(false)),
-            requested: Arc::new(RwLock::new(String::new())),
-            target: Arc::new(RwLock::new(String::new())),
-            live: Arc::new(RwLock::new(String::new())),
-            model_spec: Arc::new(RwLock::new(String::new())),
-            cached: Arc::new(RwLock::new(Cached::default())),
-            plan: Arc::new(plan),
+            shared: Arc::new(Shared {
+                slot: Mutex::new(TranslatorSlot {
+                    translator: None::<T>,
+                    generation: 0,
+                }),
+                wanted: AtomicBool::new(false),
+                requested: RwLock::new(String::new()),
+                target: RwLock::new(String::new()),
+                live: RwLock::new(String::new()),
+                model_spec: RwLock::new(String::new()),
+                cached: RwLock::new(Cached::default()),
+                plan,
+                loading: Mutex::new(()),
+                on_change: OnceLock::new(),
+            }),
             loader,
-            loading: Arc::new(Mutex::new(())),
-            on_change: Arc::new(OnceLock::new()),
         }
     }
 
     /// Install the listener `announce` reports to. Only the first call takes
     /// effect; a run has one bus.
     pub(crate) fn set_change_hook(&self, hook: ChangeHook) {
-        if self.on_change.set(hook).is_err() {
+        if self.shared.on_change.set(hook).is_err() {
             log::warn!("translate: a change hook is already installed");
         }
     }
@@ -196,43 +204,43 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
     /// The slot guard. Poison-tolerant, because a poisoned step must still emit
     /// the source text rather than stop the pipeline.
     pub(crate) fn lock_slot(&self) -> std::sync::MutexGuard<'_, TranslatorSlot<T>> {
-        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+        self.shared.slot.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ---- reads, all of which the bus serves without waiting on a translation --
 
     /// Whether the step is translating right now: asked for **and** loaded.
     pub(crate) fn is_enabled(&self) -> bool {
-        lock_read(&self.cached).enabled
+        lock_read(&self.shared.cached).enabled
     }
 
     /// The language the live translator writes, empty when none is loaded. It
     /// survives a disable, because the translator does, and it does **not** follow
     /// a switch until the new translator lands.
     pub(crate) fn target_language(&self) -> String {
-        lock_read(&self.cached).target.clone()
+        lock_read(&self.shared.cached).target.clone()
     }
 
     /// The spec of the live translator, empty when none is loaded.
     pub(crate) fn model(&self) -> String {
-        lock_read(&self.cached).model.clone()
+        lock_read(&self.shared.cached).model.clone()
     }
 
     /// The language of the load in flight, empty when nothing is loading. Its
     /// being non-empty is the whole "please wait" signal, so there is no separate
     /// `Loading` property to fall out of step with it.
     pub(crate) fn requested_language(&self) -> String {
-        lock_read(&self.requested).clone()
+        lock_read(&self.shared.requested).clone()
     }
 
     /// `(enabled, target, requested, model)` in one round trip.
     #[allow(clippy::type_complexity)]
     pub(crate) fn state(&self) -> (bool, String, String, String) {
-        let cached = lock_read(&self.cached);
+        let cached = lock_read(&self.shared.cached);
         (
             cached.enabled,
             cached.target.clone(),
-            lock_read(&self.requested).clone(),
+            lock_read(&self.shared.requested).clone(),
             cached.model.clone(),
         )
     }
@@ -241,13 +249,13 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
     /// worker asks before handing a job over. Cheap on purpose: an `AtomicBool`
     /// and a lock that is never held across a decode.
     pub(crate) fn will_translate(&self) -> bool {
-        self.wanted.load(Ordering::Acquire) && self.lock_slot().translator.is_some()
+        self.shared.wanted.load(Ordering::Acquire) && self.lock_slot().translator.is_some()
     }
 
     /// The intent flag alone. The lane reads it per job while it holds the slot,
     /// so it must not need a lock of its own.
     pub(crate) fn wanted_now(&self) -> bool {
-        self.wanted.load(Ordering::Acquire)
+        self.shared.wanted.load(Ordering::Acquire)
     }
 
     /// Whether a translator is loaded, whatever the switch says.
@@ -271,19 +279,19 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
     fn refresh_cached(&self) {
         let loaded = self.lock_slot().translator.is_some();
         let snapshot = Cached {
-            enabled: loaded && self.wanted.load(Ordering::Acquire),
+            enabled: loaded && self.shared.wanted.load(Ordering::Acquire),
             target: if loaded {
-                lock_read(&self.live).clone()
+                lock_read(&self.shared.live).clone()
             } else {
                 String::new()
             },
             model: if loaded {
-                lock_read(&self.model_spec).clone()
+                lock_read(&self.shared.model_spec).clone()
             } else {
                 String::new()
             },
         };
-        *lock_write(&self.cached) = snapshot;
+        *lock_write(&self.shared.cached) = snapshot;
     }
 
     /// Turn the step on, returning `(enabled, message)`.
@@ -297,14 +305,14 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
     /// The announcement is the caller's: a bus method has a `SignalEmitter` to hand
     /// and the loader thread has not, so this only reports.
     pub(crate) fn enable(&self) -> (bool, String) {
-        self.wanted.store(true, Ordering::Release);
+        self.shared.wanted.store(true, Ordering::Release);
         if self.is_loaded() {
             self.refresh_cached();
             return (true, String::new());
         }
-        let remembered = lock_read(&self.target).clone();
+        let remembered = lock_read(&self.shared.target).clone();
         if remembered.is_empty() {
-            self.wanted.store(false, Ordering::Release);
+            self.shared.wanted.store(false, Ordering::Release);
             self.refresh_cached();
             return (
                 false,
@@ -325,12 +333,12 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
     /// unload and a reload from the local cache with one.
     pub(crate) fn disable(&self, unload: bool) -> bool {
         self.cancel_pending();
-        self.wanted.store(false, Ordering::Release);
+        self.shared.wanted.store(false, Ordering::Release);
         if unload {
             let mut slot = self.lock_slot();
             slot.translator = None;
-            *lock_write(&self.live) = String::new();
-            *lock_write(&self.model_spec) = String::new();
+            *lock_write(&self.shared.live) = String::new();
+            *lock_write(&self.shared.model_spec) = String::new();
         }
         self.refresh_cached();
         self.is_enabled()
@@ -364,21 +372,21 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
             let message = "empty target language".to_string();
             return (false, self.target_language(), message);
         }
-        let direction = self.plan.direction(&target);
+        let direction = self.shared.plan.direction(&target);
         if let Err(e) =
-            crate::translator_store::reference_for(direction, self.plan.model.as_deref())
+            crate::translator_store::reference_for(direction, self.shared.plan.model.as_deref())
         {
             let message = format!("{e:#}");
             return (false, self.target_language(), message);
         }
         // The same language, already loaded: this is a switch on, not a load.
-        if lock_read(&self.live).eq(target.as_str()) && self.is_loaded() {
-            self.wanted.store(true, Ordering::Release);
+        if lock_read(&self.shared.live).eq(target.as_str()) && self.is_loaded() {
+            self.shared.wanted.store(true, Ordering::Release);
             self.refresh_cached();
             return (true, target, String::new());
         }
-        *lock_write(&self.target) = target.clone();
-        self.wanted.store(true, Ordering::Release);
+        *lock_write(&self.shared.target) = target.clone();
+        self.shared.wanted.store(true, Ordering::Release);
         self.refresh_cached();
         self.start_load(&target);
         (true, target, String::new())
@@ -394,13 +402,13 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
     /// wanted from the first utterance: the worker asks `will_translate` before
     /// every hand-off, and a translator loaded but not wanted is never used.
     pub(crate) fn load_startup(&self) -> Result<()> {
-        let Some(target) = self.plan.configured.clone() else {
+        let Some(target) = self.shared.plan.configured.clone() else {
             return Ok(());
         };
-        *lock_write(&self.target) = target.clone();
-        self.wanted.store(true, Ordering::Release);
+        *lock_write(&self.shared.target) = target.clone();
+        self.shared.wanted.store(true, Ordering::Release);
         let generation = self.begin_request(&target);
-        let translator = self.loader.load(&self.plan, &target)?;
+        let translator = self.loader.load(&self.shared.plan, &target)?;
         self.install(generation, &target, translator);
         Ok(())
     }
@@ -412,7 +420,7 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
             slot.generation = slot.generation.wrapping_add(1);
             slot.generation
         };
-        *lock_write(&self.requested) = target.to_string();
+        *lock_write(&self.shared.requested) = target.to_string();
         generation
     }
 
@@ -424,7 +432,7 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
             let mut slot = self.lock_slot();
             slot.generation = slot.generation.wrapping_add(1);
         }
-        *lock_write(&self.requested) = String::new();
+        *lock_write(&self.shared.requested) = String::new();
     }
 
     /// Put the translator in place, if this request is still the current one.
@@ -443,9 +451,9 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
         slot.generation = generation;
         // Still under the slot, so a client cannot read a loaded translator whose
         // language and spec have not been written yet.
-        *lock_write(&self.live) = target.to_string();
-        *lock_write(&self.model_spec) = spec.clone();
-        *lock_write(&self.requested) = String::new();
+        *lock_write(&self.shared.live) = target.to_string();
+        *lock_write(&self.shared.model_spec) = spec.clone();
+        *lock_write(&self.shared.requested) = String::new();
         drop(slot);
         self.refresh_cached();
         log::info!("translate: writing {target} (translator {spec})");
@@ -466,10 +474,10 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
                 // Nothing to fall back on, so the step is off rather than on with
                 // no translator: `Enabled` must never claim work that cannot
                 // happen.
-                self.wanted.store(false, Ordering::Release);
+                self.shared.wanted.store(false, Ordering::Release);
             }
         }
-        *lock_write(&self.requested) = String::new();
+        *lock_write(&self.shared.requested) = String::new();
         self.refresh_cached();
         self.announce(false, message);
     }
@@ -492,8 +500,12 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
             .spawn(move || {
                 // Held across the load, so a superseded request waits its turn
                 // instead of building a second set of weights beside the first.
-                let _serialized = state.loading.lock().unwrap_or_else(|e| e.into_inner());
-                match state.loader.load(&state.plan, &target) {
+                let _serialized = state
+                    .shared
+                    .loading
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                match state.loader.load(&state.shared.plan, &target) {
                     Ok(translator) => {
                         state.install(generation, &target, translator);
                     }
@@ -524,10 +536,10 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
     /// and every refusal, which have no emitter to hand — through the hook
     /// [`Self::set_change_hook`] installed. Silent when none is installed.
     fn announce(&self, ok: bool, message: &str) {
-        let Some(hook) = self.on_change.get() else {
+        let Some(hook) = self.shared.on_change.get() else {
             return;
         };
-        let cached = lock_read(&self.cached);
+        let cached = lock_read(&self.shared.cached);
         hook(cached.enabled, &cached.target, &cached.model, ok, message);
     }
 
@@ -561,8 +573,8 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
         {
             let mut slot = self.lock_slot();
             slot.translator = None;
-            *lock_write(&self.live) = String::new();
-            *lock_write(&self.model_spec) = String::new();
+            *lock_write(&self.shared.live) = String::new();
+            *lock_write(&self.shared.model_spec) = String::new();
         }
         self.refresh_cached();
         self.announce(
@@ -577,17 +589,8 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
 impl<T, L: Clone> Clone for TranslationState<T, L> {
     fn clone(&self) -> Self {
         Self {
-            slot: Arc::clone(&self.slot),
-            wanted: Arc::clone(&self.wanted),
-            requested: Arc::clone(&self.requested),
-            target: Arc::clone(&self.target),
-            live: Arc::clone(&self.live),
-            model_spec: Arc::clone(&self.model_spec),
-            cached: Arc::clone(&self.cached),
-            plan: Arc::clone(&self.plan),
+            shared: Arc::clone(&self.shared),
             loader: self.loader.clone(),
-            loading: Arc::clone(&self.loading),
-            on_change: Arc::clone(&self.on_change),
         }
     }
 }
@@ -758,7 +761,7 @@ pub(super) mod fakes {
     /// Put a translator in the slot the way a successful load would, so every
     /// read below turns on a real occupant without any weights.
     pub(in crate::translate) fn with_fake_translator(s: &TestState, target: &str, spec: &str) {
-        *lock_write(&s.target) = target.to_string();
+        *lock_write(&s.shared.target) = target.to_string();
         seat(s, target, spec, || fake(spec));
     }
 
@@ -776,9 +779,9 @@ pub(super) mod fakes {
         let generation = slot.generation;
         slot.translator = Some(make());
         drop(slot);
-        *lock_write(&s.live) = target.to_string();
-        *lock_write(&s.model_spec) = spec.to_string();
-        s.wanted.store(true, Ordering::Release);
+        *lock_write(&s.shared.live) = target.to_string();
+        *lock_write(&s.shared.model_spec) = spec.to_string();
+        s.shared.wanted.store(true, Ordering::Release);
         assert!(
             s.install(generation, target, make()),
             "a current generation must install"
@@ -1168,7 +1171,7 @@ mod tests {
     fn a_failed_first_load_leaves_the_step_off() {
         let s = state("pl");
         let generation = s.begin_request("en");
-        s.wanted.store(true, Ordering::Release);
+        s.shared.wanted.store(true, Ordering::Release);
         s.fail_request(generation, "the decoder ran out of cache slots");
         assert!(
             !s.is_enabled(),
