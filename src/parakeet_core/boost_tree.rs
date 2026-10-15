@@ -1,5 +1,7 @@
-// Vendored verbatim from Murmure `src-tauri/src/engine/boost_tree.rs`
-// (AGPL-3.0-or-later): weighted Aho-Corasick phrase booster, no changes.
+// Vendored from Murmure `src-tauri/src/engine/boost_tree.rs`
+// (AGPL-3.0-or-later): weighted Aho-Corasick phrase booster. Local change:
+// `bias_into` checks a token for duplicates only against candidates from
+// deeper nodes (see its doc).
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
@@ -155,16 +157,22 @@ impl BoostTree {
     }
 
     /// Same as `bias`, but writes into the caller's buffer and reuses its
-    /// allocation. Candidate sets are small (the dictionary's live first
-    /// tokens), so a linear scan for an already-seen token beats a `HashMap`
-    /// per decode step.
+    /// allocation.
+    ///
+    /// One node's children are distinct tokens (they are `HashMap` keys), so
+    /// a token can only collide with a candidate from a deeper node visited
+    /// earlier on the chain: each node checks only those. At the root — the
+    /// common state, where every dictionary first-token is a candidate — that
+    /// is no check at all, instead of a scan of the candidates pushed so far
+    /// for every child.
     pub fn bias_into(&self, state: NodeId, result: &mut Vec<BiasCandidate>) {
         result.clear();
         let mut acc = 0.0;
         let mut cur = state;
         loop {
+            let deeper = result.len();
             for (&token, &child) in &self.nodes[cur].children {
-                if result.iter().any(|c| c.token == token) {
+                if result[..deeper].iter().any(|c| c.token == token) {
                     continue;
                 }
                 result.push(BiasCandidate {

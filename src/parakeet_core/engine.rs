@@ -109,17 +109,34 @@ fn top_k_threshold(logits: &[f32], k: usize) -> f32 {
     *kth
 }
 
-// Both boost gates (BOOST_TOP_K and BOOST_TOP_K_DEEP) from a single copy of
-// the logits into `scratch`. The second selection runs on the permuted
-// scratch, which does not change the k-th largest value.
-fn top_k_thresholds_with_scratch(logits: &[f32], scratch: &mut Vec<f32>) -> (f32, f32) {
-    if logits.is_empty() {
+// The boost gates the candidates need, BOOST_TOP_K (`tight`, for depths
+// below BOOST_DEEP_DEPTH) and BOOST_TOP_K_DEEP (`deep`), from a single copy of
+// the logits into `scratch`. A gate no candidate needs is not computed and
+// reads NEG_INFINITY: at the root every candidate is a first token, so only
+// `tight` is. The second selection runs on the permuted scratch, which does not
+// change the k-th largest value.
+fn top_k_thresholds_with_scratch(
+    logits: &[f32],
+    candidates: &[BiasCandidate],
+    scratch: &mut Vec<f32>,
+) -> (f32, f32) {
+    let needs_tight = candidates.iter().any(|c| c.depth < BOOST_DEEP_DEPTH);
+    let needs_deep = candidates.iter().any(|c| c.depth >= BOOST_DEEP_DEPTH);
+    if logits.is_empty() || !(needs_tight || needs_deep) {
         return (f32::NEG_INFINITY, f32::NEG_INFINITY);
     }
     scratch.clear();
     scratch.extend_from_slice(logits);
-    let tight = *select_kth_largest(scratch, BOOST_TOP_K);
-    let deep = *select_kth_largest(scratch, BOOST_TOP_K_DEEP);
+    let tight = if needs_tight {
+        *select_kth_largest(scratch, BOOST_TOP_K)
+    } else {
+        f32::NEG_INFINITY
+    };
+    let deep = if needs_deep {
+        *select_kth_largest(scratch, BOOST_TOP_K_DEEP)
+    } else {
+        f32::NEG_INFINITY
+    };
     (tight, deep)
 }
 
@@ -581,11 +598,14 @@ impl Joint<'_> {
                     }
                     boosted.copy_from_slice(vocab_logits);
                     if !candidates.is_empty() {
-                        let (tight, deep) =
-                            top_k_thresholds_with_scratch(vocab_logits, &mut topk_scratch);
+                        let (tight, deep) = top_k_thresholds_with_scratch(
+                            vocab_logits,
+                            &candidates,
+                            &mut topk_scratch,
+                        );
                         for cand in &candidates {
                             let idx = cand.token as usize;
-                            let threshold = if top_k_for_depth(cand.depth) == BOOST_TOP_K_DEEP {
+                            let threshold = if cand.depth >= BOOST_DEEP_DEPTH {
                                 deep
                             } else {
                                 tight
@@ -677,6 +697,35 @@ fn tdt_logits<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_k_thresholds_compute_only_the_gates_candidates_need() {
+        let logits: Vec<f32> = (0..40).map(|i| ((i * 7) % 40) as f32).collect();
+        let cand = |depth| BiasCandidate {
+            token: 0,
+            score: 1.0,
+            depth,
+        };
+        let mut scratch = Vec::new();
+        // The 5th and 20th largest of 0..40.
+        let (tight, deep) = (35.0, 20.0);
+        assert_eq!(
+            top_k_thresholds_with_scratch(
+                &logits,
+                &[cand(1), cand(BOOST_DEEP_DEPTH)],
+                &mut scratch
+            ),
+            (tight, deep)
+        );
+        assert_eq!(
+            top_k_thresholds_with_scratch(&logits, &[cand(1)], &mut scratch),
+            (tight, f32::NEG_INFINITY)
+        );
+        assert_eq!(
+            top_k_thresholds_with_scratch(&logits, &[cand(BOOST_DEEP_DEPTH)], &mut scratch),
+            (f32::NEG_INFINITY, deep)
+        );
+    }
 
     #[test]
     fn degressive_alpha_decays_with_word_count() {
