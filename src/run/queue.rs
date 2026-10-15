@@ -28,8 +28,17 @@ pub(super) fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f
     chunk.commit_all();
 }
 
-/// Drain complete frames from the utterance buffer into the VAD branch and
-/// the model branch, handing each closed utterance to `push` for emission.
+/// Drop every sample waiting in the ring without copying it anywhere: what a
+/// pause or a cue hold does with capture it must not transcribe.
+pub(super) fn discard_raw(raw_rx: &mut Consumer<f32>) {
+    if let Ok(chunk) = raw_rx.read_chunk(raw_rx.slots()) {
+        chunk.commit_all();
+    }
+}
+
+/// Feed every whole hw-rate frame in `accumulator` through `fp` (VAD branch
+/// and model branch), queueing each closed utterance under the live policy
+/// (`Backpressure::Drop`).
 /// Frames are consumed through a cursor and the remainder is compacted once
 /// at the end, instead of a `drain` per frame (which memmoved the whole
 /// remainder every time).
@@ -38,25 +47,24 @@ pub(super) fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f
 /// utterance in `partials` (latest wins), and a close drops the one waiting: its
 /// utterance is now a final in the queue.
 pub(super) fn drain_frames(
-    utterance_buffer: &mut Vec<f32>,
-    input_frames: usize,
+    accumulator: &mut Vec<f32>,
     fp: &mut FrameProcessor,
     asr_tx: &mut Producer<Utterance>,
-    push: fn(&mut Producer<Utterance>, Utterance),
     partials: &PartialSlot,
 ) {
+    let input_frames = fp.required_input_frames();
     let mut consumed = 0;
-    while utterance_buffer.len() - consumed >= input_frames {
-        let frame = &utterance_buffer[consumed..consumed + input_frames];
+    while accumulator.len() - consumed >= input_frames {
+        let frame = &accumulator[consumed..consumed + input_frames];
         if let Some(utterance) = fp.process_frame(frame) {
             partials.clear();
-            push(asr_tx, utterance);
+            push_utterance(asr_tx, utterance, Backpressure::Drop);
         } else if let Some(pcm) = fp.take_partial() {
             partials.put(pcm);
         }
         consumed += input_frames;
     }
-    utterance_buffer.drain(..consumed);
+    accumulator.drain(..consumed);
 }
 
 /// What a full ASR ring means, i.e. the one policy that differs between the
@@ -112,12 +120,6 @@ pub(super) fn push_utterance(
     }
 }
 
-/// Microphone-mode push, as a plain function pointer for `drain_frames`.
-/// File mode calls `push_utterance` with `Backpressure::Wait` directly.
-pub(super) fn push_live_utterance(asr_tx: &mut Producer<Utterance>, utterance: Utterance) {
-    push_utterance(asr_tx, utterance, Backpressure::Drop);
-}
-
 /// Occupied slots on the producer side (`Producer::slots` reports free).
 pub(super) fn producer_occupied<T>(tx: &Producer<T>, cap: usize) -> usize {
     cap.saturating_sub(tx.slots())
@@ -167,6 +169,21 @@ mod tests {
     }
 
     #[test]
+    fn discard_raw_empties_a_wrapped_ring() {
+        let (mut tx, mut rx) = RingBuffer::<f32>::new(8);
+        for s in 0..6 {
+            tx.push(s as f32).unwrap();
+        }
+        discard_raw(&mut rx);
+        for s in 6..12 {
+            tx.push(s as f32).unwrap();
+        }
+        discard_raw(&mut rx);
+        assert!(rx.is_empty());
+        assert_eq!(tx.slots(), 8);
+    }
+
+    #[test]
     fn drain_frames_consumes_whole_frames_and_keeps_the_remainder() {
         let cli = Cli::try_parse_from(["sttd"]).expect("defaults must parse");
         let mut fp = AcousticConfig::from_cli(&cli)
@@ -179,10 +196,8 @@ mod tests {
         let mut buffer = vec![0.0f32; input_frames * 2 + 7];
         drain_frames(
             &mut buffer,
-            input_frames,
             &mut fp,
             &mut asr_tx,
-            push_live_utterance,
             &crate::asr::PartialSlot::default(),
         );
         assert_eq!(buffer.len(), 7);

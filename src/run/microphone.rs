@@ -13,8 +13,8 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::queue::{
-    drain_frames, drain_raw_into, finish_run, producer_occupied, push_live_utterance,
-    push_utterance, Backpressure,
+    discard_raw, drain_frames, drain_raw_into, finish_run, producer_occupied, push_utterance,
+    Backpressure,
 };
 use super::setup::{
     asr_config, live_dictionary, make_emitter, open_metrics, prepare_model, start_translation,
@@ -201,8 +201,6 @@ struct InputPath {
     stream: cpal::Stream,
     fp: FrameProcessor,
     raw_rx: Consumer<f32>,
-    /// Raw hw-rate samples per 10 ms frame (`FrameProcessor::required_input_frames`).
-    input_frames: usize,
 }
 
 /// The capture loop's state: the input path, the utterance producer that
@@ -398,12 +396,11 @@ impl MicLoop<'_> {
     /// `discard_pending` hold itself was already taken on the rising edge, so no
     /// resampling or VAD happens in here.
     fn hold(&mut self) {
-        drain_raw_into(&mut self.input.raw_rx, &mut self.accumulator);
+        discard_raw(&mut self.input.raw_rx);
         self.accumulator.clear();
         if !self.input.raw_rx.is_abandoned() {
             thread::sleep(Duration::from_millis(50));
-            drain_raw_into(&mut self.input.raw_rx, &mut self.accumulator);
-            self.accumulator.clear();
+            discard_raw(&mut self.input.raw_rx);
         }
     }
 
@@ -415,7 +412,9 @@ impl MicLoop<'_> {
         // A full hw frame still isn't available: park briefly for the next
         // samples instead of busy-spinning. Same ~2 ms worst-case cadence
         // for the device/ASR checks.
-        if self.accumulator.len() < self.input.input_frames && !self.input.raw_rx.is_abandoned() {
+        if self.accumulator.len() < self.input.fp.required_input_frames()
+            && !self.input.raw_rx.is_abandoned()
+        {
             thread::sleep(Duration::from_millis(2));
             drain_raw_into(&mut self.input.raw_rx, &mut self.accumulator);
         }
@@ -430,10 +429,8 @@ impl MicLoop<'_> {
     fn drain_accumulated(&mut self) {
         drain_frames(
             &mut self.accumulator,
-            self.input.input_frames,
             &mut self.input.fp,
             &mut self.asr_tx,
-            push_live_utterance,
             &self.partials,
         );
     }
@@ -483,11 +480,10 @@ impl MicLoop<'_> {
             return;
         }
         self.input.fp.discard_pending();
-        drain_raw_into(&mut self.input.raw_rx, &mut self.accumulator);
+        discard_raw(&mut self.input.raw_rx);
         self.accumulator.clear();
         thread::sleep(Duration::from_millis(crate::sound::CUE_QUIET_MS));
-        drain_raw_into(&mut self.input.raw_rx, &mut self.accumulator);
-        self.accumulator.clear();
+        discard_raw(&mut self.input.raw_rx);
     }
 
     /// The loop has stopped: cut the spoken channel, stop capture, flush what
@@ -513,7 +509,6 @@ impl MicLoop<'_> {
             stream,
             mut fp,
             mut raw_rx,
-            input_frames,
             ..
         } = input;
 
@@ -522,14 +517,7 @@ impl MicLoop<'_> {
         // below only for full frames already accumulated.
         drop(stream);
         drain_raw_into(&mut raw_rx, &mut accumulator);
-        drain_frames(
-            &mut accumulator,
-            input_frames,
-            &mut fp,
-            &mut asr_tx,
-            push_live_utterance,
-            &partials,
-        );
+        drain_frames(&mut accumulator, &mut fp, &mut asr_tx, &partials);
         // Flush trailing speech, then wait for the ASR thread to finish with it
         // (and any earlier backlog) before the process exits, so an in-flight
         // CUDA op cannot race process teardown the same way an early `?` used to.
@@ -617,12 +605,10 @@ fn open_input_path(
         telemetry,
     )?;
     stream.play().context("failed to start input stream")?;
-    let input_frames = fp.required_input_frames();
     Ok(InputPath {
         hw_rate,
         stream,
         fp,
         raw_rx,
-        input_frames,
     })
 }
