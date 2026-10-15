@@ -240,22 +240,9 @@ impl PiperVoice {
         // treated as working from the first utterance on.
         espeak_available(&config.espeak.voice)?;
 
-        // `ort`'s builder errors are its own type rather than `anyhow`-friendly,
-        // so each step is mapped with a message instead of `.context()`. The
-        // settings mirror `parakeet_core`'s sessions: one intra-op thread count,
-        // no parallel execution, no memory pattern.
-        let session = Session::builder()
-            .map_err(ort_err("failed to build the piper session builder"))?
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            .map_err(ort_err("failed to set the piper optimization level"))?
-            .with_intra_threads(intra_threads.max(1))
-            .map_err(ort_err("failed to set the piper thread count"))?
-            .with_inter_threads(1)
-            .map_err(ort_err("failed to set the piper inter-op thread count"))?
-            .with_memory_pattern(false)
-            .map_err(ort_err("failed to set the piper memory pattern"))?
-            .with_parallel_execution(false)
-            .map_err(ort_err("failed to set the piper parallel execution"))?
+        // The settings every `ort` session shares (`device::session_builder`).
+        let session = crate::device::session_builder(intra_threads)
+            .map_err(|e| anyhow::anyhow!("failed to configure the piper session: {e:?}"))?
             .commit_from_file(&voice.onnx)
             .with_context(|| format!("failed to load {}", voice.onnx.display()))?;
         let inputs = resolve_input_names(&session)?;
@@ -361,16 +348,6 @@ impl PiperVoice {
         }
         audio.ok_or_else(|| anyhow::anyhow!("piper graph returned no output"))
     }
-}
-
-/// Attach a message to an `ort` builder error.
-///
-/// `ort::Error<T>` is parameterized by the value the failed call would have
-/// returned, and each step of the builder chain fails with a different one, so
-/// this is generic over `T` rather than a single closure that would only fit the
-/// first `map_err`.
-fn ort_err<T>(what: &'static str) -> impl Fn(ort::Error<T>) -> anyhow::Error {
-    move |e| anyhow::anyhow!("{what}: {e:?}")
 }
 
 /// Match the graph's input names rather than assuming them.

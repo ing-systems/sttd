@@ -16,7 +16,6 @@
 use ndarray17::{Array, Array1, Array2, ArrayD, ArrayViewD, IxDyn};
 use once_cell::sync::Lazy;
 use ort::inputs;
-use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
 use ort::value::TensorRef;
 use regex::Regex;
@@ -359,24 +358,11 @@ impl ParakeetModel {
         // describe is where a session goes and which file it loads.
         let build = |device| -> Result<Session, ParakeetError> {
             Ok(
-                crate::device::apply(Self::session_builder(intra_threads)?, device)
+                crate::device::apply(crate::device::session_builder(intra_threads)?, device)
                     .commit_from_file(&model_path)?,
             )
         };
         crate::device::commit_with_cpu_fallback(device, &format!("parakeet {model_name}"), build)
-    }
-
-    /// The ORT settings every parakeet session shares. Kept apart from
-    /// [`Self::init_session`] because the provider is attached afterwards by
-    /// `crate::device::apply`, and because the CPU retry needs a fresh builder:
-    /// committing one consumes it.
-    fn session_builder(intra_threads: usize) -> Result<SessionBuilder, ParakeetError> {
-        Ok(Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(intra_threads)?
-            .with_inter_threads(1)?
-            .with_memory_pattern(false)?
-            .with_parallel_execution(false)?)
     }
 
     fn load_vocab<P: AsRef<Path>>(model_dir: P) -> Result<(Vec<String>, i32), ParakeetError> {

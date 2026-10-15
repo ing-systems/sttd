@@ -664,38 +664,17 @@ fn use_cache_branch_tensor(use_cache: bool) -> ort::Result<Tensor<bool>> {
     Tensor::from_array((USE_CACHE_BRANCH_SHAPE, vec![use_cache]))
 }
 
-/// A CPU session with the settings the piper voice uses.
-///
-/// `ort`'s builder errors are its own type rather than `anyhow`-friendly, so
-/// each step is mapped with a message instead of `.context()`.
+/// A CPU session with the settings every `ort` session shares
+/// (`device::session_builder`).
 fn cpu_session(
     path: &std::path::Path,
     intra_threads: usize,
     what: &'static str,
 ) -> Result<Session> {
-    Session::builder()
-        .map_err(ort_err(what, "build the session builder"))?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-        .map_err(ort_err(what, "set the optimization level"))?
-        .with_intra_threads(intra_threads.max(1))
-        .map_err(ort_err(what, "set the thread count"))?
-        .with_inter_threads(1)
-        .map_err(ort_err(what, "set the inter-op thread count"))?
-        .with_memory_pattern(false)
-        .map_err(ort_err(what, "set the memory pattern"))?
-        .with_parallel_execution(false)
-        .map_err(ort_err(what, "set parallel execution"))?
+    crate::device::session_builder(intra_threads)
+        .map_err(|e| anyhow::anyhow!("failed to configure the {what} session: {e:?}"))?
         .commit_from_file(path)
         .with_context(|| format!("failed to load {}", path.display()))
-}
-
-/// Attach a message to an `ort` builder error.
-///
-/// `ort::Error<T>` is parameterized by the value the failed call would have
-/// returned, and each step of the builder chain fails with a different one, so
-/// this is generic over `T`.
-fn ort_err<T>(what: &'static str, step: &'static str) -> impl Fn(ort::Error<T>) -> anyhow::Error {
-    move |e| anyhow::anyhow!("failed to {step} for the {what}: {e:?}")
 }
 
 /// Fail at load, with the path, when the graph does not take `name`.

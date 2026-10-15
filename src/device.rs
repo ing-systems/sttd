@@ -11,7 +11,7 @@
 //! `Gpu` variant stays in the enum (callers match on it) but nothing can
 //! produce it, and [`apply`] hands back the builder unchanged.
 
-use ort::session::builder::SessionBuilder;
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 
 use crate::config::DEFAULT_THREADS;
 
@@ -169,6 +169,24 @@ where
         }
         Err(e) => Err(e),
     }
+}
+
+/// The CPU settings every `ort` session in sttd starts from — both speech
+/// engines, the translator and the piper voice: Level3 graph optimization,
+/// `intra_threads` intra-op threads, one inter-op thread, no memory pattern,
+/// no parallel execution. One place, so `--threads` means the same thing for
+/// every model (`whisper_core::engine::init_session` records the measurements
+/// behind leaving the other knobs alone).
+///
+/// The execution provider is not attached here: [`apply`] does that, after,
+/// because a CPU retry needs a fresh builder and committing one consumes it.
+pub(crate) fn session_builder(intra_threads: usize) -> ort::Result<SessionBuilder> {
+    Ok(ort::session::Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_intra_threads(intra_threads.max(1))?
+        .with_inter_threads(1)?
+        .with_memory_pattern(false)?
+        .with_parallel_execution(false)?)
 }
 
 /// Query physical cores for `--threads 0` (auto). Falls back to

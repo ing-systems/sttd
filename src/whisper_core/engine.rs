@@ -34,7 +34,7 @@ use std::path::Path;
 
 use ndarray17::{Array2, ArrayD};
 use ort::inputs;
-use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
+use ort::session::builder::SessionBuilder;
 use ort::session::Session;
 use ort::value::TensorRef;
 use tokenizers::Tokenizer;
@@ -491,10 +491,10 @@ fn verify_token_ids(tokenizer: &Tokenizer) -> Result<(), WhisperError> {
 
 /// One `ort` session with sttd's fixed CPU settings.
 ///
-/// Deliberately the same configuration `parakeet_core::engine::init_session`
-/// uses (Level3 graph optimization, fixed intra/inter thread counts, no memory
-/// pattern, no parallel execution): the two engines then get the same
-/// treatment, and `--threads` means the same thing for both.
+/// The configuration is `crate::device::session_builder`, the one every `ort`
+/// session in sttd uses (Level3 graph optimization, fixed intra/inter thread
+/// counts, no memory pattern, no parallel execution): the engines then get the
+/// same treatment, and `--threads` means the same thing for all of them.
 ///
 /// Every knob here was measured, and none of them is worth turning. Against a
 /// 30-token utterance on a 16-core 9950X (median of three, `--threads 16`,
@@ -546,17 +546,13 @@ fn init_session(
     )
 }
 
-/// The settings every Whisper session shares (see `init_session`).
+/// A builder with sttd's shared session settings (`crate::device::session_builder`)
+/// and `device`'s execution provider attached (see `init_session`).
 pub(super) fn session_builder(
     intra_threads: usize,
     device: Device,
 ) -> Result<SessionBuilder, WhisperError> {
-    let builder = Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_intra_threads(intra_threads)?
-        .with_inter_threads(1)?
-        .with_memory_pattern(false)?
-        .with_parallel_execution(false)?;
+    let builder = crate::device::session_builder(intra_threads)?;
     Ok(crate::device::apply(builder, device))
 }
 
