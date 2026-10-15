@@ -474,6 +474,18 @@ pub(crate) fn prepare_voice(input: &str) -> Result<VoiceRef> {
     Ok(voice)
 }
 
+/// The language part of a piper voice key (`pl_PL-...`, `en_US-...`), which is
+/// the only place a piper voice states its language. Split out so the rule is
+/// testable without a voice or a translator.
+pub(crate) fn voice_language(key: &str) -> Option<&str> {
+    let key = key.trim();
+    if key.contains('/') || key.contains('\\') {
+        return None;
+    }
+    let lang = key.split(['_', '-']).next()?;
+    (!lang.is_empty()).then_some(lang)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +787,17 @@ mod tests {
             voice_dir("pl_PL-gosia-medium"),
             voice_dir("parakeet-ultra-int8")
         );
+    }
+
+    #[test]
+    fn a_voice_key_states_its_language_and_a_path_states_nothing() {
+        assert_eq!(voice_language("pl_PL-gosia-medium"), Some("pl"));
+        assert_eq!(voice_language("en_US-amy-medium"), Some("en"));
+        assert_eq!(voice_language("de_DE-thorsten"), Some("de"));
+        // A path is a directory, not a key: no language to compare against.
+        assert_eq!(voice_language("/opt/voices/amy"), None);
+        assert_eq!(voice_language("C:\\voices\\amy"), None);
+        // Nothing before the first separator.
+        assert_eq!(voice_language("-medium"), None);
     }
 }

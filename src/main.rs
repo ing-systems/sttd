@@ -548,8 +548,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // a row for every utterance it does not hand over and the thread writes the
     // rows whose `text` column is a translation.
     let metrics = metrics::MetricsSlot::new(metrics::open_metrics_log(cli.metrics.as_deref()));
-    let translation_state =
-        TranslationState::new(TranslationPlan::from_cli(cli), translate::RealTranslator);
+    let translation_state = TranslationState::new(translation_plan(cli), translate::RealTranslator);
     // With `--translate`, the translator is loaded here, on the main thread,
     // before the worker starts: it is ~114 MiB of weights and a setup problem
     // (no file, no write access) that should fail fast rather than on the first
@@ -1012,8 +1011,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     // here, so nothing can switch it later: the lane exists only when a
     // translator did, and the worker emits inline when it does not.
     let metrics = metrics::MetricsSlot::new(metrics::open_metrics_log(cli.metrics.as_deref()));
-    let translation_state =
-        TranslationState::new(TranslationPlan::from_cli(cli), translate::RealTranslator);
+    let translation_state = TranslationState::new(translation_plan(cli), translate::RealTranslator);
     translation_state.load_startup()?;
     let translation = translation_state.is_loaded().then(|| {
         TranslationOut::spawn(
@@ -1179,6 +1177,19 @@ fn run_paste_last(cli: &Cli) -> Result<()> {
     crate::emit::paste_via_ydotool(cli.paste_mode)
         .context("paste-last: ydotool failed (is ydotoold running?)")?;
     Ok(())
+}
+
+/// The run's translation settings, read out of the flags. See
+/// `translate::PlanFlags` for what each one is.
+fn translation_plan(cli: &Cli) -> TranslationPlan {
+    TranslationPlan::from_flags(translate::PlanFlags {
+        translate: cli.translate.as_deref(),
+        translate_model: cli.translate_model.as_deref(),
+        language: cli.language(),
+        intra_threads: resolve_n_threads(cli.threads, auto_threads()).max(1) as usize,
+        voice: cli.speak.then(|| cli.voice.clone()),
+        runtime_requests: !cli.no_dbus && cli.file.is_none(),
+    })
 }
 
 /// Load `--dictionary` once at startup. A broken path warns and disables

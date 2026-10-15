@@ -1256,16 +1256,25 @@ pub(crate) struct TranslationPlan {
     voice: Option<String>,
 }
 
+/// The flags a [`TranslationPlan`] is read from, as `main` resolves them. Kept
+/// apart from `Cli` so this module never depends on the command line.
+pub(crate) struct PlanFlags<'a> {
+    /// `--translate`, verbatim.
+    pub(crate) translate: Option<&'a str>,
+    /// `--translate-model`, verbatim.
+    pub(crate) translate_model: Option<&'a str>,
+    /// The language the engine is told to decode in (`--language` or the locale).
+    pub(crate) language: crate::language::Language,
+    /// `--threads`, already resolved (`0` = auto has been answered).
+    pub(crate) intra_threads: usize,
+    /// `--voice`, only under `--speak`.
+    pub(crate) voice: Option<String>,
+    /// Whether this run has any way to ask for a translation other than
+    /// `--translate`: the session bus in microphone mode.
+    pub(crate) runtime_requests: bool,
+}
+
 impl TranslationPlan {
-    /// The warnings are the startup ones: a `--translate` with no code cannot name
-    /// a direction, and a `--translate-model` with nothing asking for a
-    /// translation downloads nothing.
-    ///
-    /// The second is only *unused* when no one can ask at runtime, which is why the
-    /// session bus counts as an asker: the override now applies to a
-    /// `SetTargetLanguage` too, not only to a `--translate` named at startup. So
-    /// `--translate-model` on its own warns under `--no-dbus` and in file mode, and
-    /// stays quiet in microphone mode with the bus, where it does something.
     /// A plan for a test: one named source, no override, nothing configured and no
     /// load. Every direction it can resolve is a catalog lookup, so a bus test
     /// exercises the refusals without weights and without a network.
@@ -1305,28 +1314,36 @@ impl TranslationPlan {
 
     /// Read the plan out of the flags, warning about the combinations that
     /// cannot work. See the type for what each field is.
-    pub(crate) fn from_cli(cli: &crate::cli::Cli) -> Self {
-        let configured = cli
+    ///
+    /// The warnings are the startup ones: a `--translate` with no code cannot name
+    /// a direction, and a `--translate-model` with nothing asking for a
+    /// translation downloads nothing.
+    ///
+    /// The second is only *unused* when no one can ask at runtime, which is why the
+    /// session bus counts as an asker: the override now applies to a
+    /// `SetTargetLanguage` too, not only to a `--translate` named at startup. So
+    /// `--translate-model` on its own warns under `--no-dbus` and in file mode, and
+    /// stays quiet in microphone mode with the bus, where it does something.
+    pub(crate) fn from_flags(flags: PlanFlags<'_>) -> Self {
+        let configured = flags
             .translate
-            .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(|t| t.to_ascii_lowercase());
-        let model = cli
+        let model = flags
             .translate_model
-            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         if configured.is_none() {
-            if cli.translate.is_some() {
+            if flags.translate.is_some() {
                 log::warn!("--translate needs a language code (e.g. en); the step is off");
             }
-            if model.is_some() && !can_ask_at_runtime(cli) {
+            if model.is_some() && !flags.runtime_requests {
                 log::warn!("--translate-model is ignored without --translate");
             }
         }
-        let source = match cli.language() {
+        let source = match flags.language {
             crate::language::Language::Explicit(code) | crate::language::Language::System(code) => {
                 Some(code)
             }
@@ -1336,12 +1353,8 @@ impl TranslationPlan {
             source,
             model,
             configured,
-            intra_threads: crate::device::resolve_n_threads(
-                cli.threads,
-                crate::device::auto_threads(),
-            )
-            .max(1) as usize,
-            voice: cli.speak.then(|| cli.voice.clone()),
+            intra_threads: flags.intra_threads,
+            voice: flags.voice,
         }
     }
 
@@ -1358,12 +1371,6 @@ impl TranslationPlan {
     fn source_label(&self) -> &str {
         self.source.as_deref().unwrap_or("auto")
     }
-}
-
-/// Whether this run has any way to ask for a translation other than `--translate`:
-/// the session bus in microphone mode.
-fn can_ask_at_runtime(cli: &crate::cli::Cli) -> bool {
-    !cli.no_dbus && cli.file.is_none()
 }
 
 /// Resolve, download and load the translator for `target`, on the calling thread.
@@ -1422,24 +1429,12 @@ fn log_translator_direction(prepared: &Prepared, target: &str) {
 /// leave a stale copy in a warning.
 const NLLB_SPEC_IN_LOG: &str = crate::translator_store::NLLB_SPEC;
 
-/// The language part of a piper voice key (`pl_PL-...`, `en_US-...`), which is
-/// the only place a piper voice states its language. Split out so the rule is
-/// testable without a voice or a translator.
-pub(crate) fn voice_language(key: &str) -> Option<&str> {
-    let key = key.trim();
-    if key.contains('/') || key.contains('\\') {
-        return None;
-    }
-    let lang = key.split(['_', '-']).next()?;
-    (!lang.is_empty()).then_some(lang)
-}
-
 /// Warn when the `--speak` voice speaks a different language than the one being
 /// written to the clipboard. Not an error: a translation can still be read aloud
 /// in the wrong language, which is bad but not fatal, and the user may know
 /// their voice speaks it.
 fn warn_on_voice_language_mismatch(voice: &str, target: &str) {
-    let Some(voice_lang) = voice_language(voice) else {
+    let Some(voice_lang) = crate::voice_store::voice_language(voice) else {
         return;
     };
     if voice_lang.eq_ignore_ascii_case(target) {
@@ -3100,18 +3095,6 @@ mod tests {
         assert_eq!(target, s.target_language());
         assert_eq!(requested, s.requested_language());
         assert_eq!(model, s.model());
-    }
-
-    #[test]
-    fn a_voice_key_states_its_language_and_a_path_states_nothing() {
-        assert_eq!(voice_language("pl_PL-gosia-medium"), Some("pl"));
-        assert_eq!(voice_language("en_US-amy-medium"), Some("en"));
-        assert_eq!(voice_language("de_DE-thorsten"), Some("de"));
-        // A path is a directory, not a key: no language to compare against.
-        assert_eq!(voice_language("/opt/voices/amy"), None);
-        assert_eq!(voice_language("C:\\voices\\amy"), None);
-        // Nothing before the first separator.
-        assert_eq!(voice_language("-medium"), None);
     }
 
     #[test]
