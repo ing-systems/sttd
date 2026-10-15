@@ -65,8 +65,6 @@ pub(crate) struct SpeechDetector {
     /// with `false` (silence) so the very first windows get flicker
     /// protection too, and reset to the same on pause.
     window_history: [bool; MEDIAN_WINDOWS],
-    /// Last earshot score, for hysteresis across windows.
-    last_score: f32,
     /// Warm background estimate: survives `reset()` on purpose (see below).
     noise: crate::noise::NoiseTracker,
     adapt: bool,
@@ -81,7 +79,6 @@ impl SpeechDetector {
             in_speech: false,
             raw_speech: false,
             window_history: [false; MEDIAN_WINDOWS],
-            last_score: 0.0,
             noise: crate::noise::NoiseTracker::new(),
             adapt,
         }
@@ -116,19 +113,20 @@ impl SpeechDetector {
     pub(crate) fn verdict(&mut self, frame_16k: &[f32], frame_rms: f32) -> bool {
         self.staging.extend_from_slice(frame_16k);
 
+        // The floor only moves after the loop, so the thresholds hold for
+        // every window this frame completes.
+        let (enter, exit) = if self.adapt {
+            (
+                self.noise.enter_threshold(self.threshold),
+                self.noise.exit_threshold(self.threshold),
+            )
+        } else {
+            (self.threshold, self.threshold)
+        };
         let mut consumed = 0;
         while self.staging.len() - consumed >= EARSHOT_WINDOW {
             let window = &self.staging[consumed..consumed + EARSHOT_WINDOW];
             let score = self.detector.predict_f32(window);
-            self.last_score = score;
-            let (enter, exit) = if self.adapt {
-                (
-                    self.noise.enter_threshold(self.threshold),
-                    self.noise.exit_threshold(self.threshold),
-                )
-            } else {
-                (self.threshold, self.threshold)
-            };
             let raw = if self.raw_speech {
                 score >= exit
             } else {
@@ -178,7 +176,6 @@ impl SpeechDetector {
         self.in_speech = false;
         self.raw_speech = false;
         self.window_history = [false; MEDIAN_WINDOWS];
-        self.last_score = 0.0;
     }
 }
 

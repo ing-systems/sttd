@@ -218,7 +218,7 @@ impl UtteranceBuffer {
     /// Test-only in production (`FrameProcessor` calls `push_frame_evidenced`
     /// directly), kept as the ergonomic entry point for the many tests below
     /// that don't care about the AGC distinction.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn push_frame(&mut self, frame: &[f32], is_speech: bool) -> FrameAction {
         let rms = frame_rms(frame);
         self.push_frame_evidenced(frame, is_speech, rms, rms)

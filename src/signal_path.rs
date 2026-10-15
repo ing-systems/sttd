@@ -56,9 +56,6 @@ pub(crate) struct SignalPath {
     /// holds less than one frame in `Direct`, and in `Denoised` whatever the
     /// model branch ran ahead of the VAD branch.
     model16: Vec<f32>,
-    fed_chunks: u64,
-    paired_frames: u64,
-    max_pending: usize,
 }
 
 /// The VAD branch's signal path, chosen once at startup from `--denoiser`
@@ -138,9 +135,6 @@ impl SignalPath {
         Ok(Self {
             vad_path,
             model16: Vec::new(),
-            fed_chunks: 0,
-            paired_frames: 0,
-            max_pending: 0,
         })
     }
 
@@ -156,21 +150,12 @@ impl SignalPath {
         }
     }
 
-    /// Totals for lockstep monitoring: `(fed_chunks, paired_frames,
-    /// max_pending)`. `max_pending` is the most whole frames either branch
-    /// held before pairing. Test-only reader; prod uses `pending_depths`.
-    #[allow(dead_code)]
-    pub(crate) const fn stats(&self) -> (u64, u64, usize) {
-        (self.fed_chunks, self.paired_frames, self.max_pending)
-    }
-
     /// Feed one raw hw-rate chunk and hand every completed pair to `on_pair`,
     /// in order. Each branch's `FirStream` may complete zero, one, or (on
     /// catch-up) several 10 ms frames per call; a branch running ahead waits
     /// in its buffer. Both average 100 frames/s, so that stays at a frame or
     /// two.
     pub(crate) fn feed(&mut self, frame_hw_raw: &[f32], on_pair: impl FnMut(PairedFrames<'_>)) {
-        self.fed_chunks += 1;
         self.run(Some(frame_hw_raw), on_pair);
     }
 
@@ -185,14 +170,8 @@ impl SignalPath {
     /// then high-pass and hand out every completed pair. `input` is `None`
     /// for `flush`.
     fn run(&mut self, input: Option<&[f32]>, mut on_pair: impl FnMut(PairedFrames<'_>)) {
-        let Self {
-            vad_path,
-            model16,
-            paired_frames,
-            max_pending,
-            ..
-        } = self;
-        let paired = match vad_path {
+        let Self { vad_path, model16 } = self;
+        match vad_path {
             VadPath::Direct { resampler, hp } => {
                 resample(resampler, input, model16);
                 let whole = model16.len() / FRAME_16K * FRAME_16K;
@@ -201,8 +180,6 @@ impl SignalPath {
                     on_pair(PairedFrames::Shared(frame));
                 }
                 model16.drain(..whole);
-                *max_pending = (*max_pending).max(whole / FRAME_16K);
-                whole / FRAME_16K
             }
             #[cfg(feature = "denoise")]
             VadPath::Denoised {
@@ -230,9 +207,6 @@ impl SignalPath {
                 }
                 resample(resampler_model, input, model16);
                 let frames = (vad16.len() / FRAME_16K).min(model16.len() / FRAME_16K);
-                *max_pending = (*max_pending)
-                    .max(vad16.len() / FRAME_16K)
-                    .max(model16.len() / FRAME_16K);
                 let whole = frames * FRAME_16K;
                 for (vad, model) in vad16[..whole]
                     .chunks_exact_mut(FRAME_16K)
@@ -244,21 +218,15 @@ impl SignalPath {
                 }
                 vad16.drain(..whole);
                 model16.drain(..whole);
-                frames
             }
-        };
-        *paired_frames += paired as u64;
+        }
     }
 
     /// Drop in-flight audio: unpaired output + resampler partial-chunk
     /// state, so the first frames after resume aren't blended from pre-pause
-    /// audio. Idempotent. Also resets pairing counters so post-resume
-    /// `stats()` start clean.
+    /// audio. Idempotent.
     pub(crate) fn clear(&mut self) {
         self.model16.clear();
-        self.fed_chunks = 0;
-        self.paired_frames = 0;
-        self.max_pending = 0;
         match &mut self.vad_path {
             VadPath::Direct { resampler, hp } => {
                 resampler.clear();
@@ -487,16 +455,19 @@ mod tests {
     }
 
     #[test]
-    fn counters_track_feed_and_pair_in_lockstep() {
+    fn feed_and_pair_stay_in_lockstep() {
         for hw in [16_000, 44_100, 48_000] {
             let mut signal = SignalPath::new(hw, DenoiserKind::Bypass).unwrap();
             let hw_chunk = hw_input_frames(hw);
             let silence = vec![0.0f32; hw_chunk];
+            let (mut paired, mut max_pending) = (0, 0);
             for _ in 0..200 {
-                let _ = feed(&mut signal, &silence);
+                // In `Direct` every whole frame a feed completes is paired
+                // in that same call, so its pair count is the burst size.
+                let burst = feed(&mut signal, &silence).len();
+                paired += burst;
+                max_pending = max_pending.max(burst);
             }
-            let (fed, paired, max_pending) = signal.stats();
-            assert_eq!(fed, 200, "hw={hw}");
             // FIR delay shifts the count by a few frames, same
             // tolerance as `branches_stay_in_lockstep`.
             assert!(
@@ -516,12 +487,11 @@ mod tests {
     }
 
     #[test]
-    fn clear_resets_counters() {
+    fn clear_empties_pending_frames() {
         let mut signal = SignalPath::new(48_000, DenoiserKind::Bypass).unwrap();
         let hw_chunk = hw_input_frames(48_000);
         let _ = feed(&mut signal, &vec![0.1f32; hw_chunk]);
         signal.clear();
-        assert_eq!(signal.stats(), (0, 0, 0));
         assert_eq!(signal.pending_depths(), (0, 0));
         assert_eq!(SIGNAL_PENDING_WARN, 8);
     }
