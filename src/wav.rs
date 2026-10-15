@@ -20,7 +20,9 @@ pub(crate) fn write_wav_mono16(path: &Path, pcm_f32: &[f32], sample_rate: u32) -
     // `WavWriter::create`'s umask default. `create` would also clobber an
     // existing file's mode; opening first preserves nothing — a pre-existing
     // path is truncated with fresh restricted perms, same as the TXT dumps.
-    let file = owner_only_file(path)?;
+    // `WavWriter::new` doesn't buffer (only `create` does), so wrap the file:
+    // otherwise every sample is its own 2-byte write syscall.
+    let file = std::io::BufWriter::new(owner_only_file(path)?);
     let mut writer = hound::WavWriter::new(file, spec)
         .with_context(|| format!("failed to create {}", path.display()))?;
     for &s in pcm_f32 {
