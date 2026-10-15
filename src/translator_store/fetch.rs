@@ -3,9 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::config::{DEFAULT_MODELS_DIR, NLLB_REPO, OPUS_MT_REPO, TRANSLATORS_SUBDIR};
+use crate::download::Target;
 
 use super::catalog::NLLB_SPEC;
 use super::TranslatorRef;
@@ -132,33 +133,16 @@ pub(super) fn ensure_available(t: &TranslatorRef) -> Result<()> {
         }
         return Ok(());
     }
-    std::fs::create_dir_all(&t.dir).with_context(|| install_hint(&t.dir))?;
-    for (repo_path, file_name) in &t.assets {
-        let dest = t.dir.join(file_name);
-        if dest.exists() {
-            continue;
-        }
-        let url = asset_url(&t.spec, repo_path);
-        log::info!(
-            "translator file not found at {}, downloading {url}...",
-            dest.display()
-        );
-        crate::model_store::download(&url, &dest)
-            .with_context(|| format!("{file_name}: {}", install_hint(&t.dir)))?;
-    }
-    Ok(())
-}
-
-/// What to say when a translator has to be fetched into a directory that is
-/// not writable — the usual case being a packaged install's root-owned models
-/// directory, where only the bundled speech model is present. Same wording as
-/// the voice path, because the cause and the fix are identical.
-fn install_hint(dir: &Path) -> String {
-    format!(
-        "cannot prepare translator directory {} (packaged model dirs are \
-         root-owned: install the sttd package, run once with sudo, or point \
-         --translate-model at a writable directory)",
-        dir.display()
+    crate::download::fetch_missing(
+        &Target {
+            dir: &t.dir,
+            kind: "translator",
+            flag: "--translate-model",
+            file_noun: "translator file",
+        },
+        t.assets
+            .iter()
+            .map(|(repo_path, file_name)| (asset_url(&t.spec, repo_path), *file_name)),
     )
 }
 

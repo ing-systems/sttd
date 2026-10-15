@@ -85,6 +85,7 @@ mod daemon;
 mod dbus;
 mod denoise;
 mod dictionary;
+mod download;
 mod dsp;
 mod emit;
 mod metrics;

@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::config::{
     DEFAULT_MODELS_DIR, PARAKEET_DEFAULT_SPEC, PARAKEET_TOKENIZER_URL, WHISPER_DEFAULT_SPEC,
 };
+use crate::download::Target;
 
 /// Which engine a resolved `--model` value selects. Both engines load from a
 /// directory of files, but the file names differ, so a directory the user
@@ -453,37 +454,20 @@ fn ensure_available_for(
         }
         return Ok(());
     }
-    std::fs::create_dir_all(dir).with_context(|| install_hint(dir))?;
     let spec = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    for file in assets {
-        let dest = dir.join(file);
-        if dest.exists() {
-            continue;
-        }
-        let url = asset_url(kind, &spec, file);
-        log::info!(
-            "model not found at {}, downloading {url}...",
-            dest.display()
-        );
-        download(&url, &dest).with_context(|| format!("{file}: {}", install_hint(dir)))?;
-    }
-    Ok(())
-}
-
-/// What to say when a catalog model has to be fetched into a directory that
-/// isn't writable — the usual case being `DEFAULT_MODELS_DIR` baked to the
-/// root-owned `/usr/share/sttd/models` of a packaged install, where only the
-/// bundled default model is present. Keeps the raw `EACCES` from
-/// `create_dir_all`/`File::create` from being the whole story.
-fn install_hint(dir: &Path) -> String {
-    format!(
-        "cannot prepare model directory {} (packaged model dirs are root-owned: \
-         install the sttd package, run once with sudo, or point --model at a \
-         writable directory)",
-        dir.display()
+    crate::download::fetch_missing(
+        &Target {
+            dir,
+            kind: "model",
+            flag: "--model",
+            file_noun: "model",
+        },
+        assets
+            .iter()
+            .map(|file| (asset_url(kind, &spec, file), *file)),
     )
 }
 
@@ -542,102 +526,6 @@ fn asset_url(kind: EngineKind, spec: &str, file_name: &str) -> String {
         EngineKind::Parakeet => parakeet_asset_url(spec, file_name),
         EngineKind::Whisper => whisper_asset_url(spec, file_name),
     }
-}
-
-/// One-line download progress for stderr, e.g.
-/// `[==============>               ]  45.2% (360.0/800.0 MiB)`.
-/// Without a total it degrades to `123.4 MiB downloaded...`.
-pub(crate) fn format_download_progress(downloaded: u64, total: Option<u64>) -> String {
-    const WIDTH: usize = 30;
-    const MIB: f64 = 1_048_576.0;
-    match total {
-        Some(t) if t > 0 => {
-            let frac = (downloaded as f64 / t as f64).clamp(0.0, 1.0);
-            let filled = (frac * WIDTH as f64) as usize;
-            let mut bar = String::with_capacity(WIDTH + 2);
-            bar.push('[');
-            for i in 0..WIDTH {
-                if i < filled {
-                    bar.push('=');
-                } else if i == filled {
-                    bar.push('>');
-                } else {
-                    bar.push(' ');
-                }
-            }
-            bar.push(']');
-            format!(
-                "{bar} {:5.1}% ({:.1}/{:.1} MiB)",
-                frac * 100.0,
-                downloaded as f64 / MIB,
-                t as f64 / MIB
-            )
-        }
-        _ => format!("{:.1} MiB downloaded...", downloaded as f64 / MIB),
-    }
-}
-
-/// Note: no resume support — an interrupted download restarts from zero on
-/// the next `ensure_available` call (`.part` is recreated with
-/// `File::create` every attempt). This bites on the 619 MiB encoder; not
-/// fixed here.
-pub(crate) fn download(url: &str, dest: &Path) -> Result<()> {
-    let tmp = dest.with_extension("part");
-    let resp = ureq::get(url)
-        .call()
-        .with_context(|| format!("model download request failed: {url}"))?;
-
-    let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
-    if let Some(n) = total {
-        log::info!("downloading {:.1} MiB...", n as f64 / 1_048_576.0);
-    } else {
-        log::info!("downloading (size unknown)...");
-    }
-
-    let mut reader = resp.into_reader();
-    let mut out = std::fs::File::create(&tmp)
-        .with_context(|| format!("failed to create {}", tmp.display()))?;
-    // Chunked copy (instead of `std::io::copy`) so a large model download
-    // reports progress via the logger (timestamps replace the old `\r` bar).
-    use std::io::{Read, Write};
-    use std::time::{Duration, Instant};
-    let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    let mut downloaded: u64 = 0;
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut last_render = Instant::now() - Duration::from_secs(3600);
-    let mut next_log_at: u64 = 64 * 1_048_576;
-    // Initial 0% so even a fast download shows the bar shape.
-    log::debug!("{}", format_download_progress(0, total));
-    loop {
-        let n = reader.read(&mut buf).context("download I/O failed")?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n]).context("download I/O failed")?;
-        downloaded += n as u64;
-        if tty {
-            if last_render.elapsed() >= Duration::from_millis(200) {
-                log::debug!("{}", format_download_progress(downloaded, total));
-                last_render = Instant::now();
-            }
-        } else if downloaded >= next_log_at {
-            log::info!("{}", format_download_progress(downloaded, total));
-            next_log_at += 64 * 1_048_576;
-        }
-    }
-    if tty {
-        log::debug!("{}", format_download_progress(downloaded, total));
-    }
-    out.flush().ok();
-    drop(out);
-    std::fs::rename(&tmp, dest)
-        .with_context(|| format!("failed to move {} -> {}", tmp.display(), dest.display()))?;
-    log::info!(
-        "downloaded {} ({:.1} MiB)",
-        dest.display(),
-        downloaded as f64 / 1_048_576.0
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1054,46 +942,5 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("parakeet"), "msg={msg}");
         }
-    }
-
-    #[test]
-    fn install_hint_names_the_directory_and_the_way_out() {
-        // The raw EACCES from a root-owned /usr/share/sttd/models must not be
-        // the whole story: name the directory, then the three ways forward.
-        let hint = install_hint(Path::new("/usr/share/sttd/models/parakeet-ultra-int8"));
-        assert!(
-            hint.contains("/usr/share/sttd/models/parakeet-ultra-int8"),
-            "hint={hint}"
-        );
-        for way_out in ["sttd package", "sudo", "--model"] {
-            assert!(hint.contains(way_out), "missing {way_out:?} in hint={hint}");
-        }
-    }
-
-    #[test]
-    fn download_progress_renders_bar_with_known_total() {
-        let total = Some(100 * 1_048_576);
-        let start = format_download_progress(0, total);
-        assert!(start.contains("0.0%"), "start={start}");
-        assert!(start.starts_with('['), "start={start}");
-        let half = format_download_progress(50 * 1_048_576, total);
-        assert!(half.contains("50.0%"), "half={half}");
-        assert!(half.contains("50.0/100.0 MiB"), "half={half}");
-        let done = format_download_progress(100 * 1_048_576, total);
-        assert!(done.contains("100.0%"), "done={done}");
-        // Over-run clamps at 100%.
-        let over = format_download_progress(150 * 1_048_576, total);
-        assert!(over.contains("100.0%"), "over={over}");
-    }
-
-    #[test]
-    fn download_progress_degrades_without_total() {
-        let line = format_download_progress(10 * 1_048_576, None);
-        assert!(line.contains("10.0 MiB downloaded"), "line={line}");
-        let zero_total = format_download_progress(10 * 1_048_576, Some(0));
-        assert!(
-            zero_total.contains("10.0 MiB downloaded"),
-            "zero_total={zero_total}"
-        );
     }
 }

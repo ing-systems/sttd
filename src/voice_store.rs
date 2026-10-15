@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::config::{DEFAULT_MODELS_DIR, PIPER_VOICES_REPO, VOICES_INDEX_FILE, VOICES_SUBDIR};
+use crate::download::Target;
 
 /// Where a published file is fetched from. `resolve/main` rather than `main`
 /// so a voice pinned to a revision upstream resolves.
@@ -137,7 +138,7 @@ impl VoiceIndex {
         std::fs::create_dir_all(voices_dir())
             .with_context(|| format!("failed to create {}", voices_dir().display()))?;
         let url = repo_url(VOICES_INDEX_FILE);
-        crate::model_store::download(&url, &path)
+        crate::download::download(&url, &path)
             .with_context(|| format!("failed to download the voice index from {url}"))?;
         Self::read(&path).ok_or_else(|| {
             anyhow::anyhow!(
@@ -339,33 +340,17 @@ pub(crate) fn ensure_available(voice: &VoiceRef) -> Result<()> {
             }
         );
     }
-    std::fs::create_dir_all(&voice.dir).with_context(|| install_hint(&voice.dir))?;
-    for (repo_path, file_name) in &voice.assets {
-        let dest = voice.dir.join(file_name);
-        if dest.exists() {
-            continue;
-        }
-        let url = repo_url(repo_path);
-        log::info!(
-            "voice not found at {}, downloading {url}...",
-            dest.display()
-        );
-        crate::model_store::download(&url, &dest)
-            .with_context(|| format!("{file_name}: {}", install_hint(&voice.dir)))?;
-    }
-    Ok(())
-}
-
-/// What to say when a voice has to be fetched into a directory that is not
-/// writable — the usual case being a packaged install's root-owned models
-/// directory, where only the bundled speech model is present. Same wording as
-/// the speech-model path, because the cause and the fix are identical.
-fn install_hint(dir: &Path) -> String {
-    format!(
-        "cannot prepare voice directory {} (packaged model dirs are root-owned: \
-         install the sttd package, run once with sudo, or point --voice at a \
-         writable directory)",
-        dir.display()
+    crate::download::fetch_missing(
+        &Target {
+            dir: &voice.dir,
+            kind: "voice",
+            flag: "--voice",
+            file_noun: "voice",
+        },
+        voice
+            .assets
+            .iter()
+            .map(|(repo_path, file_name)| (repo_url(repo_path), file_name.as_str())),
     )
 }
 
