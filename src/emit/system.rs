@@ -18,9 +18,8 @@ use super::clipboard::{
     copy_to_clipboard, is_wayland_session_env, paste_via_ydotool, type_via_ydotool,
     write_last_text, PasteMode,
 };
-use super::dump::{dump_drop_reason, ensure_owner_only_dir, prune_dump_dir};
+use super::dump::{dump_text, ensure_owner_only_dir, prune_dump_dir};
 use super::speech::{SpeechCut, SpeechOut};
-use crate::fsutil::write_owner_only_text;
 
 /// Prod adapter: opt-in stdout, Wayland clipboard, auto-paste, spoken
 /// transcripts, dump dir.
@@ -398,7 +397,7 @@ impl EmitterWorker {
         }
         match verdict {
             TranscriptVerdict::DropEmpty => {
-                dump_drop_reason(&self.dump_dir, tag, "DROPPED(empty)");
+                dump_text(&self.dump_dir, tag, &verdict.dump_reason(text));
                 return;
             }
             TranscriptVerdict::Emit => {
@@ -406,7 +405,7 @@ impl EmitterWorker {
                 // removed everything, or an image is currently copied): keep
                 // any image/content the user has there instead.
                 if text.trim().is_empty() {
-                    dump_drop_reason(&self.dump_dir, tag, "DROPPED(empty-cleaned)");
+                    dump_text(&self.dump_dir, tag, "DROPPED(empty-cleaned)");
                     return;
                 }
                 log::info!("{tag}: emitted (density={:.3})", evidence.density());
@@ -424,18 +423,12 @@ impl EmitterWorker {
                         log::info!("{tag}: dropped repetition-loop decode: {text:?}");
                     }
                 }
-                let reason = TranscriptVerdict::Drop { kind: *kind }.dump_reason(text);
-                dump_drop_reason(&self.dump_dir, tag, &reason);
+                dump_text(&self.dump_dir, tag, &verdict.dump_reason(text));
                 return;
             }
         }
         self.copy_paste_and_remember(tag, text);
-        if let Some(dir) = &self.dump_dir {
-            let txt_path = dir.join(format!("{tag}.txt"));
-            if let Err(e) = write_owner_only_text(&txt_path, text) {
-                log::warn!("failed to write {}: {e:?}", txt_path.display());
-            }
-        }
+        dump_text(&self.dump_dir, tag, text);
         // Last, because it is the only channel that takes seconds: the
         // clipboard, the paste and the dump of this utterance and of everything
         // behind it must not wait on a voice.

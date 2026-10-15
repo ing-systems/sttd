@@ -42,10 +42,10 @@ pub(crate) fn daemonize_start(pid_file: &Path, log: &Path) -> Result<()> {
         .append(true)
         .open(log)
         .with_context(|| format!("failed to open {}", log.display()))?;
-    let stderr_log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
+    // One open file shared by both streams; O_APPEND keeps their writes at
+    // the end either way.
+    let stderr_log = stdout_log
+        .try_clone()
         .with_context(|| format!("failed to open {}", log.display()))?;
     let cwd = std::env::current_dir().context("failed to read working directory")?;
 

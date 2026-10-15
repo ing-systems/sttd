@@ -408,29 +408,31 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, String> {
 /// Parse `--threads`/`STTD_THREADS`: must be >= 0, where `0` means auto
 /// (physical cores at startup).
 pub(crate) fn parse_threads(s: &str) -> Result<i32, String> {
-    let v: i32 = s
-        .trim()
+    parse_checked(s, "an integer >= 0 (0 = auto)", |v: &i32| *v >= 0)
+}
+
+/// Parse `s` (trimmed) as a `T` that `valid` accepts. Anything else, unparsable
+/// or out of range, is the one error `expected <expected>, got "<s>"`.
+fn parse_checked<T: std::str::FromStr>(
+    s: &str,
+    expected: &str,
+    valid: impl Fn(&T) -> bool,
+) -> Result<T, String> {
+    s.trim()
         .parse()
-        .map_err(|_| format!("expected an integer >= 0 (0 = auto), got {s:?}"))?;
-    if v >= 0 {
-        Ok(v)
-    } else {
-        Err(format!("expected an integer >= 0 (0 = auto), got {s:?}"))
-    }
+        .ok()
+        .filter(|v| valid(v))
+        .ok_or_else(|| format!("expected {expected}, got {s:?}"))
 }
 
 /// Parse `--hangover-ms`/`STTD_HANGOVER_MS`: `MIN_HANGOVER_MS..=MAX_HANGOVER_MS`
 /// in 10 ms steps (the pipeline's frame cadence — no false precision).
 pub(crate) fn parse_hangover_ms(s: &str) -> Result<u64, String> {
-    let v: u64 = s.trim().parse().map_err(|_| {
-        format!("expected a multiple of 10 in {MIN_HANGOVER_MS}..={MAX_HANGOVER_MS} ms, got {s:?}")
-    })?;
-    if !(MIN_HANGOVER_MS..=MAX_HANGOVER_MS).contains(&v) || !v.is_multiple_of(10) {
-        return Err(format!(
-            "expected a multiple of 10 in {MIN_HANGOVER_MS}..={MAX_HANGOVER_MS} ms, got {s:?}"
-        ));
-    }
-    Ok(v)
+    parse_checked(
+        s,
+        &format!("a multiple of 10 in {MIN_HANGOVER_MS}..={MAX_HANGOVER_MS} ms"),
+        |v: &u64| (MIN_HANGOVER_MS..=MAX_HANGOVER_MS).contains(v) && v.is_multiple_of(10),
+    )
 }
 
 /// Whole 10 ms frames in `ms` of hangover. Exact: the parser only accepts
@@ -453,32 +455,16 @@ pub(crate) const MAX_LINEAR_RMS: f32 = 0.5;
 /// `NoiseTracker::exit_threshold` toward 0.0 — that's fixed separately by
 /// flooring `exit_threshold` itself (see `noise.rs`).
 pub(crate) fn parse_fraction(s: &str) -> Result<f32, String> {
-    let v: f32 = s
-        .trim()
-        .parse()
-        .map_err(|_| format!("expected a number 0.0..=1.0, got {s:?}"))?;
-    if (0.0..=1.0).contains(&v) {
-        Ok(v)
-    } else {
-        Err(format!("expected a number 0.0..=1.0, got {s:?}"))
-    }
+    parse_checked(s, "a number 0.0..=1.0", |v: &f32| (0.0..=1.0).contains(v))
 }
 
 /// Parse a linear RMS amplitude: shared by `--min-rms` and `--target-rms`.
 /// `0.0` is valid (disables the RMS gate / the AGC respectively); see
 /// `MAX_LINEAR_RMS` for the upper bound.
 pub(crate) fn parse_linear_rms(s: &str) -> Result<f32, String> {
-    let v: f32 = s
-        .trim()
-        .parse()
-        .map_err(|_| format!("expected a number 0.0..={MAX_LINEAR_RMS}, got {s:?}"))?;
-    if (0.0..=MAX_LINEAR_RMS).contains(&v) {
-        Ok(v)
-    } else {
-        Err(format!(
-            "expected a number 0.0..={MAX_LINEAR_RMS}, got {s:?}"
-        ))
-    }
+    parse_checked(s, &format!("a number 0.0..={MAX_LINEAR_RMS}"), |v: &f32| {
+        (0.0..=MAX_LINEAR_RMS).contains(v)
+    })
 }
 
 // ---------------------------------------------------------------------------

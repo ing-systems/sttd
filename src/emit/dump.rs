@@ -8,14 +8,15 @@ use anyhow::{Context, Result};
 use crate::config::DUMP_KEEP_FILES;
 use crate::fsutil::write_owner_only_text;
 
-/// Write `reason` as `<dump_dir>/<tag>.txt` for an utterance that was
-/// dropped rather than printed, so `STTD_DUMP_DIR` output stays correlatable
-/// with the stderr log: previously a dropped utterance left only a WAV with
-/// no indication of what became of it or why.
-pub(super) fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
+/// Write `body` as `<dump_dir>/<tag>.txt`, the WAV's partner: the emitted
+/// text, or for an utterance that was dropped rather than printed the reason
+/// why, so `STTD_DUMP_DIR` output stays correlatable with the stderr log
+/// (previously a dropped utterance left only a WAV with no indication of what
+/// became of it or why). A no-op without a dump directory.
+pub(super) fn dump_text(dump_dir: &Option<PathBuf>, tag: &str, body: &str) {
     if let Some(dir) = dump_dir {
         let txt_path = dir.join(format!("{tag}.txt"));
-        if let Err(e) = write_owner_only_text(&txt_path, reason) {
+        if let Err(e) = write_owner_only_text(&txt_path, body) {
             log::warn!("failed to write {}: {e:?}", txt_path.display());
         }
     }
