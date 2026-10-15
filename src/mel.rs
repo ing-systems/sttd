@@ -11,8 +11,16 @@
 // The scale is librosa's: Slaney mel (`htk = false`) with `norm = "slaney"`
 // area weighting, `fmax = sample_rate / 2`. Parakeet's `nemo128` filterbank and
 // Whisper's `mel_filters.npz` are both this table.
+//
+// `Stft`, the power-spectrogram step both frontends run before the filterbank,
+// lives here for the same reason. The frontends differ only in the window
+// (symmetric vs periodic Hann) and how they pad the signal, which stay theirs.
 
-use ndarray17::Array2;
+use std::sync::Arc;
+
+use ndarray17::{Array2, ArrayView2};
+use realfft::num_complex::Complex;
+use realfft::{FftError, RealToComplex};
 
 /// Slaney mel scale (librosa).
 const F_SP: f64 = 200.0 / 3.0;
@@ -73,6 +81,77 @@ pub(crate) fn create_mel_filterbank(
         }
     }
     filterbank
+}
+
+/// Power spectrogram (`|FFT|^2` of each windowed frame) with its FFT plan and
+/// every buffer built once, so a frontend allocates nothing per utterance
+/// beyond growing the spectrogram to the longest one seen.
+pub(crate) struct Stft {
+    plan: Arc<dyn RealToComplex<f32>>,
+    /// Analysis window, at most `n_fft` long; a shorter one is zero-padded.
+    window: Vec<f32>,
+    /// One windowed frame (n_fft samples).
+    frame: Vec<f32>,
+    out: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+    /// `[n_fft / 2 + 1, frames]` row-major, grown on demand and never shrunk:
+    /// a shorter utterance is a prefix of it.
+    spectrogram: Vec<f32>,
+}
+
+impl Stft {
+    pub(crate) fn new(n_fft: usize, window: Vec<f32>) -> Self {
+        assert!(window.len() <= n_fft, "analysis window longer than n_fft");
+        let plan = realfft::RealFftPlanner::<f32>::new().plan_fft_forward(n_fft);
+        Self {
+            out: plan.make_output_vec(),
+            scratch: plan.make_scratch_vec(),
+            frame: vec![0.0; n_fft],
+            plan,
+            window,
+            spectrogram: Vec::new(),
+        }
+    }
+
+    /// Power spectrogram of `n_frames` frames of `padded`, frame `i` starting
+    /// at `i * hop`, as `[n_fft / 2 + 1, n_frames]`. `padded` must hold a full
+    /// window for every frame.
+    pub(crate) fn power(
+        &mut self,
+        padded: &[f32],
+        hop: usize,
+        n_frames: usize,
+    ) -> Result<ArrayView2<'_, f32>, FftError> {
+        let win_length = self.window.len();
+        let freq_bins = self.out.len();
+        let len = freq_bins * n_frames;
+        if self.spectrogram.len() < len {
+            self.spectrogram.resize(len, 0.0);
+        }
+        let spectrogram = &mut self.spectrogram[..len];
+        for frame_idx in 0..n_frames {
+            let start = frame_idx * hop;
+            for (dst, (&sample, &taper)) in self.frame[..win_length]
+                .iter_mut()
+                .zip(padded[start..start + win_length].iter().zip(&self.window))
+            {
+                *dst = sample * taper;
+            }
+            // The FFT uses its input as scratch, so a window shorter than
+            // `n_fft` needs its zero tail restored every frame; the head was
+            // just rewritten.
+            self.frame[win_length..].fill(0.0);
+            self.plan
+                .process_with_scratch(&mut self.frame, &mut self.out, &mut self.scratch)?;
+            for (k, value) in self.out.iter().enumerate() {
+                spectrogram[k * n_frames + frame_idx] = value.norm_sqr();
+            }
+        }
+        Ok(
+            ArrayView2::from_shape((freq_bins, n_frames), &self.spectrogram[..len])
+                .expect("spectrogram buffer holds freq_bins * n_frames"),
+        )
+    }
 }
 
 #[cfg(test)]

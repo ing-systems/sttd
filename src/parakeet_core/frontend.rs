@@ -12,20 +12,17 @@
 // filterbank itself now lives in `crate::mel`, shared with the Whisper
 // frontend.
 //
-// The window, the padded signal, the FFT input/output/scratch and the
-// spectrogram scratch buffer are built once in `new` and reused by every
-// `extract` call, so a transcription allocates only the returned features.
+// The padded signal and the STFT (`crate::mel::Stft`: window, FFT plan and
+// buffers, spectrogram) are built once in `new` and reused by every `extract`
+// call, so a transcription allocates only the returned features.
 // ---------------------------------------------------------------------------
 
 use ndarray17::linalg::general_mat_mul;
 use ndarray17::{Array2, Array3, Axis};
-use realfft::num_complex::Complex;
-use realfft::RealToComplex;
 use std::f32::consts::PI;
-use std::sync::Arc;
 
 use super::types::ParakeetError;
-use crate::mel::create_mel_filterbank;
+use crate::mel::{create_mel_filterbank, Stft};
 
 /// NeMo `ParakeetFeatureExtractor` parameters for the TDT 0.6B model.
 #[derive(Debug, Clone)]
@@ -56,18 +53,10 @@ impl PreprocessorConfig {
 pub struct Frontend {
     pub config: PreprocessorConfig,
     mel_basis: Array2<f32>,
-    fft_plan: Arc<dyn RealToComplex<f32>>,
-    /// Hann analysis window (win_length), precomputed.
-    window: Vec<f32>,
+    /// Symmetric Hann analysis window (win_length) inside an n_fft STFT.
+    stft: Stft,
     /// Zero-padded, preemphasized signal of the current utterance.
     padded: Vec<f32>,
-    /// One windowed frame (n_fft samples).
-    frame: Vec<f32>,
-    /// Reusable FFT input/output/scratch buffers.
-    fft_out: Vec<Complex<f32>>,
-    fft_scratch: Vec<Complex<f32>>,
-    /// Power spectrogram scratch: [n_fft / 2 + 1, time_steps].
-    spectrogram: Array2<f32>,
     /// Feature scratch: [1, feature_size, time_steps] in encoder layout.
     features: Array3<f32>,
 }
@@ -76,22 +65,13 @@ impl Frontend {
     pub fn new(config: PreprocessorConfig) -> Self {
         let mel_basis =
             create_mel_filterbank(config.n_fft, config.feature_size, config.sampling_rate);
-        let mut planner = realfft::RealFftPlanner::<f32>::new();
-        let fft_plan = planner.plan_fft_forward(config.n_fft);
-        let freq_bins = config.n_fft / 2 + 1;
-        let window = hann_window(config.win_length);
-        let frame = vec![0.0; config.n_fft];
+        let stft = Stft::new(config.n_fft, hann_window(config.win_length));
         let features = Array3::zeros((1, config.feature_size, 0));
         Self {
             config,
             mel_basis,
-            fft_out: fft_plan.make_output_vec(),
-            fft_scratch: fft_plan.make_scratch_vec(),
-            fft_plan,
-            window,
+            stft,
             padded: Vec::new(),
-            frame,
-            spectrogram: Array2::zeros((freq_bins, 0)),
             features,
         }
     }
@@ -101,8 +81,7 @@ impl Frontend {
     /// cached scratch buffers stay valid for the next call.
     pub fn extract(&mut self, audio: &[f32]) -> Result<Array3<f32>, ParakeetError> {
         self.pad_and_preemphasize(audio);
-        let time_steps = self.stft()?;
-        self.mel_features(time_steps);
+        self.mel_features()?;
         Ok(std::mem::take(&mut self.features))
     }
 
@@ -122,37 +101,17 @@ impl Frontend {
         self.padded.resize(self.padded.len() + pad_amount, 0.0);
     }
 
-    /// Power spectrogram of the padded signal into `self.spectrogram`.
-    /// Returns the frame count.
-    fn stft(&mut self) -> Result<usize, ParakeetError> {
-        let n_fft = self.config.n_fft;
-        let hop_length = self.config.hop_length;
-        let win_length = self.config.win_length;
-        let num_frames = (self.padded.len() - n_fft) / hop_length + 1;
-        let freq_bins = n_fft / 2 + 1;
-        if self.spectrogram.shape() != [freq_bins, num_frames] {
-            self.spectrogram = Array2::zeros((freq_bins, num_frames));
-        }
-
-        for frame_idx in 0..num_frames {
-            let start = frame_idx * hop_length;
-            self.frame.fill(0.0);
-            for i in 0..win_length.min(self.padded.len() - start) {
-                self.frame[i] = self.padded[start + i] * self.window[i];
-            }
-            self.fft_plan
-                .process_with_scratch(&mut self.frame, &mut self.fft_out, &mut self.fft_scratch)
-                .map_err(|e| ParakeetError::Frontend(format!("FFT failed: {e}")))?;
-            for k in 0..freq_bins {
-                self.spectrogram[[k, frame_idx]] = self.fft_out[k].norm_sqr();
-            }
-        }
-        Ok(num_frames)
-    }
-
-    /// Mel projection, `ln(x + 2^-24)` and per-feature normalization (mean=0,
-    /// std=1, Bessel's correction) into `self.features`.
-    fn mel_features(&mut self, time_steps: usize) {
+    /// Power spectrogram of the padded signal, then mel projection,
+    /// `ln(x + 2^-24)` and per-feature normalization (mean=0, std=1, Bessel's
+    /// correction) into `self.features`.
+    fn mel_features(&mut self) -> Result<(), ParakeetError> {
+        // Every frame has a full `n_fft` of padded signal, so the analysis
+        // window (shorter than `n_fft`) always fits.
+        let time_steps = (self.padded.len() - self.config.n_fft) / self.config.hop_length + 1;
+        let spectrogram = self
+            .stft
+            .power(&self.padded, self.config.hop_length, time_steps)
+            .map_err(|e| ParakeetError::Frontend(format!("FFT failed: {e}")))?;
         let num_features = self.config.feature_size;
         if self.features.shape() != [1, num_features, time_steps] {
             self.features = Array3::zeros((1, num_features, time_steps));
@@ -167,7 +126,7 @@ impl Frontend {
         general_mat_mul(
             1.0,
             &self.mel_basis.view(),
-            &self.spectrogram.view(),
+            &spectrogram,
             0.0,
             &mut mel,
         );
@@ -175,7 +134,7 @@ impl Frontend {
             *value = (*value + log_zero_guard).ln();
         }
         if time_steps <= 1 {
-            return;
+            return Ok(());
         }
         let num_frames = time_steps as f32;
         for feat_idx in 0..num_features {
@@ -188,6 +147,7 @@ impl Frontend {
                 *value = (*value - mean) / std;
             }
         }
+        Ok(())
     }
 }
 

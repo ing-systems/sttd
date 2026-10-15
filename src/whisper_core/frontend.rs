@@ -20,19 +20,16 @@
 //   right-padded with zeros first, which makes the right-hand reflection
 //   zeros, but the left-hand one still reflects real audio.
 //
-// The filterbank, FFT plan and scratch buffers are built once in `new` and
+// The filterbank and the STFT (`crate::mel::Stft`) are built once in `new` and
 // reused by every `extract`, as in the Parakeet frontend.
 // ---------------------------------------------------------------------------
 
 use ndarray17::linalg::general_mat_mul;
-use ndarray17::{Array2, ArrayView3, ArrayViewMut2, Axis};
-use realfft::num_complex::Complex;
-use realfft::RealToComplex;
+use ndarray17::{Array2, ArrayView3, ArrayViewMut2};
 use std::f32::consts::PI;
-use std::sync::Arc;
 
 use super::types::{MelConfig, WhisperError};
-use crate::mel::create_mel_filterbank;
+use crate::mel::{create_mel_filterbank, Stft};
 
 /// Floor applied before `log10`, matching `torch.clamp(mel_spec, min=1e-10)`.
 const LOG_FLOOR: f32 = 1e-10;
@@ -50,20 +47,11 @@ const LOG_SCALE: f32 = 4.0;
 pub struct Frontend {
     pub config: MelConfig,
     mel_basis: Array2<f32>,
-    fft_plan: Arc<dyn RealToComplex<f32>>,
-    /// Periodic Hann analysis window (win_length), precomputed.
-    window: Vec<f32>,
+    /// Periodic Hann analysis window (win_length) inside an n_fft STFT.
+    stft: Stft,
     /// The current utterance, zero-padded to `n_samples` and reflect-padded
     /// by `n_fft / 2` on each side.
     padded: Vec<f32>,
-    /// One windowed frame (n_fft samples).
-    frame: Vec<f32>,
-    /// Reusable FFT input/output/scratch buffers.
-    fft_out: Vec<Complex<f32>>,
-    fft_scratch: Vec<Complex<f32>>,
-    /// Power spectrogram scratch: `[n_fft / 2 + 1, frames]`, reallocated only
-    /// when the window length changes.
-    spectrogram: Array2<f32>,
     /// The encoder's `[1, n_mels, frames]` input, in a buffer sized for the
     /// full window: a shorter window is a prefix of it, so a change of window
     /// never allocates.
@@ -73,21 +61,12 @@ pub struct Frontend {
 impl Frontend {
     pub fn new(config: MelConfig) -> Self {
         let mel_basis = create_mel_filterbank(config.n_fft, config.n_mels, config.sampling_rate);
-        let mut planner = realfft::RealFftPlanner::<f32>::new();
-        let fft_plan = planner.plan_fft_forward(config.n_fft);
-        let freq_bins = config.n_fft / 2 + 1;
-        let window = periodic_hann(config.win_length);
-        let frame = vec![0.0; config.n_fft];
+        let stft = Stft::new(config.n_fft, periodic_hann(config.win_length));
         Self {
             config,
             mel_basis,
-            fft_out: fft_plan.make_output_vec(),
-            fft_scratch: fft_plan.make_scratch_vec(),
-            fft_plan,
-            window,
+            stft,
             padded: Vec::new(),
-            frame,
-            spectrogram: Array2::zeros((freq_bins, config.n_frames)),
             features: vec![0.0; config.n_mels * config.n_frames],
         }
     }
@@ -124,7 +103,6 @@ impl Frontend {
             );
         }
         self.pad_and_reflect(audio, n_samples);
-        self.stft(n_frames)?;
         self.log_mel(n_frames)?;
         let len = self.config.n_mels * n_frames;
         Ok(ArrayView3::from_shape(
@@ -160,64 +138,27 @@ impl Frontend {
         }
     }
 
-    /// Power spectrogram of the padded signal into `self.spectrogram`.
+    /// Power spectrogram of the padded signal, then mel projection, `log10`
+    /// with the window-relative clamp, and the affine map into the encoder's
+    /// input range, all into `self.features`.
     ///
     /// The centre pad makes this `n_samples / hop` frames — 3000 for the 30 s
-    /// window, which is exactly the encoder's `input_features` frame count. The
-    /// scratch is reallocated only when the window length changes.
-    fn stft(&mut self, n_frames: usize) -> Result<(), WhisperError> {
-        let n_fft = self.config.n_fft;
-        let hop_length = self.config.hop_length;
-        let win_length = self.config.win_length;
-        let freq_bins = n_fft / 2 + 1;
-        let num_frames = (self.padded.len() - n_fft) / hop_length;
-        debug_assert_eq!(num_frames, n_frames);
-        if self.spectrogram.shape() != [freq_bins, num_frames] {
-            self.spectrogram = Array2::zeros((freq_bins, num_frames));
-        }
-        // Whisper's analysis window fills the FFT buffer exactly (`win_length
-        // == n_fft == 400`) and every frame has `n_fft` samples available, so
-        // there is no unwritten tail to clear and the old
-        // `win_length.min(..)` bound was always `win_length`. A shorter
-        // analysis window would leave one, which is all this flag guards.
-        let needs_tail_clear = win_length < n_fft;
-
-        for (frame_idx, mut column) in self.spectrogram.axis_iter_mut(Axis(1)).enumerate() {
-            let start = frame_idx * hop_length;
-            if needs_tail_clear {
-                self.frame.fill(0.0);
-            }
-            for (dst, (&sample, &taper)) in self.frame[..win_length]
-                .iter_mut()
-                .zip(self.padded[start..].iter().zip(&self.window))
-            {
-                *dst = sample * taper;
-            }
-            self.fft_plan
-                .process_with_scratch(&mut self.frame, &mut self.fft_out, &mut self.fft_scratch)
-                .map_err(|e| WhisperError::Frontend(format!("FFT failed: {e}")))?;
-            for (bin, value) in column.iter_mut().zip(&self.fft_out) {
-                *bin = value.norm_sqr();
-            }
-        }
-        Ok(())
-    }
-
-    /// Mel projection, `log10` with the window-relative clamp, and the affine
-    /// map into the encoder's input range, all into `self.features`.
+    /// window, which is exactly the encoder's `input_features` frame count.
     fn log_mel(&mut self, n_frames: usize) -> Result<(), WhisperError> {
+        debug_assert_eq!(
+            (self.padded.len() - self.config.n_fft) / self.config.hop_length,
+            n_frames
+        );
+        let spectrogram = self
+            .stft
+            .power(&self.padded, self.config.hop_length, n_frames)
+            .map_err(|e| WhisperError::Frontend(format!("FFT failed: {e}")))?;
         let len = self.config.n_mels * n_frames;
         let features = &mut self.features[..len];
         // C <- 1 * mel_basis * spectrogram + 0 * C: writes into the frontend's
         // own feature buffer instead of allocating per utterance.
         let mut mel = ArrayViewMut2::from_shape((self.config.n_mels, n_frames), &mut *features)?;
-        general_mat_mul(
-            1.0,
-            &self.mel_basis.view(),
-            &self.spectrogram.view(),
-            0.0,
-            &mut mel,
-        );
+        general_mat_mul(1.0, &self.mel_basis.view(), &spectrogram, 0.0, &mut mel);
         // `log_spec.max()` is over the whole window, so a silent utterance
         // scales its own noise floor up to full range rather than collapsing
         // to a constant — the model was trained on windows like this.
