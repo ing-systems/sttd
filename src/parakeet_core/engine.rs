@@ -13,7 +13,7 @@
 //   confidences (`speech::Transcript`).
 // ---------------------------------------------------------------------------
 
-use ndarray17::{Array, Array1, Array2, ArrayD, ArrayView1, ArrayView3, ArrayViewD, IxDyn};
+use ndarray17::{Array, ArrayD, ArrayView1, ArrayView2, ArrayView3, ArrayViewD, IxDyn};
 use once_cell::sync::Lazy;
 use ort::inputs;
 use ort::session::Session;
@@ -152,6 +152,46 @@ fn to_decoder_layout(encoder_output: &ArrayViewD<f32>) -> ArrayD<f32> {
         .into_owned()
 }
 
+/// The vocabulary piece for `id`, `?` when it is out of range (diagnostics).
+fn token_str(vocab: &[String], id: i32) -> &str {
+    vocab.get(id as usize).map(String::as_str).unwrap_or("?")
+}
+
+// Diagnostic only: one compact line per emitted token listing the 5
+// best-ranked dictionary candidates and their raw rank (* = boosted, i.e.
+// within the top-K gate), to see where a word's tokens really stand.
+fn log_boost_step(vocab: &[String], logits: &[f32], candidates: &[BiasCandidate], emitted: i32) {
+    let rank_of = |tok: i32| {
+        let raw = logits
+            .get(tok as usize)
+            .copied()
+            .unwrap_or(f32::NEG_INFINITY);
+        logits.iter().filter(|&&l| l > raw).count()
+    };
+    let mut ranked: Vec<(i32, usize, usize)> = candidates
+        .iter()
+        .map(|c| (c.token, rank_of(c.token), c.depth))
+        .collect();
+    ranked.sort_by_key(|&(_, rank, _)| rank);
+    let shown: Vec<String> = ranked
+        .iter()
+        .take(5)
+        .map(|&(tok, rank, depth)| {
+            let mark = if in_top_k(logits, tok as usize, top_k_for_depth(depth)) {
+                "*"
+            } else {
+                ""
+            };
+            format!("{:?}#{}{}", token_str(vocab, tok), rank, mark)
+        })
+        .collect();
+    log::trace!(
+        "boost: out={:?} | cand {}",
+        token_str(vocab, emitted),
+        shown.join(" ")
+    );
+}
+
 /// Index of the maximum value, taking the blank id when the row is empty.
 /// Unlike `crate::decode::argmax_index` this lets the *last* maximum win a
 /// tie: TDT's joint pads its vocabulary with the blank id, so the highest
@@ -190,11 +230,10 @@ impl ParakeetModel {
             Self::init_session(&model_dir, "decoder_joint-model", threads, Device::Cpu)?;
 
         let (vocab, blank_idx) = Self::load_vocab(&model_dir)?;
-        let vocab_size = vocab.len();
 
         log::trace!(
             "Loaded vocabulary with {} tokens, blank_idx={}",
-            vocab_size,
+            vocab.len(),
             blank_idx
         );
 
@@ -205,7 +244,6 @@ impl ParakeetModel {
             decoder_joint,
             vocab,
             blank_idx,
-            vocab_size,
             tokenizer,
             boost_tree: None,
             boost_alpha: BOOST_ALPHA_MAX,
@@ -250,7 +288,7 @@ impl ParakeetModel {
                     .map(|(v, ids)| {
                         (
                             v.as_str(),
-                            ids.iter().map(|&id| self.token_str(id)).collect(),
+                            ids.iter().map(|&id| token_str(&self.vocab, id)).collect(),
                         )
                     })
                     .collect();
@@ -273,48 +311,6 @@ impl ParakeetModel {
             );
             Some(BoostTree::new(&phrases))
         };
-    }
-
-    fn token_str(&self, id: i32) -> &str {
-        self.vocab
-            .get(id as usize)
-            .map(String::as_str)
-            .unwrap_or("?")
-    }
-
-    // Diagnostic only: one compact line per emitted token listing the 5
-    // best-ranked dictionary candidates and their raw rank (* = boosted, i.e.
-    // within the top-K gate), to see where a word's tokens really stand.
-    fn log_boost_step(&self, logits: &[f32], candidates: &[BiasCandidate], emitted: i32) {
-        let rank_of = |tok: i32| {
-            let raw = logits
-                .get(tok as usize)
-                .copied()
-                .unwrap_or(f32::NEG_INFINITY);
-            logits.iter().filter(|&&l| l > raw).count()
-        };
-        let mut ranked: Vec<(i32, usize, usize)> = candidates
-            .iter()
-            .map(|c| (c.token, rank_of(c.token), c.depth))
-            .collect();
-        ranked.sort_by_key(|&(_, rank, _)| rank);
-        let shown: Vec<String> = ranked
-            .iter()
-            .take(5)
-            .map(|&(tok, rank, depth)| {
-                let mark = if in_top_k(logits, tok as usize, top_k_for_depth(depth)) {
-                    "*"
-                } else {
-                    ""
-                };
-                format!("{:?}#{}{}", self.token_str(tok), rank, mark)
-            })
-            .collect();
-        log::trace!(
-            "boost: out={:?} | cand {}",
-            self.token_str(emitted),
-            shown.join(" ")
-        );
     }
 
     fn init_session<P: AsRef<Path>>(
@@ -414,80 +410,6 @@ impl ParakeetModel {
         Ok((to_decoder_layout(&encoder_output), encodings_len))
     }
 
-    pub fn create_decoder_state(&self) -> Result<DecoderState, ParakeetError> {
-        // LSTM state layout is fixed for this model: 2 layers x batch 1 x
-        // 640 hidden (mirrors `parakeet-rs`; no session introspection).
-        Ok((Array::zeros((2, 1, 640)), Array::zeros((2, 1, 640))))
-    }
-
-    /// One decoder step. `encoder_out` is a single `[1024]` encoder frame and
-    /// must be contiguous, so the `[1, time_steps, 1]` input is a stride-only
-    /// reshape of the caller's buffer.
-    pub fn decode_step(
-        &mut self,
-        prev_tokens: &[i32],
-        prev_state: &DecoderState,
-        encoder_out: &ArrayViewD<f32>,
-    ) -> Result<(ArrayD<f32>, DecoderState), ParakeetError> {
-        log::trace!("Running decoder inference...");
-
-        // Get last token or blank_idx if empty
-        let target_token = prev_tokens.last().copied().unwrap_or(self.blank_idx);
-
-        // Prepare inputs matching Python: encoder_out[None, :, None] -> [1, time_steps, 1].
-        // `insert_axis` on a view only reshapes the strides, so the decoder
-        // reads the frame in place instead of a per-step copy.
-        debug_assert!(
-            encoder_out.as_slice().is_some(),
-            "decode_step needs a contiguous encoder frame"
-        );
-        let encoder_outputs = encoder_out
-            .view()
-            .insert_axis(ndarray17::Axis(0))
-            .insert_axis(ndarray17::Axis(2));
-        let targets = Array2::from_shape_vec((1, 1), vec![target_token])?;
-        let target_length = Array1::from_vec(vec![1]);
-
-        let inputs = inputs![
-            "encoder_outputs" => TensorRef::from_array_view(encoder_outputs.view())?,
-            "targets" => TensorRef::from_array_view(targets.view())?,
-            "target_length" => TensorRef::from_array_view(target_length.view())?,
-            "input_states_1" => TensorRef::from_array_view(prev_state.0.view())?,
-            "input_states_2" => TensorRef::from_array_view(prev_state.1.view())?,
-        ];
-
-        let outputs = self.decoder_joint.run(inputs)?;
-
-        let logits = outputs
-            .get("outputs")
-            .ok_or_else(|| ParakeetError::OutputNotFound("outputs".to_string()))?
-            .try_extract_array()?;
-        log::trace!(
-            "Logits shape: {:?}, vocab_size: {}",
-            logits.shape(),
-            self.vocab_size
-        );
-        let state1 = outputs
-            .get("output_states_1")
-            .ok_or_else(|| ParakeetError::OutputNotFound("output_states_1".to_string()))?
-            .try_extract_array()?;
-        let state2 = outputs
-            .get("output_states_2")
-            .ok_or_else(|| ParakeetError::OutputNotFound("output_states_2".to_string()))?
-            .try_extract_array()?;
-
-        // Squeeze outputs like Python (remove batch dimension)
-        let logits = logits.remove_axis(ndarray17::Axis(0));
-
-        // Reshape on the view (free), then take ownership of the two state
-        // arrays once. They are 2 x 1 x 640 floats, so this copy is small
-        // next to the per-step inference itself.
-        let state1_3d = state1.into_dimensionality::<ndarray17::Ix3>()?.to_owned();
-        let state2_3d = state2.into_dimensionality::<ndarray17::Ix3>()?.to_owned();
-
-        Ok((logits.to_owned(), (state1_3d, state2_3d)))
-    }
-
     /// Full pipeline over raw 16 kHz mono samples: Rust mel frontend,
     /// encoder, greedy (optionally boosted) TDT decode.
     pub fn transcribe_samples(&mut self, samples: &[f32]) -> Result<Transcript, ParakeetError> {
@@ -522,189 +444,34 @@ impl ParakeetModel {
         encodings: &ArrayViewD<f32>, // [time_steps, 1024]
         encodings_len: usize,
     ) -> Result<DecodedSequence, ParakeetError> {
-        // Logit boosting only runs when a boost tree is active. With no boost
-        // tree the greedy path must stay bit-exact (default path, streaming),
-        // so it lives in its own function with no boost code on it.
-        if self.boost_tree.is_some() {
-            let boosted = self.decode_sequence_boosted(encodings, encodings_len)?;
-            // Encoder already ran: replay the light greedy decode and use it
-            // when the boost diverged too far (flipped language). A genuine
-            // other-language utterance decodes the same both ways, so it stays.
-            if boosted.0.len() >= GUARD_MIN_TOKENS {
-                let greedy = self.decode_sequence_greedy(encodings, encodings_len)?;
-                let divergence = token_divergence(&boosted.0, &greedy.0);
-                if divergence > GUARD_DIVERGENCE {
-                    log::debug!(
-                        "boost guard: token divergence {:.2} over {} tokens, using unboosted decode",
-                        divergence,
-                        boosted.0.len()
-                    );
-                    return Ok(greedy);
-                }
-            }
-            Ok(boosted)
-        } else {
-            self.decode_sequence_greedy(encodings, encodings_len)
-        }
-    }
-
-    // Pure greedy TDT decode, no boosting. Bit-exact reference path.
-    fn decode_sequence_greedy(
-        &mut self,
-        encodings: &ArrayViewD<f32>,
-        encodings_len: usize,
-    ) -> Result<DecodedSequence, ParakeetError> {
-        let mut prev_state = self.create_decoder_state()?;
-        let mut tokens = Vec::new();
-        let mut token_probs = Vec::new();
-
-        let mut t = 0;
-        let mut emitted_tokens = 0;
-
-        while t < encodings_len {
-            // A row view of the encoder output: contiguous, so the decoder
-            // reads it without a per-step copy.
-            let encoder_step = encodings.slice(ndarray17::s![t, ..]).into_dyn();
-            let (probs, new_state) = self.decode_step(&tokens, &prev_state, &encoder_step)?;
-
-            let (vocab_logits, dur_logits) = Self::tdt_logits(&probs, self.vocab_size)?;
-            let token = argmax_token(vocab_logits, self.blank_idx);
-
-            if token != self.blank_idx {
-                token_probs.push(softmax_prob(vocab_logits, token as usize));
-                prev_state = new_state;
-                tokens.push(token);
-                emitted_tokens += 1;
-            }
-
-            let duration = argmax_index(dur_logits);
-            if duration > 0 {
-                t += duration;
-                emitted_tokens = 0;
-            } else if token == self.blank_idx || emitted_tokens == MAX_TOKENS_PER_STEP {
-                t += 1;
-                emitted_tokens = 0;
-            }
-        }
-
-        Ok((tokens, token_probs))
-    }
-
-    // Split a (possibly TDT) decoder output into (vocab_logits, duration_logits);
-    // the duration slice is empty for a plain RNN-T joint.
-    fn tdt_logits(
-        probs: &ArrayD<f32>,
-        vocab_size: usize,
-    ) -> Result<(&[f32], &[f32]), ParakeetError> {
-        let slice = probs.as_slice().ok_or_else(|| {
-            ParakeetError::Shape(ndarray17::ShapeError::from_kind(
-                ndarray17::ErrorKind::IncompatibleShape,
-            ))
-        })?;
-        Ok(if slice.len() > vocab_size {
-            (&slice[..vocab_size], &slice[vocab_size..])
-        } else {
-            (slice, &[][..])
-        })
-    }
-
-    // Greedy decode with dictionary logit boosting. At each frame the boost
-    // tree biases the expected dictionary tokens on the non-blank logits (gated
-    // by the top-K guard) before the argmax; the boost state advances along the
-    // trie with every emitted token. One decode_step per frame, no parallel
-    // hypotheses.
-    fn decode_sequence_boosted(
-        &mut self,
-        encodings: &ArrayViewD<f32>,
-        encodings_len: usize,
-    ) -> Result<DecodedSequence, ParakeetError> {
-        let tree = match self.boost_tree.take() {
-            Some(tree) => tree,
-            None => return self.decode_sequence_greedy(encodings, encodings_len),
+        let mut joint = Joint {
+            session: &mut self.decoder_joint,
+            vocab: &self.vocab,
+            blank_idx: self.blank_idx,
         };
-
-        let result = self.run_boosted_decode(encodings, encodings_len, &tree);
-        self.boost_tree = Some(tree);
-        result
-    }
-
-    fn run_boosted_decode(
-        &mut self,
-        encodings: &ArrayViewD<f32>,
-        encodings_len: usize,
-        tree: &BoostTree,
-    ) -> Result<DecodedSequence, ParakeetError> {
-        let mut prev_state = self.create_decoder_state()?;
-        let mut tokens: Vec<i32> = Vec::new();
-        let mut token_probs: Vec<f32> = Vec::new();
-
-        let mut t = 0;
-        let mut emitted_tokens = 0;
-        let mut boost_state = tree.root();
-
-        // Reused across steps so the decode loop does not allocate per frame.
-        let mut candidates: Vec<BiasCandidate> = Vec::new();
-        let mut boosted: Vec<f32> = Vec::new();
-        let mut topk_scratch: Vec<f32> = Vec::new();
-
-        while t < encodings_len {
-            // A row view of the encoder output: contiguous, so the decoder
-            // reads it without a per-step copy.
-            let encoder_step = encodings.slice(ndarray17::s![t, ..]).into_dyn();
-            let (probs, new_state) = self.decode_step(&tokens, &prev_state, &encoder_step)?;
-            let (vocab_logits, dur_logits) = Self::tdt_logits(&probs, self.vocab_size)?;
-
-            tree.bias_into(boost_state, &mut candidates);
-            if boosted.len() != vocab_logits.len() {
-                boosted.resize(vocab_logits.len(), 0.0);
-            }
-            boosted.copy_from_slice(vocab_logits);
-            if !candidates.is_empty() {
-                let (tight, deep) = top_k_thresholds_with_scratch(vocab_logits, &mut topk_scratch);
-                for cand in &candidates {
-                    let idx = cand.token as usize;
-                    let threshold = if top_k_for_depth(cand.depth) == BOOST_TOP_K_DEEP {
-                        deep
-                    } else {
-                        tight
-                    };
-                    if cand.token != self.blank_idx
-                        && idx < boosted.len()
-                        && vocab_logits[idx] >= threshold
-                    {
-                        boosted[idx] += self.boost_alpha * cand.score;
-                    }
-                }
-            }
-            let token = argmax_token(&boosted, self.blank_idx);
-            if log::log_enabled!(log::Level::Trace)
-                && token != self.blank_idx
-                && !candidates.is_empty()
-            {
-                self.log_boost_step(vocab_logits, &candidates, token);
-            }
-
-            if token != self.blank_idx {
-                // Confidence from the raw logits, not the boosted ones, so
-                // boosted tokens stay correctable downstream.
-                token_probs.push(softmax_prob(vocab_logits, token as usize));
-                prev_state = new_state;
-                tokens.push(token);
-                emitted_tokens += 1;
-                boost_state = tree.advance(boost_state, token);
-            }
-
-            let duration = argmax_index(dur_logits);
-            if duration > 0 {
-                t += duration;
-                emitted_tokens = 0;
-            } else if token == self.blank_idx || emitted_tokens == MAX_TOKENS_PER_STEP {
-                t += 1;
-                emitted_tokens = 0;
+        // Logit boosting only runs when a boost tree is active. With no boost
+        // tree the decode is plain greedy and bit-exact (default path,
+        // streaming): `Joint::decode` runs no boost code without one.
+        let Some(tree) = &self.boost_tree else {
+            return joint.decode(encodings, encodings_len, None);
+        };
+        let boosted = joint.decode(encodings, encodings_len, Some((tree, self.boost_alpha)))?;
+        // Encoder already ran: replay the light greedy decode and use it when
+        // the boost diverged too far (flipped language). A genuine
+        // other-language utterance decodes the same both ways, so it stays.
+        if boosted.0.len() >= GUARD_MIN_TOKENS {
+            let greedy = joint.decode(encodings, encodings_len, None)?;
+            let divergence = token_divergence(&boosted.0, &greedy.0);
+            if divergence > GUARD_DIVERGENCE {
+                log::debug!(
+                    "boost guard: token divergence {:.2} over {} tokens, using unboosted decode",
+                    divergence,
+                    boosted.0.len()
+                );
+                return Ok(greedy);
             }
         }
-
-        Ok((tokens, token_probs))
+        Ok(boosted)
     }
 
     fn decode_tokens(&self, ids: Vec<i32>, probs: Vec<f32>) -> DecodedTokens {
@@ -738,6 +505,173 @@ impl ParakeetModel {
             probs: kept_probs,
         }
     }
+}
+
+/// The TDT decoder_joint session with what its decode loop reads: borrowed
+/// field by field from `ParakeetModel`, so the boost tree (another field) can
+/// stay borrowed alongside it.
+struct Joint<'a> {
+    session: &'a mut Session,
+    vocab: &'a [String],
+    blank_idx: i32,
+}
+
+impl Joint<'_> {
+    /// Greedy TDT decode over the first `encodings_len` encoder frames,
+    /// optionally with dictionary logit boosting (`boost`: the tree and its
+    /// fusion weight).
+    ///
+    /// With a boost tree, at each frame the tree biases the expected
+    /// dictionary tokens on the non-blank logits (gated by the top-K guard)
+    /// before the argmax, and the boost state advances along the trie with
+    /// every emitted token. One joint run per frame, no parallel hypotheses.
+    /// Without one, the argmax reads the raw logits directly.
+    fn decode(
+        &mut self,
+        encodings: &ArrayViewD<f32>,
+        encodings_len: usize,
+        boost: Option<(&BoostTree, f32)>,
+    ) -> Result<DecodedSequence, ParakeetError> {
+        // LSTM state layout is fixed for this model: 2 layers x batch 1 x
+        // 640 hidden (mirrors `parakeet-rs`; no session introspection).
+        let mut state: DecoderState = (Array::zeros((2, 1, 640)), Array::zeros((2, 1, 640)));
+        let mut tokens: Vec<i32> = Vec::new();
+        let mut token_probs: Vec<f32> = Vec::new();
+
+        let mut t = 0;
+        let mut emitted_tokens = 0;
+        // Unused without a boost tree.
+        let mut boost_node = boost.map_or(0, |(tree, _)| tree.root());
+
+        // Reused across steps so the decode loop does not allocate per frame.
+        let mut candidates: Vec<BiasCandidate> = Vec::new();
+        let mut boosted: Vec<f32> = Vec::new();
+        let mut topk_scratch: Vec<f32> = Vec::new();
+
+        while t < encodings_len {
+            // A row view of the encoder output: contiguous, so the decoder
+            // reads it without a per-step copy. encoder_out[None, :, None]
+            // -> [1, 1024, 1] is a stride-only reshape of it.
+            let encoder_step = encodings.slice(ndarray17::s![t, ..]);
+            debug_assert!(
+                encoder_step.as_slice().is_some(),
+                "the joint needs a contiguous encoder frame"
+            );
+            let encoder_outputs = encoder_step
+                .insert_axis(ndarray17::Axis(0))
+                .insert_axis(ndarray17::Axis(2));
+            let target = [tokens.last().copied().unwrap_or(self.blank_idx)];
+            let target_length = [1i32];
+            let outputs = self.session.run(inputs![
+                "encoder_outputs" => TensorRef::from_array_view(encoder_outputs)?,
+                "targets" => TensorRef::from_array_view(ArrayView2::from_shape((1, 1), &target)?)?,
+                "target_length" => TensorRef::from_array_view(ArrayView1::from(&target_length))?,
+                "input_states_1" => TensorRef::from_array_view(state.0.view())?,
+                "input_states_2" => TensorRef::from_array_view(state.1.view())?,
+            ])?;
+            let logits = output(&outputs, "outputs")?;
+            let (vocab_logits, dur_logits) = tdt_logits(&logits, self.vocab.len())?;
+
+            let token = match boost {
+                None => argmax_token(vocab_logits, self.blank_idx),
+                Some((tree, alpha)) => {
+                    tree.bias_into(boost_node, &mut candidates);
+                    if boosted.len() != vocab_logits.len() {
+                        boosted.resize(vocab_logits.len(), 0.0);
+                    }
+                    boosted.copy_from_slice(vocab_logits);
+                    if !candidates.is_empty() {
+                        let (tight, deep) =
+                            top_k_thresholds_with_scratch(vocab_logits, &mut topk_scratch);
+                        for cand in &candidates {
+                            let idx = cand.token as usize;
+                            let threshold = if top_k_for_depth(cand.depth) == BOOST_TOP_K_DEEP {
+                                deep
+                            } else {
+                                tight
+                            };
+                            if cand.token != self.blank_idx
+                                && idx < boosted.len()
+                                && vocab_logits[idx] >= threshold
+                            {
+                                boosted[idx] += alpha * cand.score;
+                            }
+                        }
+                    }
+                    let token = argmax_token(&boosted, self.blank_idx);
+                    if log::log_enabled!(log::Level::Trace)
+                        && token != self.blank_idx
+                        && !candidates.is_empty()
+                    {
+                        log_boost_step(self.vocab, vocab_logits, &candidates, token);
+                    }
+                    token
+                }
+            };
+
+            if token != self.blank_idx {
+                // Confidence from the raw logits, not the boosted ones, so
+                // boosted tokens stay correctable downstream.
+                token_probs.push(softmax_prob(vocab_logits, token as usize));
+                // The LSTM state only advances on an emitted token, so it is
+                // copied out of the outputs only then (blank frames are the
+                // majority), and into the arrays already held.
+                state.0.assign(
+                    &output(&outputs, "output_states_1")?
+                        .into_dimensionality::<ndarray17::Ix3>()?,
+                );
+                state.1.assign(
+                    &output(&outputs, "output_states_2")?
+                        .into_dimensionality::<ndarray17::Ix3>()?,
+                );
+                tokens.push(token);
+                emitted_tokens += 1;
+                if let Some((tree, _)) = boost {
+                    boost_node = tree.advance(boost_node, token);
+                }
+            }
+
+            let duration = argmax_index(dur_logits);
+            if duration > 0 {
+                t += duration;
+                emitted_tokens = 0;
+            } else if token == self.blank_idx || emitted_tokens == MAX_TOKENS_PER_STEP {
+                t += 1;
+                emitted_tokens = 0;
+            }
+        }
+
+        Ok((tokens, token_probs))
+    }
+}
+
+/// One named f32 output of a session run, viewed in place.
+fn output<'a>(
+    outputs: &'a ort::session::SessionOutputs<'_>,
+    name: &str,
+) -> Result<ArrayViewD<'a, f32>, ParakeetError> {
+    Ok(outputs
+        .get(name)
+        .ok_or_else(|| ParakeetError::OutputNotFound(name.to_string()))?
+        .try_extract_array()?)
+}
+
+// Split a (possibly TDT) joint output into (vocab_logits, duration_logits);
+// the duration slice is empty for a plain RNN-T joint.
+fn tdt_logits<'a>(
+    logits: &'a ArrayViewD<'_, f32>,
+    vocab_size: usize,
+) -> Result<(&'a [f32], &'a [f32]), ParakeetError> {
+    let slice = logits.as_slice().ok_or_else(|| {
+        ParakeetError::Shape(ndarray17::ShapeError::from_kind(
+            ndarray17::ErrorKind::IncompatibleShape,
+        ))
+    })?;
+    Ok(if slice.len() > vocab_size {
+        (&slice[..vocab_size], &slice[vocab_size..])
+    } else {
+        (slice, &[][..])
+    })
 }
 
 #[cfg(test)]
@@ -827,7 +761,7 @@ mod tests {
     #[test]
     fn decoder_step_input_stays_standard_layout() {
         let features = 1024;
-        let frame = Array1::<f32>::zeros(features);
+        let frame = ndarray17::Array1::<f32>::zeros(features);
         let encoder_outputs = frame
             .view()
             .into_dyn()

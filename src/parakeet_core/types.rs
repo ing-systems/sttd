@@ -53,7 +53,6 @@ pub struct ParakeetModel {
     pub decoder_joint: Session,
     pub vocab: Vec<String>,
     pub blank_idx: i32,
-    pub vocab_size: usize,
     pub tokenizer: Option<Tokenizer>,
     pub boost_tree: Option<BoostTree>,
     pub boost_alpha: f32,
