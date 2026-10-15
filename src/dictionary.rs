@@ -28,7 +28,7 @@
 // - duplicates by normalized form (case/accent-insensitive) keep the first;
 // - UTF-8 BOM stripped, surrounding whitespace trimmed, empties dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Words shorter than this (normalized chars) are never fuzzy-corrected.
@@ -99,7 +99,7 @@ pub(crate) fn sanitize_entries<'a, I>(lines: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let mut seen: HashMap<String, ()> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut kept = Vec::new();
     let mut skipped_digits = 0usize;
     let mut skipped_spaces = 0usize;
@@ -117,12 +117,10 @@ where
             skipped_spaces += 1;
             continue;
         }
-        let key = normalize_word(line);
-        if seen.contains_key(&key) {
+        if !seen.insert(normalize_word(line)) {
             skipped_dupes += 1;
             continue;
         }
-        seen.insert(key, ());
         kept.push(line.to_string());
     }
     if skipped_digits > 0 {
@@ -173,14 +171,6 @@ pub(crate) fn confidence_map(word_confidences: &[(String, f32)]) -> HashMap<Stri
 /// `confidences` maps normalized word -> model confidence; `None` (all
 /// current engines) behaves ungated.
 pub(crate) fn correct_transcription(
-    text: &str,
-    dictionary: &[String],
-    confidences: Option<&HashMap<String, f32>>,
-) -> String {
-    restore_dictionary_casing_gated(text, dictionary, confidences)
-}
-
-pub(crate) fn restore_dictionary_casing_gated(
     text: &str,
     dictionary: &[String],
     confidences: Option<&HashMap<String, f32>>,

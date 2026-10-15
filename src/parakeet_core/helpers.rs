@@ -15,34 +15,36 @@ use tokenizers::Tokenizer;
 /// French/Latin coverage plus Polish (ą ć ę ł ń ó ś ź ż) via `gate`, so
 /// dictionary variants cover Polish spellings (`zolc` for `żółć`).
 pub fn fold_accents(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            // Polish fold first (identity for non-Polish chars).
-            let c = crate::gate::fold_polish_diacritic(c);
-            match c {
-                'à' | 'â' | 'ä' => "a",
-                'é' | 'è' | 'ê' | 'ë' => "e",
-                'î' | 'ï' => "i",
-                'ô' | 'ö' => "o",
-                'ù' | 'û' | 'ü' => "u",
-                'ÿ' => "y",
-                'ç' => "c",
-                'À' | 'Â' | 'Ä' => "A",
-                'É' | 'È' | 'Ê' | 'Ë' => "E",
-                'Î' | 'Ï' => "I",
-                'Ô' | 'Ö' => "O",
-                'Ù' | 'Û' | 'Ü' => "U",
-                'Ÿ' => "Y",
-                'Ç' => "C",
-                'œ' => "oe",
-                'æ' => "ae",
-                'Œ' => "Oe",
-                'Æ' => "Ae",
-                other => return other.to_string(),
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        // Polish fold first (identity for non-Polish chars).
+        let folded = match crate::gate::fold_polish_diacritic(c) {
+            'à' | 'â' | 'ä' => "a",
+            'é' | 'è' | 'ê' | 'ë' => "e",
+            'î' | 'ï' => "i",
+            'ô' | 'ö' => "o",
+            'ù' | 'û' | 'ü' => "u",
+            'ÿ' => "y",
+            'ç' => "c",
+            'À' | 'Â' | 'Ä' => "A",
+            'É' | 'È' | 'Ê' | 'Ë' => "E",
+            'Î' | 'Ï' => "I",
+            'Ô' | 'Ö' => "O",
+            'Ù' | 'Û' | 'Ü' => "U",
+            'Ÿ' => "Y",
+            'Ç' => "C",
+            'œ' => "oe",
+            'æ' => "ae",
+            'Œ' => "Oe",
+            'Æ' => "Ae",
+            other => {
+                out.push(other);
+                continue;
             }
-            .to_string()
-        })
-        .collect()
+        };
+        out.push_str(folded);
+    }
+    out
 }
 
 fn title_case(word: &str) -> String {

@@ -56,8 +56,10 @@ pub(crate) trait SpeechModel {
     fn describe(&self) -> String;
 
     /// Reload readiness log line, logged after an auto-unload/resume cycle
-    /// instead of `describe()` (which would re-print the full config).
-    fn describe_reload(&self) -> String;
+    /// instead of bare `describe()`.
+    fn describe_reload(&self) -> String {
+        format!("{} (reloaded after pause)", self.describe())
+    }
 
     /// Short engine name for the shared load/unload log lines this module
     /// prints ("{name} model unloaded...", "reloading {name} model...").

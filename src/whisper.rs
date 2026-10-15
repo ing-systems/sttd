@@ -124,10 +124,6 @@ impl SpeechModel for WhisperModel {
         self.ready_line.clone()
     }
 
-    fn describe_reload(&self) -> String {
-        format!("{} (reloaded after pause)", self.ready_line)
-    }
-
     fn engine_name(&self) -> &'static str {
         "whisper"
     }
