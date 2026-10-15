@@ -13,13 +13,19 @@ use crate::asr::PartialSlot;
 use crate::frame::FrameProcessor;
 use crate::utterance::Utterance;
 
-/// Drain every available sample from the `rtrb` consumer into the accumulator.
-/// Main thread only; allocation (accumulator growth) is fine here — only the
-/// cpal callback is real-time.
+/// Drain every available sample from the `rtrb` consumer into the accumulator,
+/// as at most two slice copies (the ring's contiguous runs) instead of one
+/// atomic pop per sample. Samples the callback pushes meanwhile wait for the
+/// next drain. Main thread only; allocation (accumulator growth) is fine here
+/// — only the cpal callback is real-time.
 pub(super) fn drain_raw_into(raw_rx: &mut Consumer<f32>, accumulator: &mut Vec<f32>) {
-    while let Ok(s) = raw_rx.pop() {
-        accumulator.push(s);
-    }
+    let Ok(chunk) = raw_rx.read_chunk(raw_rx.slots()) else {
+        return;
+    };
+    let (first, second) = chunk.as_slices();
+    accumulator.extend_from_slice(first);
+    accumulator.extend_from_slice(second);
+    chunk.commit_all();
 }
 
 /// Drain complete frames from the utterance buffer into the VAD branch and
@@ -141,6 +147,24 @@ mod tests {
     use crate::run::setup::AcousticConfig;
     use clap::Parser;
     use rtrb::RingBuffer;
+
+    #[test]
+    fn drain_raw_into_keeps_order_across_the_ring_wrap() {
+        let (mut tx, mut rx) = RingBuffer::<f32>::new(8);
+        let mut acc = Vec::new();
+        for s in 0..6 {
+            tx.push(s as f32).unwrap();
+        }
+        drain_raw_into(&mut rx, &mut acc);
+        // The next six wrap past the end of the 8-slot ring.
+        for s in 6..12 {
+            tx.push(s as f32).unwrap();
+        }
+        drain_raw_into(&mut rx, &mut acc);
+        drain_raw_into(&mut rx, &mut acc);
+        assert_eq!(acc, (0..12).map(|s| s as f32).collect::<Vec<_>>());
+        assert!(rx.is_empty());
+    }
 
     #[test]
     fn drain_frames_consumes_whole_frames_and_keeps_the_remainder() {
