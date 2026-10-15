@@ -26,7 +26,7 @@
 // the prompt step and is the only graph that computes the cross-attention keys;
 // the `with_past` one runs every step after it and is the only one that reads a
 // cache. A decode through the merged graph alone re-runs the whole prefix per
-// token, which is O(n²) in output length — see `translate::Translator`.
+// token, which is O(n²) in output length — see `translate::engine::Translator`.
 //
 // Layout mirrors `voice_store` deliberately: a spec resolves into
 // `<models>/translators/<spec>/` with the five files sttd reads flat on disk,
@@ -61,7 +61,7 @@ const DECODER_FILE: &str = "decoder_model_merged_quantized.onnx";
 /// sequence on every step, which is **O(n²) in output length**; this graph takes
 /// one token per step against the cache the merged graph returned, which is
 /// O(n). Both are published for both families, and the split is the same one
-/// `whisper_core` runs — see `translate::Translator::run_cached_step`.
+/// `whisper_core` runs — see `translate::engine::Translator::run_cached_step`.
 const DECODER_WITH_PAST_FILE: &str = "decoder_with_past_model_quantized.onnx";
 /// Tokenizer, at the repository root.
 const TOKENIZER_FILE: &str = "tokenizer.json";
@@ -281,7 +281,7 @@ pub(crate) const CATALOG: &[TranslatorPair] = &[
 /// translate, so the run's own `--language` and `--translate` are required
 /// rather than inferred. ~870 MiB against a Marian pair's ~114 MiB, and a
 /// heavier decode (12 layers of `d_model` 1024 against 6 of 512) — see
-/// `translate::Translator`.
+/// `translate::engine::Translator`.
 pub(crate) const NLLB_SPEC: &str = "nllb-200-distilled-600M";
 
 /// The one pair export the tests that need real weights can rely on being present
@@ -432,7 +432,7 @@ impl Family {
     /// translated sentence is a sentence or two. It is small because a repetition
     /// loop is the one way a greedy decode runs away, and the decode is otherwise
     /// **O(n) in output length**: the prompt step fills a key/value cache and every
-    /// step after it adds one token (see `translate::Translator::run_cached_step`).
+    /// step after it adds one token (see `translate::engine::Translator::run_cached_step`).
     /// So this is a bound on how much work one utterance can ask for, not the thing
     /// keeping a quadratic tail in check — the single-graph form that needed a
     /// per-family cap for that is gone.
@@ -442,7 +442,7 @@ impl Family {
     /// four threads with the cache, one sentence is 79 ms for a pair and 677 ms for
     /// NLLB, so 96 covers a runaway in about 2 s and 48 in about 11 s. Marian's 96
     /// also still covers a sentence with no terminator in it, which is what
-    /// `translate::split_sentences` hands over.
+    /// `translate::text::split_sentences` hands over.
     pub(crate) const fn max_new_tokens(self) -> usize {
         match self {
             Self::Marian => 96,
@@ -518,7 +518,7 @@ pub(crate) struct ModelFacts {
     /// NLLB — read from the same place as the start token rather than assumed.
     pub(crate) eos_token: i64,
     /// `pad_token_id`, when the export publishes one. Must be suppressed from a
-    /// decode; see `translate::Suppressed`.
+    /// decode; see `translate::engine::Suppressed`.
     pub(crate) pad_token: Option<i64>,
 }
 
@@ -1031,7 +1031,7 @@ fn read_config(t: &TranslatorRef) -> Result<ModelFacts> {
     // cannot: `pl-en` opens on 63429 and stops on 0, `mul-en` on 64171 and 0. NLLB
     // declares **both as 2** and is perfectly runnable, because it does not open
     // on `decoder_start_token_id` at all -- it opens on the target language code
-    // (see `translate::Feed`). So the rule belongs to the family that is bound by
+    // (see `translate::engine::Feed`). So the rule belongs to the family that is bound by
     // it, and applying it to NLLB would refuse a working model.
     if family == Family::Marian && start_token == eos_token {
         anyhow::bail!(

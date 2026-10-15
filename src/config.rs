@@ -516,7 +516,7 @@ pub(crate) const NLLB_REPO: &str = "Xenova";
 pub(crate) const TRANSLATE_EXAMPLE_PAIR: &str = "pl-en";
 
 /// Token budget for one translated piece: over this the ids are truncated (see
-/// `translate::Translator::translate`).
+/// `translate::engine::Translator::translate`).
 ///
 /// No prompt shares the budget in either family — Marian takes raw text and NLLB
 /// takes a language code — but NLLB spends three of its ids on the source code, the
