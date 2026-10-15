@@ -15,7 +15,7 @@
 // intended.
 
 use crate::config::{AGC_ATTACK_MS, AGC_RELEASE_MS, FRAME_16K, SAMPLE_RATE};
-use crate::noise::frame_rms;
+use crate::noise::{frame_peak, frame_rms};
 
 /// Below this frame RMS the frame never adapts (activation threshold, ~-50 dBFS).
 pub(crate) const AGC_MIN_RMS: f32 = crate::config::DEFAULT_MIN_SPEECH_RMS;
@@ -87,13 +87,13 @@ impl Agc {
         Some(self.cur_gain)
     }
 
-    /// Scale one buffer by `gain`, limited so its peak stays below 0.99.
-    /// `peak` is the caller's already-measured peak of this buffer. A single
-    /// hot sample only limits this frame's application; the loop state keeps
-    /// the smoother gain.
+    /// Scale one buffer by `gain`, limited so its peak stays below 0.99. A
+    /// single hot sample only limits this frame's application; the loop state
+    /// keeps the smoother gain.
     ///
     /// Returns whether the buffer was scaled at all.
-    fn apply_gain(buf: &mut [f32], gain: f32, peak: f32) -> bool {
+    fn apply_gain(buf: &mut [f32], gain: f32) -> bool {
+        let peak = frame_peak(buf);
         let applied = if peak > 0.0 {
             gain.min(0.99 / peak).max(1.0)
         } else {
@@ -114,8 +114,7 @@ impl Agc {
         let Some(gain) = gain else {
             return rms;
         };
-        let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        if Self::apply_gain(buf, gain, peak) {
+        if Self::apply_gain(buf, gain) {
             frame_rms(buf)
         } else {
             rms
@@ -146,8 +145,7 @@ impl Agc {
         let rms = frame_rms(model);
         let gain = self.adapt(rms, prev_speech);
         if let Some(gain) = gain {
-            let peak = vad.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-            Self::apply_gain(vad, gain, peak);
+            Self::apply_gain(vad, gain);
         }
         (rms, Self::gain_and_measure(model, gain, rms))
     }

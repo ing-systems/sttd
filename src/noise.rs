@@ -58,6 +58,12 @@ pub(crate) fn frame_rms(frame: &[f32]) -> f32 {
     (sum_sq / frame.len() as f64).sqrt() as f32
 }
 
+/// Largest absolute sample (0 for an empty buffer).
+#[inline]
+pub(crate) fn frame_peak(frame: &[f32]) -> f32 {
+    frame.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
+}
+
 /// Slow background RMS estimate. Warm across pause, frozen across speech.
 #[derive(Debug, Clone)]
 pub(crate) struct NoiseTracker {

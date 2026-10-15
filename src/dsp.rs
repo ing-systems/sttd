@@ -76,6 +76,19 @@ pub(crate) fn u16_to_f32(s: u16) -> f32 {
     s as f32 / 65535.0 * 2.0 - 1.0
 }
 
+/// Linear fade-in and fade-out of `fade` samples each: sample `i` from either
+/// end is scaled by `(i + 1) / (fade + 1)`, so neither end is cut to exact
+/// zero. `fade` is clamped to half the buffer so the ramps never overlap.
+pub(crate) fn apply_linear_fades(buf: &mut [f32], fade: usize) {
+    let fade = fade.min(buf.len() / 2);
+    let len = buf.len();
+    for i in 0..fade {
+        let ramp = (i + 1) as f32 / (fade + 1) as f32;
+        buf[i] *= ramp;
+        buf[len - 1 - i] *= ramp;
+    }
+}
+
 /// Downmix an interleaved multi-channel buffer to mono by averaging. Test
 /// reference for the `None` arm of `downmix_to_mono_with_channel`; production
 /// callers use `select_channel_and_downmix`, which resolves and mixes in one

@@ -2,6 +2,8 @@
 //! the split-seam dedup.
 
 use crate::config::CONDITION_FADE_SAMPLES;
+use crate::dsp::apply_linear_fades;
+use crate::noise::frame_peak;
 
 /// Condition an utterance for the model: DC removal, short linear fades at
 /// both ends, and peak safety to 0.99. Hum/rumble already removed upstream by
@@ -22,16 +24,10 @@ pub(crate) fn condition_utterance(pcm: &[f32], headroom: usize) -> Vec<f32> {
 
     // Linear fades at both ends; shortened for very short utterances so the
     // ramps never overlap.
-    let fade = CONDITION_FADE_SAMPLES.min(out.len() / 2);
-    for i in 0..fade {
-        let ramp = (i + 1) as f32 / (fade + 1) as f32;
-        out[i] *= ramp;
-        let j = out.len() - 1 - i;
-        out[j] *= ramp;
-    }
+    apply_linear_fades(&mut out, CONDITION_FADE_SAMPLES);
 
     // Peak safety: resampler overshoot can exceed 1.0; keep headroom.
-    let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    let peak = frame_peak(&out);
     if peak > 0.99 {
         let scale = 0.99 / peak;
         for s in out.iter_mut() {

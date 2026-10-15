@@ -57,21 +57,13 @@ pub(crate) fn tone_buffer(freq_hz: f32, duration_ms: u64, sample_rate: u32) -> V
     if total == 0 {
         return Vec::new();
     }
-    let fade = ((sample_rate as u64 * FADE_MS / 1000) as usize).min(total / 2);
-    let mut out = Vec::with_capacity(total);
-    for i in 0..total {
-        let t = i as f32 / sample_rate as f32;
-        let mut s = (2.0 * std::f32::consts::PI * freq_hz * t).sin() * CUE_GAIN;
-        if fade > 0 {
-            if i < fade {
-                s *= (i + 1) as f32 / (fade + 1) as f32;
-            } else if i >= total - fade {
-                let j = total - 1 - i;
-                s *= (j + 1) as f32 / (fade + 1) as f32;
-            }
-        }
-        out.push(s);
-    }
+    let mut out: Vec<f32> = (0..total)
+        .map(|i| {
+            let t = i as f32 / sample_rate as f32;
+            (2.0 * std::f32::consts::PI * freq_hz * t).sin() * CUE_GAIN
+        })
+        .collect();
+    crate::dsp::apply_linear_fades(&mut out, (sample_rate as u64 * FADE_MS / 1000) as usize);
     out
 }
 
