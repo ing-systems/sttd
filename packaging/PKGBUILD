@@ -88,6 +88,7 @@ check() {
 package() {
   cd "$startdir/.."
   install -Dm755 "$CARGO_TARGET_DIR/release/sttd" "$pkgdir/usr/bin/sttd"
+  install -Dm755 "$CARGO_TARGET_DIR/release/sttctl" "$pkgdir/usr/bin/sttctl"
 
   # The bundled default model: catalog specs resolve to a single directory
   # baked in at build time (STTD_MODELS_DIR above -> src/config.rs), so this

@@ -4,7 +4,7 @@ Real-time Polish-English speech-to-text for a live microphone.
 
 `sttd` captures microphone audio, cuts it into utterances locally, and sends only speech-bearing audio to the speech model. It prints or pastes one line per utterance.
 
-Single Rust binary. No server. No network at runtime except first model download.
+Rust workspace. No server. No network at runtime except first model download.
 
 ## Features
 
@@ -16,6 +16,7 @@ Single Rust binary. No server. No network at runtime except first model download
 - Optional translation of each accepted transcript before emission (`--translate`, ONNX: a MarianMT `opus-mt` pair, or one multilingual NLLB-200 for every direction).
 - Emission to stdout, Wayland clipboard (`wl-copy`), auto-paste (`ydotool`), spoken transcript (`--speak`, piper), WAV+TXT dump, last-text file, JSONL metrics.
 - Offline file mode, daemon mode, systemd user unit, pause/resume signals.
+- D-Bus control client (`sttctl`) for pause, dictionary, translation, status, signals.
 - Optional VAD-branch denoiser (DeepFilterNet3, `denoise` feature).
 - Custom dictionary for post-gate correction.
 
@@ -217,6 +218,9 @@ cargo build --release --features cuda
 STTD_MODELS_DIR=/usr/share/sttd/models cargo build --release
 ```
 
+The workspace builds two binaries: `target/release/sttd` and `target/release/sttctl`.
+`sttctl` is the D-Bus control client. It needs no features.
+
 Notes:
 
 - `.cargo/config.toml:1-4` sets `-C target-cpu=native`.
@@ -233,7 +237,7 @@ cargo test
 cargo test --release --frozen
 ```
 
-No clippy/rustfmt config. No CI config. Tests live inline (`#[cfg(test)]`, 392 tests).
+No clippy/rustfmt config. No CI config. Tests live inline (`#[cfg(test)]`, 479 tests).
 
 Five Whisper tests read the downloaded model's `tokenizer.json` and skip themselves when it is absent, so they cover the byte-level BPE handling and the compiled prompt token ids on a machine that has the weights, and leave `cargo test` runnable on a clean checkout.
 
@@ -246,6 +250,8 @@ Show help (full reference; every flag has `STTD_*` env fallback, CLI wins):
 ```sh
 cargo run --release -- --help
 sttd --help
+cargo run -q -p sttctl -- --help
+sttctl --help
 ```
 
 Live microphone (starts paused by default; resume with signal):
@@ -271,6 +277,14 @@ sttd --start
 sttd --status
 sttd --stop
 sttd --start --copy --paste --autopause
+```
+
+Control a running daemon with `sttctl` (see *Runtime control*):
+
+```sh
+sttctl status
+sttctl daemon paused
+sttctl translation state
 ```
 
 Paste last emission again:
@@ -305,6 +319,8 @@ Arch package (local build from this checkout):
 cd packaging && makepkg
 ```
 
+The package installs `sttd` and `sttctl` to `/usr/bin`.
+
 ## Configuration
 
 Precedence: CLI flag > `STTD_*` env > compiled default. See `src/cli.rs:26-351`.
@@ -332,8 +348,8 @@ Key tunables:
 | `--stdout` / `STTD_STDOUT` | off | Print one line per accepted utterance. |
 | `--speak` / `STTD_SPEAK` | off | Read each accepted transcript aloud through the default output device (needs `espeak-ng`). Holds the microphone while it speaks, so what you say during playback is discarded — pair it with `--autopause`, or use headphones. Ctrl-C cuts playback at once and does not read the last sentence aloud. Independent of `--sound`. |
 | `--voice` / `STTD_VOICE` | `pl_PL-gosia-medium` | Piper voice key or a voice directory. Downloaded on first use (~60 MiB). Ignored, and not downloaded, without `--speak`. |
-| `--translate` / `STTD_TRANSLATE` | unset | Translate each accepted transcript into `<LANG>` before emission. Unset: no translation step and no translator download — but `org.sttd.Translation.SetTargetLanguage` can turn it on at runtime (see *Runtime control*). Every emission channel then receives the translation. The direction comes from `--language` plus this flag; with the default pair translator only exported pairs exist (see *Translation*). |
-| `--translate-model` / `STTD_TRANSLATE_MODEL` | unset | Override the resolved direction: a catalog spec (`opus-mt-mul-en`, or `nllb-200-distilled-600M` for every direction at ~1.3 GiB), or a directory holding `encoder_model_quantized.onnx`, `decoder_model_merged_quantized.onnx`, `decoder_with_past_model_quantized.onnx`, `tokenizer.json` and `config.json`. Downloaded on first use. Applies to a runtime `SetTargetLanguage` too; without `--translate` it is used only by such a request, and is ignored (and not downloaded) where there is no bus to ask with. |
+| `--translate` / `STTD_TRANSLATE` | unset | Translate each accepted transcript into `<LANG>` before emission. Unset: no translation step and no translator download — but `sttctl translation set-target` can turn it on at runtime (see *Runtime control*). Every emission channel then receives the translation. The direction comes from `--language` plus this flag; with the default pair translator only exported pairs exist (see *Translation*). |
+| `--translate-model` / `STTD_TRANSLATE_MODEL` | unset | Override the resolved direction: a catalog spec (`opus-mt-mul-en`, or `nllb-200-distilled-600M` for every direction at ~1.3 GiB), or a directory holding `encoder_model_quantized.onnx`, `decoder_model_merged_quantized.onnx`, `decoder_with_past_model_quantized.onnx`, `tokenizer.json` and `config.json`. Downloaded on first use. Applies to a runtime `sttctl translation set-target` too; without `--translate` it is used only by such a request, and is ignored (and not downloaded) where there is no bus to ask with. |
 | `--copy` / `STTD_COPY` | off | Copy each emission via `wl-copy`. |
 | `--paste` / `STTD_PASTE` | off | Paste via `ydotool`. Runs only when copy runs on fresh text. |
 | `--paste-mode` / `STTD_PASTE_MODE` | `ctrl-v` | `ctrl-v`, `ctrl-shift-v`, or `type`. |
@@ -384,7 +400,7 @@ systemctl --user kill -s SIGUSR1 sttd   # pause
 
 The unit runs foreground (`ExecStart=/usr/bin/sttd --autopause --copy 1 --paste 1`). It starts paused by default. It needs `WAYLAND_DISPLAY` for copy/paste (`systemctl --user import-environment WAYLAND_DISPLAY`).
 
-D-Bus (microphone mode, unless `--no-dbus`): one bus name `org.sttd.Daemon` with three interfaces on separate object paths. A missing session bus is not fatal: the service retries in the background and the signals above keep working. File mode (`--file`) never starts the service.
+D-Bus (microphone mode, unless `--no-dbus`): one bus name `org.sttd.Daemon` with three interfaces on separate object paths. A missing session bus is not fatal: the service retries in the background and the signals above keep working. File mode (`--file`) never starts the service. `sttctl` is the control client for these interfaces. It needs a running `sttd` with the bus enabled. `--no-dbus` leaves `sttctl` with nothing to call.
 
 | Interface | Object path | Members |
 | --- | --- | --- |
@@ -392,28 +408,31 @@ D-Bus (microphone mode, unless `--no-dbus`): one bus name `org.sttd.Daemon` with
 | `org.sttd.Dictionary` | `/org/sttd/Dictionary` | `LoadFile`, `ReplaceWords`, `AddWords`, `RemoveWords`, `GetWords`, `Contains`, properties `Count` and `Dirty`, signal `DictionaryChanged` |
 | `org.sttd.Translation` | `/org/sttd/Translation` | `Enable`, `Disable`, `Toggle`, `SetTargetLanguage`, `GetState`, properties `Enabled`, `TargetLanguage`, `RequestedLanguage` and `Model`, signal `TranslationChanged` |
 
+`sttctl` prints text by default and JSON with `--json`. `--timeout SECONDS` sets the call timeout (default 30). Implementation: `sttctl/src/dbus_client.rs`, `src/dbus.rs`.
+
 Pause control (`Pause` and `Toggle` flush the utterance buffer, same as
 `SIGUSR1`/`SIGHUP` above):
 
 ```sh
-busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Pause
-busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Resume
-busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Toggle
-busctl --user get-property org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Paused
+sttctl daemon pause
+sttctl daemon resume
+sttctl daemon toggle
+sttctl daemon paused
+sttctl status                       # pause plus translation state
+sttctl status --json
 ```
 
 Live dictionary:
 
 ```sh
-busctl --user call org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary LoadFile s /path/to/words.txt
-busctl --user call org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary ReplaceWords as 2 AppImage Syntocinon
-busctl --user call org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary AddWords as 1 Zoxide
-busctl --user call org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary RemoveWords as 1 zoxide
-busctl --user call org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary Contains s appimage
-busctl --user call org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary GetWords
-busctl --user get-property org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary Count
-busctl --user get-property org.sttd.Daemon /org/sttd/Dictionary org.sttd.Dictionary Dirty
-busctl --user monitor org.sttd.Daemon
+sttctl dictionary load /path/to/words.txt
+sttctl dictionary replace AppImage Syntocinon
+sttctl dictionary add Zoxide
+sttctl dictionary remove zoxide
+sttctl dictionary contains appimage
+sttctl dictionary get
+sttctl dictionary count
+sttctl dictionary dirty
 ```
 
 `LoadFile` takes a real path. An empty or whitespace-only path is rejected with `(false, count, "empty path")`; it never reloads anything. To reload the current file, read the path from `GetWords` and pass it back to `LoadFile`. A failed load keeps the previous words and returns `(false, old_count, message)`.
@@ -431,12 +450,33 @@ Any process running as the same user can call these methods, so the dictionary i
 Translation (`--translate` needs nothing here; the step can be switched at runtime with or without the flag):
 
 ```sh
-busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation SetTargetLanguage s en
-busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation Enable
-busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation Disable b false   # off, keep the weights
-busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation Disable b true    # off, free them now
-busctl --user call org.sttd.Daemon /org/sttd/Translation org.sttd.Translation GetState
-busctl --user get-property org.sttd.Daemon /org/sttd/Translation org.sttd.Translation TargetLanguage
+sttctl translation set-target en
+sttctl translation enable
+sttctl translation disable            # off, keep the weights
+sttctl translation disable --unload   # off, free them now
+sttctl translation toggle
+sttctl translation state
+sttctl translation enabled
+sttctl translation target-language
+sttctl translation requested-language
+sttctl translation model
+```
+
+Watch signals and completions:
+
+```sh
+sttctl watch
+sttctl watch --signals StateChanged
+sttctl watch --signals DictionaryChanged --signals TranslationChanged --json
+sttctl completions bash > sttctl.bash
+```
+
+`watch` reports signals it cannot parse instead of dropping them.
+
+`busctl` fallback: `sttctl` covers the three interfaces above. Raw `busctl` calls remain possible (see `src/dbus.rs` and `sttctl/src/dbus_client.rs:7-13` for names and paths). Example:
+
+```sh
+busctl --user call org.sttd.Daemon /org/sttd/Daemon org.sttd.Daemon Pause
 busctl --user monitor org.sttd.Daemon
 ```
 
@@ -492,7 +532,13 @@ src/dictionary.rs    custom vocabulary
 src/clean.rs         filler stripping
 src/dbus.rs          session bus: pause, live dictionary, translation switch
 src/daemon.rs        start/stop/status
+src/device.rs        GPU fallback owner
 src/dsp.rs, src/hp.rs, src/agc.rs, src/denoise.rs, src/sound.rs, src/wav.rs
+sttctl/src/main.rs   sttctl entry, timeout, dispatch
+sttctl/src/cli.rs    sttctl commands: daemon, dictionary, translation, status, watch
+sttctl/src/commands.rs  sttctl text and JSON output
+sttctl/src/dbus_client.rs  sttctl D-Bus calls and signal watch
+sttctl/src/output.rs  sttctl text and JSON printers
 tools/eval.py        WER batch eval + threshold sweep
 tools/dump2corpus.py build eval corpus from --dump-dir
 packaging/           PKGBUILD, sttd.service
