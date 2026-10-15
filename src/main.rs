@@ -79,6 +79,7 @@ mod capture;
 mod config;
 use capture::*;
 mod clean;
+mod control;
 mod daemon;
 mod dbus;
 mod denoise;
@@ -478,8 +479,8 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // loop and the worker all observe the same objects.
     // `LiveDictionary::new` attaches the ASR booster hook and hands back the
     // hooked clone for `dbus::spawn`.
-    let pause_state = crate::dbus::PauseState::new(cli.start_paused);
-    let dict_state = crate::dbus::DictionaryState::new(
+    let pause_state = crate::control::PauseState::new(cli.start_paused);
+    let dict_state = crate::control::DictionaryState::new(
         load_dictionary_or_warn(cli),
         cli.dictionary.clone().unwrap_or_default(),
     );
@@ -895,7 +896,7 @@ fn install_ctrlc_handler(cb: impl Fn() + Send + 'static) -> Result<()> {
 /// itself is signaled separately by the ASR thread once transcription
 /// can actually resume.
 fn install_pause_handlers(
-    pause_state: crate::dbus::PauseState,
+    pause_state: crate::control::PauseState,
     running: Arc<AtomicBool>,
     sound_enabled: bool,
 ) -> Result<()> {
@@ -980,7 +981,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     // File mode runs offline with no D-Bus service (see the interview), but
     // the worker still takes the live handle so `asr_options` has one shape.
     // The booster hook stays unconsumed: nothing swaps words here.
-    let live_dict = crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
+    let live_dict = crate::asr::LiveDictionary::new(crate::control::DictionaryState::new(
         load_dictionary_or_warn(cli),
         cli.dictionary.clone().unwrap_or_default(),
     ))
@@ -1446,7 +1447,7 @@ mod tests {
     #[test]
     fn asr_options_carry_the_language_to_the_worker() {
         let cli = Cli::try_parse_from(["sttd", "--language", "en"]).expect("flags must parse");
-        let dictionary = crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
+        let dictionary = crate::asr::LiveDictionary::new(crate::control::DictionaryState::new(
             Vec::new(),
             Default::default(),
         ))
@@ -1460,7 +1461,7 @@ mod tests {
     #[test]
     fn asr_config_starts_with_an_empty_partial_slot() {
         let dictionary = || {
-            crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
+            crate::asr::LiveDictionary::new(crate::control::DictionaryState::new(
                 Vec::new(),
                 Default::default(),
             ))
@@ -1501,7 +1502,7 @@ mod tests {
         assert_eq!(acoustic.hangover_frames, 35);
         assert_eq!(acoustic.target_rms, 0.02);
         // The ASR worker gets the same thresholds, from the same builder.
-        let dictionary = crate::asr::LiveDictionary::new(crate::dbus::DictionaryState::new(
+        let dictionary = crate::asr::LiveDictionary::new(crate::control::DictionaryState::new(
             Vec::new(),
             Default::default(),
         ))

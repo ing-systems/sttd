@@ -114,16 +114,16 @@ pub(crate) fn with_loading_ticker<T>(label: &str, f: impl FnOnce() -> Result<T>)
     result
 }
 
-/// The ASR side of the live dictionary: a `dbus::DictionaryState` handle for the
+/// The ASR side of the live dictionary: a `control::DictionaryState` handle for the
 /// per-utterance word list, plus a one-slot queue the D-Bus hook fills so the
 /// engine boost automaton is rebuilt on the *worker* thread (the engine is
 /// worker-thread local and must never be touched from the bus thread).
 ///
-/// Ownership split: the hooked `dbus::DictionaryState` goes to `dbus::spawn`,
+/// Ownership split: the hooked `control::DictionaryState` goes to `dbus::spawn`,
 /// this value goes into `AsrConfig`. Both are cheap clones of the same state,
 /// so a swap on the bus is visible to the next utterance either way.
 pub(crate) struct LiveDictionary {
-    shared: crate::dbus::DictionaryState,
+    shared: crate::control::DictionaryState,
     /// Newest word list reported by the hook, waiting for the worker to apply
     /// it. `None` = nothing pending, so the steady state costs one atomic-free
     /// mutex lock per utterance.
@@ -131,15 +131,15 @@ pub(crate) struct LiveDictionary {
 }
 
 impl LiveDictionary {
-    /// Attach the booster hook to a `dbus::DictionaryState` clone.
+    /// Attach the booster hook to a `control::DictionaryState` clone.
     ///
     /// Returns the hooked clone (hand it to `dbus::spawn`) and this value
     /// (put it in `AsrConfig::dictionary`). A swap then reaches the worker
     /// twice over the same list: through `words()` for post-correction, and
     /// through the queue for the engine boost.
     pub(crate) fn new(
-        shared: crate::dbus::DictionaryState,
-    ) -> (crate::dbus::DictionaryState, Self) {
+        shared: crate::control::DictionaryState,
+    ) -> (crate::control::DictionaryState, Self) {
         let boost: Arc<Mutex<Option<Arc<Vec<String>>>>> = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&boost);
         let shared = shared.with_words_hook(Arc::new(move |words| {
@@ -1511,18 +1511,18 @@ mod tests {
 
     /// A live dictionary with no words, for tests that never swap one.
     fn empty_live_dictionary() -> LiveDictionary {
-        LiveDictionary::new(crate::dbus::DictionaryState::new(
+        LiveDictionary::new(crate::control::DictionaryState::new(
             Vec::new(),
             std::path::PathBuf::new(),
         ))
         .1
     }
 
-    /// A live dictionary seeded with `words`, plus the `dbus::DictionaryState`
+    /// A live dictionary seeded with `words`, plus the `control::DictionaryState`
     /// a test would hand to `dbus::spawn`, so a test can drive a swap and see
     /// what the worker would apply.
-    fn live_dictionary_with(words: &[&str]) -> (crate::dbus::DictionaryState, LiveDictionary) {
-        LiveDictionary::new(crate::dbus::DictionaryState::new(
+    fn live_dictionary_with(words: &[&str]) -> (crate::control::DictionaryState, LiveDictionary) {
+        LiveDictionary::new(crate::control::DictionaryState::new(
             words.iter().map(|w| w.to_string()).collect(),
             std::path::PathBuf::new(),
         ))

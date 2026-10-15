@@ -1216,7 +1216,7 @@ fn cache_slots(
 // The state lives in this module rather than in `dbus` because it owns the
 // weights and the loader threads, and `translator_store` plus three `ort`
 // sessions are not a bus concern: `dbus` holds this handle and forwards calls,
-// the way `asr` holds `dbus::DictionaryState`. The dependency therefore points
+// the way `asr` holds `control::DictionaryState`. The dependency therefore points
 // one way, `dbus -> translate`.
 //
 // Two rules hold the whole thing together:
