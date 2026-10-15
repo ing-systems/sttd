@@ -13,7 +13,7 @@ use std::borrow::Cow;
 
 use tokenizers::Tokenizer;
 
-use super::types::TimestampedResult;
+use super::types::DecodedTokens;
 
 /// Replace accented Latin letters with their ASCII base. Murmure's
 /// French/Latin coverage plus Polish (ą ć ę ł ń ó ś ź ż) via `gate`, so
@@ -115,7 +115,7 @@ pub fn load_tokenizer(tokenizer_path: Option<&std::path::Path>) -> Option<Tokeni
 /// minimum. The grouping itself lives in `crate::decode::word_confidences`,
 /// shared with Whisper; the pieces here are Parakeet's vocab strings, where
 /// Whisper's are byte-level BPE pieces.
-pub fn word_confidences(result: &TimestampedResult) -> Vec<(String, f32)> {
+pub fn word_confidences(result: &DecodedTokens) -> Vec<(String, f32)> {
     crate::decode::word_confidences(
         result
             .tokens

@@ -14,11 +14,11 @@ use super::boost_tree::BoostTree;
 
 pub type DecoderState = (Array3<f32>, Array3<f32>);
 
+/// One decoded sequence: the joined text, and the vocab pieces and their
+/// probabilities that per-word confidences are grouped from.
 #[derive(Debug, Clone)]
-pub struct TimestampedResult {
+pub struct DecodedTokens {
     pub text: String,
-    #[allow(dead_code)]
-    pub timestamps: Vec<f32>,
     pub tokens: Vec<String>,
     /// Softmax probability of each emitted token over the raw (unboosted)
     /// vocab logits, aligned with `tokens`.
@@ -26,7 +26,6 @@ pub struct TimestampedResult {
 }
 
 #[derive(thiserror::Error, Debug)]
-#[allow(dead_code)]
 pub enum ParakeetError {
     #[error("ORT error: {0}")]
     Ort(#[from] ort::Error),
@@ -36,12 +35,8 @@ pub enum ParakeetError {
     Shape(#[from] ndarray17::ShapeError),
     #[error("audio frontend error: {0}")]
     Frontend(String),
-    #[error("Model input not found: {0}")]
-    InputNotFound(String),
     #[error("Model output not found: {0}")]
     OutputNotFound(String),
-    #[error("Failed to get tensor shape for input: {0}")]
-    TensorShape(String),
 }
 
 // `ort` 2.x types builder errors as `Error<SessionBuilder>`; the session

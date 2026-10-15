@@ -8,9 +8,9 @@
 //   `frontend` (mel) and feeds the encoder directly;
 // - `ParakeetModel::new` takes ORT intra/inter thread counts (sttd
 //   `--threads`);
-// - the `ParakeetEngine` wrapper and timestamp-granularity plumbing are
-//   gone; sttd calls `ParakeetModel` directly and only needs
-//   `TranscriptionResult { text, word_confidences }`.
+// - the `ParakeetEngine` wrapper and the timestamp plumbing are gone; sttd
+//   calls `ParakeetModel` directly and only needs the text and per-word
+//   confidences (`speech::Transcript`).
 // ---------------------------------------------------------------------------
 
 use ndarray17::{Array, Array1, Array2, ArrayD, ArrayViewD, IxDyn};
@@ -26,17 +26,15 @@ use std::path::Path;
 use super::boost_tree::{BiasCandidate, BoostTree};
 use super::frontend::{Frontend, PreprocessorConfig};
 use super::helpers::{load_tokenizer, tokenize_word_to_ids, word_confidences, word_variants};
-use super::transcription_engine::TranscriptionResult;
-use super::types::{DecoderState, ParakeetError, ParakeetModel, TimestampedResult};
+use super::types::{DecodedTokens, DecoderState, ParakeetError, ParakeetModel};
 use crate::decode::{argmax_index, softmax_prob};
 use crate::device::Device;
+use crate::speech::Transcript;
 
-/// Tokens, frame timestamps and raw-logit probabilities of one decoded
-/// sequence, kept index-aligned by the decode loops.
-type DecodedSequence = (Vec<i32>, Vec<usize>, Vec<f32>);
+/// Tokens and raw-logit probabilities of one decoded sequence, kept
+/// index-aligned by the decode loops.
+type DecodedSequence = (Vec<i32>, Vec<f32>);
 
-const SUBSAMPLING_FACTOR: usize = 8;
-const WINDOW_SIZE: f32 = 0.01;
 const MAX_TOKENS_PER_STEP: usize = 10;
 
 // Fusion weight bounds applied to boost scores before argmax. Alpha decays
@@ -179,23 +177,17 @@ impl Drop for ParakeetModel {
 impl ParakeetModel {
     pub fn new<P: AsRef<Path>>(
         model_dir: P,
-        quantized: bool,
         tokenizer_path: Option<&Path>,
         intra_threads: usize,
         device: Device,
     ) -> Result<Self, ParakeetError> {
         let threads = intra_threads.max(1);
-        let encoder = Self::init_session(&model_dir, "encoder-model", threads, quantized, device)?;
+        let encoder = Self::init_session(&model_dir, "encoder-model", threads, device)?;
         // The TDT joint runs once per emitted frame on tiny tensors, so it
         // always stays on CPU: CUDA transfer latency costs more than the
         // compute it saves.
-        let decoder_joint = Self::init_session(
-            &model_dir,
-            "decoder_joint-model",
-            threads,
-            quantized,
-            Device::Cpu,
-        )?;
+        let decoder_joint =
+            Self::init_session(&model_dir, "decoder_joint-model", threads, Device::Cpu)?;
 
         let (vocab, blank_idx) = Self::load_vocab(&model_dir)?;
         let vocab_size = vocab.len();
@@ -329,27 +321,19 @@ impl ParakeetModel {
         model_dir: P,
         model_name: &str,
         intra_threads: usize,
-        try_quantized: bool,
         device: Device,
     ) -> Result<Session, ParakeetError> {
-        // Try quantized version first if requested, fallback to regular version
-        let model_filename = if try_quantized {
-            let quantized_name = format!("{}.int8.onnx", model_name);
-            let quantized_path = model_dir.as_ref().join(&quantized_name);
-            if quantized_path.exists() {
-                log::trace!("Loading quantized model from {}...", quantized_name);
-                quantized_name
-            } else {
-                let regular_name = format!("{}.onnx", model_name);
-                log::trace!(
-                    "Quantized model not found, loading regular model from {}...",
-                    regular_name
-                );
-                regular_name
-            }
+        // The int8 export when the directory has one, the fp32 one otherwise.
+        let quantized_name = format!("{}.int8.onnx", model_name);
+        let model_filename = if model_dir.as_ref().join(&quantized_name).exists() {
+            log::trace!("Loading quantized model from {}...", quantized_name);
+            quantized_name
         } else {
             let regular_name = format!("{}.onnx", model_name);
-            log::trace!("Loading model from {}...", regular_name);
+            log::trace!(
+                "Quantized model not found, loading regular model from {}...",
+                regular_name
+            );
             regular_name
         };
 
@@ -506,15 +490,12 @@ impl ParakeetModel {
 
     /// Full pipeline over raw 16 kHz mono samples: Rust mel frontend,
     /// encoder, greedy (optionally boosted) TDT decode.
-    pub fn transcribe_samples(
-        &mut self,
-        samples: &[f32],
-    ) -> Result<TranscriptionResult, ParakeetError> {
+    pub fn transcribe_samples(&mut self, samples: &[f32]) -> Result<Transcript, ParakeetError> {
         // The frontend already returns the encoder layout [1, features, time].
         let audio_signal = self.frontend.extract(samples)?;
         let time_steps = audio_signal.shape()[2];
         if time_steps == 0 {
-            return Ok(TranscriptionResult {
+            return Ok(Transcript {
                 text: String::new(),
                 word_confidences: Vec::new(),
             });
@@ -526,19 +507,18 @@ impl ParakeetModel {
         let encodings_len = encoder_out_lens.iter().next().copied().unwrap_or(0).max(0) as usize;
         let mut results = Vec::new();
         for encodings in encoder_out.outer_iter() {
-            let (tokens, timestamps, probs) =
-                self.decode_sequence(&encodings.view(), encodings_len)?;
-            results.push(self.decode_tokens(tokens, timestamps, probs));
+            let (tokens, probs) = self.decode_sequence(&encodings.view(), encodings_len)?;
+            results.push(self.decode_tokens(tokens, probs));
         }
-        let timestamped = results.into_iter().next().ok_or_else(|| {
+        let decoded = results.into_iter().next().ok_or_else(|| {
             ParakeetError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "No transcription result returned",
             ))
         })?;
-        Ok(TranscriptionResult {
-            word_confidences: word_confidences(&timestamped),
-            text: timestamped.text,
+        Ok(Transcript {
+            word_confidences: word_confidences(&decoded),
+            text: decoded.text,
         })
     }
 
@@ -581,7 +561,6 @@ impl ParakeetModel {
     ) -> Result<DecodedSequence, ParakeetError> {
         let mut prev_state = self.create_decoder_state()?;
         let mut tokens = Vec::new();
-        let mut timestamps = Vec::new();
         let mut token_probs = Vec::new();
 
         let mut t = 0;
@@ -600,7 +579,6 @@ impl ParakeetModel {
                 token_probs.push(softmax_prob(vocab_logits, token as usize));
                 prev_state = new_state;
                 tokens.push(token);
-                timestamps.push(t);
                 emitted_tokens += 1;
             }
 
@@ -614,7 +592,7 @@ impl ParakeetModel {
             }
         }
 
-        Ok((tokens, timestamps, token_probs))
+        Ok((tokens, token_probs))
     }
 
     // Split a (possibly TDT) decoder output into (vocab_logits, duration_logits);
@@ -663,7 +641,6 @@ impl ParakeetModel {
     ) -> Result<DecodedSequence, ParakeetError> {
         let mut prev_state = self.create_decoder_state()?;
         let mut tokens: Vec<i32> = Vec::new();
-        let mut timestamps: Vec<usize> = Vec::new();
         let mut token_probs: Vec<f32> = Vec::new();
 
         let mut t = 0;
@@ -718,7 +695,6 @@ impl ParakeetModel {
                 token_probs.push(softmax_prob(vocab_logits, token as usize));
                 prev_state = new_state;
                 tokens.push(token);
-                timestamps.push(t);
                 emitted_tokens += 1;
                 boost_state = tree.advance(boost_state, token);
             }
@@ -733,15 +709,10 @@ impl ParakeetModel {
             }
         }
 
-        Ok((tokens, timestamps, token_probs))
+        Ok((tokens, token_probs))
     }
 
-    fn decode_tokens(
-        &self,
-        ids: Vec<i32>,
-        timestamps: Vec<usize>,
-        probs: Vec<f32>,
-    ) -> TimestampedResult {
+    fn decode_tokens(&self, ids: Vec<i32>, probs: Vec<f32>) -> DecodedTokens {
         // tokens and kept_probs go through the same filter to stay aligned.
         let mut tokens: Vec<String> = Vec::with_capacity(ids.len());
         let mut kept_probs: Vec<f32> = Vec::with_capacity(ids.len());
@@ -766,14 +737,8 @@ impl ParakeetModel {
             Err(_) => tokens.join(""), // Fallback if regex failed to compile
         };
 
-        let float_timestamps: Vec<f32> = timestamps
-            .iter()
-            .map(|&t| WINDOW_SIZE * SUBSAMPLING_FACTOR as f32 * t as f32)
-            .collect();
-
-        TimestampedResult {
+        DecodedTokens {
             text,
-            timestamps: float_timestamps,
             tokens,
             probs: kept_probs,
         }

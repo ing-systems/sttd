@@ -52,7 +52,7 @@ impl ParakeetModel {
         }
         log::info!("loading parakeet model ({})...", dir.display());
         let mut inner = with_loading_ticker("parakeet model", || {
-            CoreModel::new(dir, true, tokenizer_opt.as_deref(), intra_threads, device)
+            CoreModel::new(dir, tokenizer_opt.as_deref(), intra_threads, device)
                 .map_err(|e| anyhow::anyhow!("failed to load parakeet model: {e}"))
                 .context("failed to load parakeet model")
         })?;
@@ -88,15 +88,10 @@ impl SpeechModel for ParakeetModel {
         } else {
             pcm_16k
         };
-        let result = self
-            .inner
+        // Per-word confidences ride along: they gate the dictionary correction.
+        self.inner
             .transcribe_samples(pcm)
-            .map_err(|e| anyhow::anyhow!("parakeet inference failed: {e}"))?;
-        Ok(Transcript {
-            text: result.text,
-            // Per-word confidences gate the dictionary correction.
-            word_confidences: result.word_confidences,
-        })
+            .map_err(|e| anyhow::anyhow!("parakeet inference failed: {e}"))
     }
 
     /// Rebuild the phrase-boosting automaton after a live dictionary swap

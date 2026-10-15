@@ -829,7 +829,6 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
 ///
 /// `--channel auto` probes the loudest channel once per open (~500 ms) and
 /// uses that pick for the stream; `mix`/numeric picks never probe.
-#[allow(clippy::too_many_arguments)]
 fn open_input_path(
     host: &cpal::Host,
     cli: &Cli,
