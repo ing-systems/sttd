@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use earshot::Detector;
 
 // ---------------------------------------------------------------------------
@@ -66,7 +64,7 @@ pub(crate) struct SpeechDetector {
     /// Last `MEDIAN_WINDOWS` raw window decisions, oldest-first. Pre-filled
     /// with `false` (silence) so the very first windows get flicker
     /// protection too, and reset to the same on pause.
-    window_history: VecDeque<bool>,
+    window_history: [bool; MEDIAN_WINDOWS],
     /// Last earshot score, for hysteresis across windows.
     last_score: f32,
     /// Warm background estimate: survives `reset()` on purpose (see below).
@@ -82,7 +80,7 @@ impl SpeechDetector {
             threshold,
             in_speech: false,
             raw_speech: false,
-            window_history: VecDeque::from(vec![false; MEDIAN_WINDOWS]),
+            window_history: [false; MEDIAN_WINDOWS],
             last_score: 0.0,
             noise: crate::noise::NoiseTracker::new(),
             adapt,
@@ -157,17 +155,15 @@ impl SpeechDetector {
     }
 
     /// Fold one raw window decision into the median: update the hysteresis
-    /// state, push it onto the history (capped at `MEDIAN_WINDOWS`), and
-    /// recompute the reported verdict as the majority. Split from `verdict`
-    /// so tests can drive flicker sequences without a live earshot signal.
+    /// state, shift it into the history (dropping the oldest), and recompute
+    /// the reported verdict as the majority. Split from `verdict` so tests can
+    /// drive flicker sequences without a live earshot signal.
     fn push_window(&mut self, raw: bool) {
         self.raw_speech = raw;
-        self.window_history.push_back(raw);
-        while self.window_history.len() > MEDIAN_WINDOWS {
-            self.window_history.pop_front();
-        }
+        self.window_history.rotate_left(1);
+        self.window_history[MEDIAN_WINDOWS - 1] = raw;
         let trues = self.window_history.iter().filter(|&&b| b).count();
-        self.in_speech = trues * 2 > self.window_history.len();
+        self.in_speech = trues * 2 > MEDIAN_WINDOWS;
     }
 
     /// Drop staged partial-window samples, the hysteresis latch, the median
@@ -181,8 +177,7 @@ impl SpeechDetector {
         self.staging.clear();
         self.in_speech = false;
         self.raw_speech = false;
-        self.window_history.clear();
-        self.window_history.extend(vec![false; MEDIAN_WINDOWS]);
+        self.window_history = [false; MEDIAN_WINDOWS];
         self.last_score = 0.0;
     }
 }

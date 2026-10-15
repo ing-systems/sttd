@@ -461,16 +461,21 @@ impl UtteranceBuffer {
     /// Record `frame` as recent audio, so it can be prepended as pre-roll if an
     /// utterance opens in the next `RING_FRAMES` frames. Once the ring is
     /// full each new sample overwrites the oldest one, so the live window
-    /// always spans the last `PREROLL_CAPACITY` samples.
+    /// always spans the last `PREROLL_CAPACITY` samples. Written as at most
+    /// two runs (up to the end of the array, then from its start), like
+    /// `extend_from_preroll` reads them.
     fn record_preroll(&mut self, frame: &[f32]) {
-        for &s in frame {
-            self.preroll[(self.preroll_head + self.preroll_len) % PREROLL_CAPACITY] = s;
-            if self.preroll_len == PREROLL_CAPACITY {
-                self.preroll_head = (self.preroll_head + 1) % PREROLL_CAPACITY;
-            } else {
-                self.preroll_len += 1;
-            }
-        }
+        // Only the newest `PREROLL_CAPACITY` samples can survive.
+        let frame = &frame[frame.len().saturating_sub(PREROLL_CAPACITY)..];
+        let n = frame.len();
+        let tail = (self.preroll_head + self.preroll_len) % PREROLL_CAPACITY;
+        let first = (PREROLL_CAPACITY - tail).min(n);
+        self.preroll[tail..tail + first].copy_from_slice(&frame[..first]);
+        self.preroll[..n - first].copy_from_slice(&frame[first..]);
+        // Samples past a full ring overwrite the oldest, moving the head.
+        let overflow = (self.preroll_len + n).saturating_sub(PREROLL_CAPACITY);
+        self.preroll_len += n - overflow;
+        self.preroll_head = (self.preroll_head + overflow) % PREROLL_CAPACITY;
     }
 
     /// The open utterance so far, for a partial transcript, or `None` when it is
@@ -1223,6 +1228,43 @@ mod tests {
             assert_eq!(buffer.push_frame(&silence, false), FrameAction::Continue);
         }
         assert!(buffer.is_open());
+    }
+
+    #[test]
+    fn preroll_ring_keeps_the_newest_samples_oldest_first() {
+        // Ragged sizes (below, at and above a frame, and above the whole ring)
+        // must leave the ring holding exactly the last `PREROLL_CAPACITY`
+        // samples, in order, however the writes wrap.
+        let mut buffer = UtteranceBuffer::new();
+        let mut all: Vec<f32> = Vec::new();
+        let mut next = 0.0f32;
+        for len in [
+            1usize,
+            159,
+            160,
+            161,
+            4000,
+            7,
+            PREROLL_CAPACITY + 33,
+            160,
+            0,
+            333,
+        ] {
+            let frame: Vec<f32> = (0..len)
+                .map(|_| {
+                    next += 1.0;
+                    next
+                })
+                .collect();
+            buffer.record_preroll(&frame);
+            all.extend_from_slice(&frame);
+            let want = &all[all.len().saturating_sub(PREROLL_CAPACITY)..];
+            assert_eq!(buffer.preroll_len, want.len(), "len after {len}");
+            buffer.buf.clear();
+            buffer.extend_from_preroll(0);
+            assert_eq!(buffer.buf, want, "contents after {len}");
+        }
+        buffer.buf.clear();
     }
 
     #[test]
