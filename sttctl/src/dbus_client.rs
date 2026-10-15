@@ -2,11 +2,11 @@ use crate::output::print_json;
 use anyhow::{Context, Result};
 use std::time::Duration;
 use zbus::blocking::connection::Builder;
-use zbus::blocking::Connection;
+use zbus::blocking::{Connection, MessageIterator};
 
 use sttd_dbus_names::{
-    DAEMON_INTERFACE, DAEMON_PATH, DICT_INTERFACE, DICT_PATH, SERVICE_NAME, TRANSLATION_INTERFACE,
-    TRANSLATION_PATH,
+    DAEMON_INTERFACE, DAEMON_PATH, DICT_INTERFACE, DICT_PATH, OBJECT_ROOT, SERVICE_NAME,
+    TRANSLATION_INTERFACE, TRANSLATION_PATH,
 };
 
 /// One of the daemon's objects: its path and the interface served there.
@@ -119,49 +119,53 @@ impl SttdClient {
 
     // Watch signals
     pub fn watch_signals(&self, filter: &[String], json: bool) -> Result<()> {
-        let proxy = self.proxy(DAEMON)?;
-        let iter = proxy.receive_all_signals()?;
-
-        for msg in iter {
+        // Every object the daemon serves lives under one root, so one rule
+        // covers the signals of all three interfaces.
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .path_namespace(OBJECT_ROOT)?
+            .build();
+        for msg in MessageIterator::for_match_rule(rule, &self.conn, None)? {
+            let msg = msg?;
             let header = msg.header();
             let interface = header.interface().map_or("", |v| v).to_string();
             let member = header.member().map_or("", |v| v).to_string();
-
-            if filter.is_empty() || filter.contains(&member) {
-                let body = msg.body();
-                match body.deserialize::<Vec<String>>() {
-                    Ok(args) => {
-                        if json {
-                            print_json(&serde_json::json!({
-                                "interface": interface,
-                                "member": member,
-                                "args": args,
-                            }));
-                        } else {
-                            println!(
-                                "[{}] {}.{}({})",
-                                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
-                                interface,
-                                member,
-                                args.join(", ")
-                            );
-                        }
+            if !filter.is_empty() && !filter.contains(&member) {
+                continue;
+            }
+            match signal_args(&msg) {
+                Ok(args) => {
+                    if json {
+                        print_json(&serde_json::json!({
+                            "interface": interface,
+                            "member": member,
+                            "args": args,
+                        }));
+                    } else {
+                        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+                        println!(
+                            "[{}] {}.{}({})",
+                            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
+                            interface,
+                            member,
+                            args.join(", ")
+                        );
                     }
-                    Err(e) => {
-                        if json {
-                            print_json(&serde_json::json!({
-                                "interface": interface,
-                                "member": member,
-                                "error": format!("{e}"),
-                            }));
-                        } else {
-                            println!(
-                                "[{}] {}.{} (deserialization failed: {e})",
-                                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
-                                interface,
-                                member,
-                            );
-                        }
+                }
+                Err(e) => {
+                    if json {
+                        print_json(&serde_json::json!({
+                            "interface": interface,
+                            "member": member,
+                            "error": format!("{e}"),
+                        }));
+                    } else {
+                        println!(
+                            "[{}] {}.{} (deserialization failed: {e})",
+                            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
+                            interface,
+                            member,
+                        );
                     }
                 }
             }
@@ -190,5 +194,41 @@ impl SttdClient {
         T::Error: Into<zbus::Error>,
     {
         Ok(self.proxy(object)?.get_property(name)?)
+    }
+}
+
+/// A signal's arguments as JSON values, whatever its signature: the daemon's
+/// signals carry `b`, `ubs` and `bssbs` bodies.
+fn signal_args(msg: &zbus::Message) -> Result<Vec<serde_json::Value>> {
+    let body = msg.body();
+    if body.signature().to_string().is_empty() {
+        return Ok(Vec::new());
+    }
+    let fields: zbus::zvariant::Structure = body.deserialize()?;
+    Ok(fields.fields().iter().map(to_json).collect())
+}
+
+/// One D-Bus value as plain JSON: numbers, booleans and strings as themselves,
+/// arrays and structures as arrays. Anything else (dicts, fds) is spelled the
+/// way zvariant displays it.
+fn to_json(value: &zbus::zvariant::Value<'_>) -> serde_json::Value {
+    use zbus::zvariant::Value;
+    match value {
+        Value::Bool(b) => (*b).into(),
+        Value::U8(n) => (*n).into(),
+        Value::I16(n) => (*n).into(),
+        Value::U16(n) => (*n).into(),
+        Value::I32(n) => (*n).into(),
+        Value::U32(n) => (*n).into(),
+        Value::I64(n) => (*n).into(),
+        Value::U64(n) => (*n).into(),
+        Value::F64(n) => (*n).into(),
+        Value::Str(s) => s.as_str().into(),
+        Value::ObjectPath(p) => p.as_str().into(),
+        Value::Signature(s) => s.to_string().into(),
+        Value::Value(inner) => to_json(inner),
+        Value::Array(items) => items.iter().map(to_json).collect(),
+        Value::Structure(fields) => fields.fields().iter().map(to_json).collect(),
+        other => other.to_string().into(),
     }
 }
