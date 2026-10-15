@@ -47,16 +47,15 @@ fn supports_fixed_buffer(
     sample_format: cpal::SampleFormat,
 ) -> bool {
     let fixed = fixed_buffer_config(config);
+    fn builds<S: cpal::SizedSample>(device: &cpal::Device, cfg: &cpal::StreamConfig) -> bool {
+        device
+            .build_input_stream(cfg, |_: &[S], _| {}, |_: cpal::StreamError| {}, None)
+            .is_ok()
+    }
     let ok = match sample_format {
-        cpal::SampleFormat::F32 => device
-            .build_input_stream(&fixed, |_: &[f32], _| {}, |_: cpal::StreamError| {}, None)
-            .is_ok(),
-        cpal::SampleFormat::I16 => device
-            .build_input_stream(&fixed, |_: &[i16], _| {}, |_: cpal::StreamError| {}, None)
-            .is_ok(),
-        cpal::SampleFormat::U16 => device
-            .build_input_stream(&fixed, |_: &[u16], _| {}, |_: cpal::StreamError| {}, None)
-            .is_ok(),
+        cpal::SampleFormat::F32 => builds::<f32>(device, &fixed),
+        cpal::SampleFormat::I16 => builds::<i16>(device, &fixed),
+        cpal::SampleFormat::U16 => builds::<u16>(device, &fixed),
         _ => false,
     };
     log::debug!(
@@ -86,64 +85,15 @@ pub(crate) fn probe_loudest_channel(
         return Ok(None);
     }
     let collected = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
-    let err_collected = Arc::clone(&collected);
     // Temporary stream: same downmix-scale as the realtime callback in
     // `build_input_stream` (shared `i16_to_f32`/`u16_to_f32` closures), but
     // appending interleaved f32 into a Mutex Vec instead of an rtrb ring.
     // Short-lived (hundreds of ms), so a lock per callback is fine — the
     // realtime path never takes it, and never allocates.
     let stream = match sample_format {
-        cpal::SampleFormat::F32 => build_with_buffer_fallback(config, |cfg| {
-            let collected = Arc::clone(&collected);
-            let err_collected = Arc::clone(&err_collected);
-            device.build_input_stream(
-                cfg,
-                move |data: &[f32], _| {
-                    if let Ok(mut v) = collected.lock() {
-                        v.extend_from_slice(data);
-                    }
-                },
-                move |err| {
-                    log::warn!("auto-channel probe stream error: {err}");
-                    let _ = err_collected.lock().map(|mut v| v.clear());
-                },
-                None,
-            )
-        })?,
-        cpal::SampleFormat::I16 => build_with_buffer_fallback(config, |cfg| {
-            let collected = Arc::clone(&collected);
-            let err_collected = Arc::clone(&err_collected);
-            device.build_input_stream(
-                cfg,
-                move |data: &[i16], _| {
-                    if let Ok(mut v) = collected.lock() {
-                        v.extend(data.iter().map(|&s| s as f32 / 32768.0));
-                    }
-                },
-                move |err| {
-                    log::warn!("auto-channel probe stream error: {err}");
-                    let _ = err_collected.lock().map(|mut v| v.clear());
-                },
-                None,
-            )
-        })?,
-        cpal::SampleFormat::U16 => build_with_buffer_fallback(config, |cfg| {
-            let collected = Arc::clone(&collected);
-            let err_collected = Arc::clone(&err_collected);
-            device.build_input_stream(
-                cfg,
-                move |data: &[u16], _| {
-                    if let Ok(mut v) = collected.lock() {
-                        v.extend(data.iter().map(|&s| s as f32 / 65535.0 * 2.0 - 1.0));
-                    }
-                },
-                move |err| {
-                    log::warn!("auto-channel probe stream error: {err}");
-                    let _ = err_collected.lock().map(|mut v| v.clear());
-                },
-                None,
-            )
-        })?,
+        cpal::SampleFormat::F32 => build_probe_stream(device, config, &collected, |s: f32| s)?,
+        cpal::SampleFormat::I16 => build_probe_stream(device, config, &collected, i16_to_f32)?,
+        cpal::SampleFormat::U16 => build_probe_stream(device, config, &collected, u16_to_f32)?,
         fmt => anyhow::bail!("unsupported sample format: {fmt:?}"),
     };
     use cpal::traits::StreamTrait;
@@ -174,6 +124,37 @@ pub(crate) fn probe_loudest_channel(
             Ok(None)
         }
     }
+}
+
+/// The `--channel auto` probe stream for one sample format: appends each
+/// callback's interleaved samples, scaled by `conv`, to `collected`; a stream
+/// error clears what was collected.
+fn build_probe_stream<S>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    collected: &Arc<std::sync::Mutex<Vec<f32>>>,
+    conv: fn(S) -> f32,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    S: cpal::SizedSample + Send + Sync + 'static,
+{
+    build_with_buffer_fallback(config, |cfg| {
+        let collected = Arc::clone(collected);
+        let err_collected = Arc::clone(&collected);
+        device.build_input_stream(
+            cfg,
+            move |data: &[S], _| {
+                if let Ok(mut v) = collected.lock() {
+                    v.extend(data.iter().map(|&s| conv(s)));
+                }
+            },
+            move |err| {
+                log::warn!("auto-channel probe stream error: {err}");
+                let _ = err_collected.lock().map(|mut v| v.clear());
+            },
+            None,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +322,6 @@ pub(crate) fn build_input_stream(
         }
     };
 
-    let mut tx_opt = Some(raw_tx);
     // Fixed capture buffer when the device accepts it. Probed up front: the
     // realtime producer below moves into its callback and cannot be rebuilt
     // for a retry, unlike the probe path above.
@@ -402,38 +382,23 @@ pub(crate) fn build_input_stream(
         )?)
     }
 
-    // Built once: only one arm runs, and each arm takes `raw_tx` (which is not
-    // `Clone`) exactly once, preserving the original per-arm `.expect`.
+    // Built once: only one arm runs, so each arm can move `raw_tx` (which is
+    // not `Clone`) and `err_fn`.
     let args = RtArgs {
         channels,
         channel,
         dropped,
     };
     match sample_format {
-        cpal::SampleFormat::F32 => build_for_format::<f32, _, _>(
-            device,
-            config,
-            args,
-            |s: f32| s,
-            tx_opt.take().expect("raw producer taken once"),
-            err_fn,
-        ),
-        cpal::SampleFormat::I16 => build_for_format::<i16, _, _>(
-            device,
-            config,
-            args,
-            i16_to_f32,
-            tx_opt.take().expect("raw producer taken once"),
-            err_fn,
-        ),
-        cpal::SampleFormat::U16 => build_for_format::<u16, _, _>(
-            device,
-            config,
-            args,
-            u16_to_f32,
-            tx_opt.take().expect("raw producer taken once"),
-            err_fn,
-        ),
+        cpal::SampleFormat::F32 => {
+            build_for_format::<f32, _, _>(device, config, args, |s: f32| s, raw_tx, err_fn)
+        }
+        cpal::SampleFormat::I16 => {
+            build_for_format::<i16, _, _>(device, config, args, i16_to_f32, raw_tx, err_fn)
+        }
+        cpal::SampleFormat::U16 => {
+            build_for_format::<u16, _, _>(device, config, args, u16_to_f32, raw_tx, err_fn)
+        }
         fmt => anyhow::bail!("unsupported sample format: {fmt:?}"),
     }
 }

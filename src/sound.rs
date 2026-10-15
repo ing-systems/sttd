@@ -261,64 +261,20 @@ fn stream_and_play(
     let pos = Arc::new(AtomicUsize::new(0));
     let total_frames = mono.len();
     let frames = Arc::new(mono);
-    let err_fn = |err| log::warn!("playback stream error: {err}");
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
-            let pos = Arc::clone(&pos);
-            let frames = Arc::clone(&frames);
-            device.build_output_stream(
-                &config,
-                move |data: &mut [f32], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let i = pos.fetch_add(1, Ordering::Relaxed);
-                        let s = if i < total_frames { frames[i] } else { 0.0 };
-                        for out in frame.iter_mut() {
-                            *out = s;
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )
+            build_output_stream(device, &config, channels, &pos, &frames, |s: f32| s)
         }
         cpal::SampleFormat::I16 => {
-            let pos = Arc::clone(&pos);
-            let frames = Arc::clone(&frames);
-            device.build_output_stream(
-                &config,
-                move |data: &mut [i16], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let i = pos.fetch_add(1, Ordering::Relaxed);
-                        let s = if i < total_frames { frames[i] } else { 0.0 };
-                        let v = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                        for out in frame.iter_mut() {
-                            *out = v;
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )
+            build_output_stream(device, &config, channels, &pos, &frames, |s: f32| {
+                (s * 32767.0).clamp(-32768.0, 32767.0) as i16
+            })
         }
         cpal::SampleFormat::U16 => {
-            let pos = Arc::clone(&pos);
-            let frames = Arc::clone(&frames);
-            device.build_output_stream(
-                &config,
-                move |data: &mut [u16], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let i = pos.fetch_add(1, Ordering::Relaxed);
-                        let s = if i < total_frames { frames[i] } else { 0.0 };
-                        let v = ((s + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
-                        for out in frame.iter_mut() {
-                            *out = v;
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )
+            build_output_stream(device, &config, channels, &pos, &frames, |s: f32| {
+                ((s + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16
+            })
         }
         fmt => {
             log::warn!("playback skipped: unsupported sample format {fmt:?}");
@@ -353,6 +309,39 @@ fn stream_and_play(
         std::thread::sleep(Duration::from_millis(20));
     }
     true
+}
+
+/// The playback stream for one sample format: each callback writes the next
+/// `frames` sample (silence past the end), scaled by `conv`, to every channel
+/// of each output frame.
+fn build_output_stream<S>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    pos: &Arc<AtomicUsize>,
+    frames: &Arc<Vec<f32>>,
+    conv: fn(f32) -> S,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    S: cpal::SizedSample + Send + 'static,
+{
+    let pos = Arc::clone(pos);
+    let frames = Arc::clone(frames);
+    let total_frames = frames.len();
+    device.build_output_stream(
+        config,
+        move |data: &mut [S], _| {
+            for frame in data.chunks_mut(channels) {
+                let i = pos.fetch_add(1, Ordering::Relaxed);
+                let v = conv(if i < total_frames { frames[i] } else { 0.0 });
+                for out in frame.iter_mut() {
+                    *out = v;
+                }
+            }
+        },
+        |err| log::warn!("playback stream error: {err}"),
+        None,
+    )
 }
 
 #[cfg(test)]
