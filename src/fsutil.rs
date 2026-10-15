@@ -1,5 +1,5 @@
-//! Filesystem helpers shared by the dump directory, `--file` WAV output and
-//! the last-transcript file.
+//! Owner-only file helpers shared by the dump directory, `--file` WAV output
+//! and the last-transcript file.
 
 use std::path::Path;
 
@@ -18,4 +18,16 @@ pub(crate) fn owner_only_file(path: &Path) -> Result<std::fs::File> {
     }
     opts.open(path)
         .with_context(|| format!("failed to create {}", path.display()))
+}
+
+/// Write `contents` to `path` with owner-only permissions (see
+/// `owner_only_file`).
+pub(crate) fn write_owner_only_text(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut file = owner_only_file(path)?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    Ok(())
 }
