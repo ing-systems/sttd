@@ -55,7 +55,7 @@ pub(crate) fn print_available_voices(cli: &Cli, filter: &str) -> Result<()> {
     println!(
         "piper voices ({} of {}), from https://huggingface.co/{}/tree/main:",
         rows.len(),
-        index.filtered(None).len(),
+        index.len(),
         crate::config::PIPER_VOICES_REPO
     );
     print!(

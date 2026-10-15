@@ -21,13 +21,32 @@ pub(crate) enum EngineKind {
 
 /// The models directory a catalog spec resolves into: the compile-time baked
 /// `DEFAULT_MODELS_DIR` joined with the spec's directory name (which equals the
-/// spec, see `CatalogEntry::dir`).
+/// spec, see `CatalogEntry::dir`), or with the voice and translator stores'
+/// subdirectories.
 ///
-/// The one join in the codebase: the download path, `--list-models`' installed
-/// check and the tests that reach a downloaded model all go through it, so they
-/// cannot drift apart.
+/// The one join in the codebase: the download paths, the `--list-*` installed
+/// checks and the tests that reach a downloaded model all go through it, so
+/// they cannot drift apart.
 pub(crate) fn catalog_dir(spec: &str) -> PathBuf {
     PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{spec}"))
+}
+
+/// The two-character marker that opens a `--list-models`/`--list-voices` row:
+/// `*` when the row is what the flag selects, `I` when it is installed, `*I`
+/// for both and two spaces for neither.
+pub(crate) const fn row_marker(selected: bool, installed: bool) -> &'static str {
+    match (selected, installed) {
+        (true, true) => "*I",
+        (true, false) => "* ",
+        (false, true) => "I ",
+        (false, false) => "  ",
+    }
+}
+
+/// A `--list-*` column's width: its widest cell, and never narrower than its
+/// header.
+pub(crate) fn column_width(header: &str, cells: impl Iterator<Item = usize>) -> usize {
+    cells.max().unwrap_or(0).max(header.len())
 }
 
 /// One row of a model catalog: a `--model` spec and where its weights come from.
@@ -218,39 +237,16 @@ impl Catalog {
     /// `--model` selects, `I` when its weights are installed, `*I` for both and
     /// two spaces for neither.
     pub(crate) fn render_table(&self, selected: Option<&str>) -> String {
-        let spec_w = self
-            .entries
-            .iter()
-            .map(|e| e.spec.len())
-            .max()
-            .unwrap_or(0)
-            .max("SPEC".len());
-        let dir_w = self
-            .entries
-            .iter()
-            .map(|e| e.dir.len())
-            .max()
-            .unwrap_or(0)
-            .max("DIR".len());
-        let size_w = self
-            .entries
-            .iter()
-            .map(|e| e.size.len())
-            .max()
-            .unwrap_or(0)
-            .max("SIZE".len());
+        let spec_w = column_width("SPEC", self.entries.iter().map(|e| e.spec.len()));
+        let dir_w = column_width("DIR", self.entries.iter().map(|e| e.dir.len()));
+        let size_w = column_width("SIZE", self.entries.iter().map(|e| e.size.len()));
         let mut out = String::new();
         out.push_str(&format!(
             "   {0:<1$}  {2:<3$}  {4:>5$}\n",
             "SPEC", spec_w, "DIR", dir_w, "SIZE", size_w
         ));
         for entry in self.entries {
-            let marker = match (selected == Some(entry.spec), self.is_installed(entry)) {
-                (true, true) => "*I",
-                (true, false) => "* ",
-                (false, true) => "I ",
-                (false, false) => "  ",
-            };
+            let marker = row_marker(selected == Some(entry.spec), self.is_installed(entry));
             out.push_str(&format!(
                 "{marker} {0:<1$}  {2:<3$}  {4:>5$}\n",
                 entry.spec, spec_w, entry.dir, dir_w, entry.size, size_w
@@ -359,7 +355,7 @@ pub(crate) fn resolve_model(input: &str) -> Result<ModelRef> {
             kind: entry.kind,
         });
     }
-    if trimmed.contains('/') || trimmed.contains('\\') {
+    if crate::fsutil::looks_like_path(trimmed) {
         // A manually-prepared model directory (nothing to download, just
         // validated at load time). Which engine it holds is decided by its
         // files, since the two engines have different names.

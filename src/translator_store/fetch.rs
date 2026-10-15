@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::config::{DEFAULT_MODELS_DIR, NLLB_REPO, OPUS_MT_REPO, TRANSLATORS_SUBDIR};
+use crate::config::{NLLB_REPO, OPUS_MT_REPO, TRANSLATORS_SUBDIR};
 use crate::download::Target;
 
 use super::catalog::NLLB_SPEC;
@@ -54,7 +54,7 @@ pub(super) const ASSETS: &[(&str, &str)] = &[
 
 /// Directory every downloaded translator resolves into.
 fn translators_dir() -> PathBuf {
-    PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{TRANSLATORS_SUBDIR}"))
+    crate::model_store::catalog_dir(TRANSLATORS_SUBDIR)
 }
 
 /// Directory one translator spec resolves into.
@@ -220,7 +220,10 @@ mod tests {
         // from ever being pointed at a translator.
         assert_eq!(
             translators_dir(),
-            PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{TRANSLATORS_SUBDIR}"))
+            PathBuf::from(format!(
+                "{}/{TRANSLATORS_SUBDIR}",
+                crate::config::DEFAULT_MODELS_DIR
+            ))
         );
         assert_ne!(
             translator_dir("opus-mt-pl-en"),

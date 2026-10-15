@@ -84,7 +84,7 @@ pub(crate) fn resolve(input: &str) -> Result<TranslatorRef> {
              {TOKENIZER_FILE} and {CONFIG_FILE}"
         );
     }
-    if trimmed.contains('/') || trimmed.contains('\\') {
+    if crate::fsutil::looks_like_path(trimmed) {
         let dir = PathBuf::from(trimmed);
         if let Some(missing) = missing_in(&dir) {
             anyhow::bail!(

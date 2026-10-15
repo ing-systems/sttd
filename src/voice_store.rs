@@ -20,14 +20,15 @@
 // detection (`EngineKind::marker_file`) must never classify one.
 // ---------------------------------------------------------------------------
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::config::{DEFAULT_MODELS_DIR, PIPER_VOICES_REPO, VOICES_INDEX_FILE, VOICES_SUBDIR};
+use crate::config::{PIPER_VOICES_REPO, VOICES_INDEX_FILE, VOICES_SUBDIR};
 use crate::download::Target;
+use crate::model_store::{column_width, row_marker};
 
 /// Where a published file is fetched from. `resolve/main` rather than `main`
 /// so a voice pinned to a revision upstream resolves.
@@ -37,7 +38,7 @@ pub(crate) fn repo_url(repo_path: &str) -> String {
 
 /// Directory holding every downloaded voice, and the cached index.
 pub(crate) fn voices_dir() -> PathBuf {
-    PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{VOICES_SUBDIR}"))
+    crate::model_store::catalog_dir(VOICES_SUBDIR)
 }
 
 /// Directory one voice key resolves into.
@@ -177,18 +178,23 @@ impl VoiceIndex {
     /// usable.
     pub(crate) fn filtered(&self, filter: Option<&str>) -> Vec<&VoiceRow> {
         let needle = filter.map(str::trim).filter(|f| !f.is_empty());
+        let needle = needle.map(str::to_ascii_lowercase);
         self.rows
             .values()
-            .filter(|r| match needle {
+            .filter(|r| match &needle {
                 None => true,
                 Some(f) => {
-                    let f = f.to_ascii_lowercase();
-                    r.key.to_ascii_lowercase().contains(&f)
-                        || r.language.code.to_ascii_lowercase().contains(&f)
-                        || r.language.name_english.to_ascii_lowercase().contains(&f)
+                    r.key.to_ascii_lowercase().contains(f)
+                        || r.language.code.to_ascii_lowercase().contains(f)
+                        || r.language.name_english.to_ascii_lowercase().contains(f)
                 }
             })
             .collect()
+    }
+
+    /// How many voices the index lists.
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
     }
 }
 
@@ -231,7 +237,7 @@ pub(crate) fn resolve_voice(input: &str, index: &VoiceIndex) -> Result<VoiceRef>
     if trimmed.is_empty() {
         anyhow::bail!("empty --voice value; expected a piper voice key (see --list-voices)");
     }
-    if trimmed.contains('/') || trimmed.contains('\\') {
+    if crate::fsutil::looks_like_path(trimmed) {
         let dir = PathBuf::from(trimmed);
         if !dir.is_dir() {
             anyhow::bail!(
@@ -364,37 +370,16 @@ pub(crate) fn render_table(
     selected: Option<&str>,
 ) -> String {
     let selected = selected.map(str::trim);
-    let spk_w = rows
-        .iter()
-        .map(|r| r.num_speakers.to_string().len() + usize::from(r.multi_speaker()))
-        .max()
-        .unwrap_or(1)
-        .max("SPK".len());
+    let spk_w = column_width(
+        "SPK",
+        rows.iter()
+            .map(|r| r.num_speakers.to_string().len() + usize::from(r.multi_speaker())),
+    );
     let sizes: Vec<u64> = rows.iter().map(|r| r.onnx_size()).collect();
-    let spec_w = rows
-        .iter()
-        .map(|r| r.key.len())
-        .max()
-        .unwrap_or(0)
-        .max("SPEC".len());
-    let lang_w = rows
-        .iter()
-        .map(|r| r.language.code.len())
-        .max()
-        .unwrap_or(0)
-        .max("LANG".len());
-    let quality_w = rows
-        .iter()
-        .map(|r| r.quality.len())
-        .max()
-        .unwrap_or(0)
-        .max("QUALITY".len());
-    let size_w = sizes
-        .iter()
-        .map(|s| format_size(*s).len())
-        .max()
-        .unwrap_or(0)
-        .max("SIZE".len());
+    let spec_w = column_width("SPEC", rows.iter().map(|r| r.key.len()));
+    let lang_w = column_width("LANG", rows.iter().map(|r| r.language.code.len()));
+    let quality_w = column_width("QUALITY", rows.iter().map(|r| r.quality.len()));
+    let size_w = column_width("SIZE", sizes.iter().map(|s| format_size(*s).len()));
 
     let mut out = String::new();
     // `SIZE` is padded to `size_w`, which was already widened to hold the widest
@@ -404,19 +389,18 @@ pub(crate) fn render_table(
         "SPEC", "LANG", "QUALITY", "SIZE", "SPK"
     ));
     out.push('\n');
+    // Installed is asked of the resolved reference, which is what knows where
+    // a row's two files live; collected once rather than searched per row.
+    let installed: HashSet<&str> = refs
+        .iter()
+        .filter(|v| v.is_installed())
+        .map(|v| v.key.as_str())
+        .collect();
     for (row, size) in rows.iter().zip(&sizes) {
-        // Installed is asked of the resolved reference, which is what knows
-        // where this row's two files live.
-        let installed = refs
-            .iter()
-            .find(|v| v.key == row.key)
-            .is_some_and(VoiceRef::is_installed);
-        let marker = match (selected == Some(row.key.as_str()), installed) {
-            (true, true) => "*I",
-            (true, false) => "* ",
-            (false, true) => "I ",
-            (false, false) => "  ",
-        };
+        let marker = row_marker(
+            selected == Some(row.key.as_str()),
+            installed.contains(row.key.as_str()),
+        );
         // A multi-speaker voice is listed but not usable (`piper::PiperVoice::load`
         // refuses one), so the speaker count says so rather than leaving the
         // user to discover it at load time.
@@ -464,7 +448,7 @@ pub(crate) fn prepare_voice(input: &str) -> Result<VoiceRef> {
 /// testable without a voice or a translator.
 pub(crate) fn voice_language(key: &str) -> Option<&str> {
     let key = key.trim();
-    if key.contains('/') || key.contains('\\') {
+    if crate::fsutil::looks_like_path(key) {
         return None;
     }
     let lang = key.split(['_', '-']).next()?;
@@ -766,7 +750,10 @@ mod tests {
         // from ever being pointed at a voice.
         assert_eq!(
             voices_dir(),
-            PathBuf::from(format!("{DEFAULT_MODELS_DIR}/{VOICES_SUBDIR}"))
+            PathBuf::from(format!(
+                "{}/{VOICES_SUBDIR}",
+                crate::config::DEFAULT_MODELS_DIR
+            ))
         );
         assert_ne!(
             voice_dir("pl_PL-gosia-medium"),

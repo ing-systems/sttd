@@ -1,9 +1,15 @@
 //! Owner-only file helpers shared by the dump directory, `--file` WAV output
-//! and the last-transcript file.
+//! and the last-transcript file, and the path-or-name test the stores share.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
+
+/// Whether a `--model`/`--voice`/`--translate-model` value names a path (it
+/// holds a separator) rather than a catalog key.
+pub(crate) fn looks_like_path(value: &str) -> bool {
+    value.contains(['/', '\\'])
+}
 
 /// Create/truncate `path` with owner-only permissions (0600 on unix). Mic
 /// audio and transcripts are sensitive; `File::create` honors umask (often
