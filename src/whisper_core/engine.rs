@@ -130,6 +130,20 @@ fn best_unsuppressed(logits: &[f32]) -> Option<usize> {
     best
 }
 
+/// The token a decode step takes from one logits row, and its probability:
+/// the argmax, except that on the opening step (`first_step`) a suppressed
+/// winner gives way to the best id that is not. Picked straight from the
+/// session's output, so the 51866-float row is never copied out.
+fn pick_token(logits: &[f32], first_step: bool) -> (usize, f32) {
+    let mut next = argmax_index(logits);
+    if first_step && is_suppressed(next) {
+        // One pass over the vocabulary, not a sort of it — this is 51866 ids
+        // on the hottest path there is.
+        next = best_unsuppressed(logits).unwrap_or(next);
+    }
+    (next, softmax_prob(logits, next))
+}
+
 impl WhisperModel {
     /// Load the three graphs and the tokenizer from `model_dir` (already
     /// guaranteed to hold them by `model_store::ensure_available`).
@@ -253,10 +267,10 @@ impl WhisperModel {
         // The prompt's first position has served its purpose (language
         // detection); the decode starts from its last position.
         let PromptRun {
-            mut cache, next, ..
+            mut cache, first, ..
         } = prompt;
 
-        let mut logits = next;
+        let mut pick = first;
         let mut tokens: Vec<u32> = Vec::new();
         let mut probs: Vec<f32> = Vec::new();
         let mut truncated = false;
@@ -265,24 +279,18 @@ impl WhisperModel {
         // `decoder_with_past_model` call than that: the last token needs no
         // successor logits, since there is no step left to use them in.
         for step in 0..max_tokens {
-            let mut next = argmax_index(&logits);
-            if step == 0 && is_suppressed(next) {
-                // The winning id is suppressed on the opening step: take the
-                // best one that is not. One pass over the vocabulary, not a
-                // sort of it — this is 51866 ids on the hottest path there is.
-                next = best_unsuppressed(&logits).unwrap_or(next);
-            }
+            let (next, prob) = pick;
             if next as i64 == TOK_EOT {
                 break;
             }
             tokens.push(next as u32);
-            probs.push(softmax_prob(&logits, next));
+            probs.push(prob);
             if step + 1 == max_tokens {
                 // Out of budget with the model still talking.
                 truncated = true;
                 break;
             }
-            logits = self.run_cached_token(next as i64, &mut cache)?;
+            pick = self.run_cached_token(next as i64, &mut cache)?;
         }
         if truncated {
             log::warn!("whisper decode hit the {max_tokens}-token cap; transcript truncated");
@@ -318,9 +326,9 @@ impl WhisperModel {
     }
 
     /// The whole prompt through `decoder_model`, returning the KV cache it
-    /// produced plus the logits rows the decode starts from.
+    /// produced, the language logits, and the first token the decode takes.
     ///
-    /// Both halves are copied out here so nothing borrows the session's output
+    /// Everything is copied or picked out here so nothing borrows the session's output
     /// past this call — the caller goes on to run the *other* session, and
     /// holding a `SessionOutputs` across that would tie both to one borrow.
     fn run_prompt(
@@ -354,17 +362,19 @@ impl WhisperModel {
         Ok(PromptRun {
             cache,
             language,
-            next: flat[flat.len() - vocab..].to_vec(),
+            // The opening step: the only one with suppressed tokens.
+            first: pick_token(&flat[flat.len() - vocab..], true),
         })
     }
 
     /// One generated token through `decoder_with_past_model`, growing the
-    /// self-attention half of `cache` in place.
+    /// self-attention half of `cache` in place, and the token it predicts
+    /// next (with its probability).
     fn run_cached_token(
         &mut self,
         token: i64,
         cache: &mut KvCache,
-    ) -> Result<Vec<f32>, WhisperError> {
+    ) -> Result<(usize, f32), WhisperError> {
         log::trace!("running whisper cached decoder step...");
         let ids = Array2::from_shape_vec((1, 1), vec![token])?;
         // The graph takes 17 named inputs and 16 of the names are generated
@@ -382,7 +392,7 @@ impl WhisperModel {
             .ok_or_else(|| WhisperError::OutputNotFound("logits".to_string()))?
             .try_extract_array::<f32>()?;
         let (flat, _) = logits_rows(&logits)?;
-        Ok(flat.to_vec())
+        Ok(pick_token(flat, false))
     }
 }
 
@@ -422,8 +432,9 @@ struct PromptRun {
     /// Position 0's logits over the language tokens only, which is all
     /// `detect_language` reads.
     language: Vec<f32>,
-    /// The last position's full row: the first generated token.
-    next: Vec<f32>,
+    /// The first generated token and its probability, from the last
+    /// position's row.
+    first: (usize, f32),
 }
 
 /// One utterance's transcription. `word_confidences` is index-aligned with the
