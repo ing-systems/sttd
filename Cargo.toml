@@ -46,7 +46,6 @@ unicode-normalization = "0.1"
 num_cpus = "1.17"
 ureq = "2"
 anyhow = "1"
-ctrlc = "3"
 hound = "3.5"
 signal-hook = { version = "0.3", features = ["iterator"] }
 # Session-bus control surface: Pause/Resume/Toggle plus live dictionary

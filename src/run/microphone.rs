@@ -20,7 +20,7 @@ use super::setup::{
     asr_config, live_dictionary, make_emitter, open_metrics, prepare_model, start_translation,
     AcousticConfig,
 };
-use super::unix_signals::{install_ctrlc_handler, install_pause_handlers};
+use super::unix_signals::install_signal_handlers;
 use crate::asr::{spawn_asr_worker, PartialSlot};
 use crate::capture::{
     build_input_stream, probe_loudest_channel, select_input_device, StreamTelemetry,
@@ -95,25 +95,12 @@ pub(crate) fn run_microphone_mode(cli: &Cli) -> Result<()> {
     }
     log::info!("pause: SIGUSR1, resume: SIGUSR2, toggle: SIGHUP");
 
-    // Ctrl-C sets the flag; the loop below flushes trailing speech first.
-    {
-        let running = Arc::clone(&running);
-        if let Err(e) = install_ctrlc_handler(move || running.store(false, Ordering::Release)) {
-            log::warn!("{e:?} (Ctrl-C will terminate immediately)");
-        }
-    }
-
-    // USR1/USR2/HUP drive the pause flag, TERM requests a graceful shutdown
-    // (same flag as Ctrl-C, so `--stop`/`kill` flushes trailing speech); a
-    // failed install isn't fatal, pause/resume via signals is then simply
-    // unavailable.
-    {
-        let shared = pause_state.clone();
-        let running = Arc::clone(&running);
-        let sound_enabled = cli.sound;
-        if let Err(e) = install_pause_handlers(shared, running, sound_enabled) {
-            log::warn!("{e:?} (signal pause/resume unavailable)");
-        }
+    // Ctrl-C and TERM clear `running`, and the loop below flushes trailing
+    // speech first; USR1/USR2/HUP drive the pause flag. A failed install isn't
+    // fatal: Ctrl-C then terminates immediately (losing only the trailing
+    // flush) and pause/resume via signals is unavailable.
+    if let Err(e) = install_signal_handlers(pause_state.clone(), Arc::clone(&running), cli.sound) {
+        log::warn!("{e:?} (Ctrl-C will terminate immediately; signal pause/resume unavailable)");
     }
 
     // ---- now the model load: onto the GPU/CPU (per `--gpu`) on its own thread.
