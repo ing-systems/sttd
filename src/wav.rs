@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::dsp::{select_channel_and_downmix, ChannelSel};
-use crate::emit::owner_only_file;
+use crate::fsutil::owner_only_file;
 
 // ---------------------------------------------------------------------------
 // WAV I/O (utterance dumps + `--file` mode) via `hound`.

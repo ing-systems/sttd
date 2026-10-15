@@ -2,7 +2,7 @@
 // Constants / config
 // ---------------------------------------------------------------------------
 
-use crate::whisper_core::types::Language;
+use crate::language::Language;
 
 /// Sample rate required by the VAD branch's denoiser (DeepFilterNet3,
 /// opt-in via `STTD_DENOISER=deepfilter` with the `denoise` Cargo feature;

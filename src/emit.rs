@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::clock::now_ms;
 use crate::config::{DUMP_KEEP_FILES, SAMPLE_RATE, SPEAK_TAIL_MS};
+use crate::fsutil::owner_only_file;
 use crate::gate::{TranscriptDropKind, TranscriptVerdict};
 use crate::piper::PiperVoice;
 use crate::utterance::Evidence;
@@ -260,21 +262,11 @@ impl Drop for SpeechOut {
     }
 }
 
-/// Milliseconds since an arbitrary fixed instant, for the finish deadline.
-///
-/// `Instant` cannot cross the thread boundary as a shared value, and
-/// `SystemTime` can jump. A monotonic counter derived from a process-start
-/// `Instant` is the cheap monotonic clock this needs.
-pub(crate) fn now_ms() -> u64 {
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u64
-}
-
 /// Whether the finish deadline has passed. Zero means no deadline, so a thread
 /// that was never asked to finish never sees one. Delegates to the same rule
 /// `sound` applies while it waits.
 fn past_deadline(finish_by_ms: &AtomicU64) -> bool {
-    crate::sound::past_deadline(finish_by_ms, now_ms())
+    crate::clock::past_deadline(finish_by_ms, now_ms())
 }
 
 /// Sleep `total`, giving up early once the finish deadline passes. Returns
@@ -445,7 +437,7 @@ struct EmitterWorker {
     dump_dir: Option<PathBuf>,
     clipboard_available: bool,
     paste_available: bool,
-    paste_mode: crate::cli::PasteMode,
+    paste_mode: PasteMode,
     stdout_enabled: bool,
     /// Utterances handled since the last `prune_dump_dir` scan.
     since_prune: usize,
@@ -466,7 +458,7 @@ pub(crate) struct EmissionPolicy {
     pub(crate) dump_dir: Option<PathBuf>,
     pub(crate) copy: bool,
     pub(crate) paste: bool,
-    pub(crate) paste_mode: crate::cli::PasteMode,
+    pub(crate) paste_mode: PasteMode,
     pub(crate) stdout: bool,
     /// The loaded voice plus its thread, from `SpeechOut::spawn`.
     pub(crate) speech: Option<SpeechOut>,
@@ -739,7 +731,7 @@ impl EmitterWorker {
         // fresh text), `type_via_ydotool` for `type` mode (no clipboard).
         let result = if copied {
             paste_via_ydotool(mode)
-        } else if mode == crate::cli::PasteMode::Type {
+        } else if mode == PasteMode::Type {
             type_via_ydotool(text)
         } else {
             return;
@@ -836,21 +828,6 @@ fn dump_drop_reason(dump_dir: &Option<PathBuf>, tag: &str, reason: &str) {
             log::warn!("failed to write {}: {e:?}", txt_path.display());
         }
     }
-}
-
-/// Create/truncate `path` with owner-only permissions (0600 on unix). Mic
-/// audio and transcripts are sensitive; `File::create` honors umask (often
-/// 0644) and keeps a pre-existing path's mode — neither is acceptable here.
-pub(crate) fn owner_only_file(path: &Path) -> Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
-        .with_context(|| format!("failed to create {}", path.display()))
 }
 
 /// Write `contents` to `path` with owner-only permissions (see
@@ -993,14 +970,25 @@ pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     }
 }
 
+/// How `--paste` inserts text via `ydotool` (Wayland only).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PasteMode {
+    /// LEFTCTRL+V (default).
+    #[default]
+    CtrlV,
+    /// LEFTCTRL+LEFTSHIFT+V (terminals).
+    CtrlShiftV,
+    /// `ydotool type` via stdin (no clipboard, layout-dependent).
+    Type,
+}
+
 /// Paste the clipboard at the current cursor position via `ydotool`
 /// (requires the `ydotoold` daemon). `CtrlV` synthesizes LEFTCTRL+V
 /// (`29:1 47:1 47:0 29:0`); `CtrlShiftV` adds LEFTSHIFT for terminals;
 /// `Type` types via `ydotool type` on stdin (no clipboard, layout-dependent).
 /// Returns `io::Error` unwrapped so the caller can match `NotFound` and
 /// disable itself with a single warning on machines without `ydotool`.
-pub(crate) fn paste_via_ydotool(mode: crate::cli::PasteMode) -> std::io::Result<()> {
-    use crate::cli::PasteMode;
+pub(crate) fn paste_via_ydotool(mode: PasteMode) -> std::io::Result<()> {
     match mode {
         PasteMode::CtrlV => run_ydotool_key(&["29:1", "47:1", "47:0", "29:0"]),
         PasteMode::CtrlShiftV => run_ydotool_key(&["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]),
@@ -1080,7 +1068,7 @@ pub(crate) fn policy_off() -> EmissionPolicy {
         dump_dir: None,
         copy: false,
         paste: false,
-        paste_mode: crate::cli::PasteMode::CtrlV,
+        paste_mode: PasteMode::CtrlV,
         stdout: false,
         speech: None,
     }
@@ -1348,12 +1336,12 @@ mod tests {
         // than a real playback, since there is no voice or device here.
         let deadline = AtomicU64::new(1);
         assert!(
-            crate::sound::past_deadline(&deadline, 1),
+            crate::clock::past_deadline(&deadline, 1),
             "a deadline at or before now is past"
         );
-        assert!(crate::sound::past_deadline(&deadline, 2));
+        assert!(crate::clock::past_deadline(&deadline, 2));
         assert!(
-            !crate::sound::past_deadline(&deadline, 0),
+            !crate::clock::past_deadline(&deadline, 0),
             "not yet, a millisecond before"
         );
         let t0 = Instant::now();
@@ -1371,8 +1359,8 @@ mod tests {
         // waits its whole course out. (Otherwise every speak would cut itself
         // off at once, since the clock is always past zero.)
         let none = AtomicU64::new(0);
-        assert!(!crate::sound::past_deadline(&none, u64::MAX / 2));
-        assert!(!crate::sound::past_deadline(&none, 0));
+        assert!(!crate::clock::past_deadline(&none, u64::MAX / 2));
+        assert!(!crate::clock::past_deadline(&none, 0));
         let t0 = Instant::now();
         assert!(!sleep_until_deadline(Duration::from_millis(50), &none));
         assert!(
@@ -1396,8 +1384,8 @@ mod tests {
         // the future rather than in the past (an overflow would).
         let deadline = drop_deadline(false, 100);
         assert_eq!(deadline, 100 + SPEAK_DRAIN_MS);
-        assert!(!crate::sound::past_deadline(&AtomicU64::new(deadline), 100));
-        assert!(crate::sound::past_deadline(
+        assert!(!crate::clock::past_deadline(&AtomicU64::new(deadline), 100));
+        assert!(crate::clock::past_deadline(
             &AtomicU64::new(deadline),
             deadline
         ));
@@ -1410,7 +1398,7 @@ mod tests {
         // Literals, never `now_ms()`, which returns 0 on a first call and 0
         // reads as "no deadline".
         assert_eq!(drop_deadline(true, 100), 100);
-        assert!(crate::sound::past_deadline(
+        assert!(crate::clock::past_deadline(
             &AtomicU64::new(drop_deadline(true, 7)),
             7
         ));
@@ -1438,18 +1426,18 @@ mod tests {
         // clock passes that instant rather than the same millisecond. A bounded
         // wait, not a sleep: the assert is what decides.
         let t0 = Instant::now();
-        while !crate::sound::past_deadline(&cut.finish_by_ms, now_ms())
+        while !crate::clock::past_deadline(&cut.finish_by_ms, now_ms())
             && t0.elapsed() < Duration::from_millis(200)
         {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(crate::sound::past_deadline(&cut.finish_by_ms, now_ms()));
+        assert!(crate::clock::past_deadline(&cut.finish_by_ms, now_ms()));
         // Idempotent: a second abort cannot clear the mark, and it may not reset
         // the deadline to the no-deadline sentinel.
         cut.abort();
         assert!(cut.aborted.load(Ordering::Acquire));
         assert_ne!(cut.finish_by_ms.load(Ordering::Acquire), 0);
-        assert!(crate::sound::past_deadline(&cut.finish_by_ms, now_ms()));
+        assert!(crate::clock::past_deadline(&cut.finish_by_ms, now_ms()));
     }
 
     #[test]

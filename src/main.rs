@@ -79,6 +79,7 @@ mod capture;
 mod config;
 use capture::*;
 mod clean;
+mod clock;
 mod control;
 mod daemon;
 mod dbus;
@@ -86,11 +87,14 @@ mod denoise;
 mod dictionary;
 mod dsp;
 mod emit;
+mod metrics;
 use emit::{EmissionPolicy, SpeechOut, SystemEmitter};
 mod agc;
 mod frame;
+mod fsutil;
 mod gate;
 mod hp;
+mod language;
 mod noise;
 mod signal;
 mod sound;
@@ -103,7 +107,8 @@ use wav::*;
 mod model_store;
 use model_store::{ensure_available, resolve_model, EngineKind, ModelRef, CATALOGS};
 mod asr;
-use asr::{auto_threads, resolve_n_threads, spawn_asr_worker, AsrConfig};
+use asr::{spawn_asr_worker, AsrConfig};
+use device::{auto_threads, resolve_n_threads};
 mod decode;
 mod device;
 mod mel;
@@ -116,7 +121,8 @@ mod translator_store;
 mod voice_store;
 mod whisper;
 mod whisper_core;
-use whisper_core::types::{Language, DEFAULT_WINDOW_FRAMES};
+use language::Language;
+use whisper_core::types::DEFAULT_WINDOW_FRAMES;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -541,7 +547,7 @@ fn run_microphone_mode(cli: &Cli) -> Result<()> {
     // worker and the translation thread write through, because the worker writes
     // a row for every utterance it does not hand over and the thread writes the
     // rows whose `text` column is a translation.
-    let metrics = asr::MetricsSlot::new(asr::open_metrics_log(cli.metrics.as_deref()));
+    let metrics = metrics::MetricsSlot::new(metrics::open_metrics_log(cli.metrics.as_deref()));
     let translation_state =
         TranslationState::new(TranslationPlan::from_cli(cli), translate::RealTranslator);
     // With `--translate`, the translator is loaded here, on the main thread,
@@ -1005,7 +1011,7 @@ fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
     // so an offline `--file ... --translate en` prints English. There is no bus
     // here, so nothing can switch it later: the lane exists only when a
     // translator did, and the worker emits inline when it does not.
-    let metrics = asr::MetricsSlot::new(asr::open_metrics_log(cli.metrics.as_deref()));
+    let metrics = metrics::MetricsSlot::new(metrics::open_metrics_log(cli.metrics.as_deref()));
     let translation_state =
         TranslationState::new(TranslationPlan::from_cli(cli), translate::RealTranslator);
     translation_state.load_startup()?;
@@ -1162,7 +1168,7 @@ fn run_paste_last(cli: &Cli) -> Result<()> {
     if !crate::emit::is_wayland_session_env() {
         log::warn!("paste-last: not a Wayland session; copy attempted anyway");
     }
-    if cli.paste_mode == crate::cli::PasteMode::Type {
+    if cli.paste_mode == crate::emit::PasteMode::Type {
         crate::emit::type_via_ydotool(text)
             .context("paste-last: ydotool type failed (is ydotoold running?)")?;
         log::info!("paste-last: typed {} chars", text.chars().count());

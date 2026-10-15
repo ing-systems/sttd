@@ -31,6 +31,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SupportedStreamConfig;
 use resampler::{Attenuation, Latency, ResamplerFir};
 
+use crate::clock::{now_ms, past_deadline};
+
 /// Peak amplitude of the cue tones. Conservative so a loud desktop mix
 /// doesn't clip.
 const CUE_GAIN: f32 = 0.2;
@@ -137,16 +139,6 @@ pub(crate) fn play_mono(samples: &[f32], sample_rate: u32, finish_by_ms: &Atomic
     };
     let mono = resample_mono(samples, sample_rate, device_rate);
     stream_and_play(&device, &config, mono, Some(finish_by_ms))
-}
-
-/// Whether `finish_by_ms` holds a deadline that has already passed. Zero means
-/// no deadline, so a caller that never set one is never cut off.
-///
-/// Takes the clock as an argument so the wait itself is testable without a
-/// device: `now_ms` is a process-wide monotonic counter, not wall time.
-pub(crate) fn past_deadline(finish_by_ms: &AtomicU64, now_ms: u64) -> bool {
-    let deadline = finish_by_ms.load(Ordering::Acquire);
-    deadline != 0 && now_ms >= deadline
 }
 
 /// Blocking playback on the cue thread: open the default output, render the
@@ -355,7 +347,7 @@ fn stream_and_play(
         // The clock is read per iteration rather than threaded through, so this
         // loop cannot be the thing that hangs: a deadline that never arrives
         // ends it when the buffer has played out.
-        if past_deadline(finish_by_ms, crate::emit::now_ms()) {
+        if past_deadline(finish_by_ms, now_ms()) {
             return false;
         }
         std::thread::sleep(Duration::from_millis(20));

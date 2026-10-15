@@ -1327,16 +1327,20 @@ impl TranslationPlan {
             }
         }
         let source = match cli.language() {
-            crate::whisper_core::types::Language::Explicit(code)
-            | crate::whisper_core::types::Language::System(code) => Some(code),
-            crate::whisper_core::types::Language::Auto => None,
+            crate::language::Language::Explicit(code) | crate::language::Language::System(code) => {
+                Some(code)
+            }
+            crate::language::Language::Auto => None,
         };
         Self {
             source,
             model,
             configured,
-            intra_threads: crate::asr::resolve_n_threads(cli.threads, crate::asr::auto_threads())
-                .max(1) as usize,
+            intra_threads: crate::device::resolve_n_threads(
+                cli.threads,
+                crate::device::auto_threads(),
+            )
+            .max(1) as usize,
             voice: cli.speak.then(|| cli.voice.clone()),
         }
     }
@@ -2071,7 +2075,7 @@ impl<T: Loaded, L: Loads<T>> TranslationOut<T, L> {
     pub(crate) fn spawn(
         state: TranslationState<T, L>,
         mut emitter: Box<dyn Emitter + Send>,
-        metrics: crate::asr::MetricsSlot,
+        metrics: crate::metrics::MetricsSlot,
     ) -> Self {
         let queue: Arc<(Mutex<VecDeque<TranslationJob>>, Condvar)> =
             Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
@@ -2183,7 +2187,7 @@ fn translate_loop<T: Loaded, L: Loads<T>>(
     queue: &(Mutex<VecDeque<TranslationJob>>, Condvar),
     closed: &AtomicBool,
     emitter: &mut dyn Emitter,
-    metrics: &crate::asr::MetricsSlot,
+    metrics: &crate::metrics::MetricsSlot,
 ) {
     while let Some(job) = next_job(queue, closed) {
         emit_one(state, emitter, metrics, job);
@@ -2225,7 +2229,7 @@ fn next_job(
 fn emit_one<T: Loaded, L: Loads<T>>(
     state: &TranslationState<T, L>,
     emitter: &mut dyn Emitter,
-    metrics: &crate::asr::MetricsSlot,
+    metrics: &crate::metrics::MetricsSlot,
     job: TranslationJob,
 ) {
     let mut panicked = false;
@@ -2274,7 +2278,7 @@ fn emit_one<T: Loaded, L: Loads<T>>(
     // `src_text` only when a translation ran for *this* utterance, so a log from a
     // run with the step off stays comparable with one from before it existed.
     let mut writer = metrics.lock();
-    crate::asr::write_metrics_row(
+    crate::metrics::write_metrics_row(
         &mut writer,
         &job.tag,
         job.samples,
@@ -2321,9 +2325,9 @@ impl Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asr::MetricsSlot;
     use crate::emit::{Emission, Emitter};
     use crate::gate::TranscriptVerdict;
+    use crate::metrics::MetricsSlot;
     use anyhow::anyhow;
     use std::time::Duration;
 

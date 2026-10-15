@@ -10,21 +10,9 @@ use crate::config::{
 };
 use crate::denoise::DenoiserKind;
 use crate::dsp::{parse_channel_sel, ChannelSel};
-use crate::whisper_core::types::{
-    parse_audio_ctx, parse_language, Language, DEFAULT_WINDOW_FRAMES,
-};
-
-/// How `--paste` inserts text via `ydotool` (Wayland only).
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum PasteMode {
-    /// LEFTCTRL+V (default).
-    #[default]
-    CtrlV,
-    /// LEFTCTRL+LEFTSHIFT+V (terminals).
-    CtrlShiftV,
-    /// `ydotool type` via stdin (no clipboard, layout-dependent).
-    Type,
-}
+use crate::emit::PasteMode;
+use crate::language::{parse_language, Language};
+use crate::whisper_core::types::{parse_audio_ctx, DEFAULT_WINDOW_FRAMES};
 
 /// Real-time Polish-English speech-to-text.
 ///

@@ -4,13 +4,16 @@
 //! whether a CUDA session is worth attempting ([`cuda_available`]), how the
 //! provider is registered ([`apply`]), and what happens when a CUDA load does
 //! not work out ([`commit_with_cpu_fallback`]). The engines supply their own
-//! session settings and nothing else.
+//! session settings and nothing else. It also owns what `--threads` resolves
+//! to ([`resolve_n_threads`], [`auto_threads`]), which every `ort` user shares.
 //!
 //! The GPU path exists only in a `cuda` build. Without that Cargo feature the
 //! `Gpu` variant stays in the enum (callers match on it) but nothing can
 //! produce it, and [`apply`] hands back the builder unchanged.
 
 use ort::session::builder::SessionBuilder;
+
+use crate::config::DEFAULT_THREADS;
 
 /// The device an ONNX Runtime session runs on. `Copy`, so callers pass it by
 /// value.
@@ -168,6 +171,43 @@ where
     }
 }
 
+/// Query physical cores for `--threads 0` (auto). Falls back to
+/// `available_parallelism` and then `DEFAULT_THREADS` when the query fails.
+pub(crate) fn auto_threads() -> i32 {
+    pick_auto_threads(
+        num_cpus::get_physical(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
+    )
+}
+
+/// Pick an auto thread count from a physical-core count and a logical-core
+/// count (`0` = query failed). Prefers physical (ORT `intra_op` guidance:
+/// one thread per physical core); falls back to logical, then
+/// `DEFAULT_THREADS`. Pure over its inputs so tests don't touch the
+/// scheduler. Always >= 1.
+pub(crate) fn pick_auto_threads(physical: usize, logical: usize) -> i32 {
+    let n = if physical > 0 {
+        physical
+    } else if logical > 0 {
+        logical
+    } else {
+        DEFAULT_THREADS.max(1) as usize
+    };
+    (n.min(i32::MAX as usize) as i32).max(1)
+}
+
+/// Resolve a `--threads` value: `0` means auto, anything else is used as-is.
+/// Pure over its inputs so tests don't touch the scheduler.
+pub(crate) fn resolve_n_threads(requested: i32, auto: i32) -> i32 {
+    if requested == 0 {
+        auto.max(1)
+    } else {
+        requested
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +319,20 @@ mod tests {
         });
         assert_eq!(seen.into_inner(), vec![Device::Cpu]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn thread_count_zero_means_auto() {
+        assert_eq!(DEFAULT_THREADS, 8);
+        assert_eq!(resolve_n_threads(0, 16), 16);
+        assert_eq!(resolve_n_threads(8, 16), 8);
+        // Auto of 0/negative can never happen via `auto_threads`, but clamp
+        // defensively so the model never gets 0 threads.
+        assert_eq!(resolve_n_threads(0, 0), 1);
+        assert!(auto_threads() >= 1);
+        // Physical preferred; logical fallback; then DEFAULT_THREADS.
+        assert_eq!(pick_auto_threads(6, 12), 6);
+        assert_eq!(pick_auto_threads(0, 12), 12);
+        assert_eq!(pick_auto_threads(0, 0), DEFAULT_THREADS);
     }
 }
