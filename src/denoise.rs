@@ -39,54 +39,36 @@ pub(crate) enum DenoiserKind {
     Bypass,
 }
 
-/// The active denoiser, built once by `SignalPath::new` when the
-/// `DenoiserKind` chosen at startup is `DeepFilter`. There is no bypass
-/// variant: `Bypass` means no denoiser object and no 48 kHz path at all.
-/// Only available with the `denoise` Cargo feature.
+/// The active denoiser (DeepFilterNet3), built once by `SignalPath::new` when
+/// the `DenoiserKind` chosen at startup is `DeepFilter`. `Bypass` means no
+/// denoiser object and no 48 kHz path at all. Only available with the
+/// `denoise` Cargo feature.
 #[cfg(feature = "denoise")]
-pub(crate) enum Denoiser {
-    DeepFilter(Box<DfTract>),
-}
+pub(crate) struct Denoiser(Box<DfTract>);
 
 #[cfg(feature = "denoise")]
 impl Denoiser {
-    pub(crate) fn new(kind: DenoiserKind) -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let t0 = std::time::Instant::now();
-        let denoiser = match kind {
-            DenoiserKind::Bypass => {
-                anyhow::bail!("Bypass has no denoiser object (no 48 kHz path)");
-            }
-            DenoiserKind::DeepFilter => {
-                let params = DfParams::default();
-                let rp = RuntimeParams::default_with_ch(1);
-                let tract = DfTract::new(params, &rp)
-                    .context("failed to initialize DeepFilterNet (tract)")?;
-                // Guard against a silent frame desync: everything downstream
-                // assumes the VAD branch's frame is exactly DENOISE_RATE /
-                // FRAME_48K samples.
-                if tract.sr != DENOISE_RATE as usize || tract.hop_size != FRAME_48K {
-                    anyhow::bail!(
-                        "DeepFilterNet model rate/frame mismatch: sr={} hop_size={} \
-                         (pipeline expects sr={DENOISE_RATE} hop_size={FRAME_48K})",
-                        tract.sr,
-                        tract.hop_size
-                    );
-                }
-                Denoiser::DeepFilter(Box::new(tract))
-            }
-        };
+        let params = DfParams::default();
+        let rp = RuntimeParams::default_with_ch(1);
+        let tract =
+            DfTract::new(params, &rp).context("failed to initialize DeepFilterNet (tract)")?;
+        // Guard against a silent frame desync: everything downstream assumes
+        // the VAD branch's frame is exactly DENOISE_RATE / FRAME_48K samples.
+        if tract.sr != DENOISE_RATE as usize || tract.hop_size != FRAME_48K {
+            anyhow::bail!(
+                "DeepFilterNet model rate/frame mismatch: sr={} hop_size={} \
+                 (pipeline expects sr={DENOISE_RATE} hop_size={FRAME_48K})",
+                tract.sr,
+                tract.hop_size
+            );
+        }
         log::info!(
-            "denoiser: {} (init {:.1}ms)",
-            denoiser.name(),
+            "denoiser: deepfilter (init {:.1}ms)",
             t0.elapsed().as_secs_f64() * 1000.0
         );
-        Ok(denoiser)
-    }
-
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Denoiser::DeepFilter(_) => "deepfilter",
-        }
+        Ok(Self(Box::new(tract)))
     }
 
     /// Reset overlap-add memory for a pause transition, so the first frames
@@ -94,12 +76,8 @@ impl Denoiser {
     /// kept warm on purpose: they carry the background estimate Faza 2
     /// (`NoiseTracker`) keeps learning from.
     pub(crate) fn reset(&mut self) {
-        match self {
-            Denoiser::DeepFilter(tract) => {
-                for state in tract.df_states.iter_mut() {
-                    state.reset();
-                }
-            }
+        for state in self.0.df_states.iter_mut() {
+            state.reset();
         }
     }
 
@@ -116,24 +94,20 @@ impl Denoiser {
             clean[..n].copy_from_slice(&noisy[..n]);
             return;
         }
-        match self {
-            Denoiser::DeepFilter(tract) => {
-                let Ok(noisy_view) = ArrayView2::from_shape((1, FRAME_48K), noisy) else {
-                    log::warn!("deepfilter noisy view failed (passing through)");
-                    clean.copy_from_slice(noisy);
-                    return;
-                };
-                let Ok(mut enh_view) = ArrayViewMut2::from_shape((1, FRAME_48K), clean) else {
-                    log::warn!("deepfilter clean view failed (passing through)");
-                    return;
-                };
-                if let Err(e) = tract.process(noisy_view, enh_view.view_mut()) {
-                    // Hand the VAD branch the raw frame rather than lose
-                    // frame-count sync with the rest of the pipeline.
-                    log::warn!("deepfilter process error: {e}; passing frame through");
-                    clean.copy_from_slice(noisy);
-                }
-            }
+        let Ok(noisy_view) = ArrayView2::from_shape((1, FRAME_48K), noisy) else {
+            log::warn!("deepfilter noisy view failed (passing through)");
+            clean.copy_from_slice(noisy);
+            return;
+        };
+        let Ok(mut enh_view) = ArrayViewMut2::from_shape((1, FRAME_48K), clean) else {
+            log::warn!("deepfilter clean view failed (passing through)");
+            return;
+        };
+        if let Err(e) = self.0.process(noisy_view, enh_view.view_mut()) {
+            // Hand the VAD branch the raw frame rather than lose frame-count
+            // sync with the rest of the pipeline.
+            log::warn!("deepfilter process error: {e}; passing frame through");
+            clean.copy_from_slice(noisy);
         }
     }
 }
@@ -182,7 +156,7 @@ mod tests {
     #[cfg(feature = "denoise")]
     #[test]
     fn deepfilter_preserves_frame_length_on_silence() {
-        let mut denoiser = Denoiser::new(DenoiserKind::DeepFilter).unwrap();
+        let mut denoiser = Denoiser::new().unwrap();
         let noisy = vec![0.0f32; FRAME_48K];
         let mut clean = vec![0.0f32; FRAME_48K];
         denoiser.denoise_frame(&noisy, &mut clean);

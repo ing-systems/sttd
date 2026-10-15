@@ -118,7 +118,7 @@ impl SignalPath {
                 let resampler_model = FirStream::new(hw_rate, SAMPLE_RATE, FRAME_16K)
                     .with_context(|| format!("failed to create resampler (hw -> {SAMPLE_RATE})"))?;
 
-                let denoiser = Denoiser::new(DenoiserKind::DeepFilter)?;
+                let denoiser = Denoiser::new()?;
                 VadPath::Denoised {
                     resampler_hw48,
                     resampler_vad,

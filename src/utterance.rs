@@ -504,14 +504,18 @@ impl UtteranceBuffer {
         if !due {
             return None;
         }
-        if self.speech_sample_count > 0 {
-            let rms = (self.speech_energy_sum_sq / self.speech_sample_count as f64).sqrt() as f32;
-            if rms < min_rms {
-                return None;
-            }
+        if self.speech_rms().is_some_and(|rms| rms < min_rms) {
+            return None;
         }
         self.partial_end = end;
         Some(self.buf[..end].to_vec())
+    }
+
+    /// RMS over the speech frames' acoustic evidence so far, `None` before
+    /// the first one.
+    fn speech_rms(&self) -> Option<f32> {
+        (self.speech_sample_count > 0)
+            .then(|| (self.speech_energy_sum_sq / self.speech_sample_count as f64).sqrt() as f32)
     }
 
     /// Decide whether the accumulated utterance is real speech and, if so, trim
@@ -541,11 +545,7 @@ impl UtteranceBuffer {
         let density = speech_frames as f32 / total_frames.max(1) as f32;
         let weighted = weighted_density(&self.speech_frame_rms, gate.min_speech_rms, total_frames);
 
-        let rms = if self.speech_sample_count > 0 {
-            (self.speech_energy_sum_sq / self.speech_sample_count as f64).sqrt() as f32
-        } else {
-            0.0
-        };
+        let rms = self.speech_rms().unwrap_or(0.0);
         // When raw frame density is clearly concentrated (short dense words where
         // pre-roll and tail silence dominate total_frames), use density so quiet-but-dense
         // speech isn't starved by the weighted-density denominator.

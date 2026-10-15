@@ -214,16 +214,11 @@ pub(crate) fn pick_louder_channel(interleaved: &[f32], channels: usize) -> Optio
     let mut any_signal = false;
     for ch in 0..channels {
         let mut sum_sq = 0.0f64;
-        let mut n = 0usize;
         for f in 0..frames {
             let s = interleaved[f * channels + ch] as f64;
             sum_sq += s * s;
-            n += 1;
         }
-        if n == 0 {
-            continue;
-        }
-        let rms = (sum_sq / n as f64).sqrt();
+        let rms = (sum_sq / frames as f64).sqrt();
         if rms > 1e-9 {
             any_signal = true;
         }
