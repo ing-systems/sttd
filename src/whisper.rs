@@ -2,7 +2,7 @@
 // Whisper engine: Whisper large-v3-turbo `SpeechModel` impl.
 // ---------------------------------------------------------------------------
 //
-// The second engine behind the `asr::SpeechModel` seam, alongside
+// The second engine behind the `speech::SpeechModel` seam, alongside
 // `parakeet::ParakeetModel`. Everything engine-agnostic (worker loop, gates,
 // metrics, conditioning, dictionary correction) stays in `asr`; this module
 // owns only what Whisper needs: the mel frontend and the greedy decode over
@@ -37,9 +37,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::asr::{with_loading_ticker, AsrConfig, SpeechModel, Transcript};
 use crate::config::WHISPER_MAX_NEW_TOKENS;
 use crate::device;
+use crate::speech::{with_loading_ticker, EngineConfig, SpeechModel, Transcript};
 use crate::whisper_core::WhisperModel as CoreModel;
 
 pub(crate) struct WhisperModel {
@@ -53,7 +53,7 @@ impl WhisperModel {
     ///
     /// `--gpu` asks for CUDA; a build without CUDA support (or without a
     /// usable device) gets CPU sessions and one warning.
-    pub(crate) fn load(dir: &Path, config: &AsrConfig) -> Result<Self> {
+    pub(crate) fn load(dir: &Path, config: &EngineConfig) -> Result<Self> {
         let device = device::resolve(config.use_gpu);
         let intra_threads = config.n_threads.max(1) as usize;
         log::info!("loading whisper model ({})...", dir.display());

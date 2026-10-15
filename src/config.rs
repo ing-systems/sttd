@@ -155,7 +155,7 @@ pub(crate) const AGC_RELEASE_MS: f32 = 200.0;
 /// clicks that the model can decode as a token.
 pub(crate) const CONDITION_FADE_SAMPLES: usize = 80;
 /// Dithered trailing pad added after each conditioned utterance before inference
-/// (see `asr::pad_trailing_with_dither`): 250 ms at 16 kHz, mirroring
+/// (see `speech::pad_trailing_with_dither`): 250 ms at 16 kHz, mirroring
 /// Murmure's `INFERENCE_SILENCE_PAD_SECS`. Gives the encoder context past the
 /// last word so final tokens are not clipped. Content is quiet dither
 /// (`+-1e-4`, same level as `pad_with_dither`), not digital zero — long

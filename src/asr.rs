@@ -1,16 +1,12 @@
 // ---------------------------------------------------------------------------
-// ASR seam: the worker loop, gates, metrics, conditioning.
+// ASR worker: the loop, gates, conditioning.
 // ---------------------------------------------------------------------------
 //
-// Two speech models exist (Parakeet-TDT-0.6B-v3 and Whisper large-v3-turbo, via
-// direct `ort` sessions, see `parakeet_core` / `whisper_core`), selected once at
-// startup by `--model`
-// (see `model_store::ModelRef`) and fixed for the process's lifetime.
 // This module owns the worker thread and its load/unload/pause/shed loop,
-// the transcript gate call, `--metrics` JSONL, audio conditioning, and the
-// split-seam dedup. The engine's own file (`parakeet`) owns only what's
-// genuinely engine-specific — the actual inference call, and enough of a
-// description to log — behind the `SpeechModel` trait.
+// the transcript gate call, audio conditioning, and the split-seam dedup. The
+// engines sit behind `speech::SpeechModel` and own only what is genuinely
+// engine-specific — the actual inference call, and enough of a description to
+// log. The `--metrics` rows the worker writes are formatted by `metrics`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,92 +21,31 @@ use crate::emit::{Emission, Emitter};
 use crate::gate::GateConfig;
 use crate::metrics::{infer_rtf, write_metrics_row, MetricsSlot};
 use crate::model_store::ModelRef;
+use crate::speech::{pad_trailing_with_dither, EngineConfig, SpeechModel};
 use crate::translate::{TranslationJob, TranslationOut};
 use crate::utterance::Utterance;
-
-/// Result of one inference: the joined text plus per-word model confidences
-/// when the engine reports them (Parakeet, for the dictionary gate).
-pub(crate) struct Transcript {
-    pub(crate) text: String,
-    pub(crate) word_confidences: Vec<(String, f32)>,
-}
-
-/// One loaded, ready-to-run speech model. The worker loop in this module
-/// only ever sees this trait.
-pub(crate) trait SpeechModel {
-    /// Run one inference over already-conditioned 16 kHz mono audio.
-    fn transcribe(&mut self, pcm_16k: &[f32], running: &Arc<AtomicBool>) -> Result<Transcript>;
-
-    /// Rebuild the engine's phrase-boosting automaton from a new dictionary
-    /// list. Default is a no-op: an engine without boosting ignores it.
-    /// Called on the worker thread, never from the D-Bus thread.
-    fn set_boost_words(&mut self, _words: &[String]) {}
-
-    /// First-load readiness log line (full config summary).
-    fn describe(&self) -> String;
-
-    /// Reload readiness log line, logged after an auto-unload/resume cycle
-    /// instead of `describe()` (which would re-print the full config).
-    fn describe_reload(&self) -> String;
-
-    /// Short engine name for the shared load/unload log lines this module
-    /// prints ("{name} model unloaded...", "reloading {name} model...").
-    fn engine_name(&self) -> &'static str;
-
-    /// Samples this engine actually decoded for a conditioned utterance of
-    /// `conditioned_len` samples, accounting for any internal short-utterance
-    /// padding, so RTF and the `--metrics` `audio_sec` column reflect what
-    /// was fed to the model rather than the raw utterance length.
-    fn decoded_sample_count(&self, conditioned_len: usize) -> usize;
-}
 
 /// Load the model `ModelRef` names. Called once per load/reload cycle by
 /// `AsrWorker::load_once`. Dispatches on the kind `resolve_model` classified,
 /// so the engine choice is settled before any session is opened.
-pub(crate) fn load_model(model: &ModelRef, config: &AsrConfig) -> Result<Box<dyn SpeechModel>> {
+/// `boost_words` is the live dictionary at load time, so an engine that boosts
+/// starts from the current list.
+fn load_model(
+    model: &ModelRef,
+    config: &EngineConfig,
+    boost_words: &[String],
+) -> Result<Box<dyn SpeechModel>> {
     Ok(match model.kind {
-        crate::model_store::EngineKind::Parakeet => {
-            Box::new(crate::parakeet::ParakeetModel::load(&model.dir, config)?)
-                as Box<dyn SpeechModel>
-        }
+        crate::model_store::EngineKind::Parakeet => Box::new(crate::parakeet::ParakeetModel::load(
+            &model.dir,
+            config,
+            boost_words,
+        )?) as Box<dyn SpeechModel>,
         crate::model_store::EngineKind::Whisper => {
             Box::new(crate::whisper::WhisperModel::load(&model.dir, config)?)
                 as Box<dyn SpeechModel>
         }
     })
-}
-
-/// Runs `f` while ticking `"loading {label}... Ns"` once per second on a
-/// side thread. Model construction can block for tens of seconds with no
-/// progress callback (a Parakeet fp32 encoder), so this exists to keep that
-/// hung. Joins the ticker before returning `f`'s result.
-pub(crate) fn with_loading_ticker<T>(label: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let load_done = Arc::new(AtomicBool::new(false));
-    let ticker = {
-        let done = Arc::clone(&load_done);
-        let label = label.to_string();
-        std::thread::spawn(move || {
-            let start = Instant::now();
-            let mut last_printed: u64 = 0;
-            loop {
-                // Short sleeps so joining after the load finishes costs at
-                // most 100 ms; only a whole-second tick is printed.
-                std::thread::sleep(Duration::from_millis(100));
-                if done.load(Ordering::Relaxed) {
-                    break;
-                }
-                let elapsed = start.elapsed().as_secs();
-                if elapsed > last_printed {
-                    last_printed = elapsed;
-                    log::info!("loading {label}... {elapsed}s");
-                }
-            }
-        })
-    };
-    let result = f();
-    load_done.store(true, Ordering::Relaxed);
-    let _ = ticker.join();
-    result
 }
 
 /// The ASR side of the live dictionary: a `control::DictionaryState` handle for the
@@ -223,18 +158,8 @@ impl PartialSlot {
 /// belongs to the `Emitter`, which is built and owned separately.
 #[derive(Debug, Clone)]
 pub(crate) struct AsrConfig {
-    // ---- engine settings, read by `parakeet` / `whisper` at load ----
-    /// `--model` as typed, for the engine's ready line.
-    pub(crate) model_spec: String,
-    pub(crate) n_threads: i32,
-    pub(crate) use_gpu: bool,
-    /// Decoding language for the Whisper engine (fixed once at startup). Parakeet
-    /// auto-detects per utterance and ignores this.
-    pub(crate) language: crate::language::Language,
-    /// `--audio-ctx`: floor of the dynamic Whisper window, in mel frames. The
-    /// encoder graph is patched at load, so the window follows the audio;
-    /// Parakeet sizes its own window and ignores this.
-    pub(crate) audio_ctx: usize,
+    /// Engine settings, read by `parakeet` / `whisper` at load.
+    pub(crate) engine: EngineConfig,
 
     // ---- gates and cleaning ----
     /// Shared with the capture side, so both paths judge the same thresholds.
@@ -564,7 +489,11 @@ impl AsrWorker<'_> {
     /// running session. Also resets the per-load state: the auto-unload
     /// clock and the pause-edge tracker.
     fn load_once(&mut self) -> Result<Loaded> {
-        let mut model = match load_model(&self.model_ref, &self.config) {
+        let mut model = match load_model(
+            &self.model_ref,
+            &self.config.engine,
+            &self.config.dictionary.words(),
+        ) {
             Ok(m) => m,
             Err(e) => {
                 if self.first_load {
@@ -1197,52 +1126,9 @@ pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
     out
 }
 
-/// One deterministic dither stream: `count` samples at `+-1e-4` from an
-/// xorshift32 generator (cheap, no extra dependency).
-///
-/// Both padding sites below share this stream, not their seed: the seed is
-/// derived from the input length by each caller, so its padding stays stable
-/// per input shape.
-fn dither_samples(seed: u32, count: usize) -> impl Iterator<Item = f32> {
-    let mut seed = seed;
-    (0..count).map(move |_| {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        (seed as f32 / u32::MAX as f32 - 0.5) * 2e-4 // +-1e-4
-    })
-}
-
-/// Pad sub-second audio with quiet dithered noise instead of exact digital
-/// silence: a long run of true zero is a hallucination trigger for the mel
-/// front-end, and a poor input for short-utterance handling in general.
-/// Grows the input to `min_samples`; longer input is returned unchanged.
-pub(crate) fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
-    let missing = min_samples.saturating_sub(pcm_16k.len());
-    let mut out = Vec::with_capacity(min_samples.max(pcm_16k.len()));
-    out.extend_from_slice(pcm_16k);
-    let seed = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_add(1);
-    out.extend(dither_samples(seed, missing));
-    out
-}
-
 /// Words compared on each side for split-seam dedup (see
 /// `remove_split_overlap`): mirrors Murmure's `MERGE_WINDOW_WORDS`.
 pub(crate) const MERGE_WINDOW_WORDS: usize = 6;
-
-/// Append `pad_samples` of quiet dither after conditioned audio
-/// (see `config::INFERENCE_PAD_SAMPLES` for why dither, not zero).
-/// Empty input stays empty (callers skip empty utterances before here).
-pub(crate) fn pad_trailing_with_dither(pcm_16k: &[f32], pad_samples: usize) -> Vec<f32> {
-    if pcm_16k.is_empty() || pad_samples == 0 {
-        return pcm_16k.to_vec();
-    }
-    let mut out = Vec::with_capacity(pcm_16k.len() + pad_samples);
-    out.extend_from_slice(pcm_16k);
-    let seed = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_mul(0x85EB_CA6B);
-    out.extend(dither_samples(seed, pad_samples));
-    out
-}
 
 /// Strip text repeated across a split seam: longest normalized word overlap
 /// (up to `MERGE_WINDOW_WORDS`) between the tail of `prev` and the head of
@@ -1288,6 +1174,7 @@ mod tests {
     use super::*;
     use crate::config::{DEFAULT_MIN_DENSITY, DEFAULT_MIN_SPEECH_RMS, DEFAULT_THREADS};
     use crate::gate::{is_hallucination, is_repetition};
+    use crate::speech::Transcript;
     use crate::utterance::Evidence;
 
     /// A live dictionary with no words, for tests that never swap one.
@@ -1532,11 +1419,13 @@ mod tests {
     /// seam, `AsrWorker::new`.
     fn for_tests() -> AsrConfig {
         AsrConfig {
-            model_spec: "scripted".to_string(),
-            n_threads: DEFAULT_THREADS,
-            use_gpu: false,
-            language: crate::language::Language::Auto,
-            audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
+            engine: EngineConfig {
+                model_spec: "scripted".to_string(),
+                n_threads: DEFAULT_THREADS,
+                use_gpu: false,
+                language: crate::language::Language::Auto,
+                audio_ctx: crate::whisper_core::types::DEFAULT_WINDOW_FRAMES,
+            },
             gate: default_gate(),
             remove_hesitations: false,
             dictionary: empty_live_dictionary(),
@@ -1756,10 +1645,8 @@ mod tests {
         // Bad model dir must propagate via the ready channel instead of
         // silently capturing into a dead queue.
         let (_tx, rx) = rtrb::RingBuffer::new(ASR_QUEUE_CAP);
-        let config = AsrConfig {
-            model_spec: "bogus".to_string(),
-            ..for_tests()
-        };
+        let mut config = for_tests();
+        config.engine.model_spec = "bogus".to_string();
         let bad = ModelRef {
             dir: std::path::PathBuf::from("/nonexistent/parakeet-bogus"),
             assets: &[],
@@ -2084,40 +1971,6 @@ mod tests {
             ""
         );
         assert_eq!(polish_transcript("utt_000005", "", &[], None, false), "");
-    }
-
-    #[test]
-    fn trailing_pad_appends_dither_and_preserves_start() {
-        use crate::config::INFERENCE_PAD_SAMPLES;
-        let pcm = vec![0.5f32; 1_600];
-        let padded = pad_trailing_with_dither(&pcm, INFERENCE_PAD_SAMPLES);
-        assert_eq!(padded.len(), pcm.len() + INFERENCE_PAD_SAMPLES);
-        assert_eq!(&padded[..pcm.len()], &pcm[..]);
-        assert!(padded[pcm.len()..].iter().all(|&s| s.abs() <= 1e-4));
-        assert!(padded[pcm.len()..].iter().any(|&s| s != 0.0));
-    }
-
-    #[test]
-    fn trailing_pad_empty_and_zero_are_noop() {
-        assert!(pad_trailing_with_dither(&[], 4000).is_empty());
-        let pcm = vec![0.1f32; 100];
-        assert_eq!(pad_trailing_with_dither(&pcm, 0), pcm);
-    }
-
-    #[test]
-    fn min_pad_grows_short_audio_only_and_stays_deterministic() {
-        use crate::config::PARAKEET_MIN_SAMPLES;
-        let short = vec![0.25f32; 1_600];
-        let padded = pad_with_dither(&short, PARAKEET_MIN_SAMPLES);
-        assert_eq!(padded.len(), PARAKEET_MIN_SAMPLES);
-        assert_eq!(&padded[..short.len()], &short[..]);
-        assert!(padded[short.len()..].iter().all(|&s| s.abs() <= 1e-4));
-        assert!(padded[short.len()..].iter().any(|&s| s != 0.0));
-        // Same input, same dither stream.
-        assert_eq!(pad_with_dither(&short, PARAKEET_MIN_SAMPLES), padded);
-        // Already long enough: untouched, no pad added.
-        let long = vec![0.25f32; PARAKEET_MIN_SAMPLES + 10];
-        assert_eq!(pad_with_dither(&long, PARAKEET_MIN_SAMPLES), long);
     }
 
     #[test]

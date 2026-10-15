@@ -98,7 +98,9 @@ mod language;
 mod noise;
 mod signal;
 mod sound;
+mod speech;
 use frame::*;
+use speech::EngineConfig;
 mod utterance;
 use utterance::*;
 mod vad;
@@ -1127,11 +1129,13 @@ fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
 /// `asr`, so the worker module never learns what a command line is.
 fn asr_config(cli: &Cli, shed_stale: bool, dictionary: crate::asr::LiveDictionary) -> AsrConfig {
     AsrConfig {
-        model_spec: cli.model_input(),
-        n_threads: resolve_n_threads(cli.threads, auto_threads()),
-        use_gpu: cli.gpu,
-        language: cli.language(),
-        audio_ctx: cli.audio_ctx,
+        engine: EngineConfig {
+            model_spec: cli.model_input(),
+            n_threads: resolve_n_threads(cli.threads, auto_threads()),
+            use_gpu: cli.gpu,
+            language: cli.language(),
+            audio_ctx: cli.audio_ctx,
+        },
         // The transcript gate shares the acoustic thresholds, so both come
         // from one resolved config.
         gate: AcousticConfig::from_cli(cli).gate,
@@ -1470,7 +1474,7 @@ mod tests {
         ))
         .1;
         assert_eq!(
-            asr_config(&cli, true, dictionary).language,
+            asr_config(&cli, true, dictionary).engine.language,
             Language::Explicit("en".to_string())
         );
     }
