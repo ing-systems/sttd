@@ -36,24 +36,35 @@ pub(crate) fn is_wayland_session_env() -> bool {
 /// so the caller can match `NotFound` and disable itself with a single warning
 /// on machines without wl-clipboard.
 pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    pipe_to("wl-copy", &["--sensitive"], text, "wl-copy")
+}
+
+/// Run `program` with `args`, write `input` to its stdin and close it, then
+/// wait for it: `Ok` only on a successful exit. `what` names it in the errors.
+/// Spawn errors pass through unwrapped, so a caller can still tell `NotFound`.
+fn pipe_to(program: &str, args: &[&str], input: &str, what: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("wl-copy")
-        .arg("--sensitive")
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .spawn()?;
-    let mut stdin = child
+    child
         .stdin
         .take()
-        .ok_or_else(|| std::io::Error::other("wl-copy stdin unavailable"))?;
-    stdin.write_all(text.as_bytes())?;
-    drop(stdin);
-    let status = child.wait()?;
+        .ok_or_else(|| std::io::Error::other(format!("{what} stdin unavailable")))?
+        .write_all(input.as_bytes())?;
+    exited_ok(child.wait()?, what)
+}
+
+/// `Ok` for a successful exit, otherwise an error naming `what` and how it
+/// exited.
+fn exited_ok(status: std::process::ExitStatus, what: &str) -> std::io::Result<()> {
     if status.success() {
         Ok(())
     } else {
         Err(std::io::Error::other(format!(
-            "wl-copy exited with {status}"
+            "{what} exited with {status}"
         )))
     }
 }
@@ -94,37 +105,15 @@ pub(crate) fn paste_via_ydotool(mode: PasteMode) -> std::io::Result<()> {
 /// Type `text` via `ydotool type --file -` (stdin). Used by `Type` paste mode
 /// and never touches the clipboard.
 pub(crate) fn type_via_ydotool(text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("ydotool")
-        .args(["type", "--file", "-"])
-        .stdin(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("ydotool type stdin unavailable"))?
-        .write_all(text.as_bytes())?;
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "ydotool type exited with {status}"
-        )))
-    }
+    pipe_to("ydotool", &["type", "--file", "-"], text, "ydotool type")
 }
 
 fn run_ydotool_key(events: &[&str]) -> std::io::Result<()> {
-    use std::process::Command;
-    let status = Command::new("ydotool").arg("key").args(events).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "ydotool exited with {status}"
-        )))
-    }
+    let status = std::process::Command::new("ydotool")
+        .arg("key")
+        .args(events)
+        .status()?;
+    exited_ok(status, "ydotool")
 }
 
 /// Path of the last-emitted-transcription file for `--paste-last`:
