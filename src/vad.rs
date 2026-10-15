@@ -37,7 +37,7 @@ const MEDIAN_WINDOWS: usize = 3;
 /// advance by `EARSHOT_STEP` (128, 50% overlap), so ~10 predictions land per
 /// 8 frames; a frame that doesn't complete a window re-reports the last
 /// verdict instead of guessing. Input arrives already 80 Hz high-passed
-/// (`Hp` in `signal`, shared with the model branch) so hum never reaches
+/// (`Hp` in `signal_path`, shared with the model branch) so hum never reaches
 /// earshot or the floor. Each window's score passes through hysteresis first
 /// (enter at `enter`, hold until below `exit`), then through a majority
 /// vote over the last `MEDIAN_WINDOWS` raw window decisions: a single

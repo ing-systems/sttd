@@ -458,8 +458,8 @@ impl MicLoop<'_> {
         self.last_drop_report = drops;
         if raw_depth > 64
             || asr_depth > 4
-            || signal_vad > crate::signal::SIGNAL_PENDING_WARN
-            || signal_model > crate::signal::SIGNAL_PENDING_WARN
+            || signal_vad > crate::signal_path::SIGNAL_PENDING_WARN
+            || signal_model > crate::signal_path::SIGNAL_PENDING_WARN
             || drops_grew
         {
             log::warn!(

@@ -5,7 +5,7 @@ use crate::denoise::DenoiserKind;
 use crate::dsp::hw_input_frames;
 use crate::gate::GateConfig;
 use crate::noise::frame_rms;
-use crate::signal::{PairedFrames, SignalPath};
+use crate::signal_path::{PairedFrames, SignalPath};
 use crate::utterance::{FrameAction, Utterance, UtteranceBuffer};
 use crate::vad::SpeechDetector;
 
@@ -215,7 +215,7 @@ impl FrameProcessor {
     ///
     /// Order is the point: the hold discards the utterance buffer, so the cut
     /// has to happen first. Marking after the trailing flush covers an
-    /// utterance that `signal`'s zero-padded tail closed rather than the open
+    /// utterance that `signal_path`'s zero-padded tail closed rather than the open
     /// buffer. The caller queues the result (see `asr::worker::keep_while_paused`),
     /// because the worker drops untagged backlog while a pause is held.
     pub(crate) fn flush_on_pause(&mut self) -> Option<Utterance> {

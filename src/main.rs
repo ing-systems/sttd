@@ -93,7 +93,7 @@ mod parakeet;
 mod parakeet_core;
 mod piper;
 mod run;
-mod signal;
+mod signal_path;
 mod sound;
 mod speech;
 mod translate;

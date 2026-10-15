@@ -37,7 +37,7 @@ impl Hp {
 
     /// Filter one 10 ms frame in place, preserving state across calls.
     ///
-    /// `#[inline]`: called once per 16 kHz frame from `signal` and `denoise`.
+    /// `#[inline]`: called once per 16 kHz frame from `signal_path` and `denoise`.
     #[inline]
     pub(crate) fn process(&mut self, frame: &mut [f32]) {
         for s in frame.iter_mut() {
