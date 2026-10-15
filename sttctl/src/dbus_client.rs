@@ -31,12 +31,16 @@ impl SttdClient {
     }
 
     // Daemon methods
+    /// `Pause` and `Resume` reply with nothing (only `Toggle` returns the new
+    /// state), so the state they leave is read back from `Paused`.
     pub fn pause(&self) -> Result<bool> {
-        self.call(DAEMON, "Pause", &())
+        self.call::<_, ()>(DAEMON, "Pause", &())?;
+        self.is_paused()
     }
 
     pub fn resume(&self) -> Result<bool> {
-        self.call(DAEMON, "Resume", &())
+        self.call::<_, ()>(DAEMON, "Resume", &())?;
+        self.is_paused()
     }
 
     pub fn toggle_pause(&self) -> Result<bool> {
