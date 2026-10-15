@@ -32,7 +32,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use ndarray17::{Array2, ArrayD};
+use ndarray17::{Array2, ArrayViewD};
 use ort::inputs;
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;
@@ -59,19 +59,6 @@ const PROMPT_LEN: usize = 4;
 pub(crate) fn token_budget(audio_samples: usize, cap: usize) -> usize {
     let seconds = audio_samples.div_ceil(16_000);
     (20 + 15 * seconds).min(cap)
-}
-
-/// `last_hidden_state` is `[1, encoder_seq, d_model]`, and the export pins the
-/// encoder length (1500 = 3000 mel frames / 2) but leaves `d_model` symbolic.
-/// Logits come back `[1, seq, vocab]`.
-fn encoder_hidden_states(
-    outputs: &ort::session::SessionOutputs<'_>,
-) -> Result<ArrayD<f32>, WhisperError> {
-    Ok(outputs
-        .get("last_hidden_state")
-        .ok_or_else(|| WhisperError::OutputNotFound("last_hidden_state".to_string()))?
-        .try_extract_array::<f32>()?
-        .to_owned())
 }
 
 /// The prompt for one inference: start-of-transcript, a language token, the
@@ -238,32 +225,7 @@ impl WhisperModel {
         } else {
             max_tokens
         };
-        let hidden = self.run_encoder(pcm, n_frames)?;
-
-        // Prompt run. For `--language auto` the language distribution is the
-        // first position's logits, which this very call produces, so detection
-        // is free unless the fallback guess was wrong — then the prompt is
-        // re-run once with what was detected.
-        //
-        // That fallback is the first language token, `<|en|>`, which is also
-        // what `detect_language` returns for a flat distribution. So the no-
-        // signal case costs nothing extra, and a wrong guess only ever happens
-        // when detection had real signal to disagree with.
-        let mut lang_token = match self.language {
-            DecodingLanguage::Fixed { token, .. } => token,
-            DecodingLanguage::Auto => LANG_TOKEN_FIRST as i64,
-        };
-        let mut prompt = self.run_prompt(&hidden, lang_token)?;
-        if self.language == DecodingLanguage::Auto {
-            if let Some(detected) = detect_language(&prompt.language) {
-                if detected != lang_token {
-                    log::debug!("whisper detected language id {detected}, re-running the prompt");
-                    lang_token = detected;
-                    prompt = self.run_prompt(&hidden, lang_token)?;
-                }
-            }
-            log::debug!("whisper decoded with language token id {lang_token}");
-        }
+        let prompt = self.encode_and_prompt(pcm, n_frames)?;
         // The prompt's first position has served its purpose (language
         // detection); the decode starts from its last position.
         let PromptRun {
@@ -307,12 +269,27 @@ impl WhisperModel {
         })
     }
 
-    /// Log-mel features for the utterance (`n_frames` of window), then the
-    /// encoder over them.
+    /// Log-mel features for the utterance (`n_frames` of window), the encoder
+    /// over them, and the prompt run the decode starts from.
     ///
-    /// The feature buffer belongs to the frontend, so it is not allocated per
-    /// utterance.
-    fn run_encoder(&mut self, pcm: &[f32], n_frames: usize) -> Result<ArrayD<f32>, WhisperError> {
+    /// The prompt reads the encoder's `last_hidden_state` (`[1, encoder_seq,
+    /// d_model]`, up to 7.7 MB) straight from the encoder's output, which stays
+    /// alive until the prompt runs are done, so it is never copied. The
+    /// feature buffer belongs to the frontend, so it is not allocated per
+    /// utterance either.
+    ///
+    /// For `--language auto` the language distribution is the prompt's first
+    /// position's logits, which the prompt run itself produces, so detection is
+    /// free unless the fallback guess was wrong — then the prompt is re-run
+    /// once with what was detected. That fallback is the first language token,
+    /// `<|en|>`, which is also what `detect_language` returns for a flat
+    /// distribution. So the no-signal case costs nothing extra, and a wrong
+    /// guess only ever happens when detection had real signal to disagree with.
+    fn encode_and_prompt(
+        &mut self,
+        pcm: &[f32],
+        n_frames: usize,
+    ) -> Result<PromptRun, WhisperError> {
         let features = self.frontend.extract(pcm, n_frames)?;
         debug_assert!(
             features.as_slice().is_some(),
@@ -322,49 +299,27 @@ impl WhisperModel {
         let outputs = self.encoder.run(inputs![
             "input_features" => TensorRef::from_array_view(features)?,
         ])?;
-        encoder_hidden_states(&outputs)
-    }
-
-    /// The whole prompt through `decoder_model`, returning the KV cache it
-    /// produced, the language logits, and the first token the decode takes.
-    ///
-    /// Everything is copied or picked out here so nothing borrows the session's output
-    /// past this call — the caller goes on to run the *other* session, and
-    /// holding a `SessionOutputs` across that would tie both to one borrow.
-    fn run_prompt(
-        &mut self,
-        hidden: &ArrayD<f32>,
-        language_token: i64,
-    ) -> Result<PromptRun, WhisperError> {
-        log::trace!("running whisper prompt decoder...");
-        let prompt = build_prompt(language_token);
-        let ids = Array2::from_shape_vec((1, PROMPT_LEN), prompt.to_vec())?;
-        let outputs = self.decoder.run(inputs![
-            "input_ids" => TensorRef::from_array_view(ids.view())?,
-            "encoder_hidden_states" => TensorRef::from_array_view(hidden.view())?,
-        ])?;
-        let cache = KvCache::capture(&outputs)?;
-        // `[1, prompt_len, vocab]`: position 0 predicts the language token
-        // (what `--language auto` reads) and the last position predicts the
-        // first generated token.
-        let logits = outputs
-            .get("logits")
-            .ok_or_else(|| WhisperError::OutputNotFound("logits".to_string()))?
+        let hidden = outputs
+            .get("last_hidden_state")
+            .ok_or_else(|| WhisperError::OutputNotFound("last_hidden_state".to_string()))?
             .try_extract_array::<f32>()?;
-        let (flat, vocab) = logits_rows(&logits)?;
-        // A vocabulary too small to hold the language range leaves `language`
-        // empty, and `detect_language` reads that as "no answer" — the
-        // caller's fallback language stands.
-        let language = flat
-            .get(LANG_TOKEN_FIRST..LANG_TOKEN_FIRST + LANG_TOKEN_COUNT)
-            .map(<[f32]>::to_vec)
-            .unwrap_or_default();
-        Ok(PromptRun {
-            cache,
-            language,
-            // The opening step: the only one with suppressed tokens.
-            first: pick_token(&flat[flat.len() - vocab..], true),
-        })
+
+        let mut lang_token = match self.language {
+            DecodingLanguage::Fixed { token, .. } => token,
+            DecodingLanguage::Auto => LANG_TOKEN_FIRST as i64,
+        };
+        let mut prompt = run_prompt(&mut self.decoder, hidden.view(), lang_token)?;
+        if self.language == DecodingLanguage::Auto {
+            if let Some(detected) = detect_language(&prompt.language) {
+                if detected != lang_token {
+                    log::debug!("whisper detected language id {detected}, re-running the prompt");
+                    lang_token = detected;
+                    prompt = run_prompt(&mut self.decoder, hidden.view(), lang_token)?;
+                }
+            }
+            log::debug!("whisper decoded with language token id {lang_token}");
+        }
+        Ok(prompt)
     }
 
     /// One generated token through `decoder_with_past_model`, growing the
@@ -394,6 +349,50 @@ impl WhisperModel {
         let (flat, _) = logits_rows(&logits)?;
         Ok(pick_token(flat, false))
     }
+}
+
+/// The whole prompt through `decoder_model`, returning the KV cache it
+/// produced, the language logits, and the first token the decode takes.
+///
+/// Everything is copied or picked out here so nothing borrows the
+/// session's output past this call — the caller goes on to run the
+/// *other* session, and holding a `SessionOutputs` across that would tie
+/// both to one borrow. `hidden` is `[1, encoder_seq, d_model]`; logits
+/// come back `[1, seq, vocab]`.
+fn run_prompt(
+    decoder: &mut Session,
+    hidden: ArrayViewD<f32>,
+    language_token: i64,
+) -> Result<PromptRun, WhisperError> {
+    log::trace!("running whisper prompt decoder...");
+    let prompt = build_prompt(language_token);
+    let ids = Array2::from_shape_vec((1, PROMPT_LEN), prompt.to_vec())?;
+    let outputs = decoder.run(inputs![
+        "input_ids" => TensorRef::from_array_view(ids.view())?,
+        "encoder_hidden_states" => TensorRef::from_array_view(hidden)?,
+    ])?;
+    let cache = KvCache::capture(&outputs)?;
+    // `[1, prompt_len, vocab]`: position 0 predicts the language token
+    // (what `--language auto` reads) and the last position predicts the
+    // first generated token.
+    let logits = outputs
+        .get("logits")
+        .ok_or_else(|| WhisperError::OutputNotFound("logits".to_string()))?
+        .try_extract_array::<f32>()?;
+    let (flat, vocab) = logits_rows(&logits)?;
+    // A vocabulary too small to hold the language range leaves `language`
+    // empty, and `detect_language` reads that as "no answer" — the
+    // caller's fallback language stands.
+    let language = flat
+        .get(LANG_TOKEN_FIRST..LANG_TOKEN_FIRST + LANG_TOKEN_COUNT)
+        .map(<[f32]>::to_vec)
+        .unwrap_or_default();
+    Ok(PromptRun {
+        cache,
+        language,
+        // The opening step: the only one with suppressed tokens.
+        first: pick_token(&flat[flat.len() - vocab..], true),
+    })
 }
 
 /// The contiguous data of a `[1, positions, vocab]` logits output, with the
