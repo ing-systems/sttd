@@ -33,6 +33,23 @@ pub(crate) fn argmax_index(logits: &[f32]) -> usize {
     best
 }
 
+/// Index of the highest logit among the ids `blocked` lets through, ties going
+/// to the lowest id. `None` when every id is blocked (or the slice is empty), so
+/// the caller picks its own fallback.
+///
+/// One pass over the row rather than a sort of it: both decoders mask a few
+/// ids on every step of a vocabulary tens of thousands wide.
+#[inline]
+pub(crate) fn argmax_where(logits: &[f32], blocked: impl Fn(usize) -> bool) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        if !blocked(i) && best.is_none_or(|b| v > logits[b]) {
+            best = Some(i);
+        }
+    }
+    best
+}
+
 /// Softmax probability of one token over `logits`, via the max-subtraction
 /// trick. Out-of-range ids score 0 rather than panicking: a wrong id here
 /// means a broken export, and the confidence then reads as "no confidence"

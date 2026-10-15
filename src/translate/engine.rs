@@ -9,6 +9,7 @@ use ort::value::{Tensor, TensorRef};
 use tokenizers::Tokenizer;
 
 use crate::config::TRANSLATE_MAX_INPUT_TOKENS;
+use crate::decode::{argmax_index, argmax_where};
 use crate::translator_store::{Family, Prepared};
 
 use super::kv_cache::{cache_slots, CacheSlots, KvCache};
@@ -604,32 +605,7 @@ const USE_CACHE_BRANCH_SHAPE: [i64; 1] = [1];
 /// ever reaches, since neither suppresses a whole row, and which is why the
 /// common case compares each logit once rather than twice.
 fn next_token(logits: &[f32], suppressed: &Suppressed) -> usize {
-    let mut best: Option<(usize, f32)> = None;
-    for (id, &logit) in logits.iter().enumerate() {
-        if suppressed.blocks(id) {
-            continue;
-        }
-        if best.is_none_or(|(_, top)| logit > top) {
-            best = Some((id, logit));
-        }
-    }
-    if best.is_some() {
-        return best.map_or(0, |(id, _)| id);
-    }
-    argmax(logits)
-}
-
-/// The largest logit's id, the lower one on a tie. The fallback for a row that
-/// suppresses every id in it: the decode still has to produce a token it can act
-/// on rather than nothing.
-fn argmax(logits: &[f32]) -> usize {
-    let mut best: Option<(usize, f32)> = None;
-    for (id, &logit) in logits.iter().enumerate() {
-        if best.is_none_or(|(_, top)| logit > top) {
-            best = Some((id, logit));
-        }
-    }
-    best.map_or(0, |(id, _)| id)
+    argmax_where(logits, |id| suppressed.blocks(id)).unwrap_or_else(|| argmax_index(logits))
 }
 
 /// The last logits row of a `[1, positions, vocab]` decoder output, and the row

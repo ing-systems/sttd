@@ -43,7 +43,7 @@ use super::types::{
     window_frames, DecodingLanguage, KvCache, Language, MelConfig, WhisperError, WhisperModel,
     BEGIN_SUPPRESS_TOKENS, LANG_TOKEN_COUNT, LANG_TOKEN_FIRST, TOK_EOT, TOK_SOT, TOK_TRANSCRIBE,
 };
-use crate::decode::{argmax_index, softmax_prob, word_confidences as group_words};
+use crate::decode::{argmax_index, argmax_where, softmax_prob, word_confidences as group_words};
 use crate::device::Device;
 
 /// Tokens in one prompt: start-of-transcript, language, task, no-timestamps.
@@ -104,19 +104,6 @@ fn is_suppressed(token: usize) -> bool {
     BEGIN_SUPPRESS_TOKENS.contains(&token)
 }
 
-/// The highest-scoring id that is not suppressed, ties going to the lowest id.
-/// `None` when every id is suppressed, in which case the caller keeps its
-/// argmax: there is nothing better to decode.
-fn best_unsuppressed(logits: &[f32]) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for (i, &v) in logits.iter().enumerate() {
-        if !is_suppressed(i) && best.is_none_or(|b| v > logits[b]) {
-            best = Some(i);
-        }
-    }
-    best
-}
-
 /// The token a decode step takes from one logits row, and its probability:
 /// the argmax, except that on the opening step (`first_step`) a suppressed
 /// winner gives way to the best id that is not. Picked straight from the
@@ -124,9 +111,9 @@ fn best_unsuppressed(logits: &[f32]) -> Option<usize> {
 fn pick_token(logits: &[f32], first_step: bool) -> (usize, f32) {
     let mut next = argmax_index(logits);
     if first_step && is_suppressed(next) {
-        // One pass over the vocabulary, not a sort of it — this is 51866 ids
-        // on the hottest path there is.
-        next = best_unsuppressed(logits).unwrap_or(next);
+        // The best id that is not suppressed. Every id suppressed leaves the
+        // argmax: there is nothing better to decode.
+        next = argmax_where(logits, is_suppressed).unwrap_or(next);
     }
     (next, softmax_prob(logits, next))
 }
@@ -736,19 +723,19 @@ mod tests {
     /// where both suppressed ids outrank everything must still land on the
     /// best ordinary token.
     #[test]
-    fn best_unsuppressed_skips_every_suppressed_id() {
+    fn argmax_where_skips_every_suppressed_id() {
         let mut vocab = vec![0.0f32; 51_866];
         vocab[220] = 9.0;
         vocab[50_256] = 8.0;
         vocab[4242] = 1.0;
         assert_eq!(argmax_index(&vocab), 220, "premise: a suppressed id wins");
-        assert_eq!(best_unsuppressed(&vocab), Some(4242));
+        assert_eq!(argmax_where(&vocab, is_suppressed), Some(4242));
         // A flat row breaks the tie toward the lowest unsuppressed id.
-        assert_eq!(best_unsuppressed(&[0.0; 4]), Some(0));
+        assert_eq!(argmax_where(&[0.0; 4], is_suppressed), Some(0));
         // A lone suppressed id leaves the rest of the row as the candidates.
-        assert_eq!(best_unsuppressed(&[0.0, 5.0]), Some(1));
+        assert_eq!(argmax_where(&[0.0, 5.0], is_suppressed), Some(1));
         // An empty row has nothing to offer; the caller keeps its own argmax.
-        assert_eq!(best_unsuppressed(&[]), None);
+        assert_eq!(argmax_where(&[], is_suppressed), None);
     }
 
     /// The downloaded model's own `tokenizer.json`, when present. The word
