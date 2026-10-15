@@ -1106,7 +1106,10 @@ mod tests {
 
     #[test]
     fn an_unload_keeps_the_remembered_target_so_enable_can_reload_it() {
-        let s = state("pl");
+        // Gated, so the reload is still in flight when it is observed: an
+        // ungated fake loader can install before `enable` returns.
+        let gate = new_gate();
+        let s = gated_state("pl", gate.clone());
         with_fake_translator(&s, "en", "opus-mt-pl-en");
         s.disable(true);
         // `Enable` finds the remembered `en`, so it asks for a load rather than
@@ -1114,11 +1117,12 @@ mod tests {
         let (enabled, message) = s.enable();
         assert!(!enabled, "the reload is in flight");
         assert!(message.is_empty(), "not a refusal");
-        assert_eq!(
-            s.requested_language(),
-            "en",
-            "and it asks for the right one"
+        wait_until(
+            "RequestedLanguage",
+            || s.requested_language(),
+            "en".to_string(),
         );
+        release(&gate);
     }
 
     #[test]
