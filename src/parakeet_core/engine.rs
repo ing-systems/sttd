@@ -13,7 +13,7 @@
 //   confidences (`speech::Transcript`).
 // ---------------------------------------------------------------------------
 
-use ndarray17::{Array, Array1, Array2, ArrayD, ArrayViewD, IxDyn};
+use ndarray17::{Array, Array1, Array2, ArrayD, ArrayView1, ArrayView3, ArrayViewD, IxDyn};
 use once_cell::sync::Lazy;
 use ort::inputs;
 use ort::session::Session;
@@ -387,17 +387,19 @@ impl ParakeetModel {
         Ok((vocab, blank_idx))
     }
 
-    pub fn encode(
-        &mut self,
-        audio_signal: &ArrayViewD<f32>,
-        length: &ArrayViewD<i64>,
-    ) -> Result<(ArrayD<f32>, ArrayD<i64>), ParakeetError> {
+    /// Encoder pass over `[1, features, time]` mel features. A free function
+    /// over the session so the features can stay borrowed from the frontend.
+    fn encode(
+        encoder: &mut Session,
+        audio_signal: ArrayView3<f32>,
+    ) -> Result<(ArrayD<f32>, usize), ParakeetError> {
         log::trace!("Running encoder inference...");
+        let length = [audio_signal.shape()[2] as i64];
         let inputs = inputs![
-            "audio_signal" => TensorRef::from_array_view(audio_signal.view())?,
-            "length" => TensorRef::from_array_view(length.view())?,
+            "audio_signal" => TensorRef::from_array_view(audio_signal)?,
+            "length" => TensorRef::from_array_view(ArrayView1::from(&length))?,
         ];
-        let outputs = self.encoder.run(inputs)?;
+        let outputs = encoder.run(inputs)?;
 
         let encoder_output = outputs
             .get("outputs")
@@ -406,12 +408,10 @@ impl ParakeetModel {
         let encoded_lengths = outputs
             .get("encoded_lengths")
             .ok_or_else(|| ParakeetError::OutputNotFound("encoded_lengths".to_string()))?
-            .try_extract_array()?;
+            .try_extract_array::<i64>()?;
+        let encodings_len = encoded_lengths.iter().next().copied().unwrap_or(0).max(0) as usize;
 
-        Ok((
-            to_decoder_layout(&encoder_output),
-            encoded_lengths.to_owned(),
-        ))
+        Ok((to_decoder_layout(&encoder_output), encodings_len))
     }
 
     pub fn create_decoder_state(&self) -> Result<DecoderState, ParakeetError> {
@@ -493,18 +493,13 @@ impl ParakeetModel {
     pub fn transcribe_samples(&mut self, samples: &[f32]) -> Result<Transcript, ParakeetError> {
         // The frontend already returns the encoder layout [1, features, time].
         let audio_signal = self.frontend.extract(samples)?;
-        let time_steps = audio_signal.shape()[2];
-        if time_steps == 0 {
+        if audio_signal.shape()[2] == 0 {
             return Ok(Transcript {
                 text: String::new(),
                 word_confidences: Vec::new(),
             });
         }
-        let length = Array1::from_vec(vec![time_steps as i64]).into_dyn();
-        let audio_signal = audio_signal.into_dyn();
-
-        let (encoder_out, encoder_out_lens) = self.encode(&audio_signal.view(), &length.view())?;
-        let encodings_len = encoder_out_lens.iter().next().copied().unwrap_or(0).max(0) as usize;
+        let (encoder_out, encodings_len) = Self::encode(&mut self.encoder, audio_signal)?;
         let mut results = Vec::new();
         for encodings in encoder_out.outer_iter() {
             let (tokens, probs) = self.decode_sequence(&encodings.view(), encodings_len)?;

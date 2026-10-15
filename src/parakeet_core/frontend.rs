@@ -14,11 +14,13 @@
 //
 // The padded signal and the STFT (`crate::mel::Stft`: window, FFT plan and
 // buffers, spectrogram) are built once in `new` and reused by every `extract`
-// call, so a transcription allocates only the returned features.
+// call, and the features are written into a grow-only buffer the caller gets
+// a view of, so a transcription allocates nothing once the frontend has seen
+// an utterance that long.
 // ---------------------------------------------------------------------------
 
 use ndarray17::linalg::general_mat_mul;
-use ndarray17::{Array2, Array3, Axis};
+use ndarray17::{Array2, ArrayView3, ArrayViewMut2, Axis};
 use std::f32::consts::PI;
 
 use super::types::ParakeetError;
@@ -57,8 +59,9 @@ pub struct Frontend {
     stft: Stft,
     /// Zero-padded, preemphasized signal of the current utterance.
     padded: Vec<f32>,
-    /// Feature scratch: [1, feature_size, time_steps] in encoder layout.
-    features: Array3<f32>,
+    /// Feature buffer: [1, feature_size, time_steps] in encoder layout, grown
+    /// on demand and never shrunk; a shorter utterance is a prefix of it.
+    features: Vec<f32>,
 }
 
 impl Frontend {
@@ -66,23 +69,26 @@ impl Frontend {
         let mel_basis =
             create_mel_filterbank(config.n_fft, config.feature_size, config.sampling_rate);
         let stft = Stft::new(config.n_fft, hann_window(config.win_length));
-        let features = Array3::zeros((1, config.feature_size, 0));
         Self {
             config,
             mel_basis,
             stft,
             padded: Vec::new(),
-            features,
+            features: Vec::new(),
         }
     }
 
     /// Raw 16 kHz mono samples -> `[1, 128, time_steps]` log-mel features in
-    /// the layout the encoder expects. The returned array owns its data; the
-    /// cached scratch buffers stay valid for the next call.
-    pub fn extract(&mut self, audio: &[f32]) -> Result<Array3<f32>, ParakeetError> {
+    /// the layout the encoder expects. The returned view borrows the
+    /// frontend's own buffer, which the next call rewrites.
+    pub fn extract(&mut self, audio: &[f32]) -> Result<ArrayView3<'_, f32>, ParakeetError> {
         self.pad_and_preemphasize(audio);
-        self.mel_features()?;
-        Ok(std::mem::take(&mut self.features))
+        let time_steps = self.mel_features()?;
+        let len = self.config.feature_size * time_steps;
+        Ok(ArrayView3::from_shape(
+            (1, self.config.feature_size, time_steps),
+            &self.features[..len],
+        )?)
     }
 
     /// Center the signal with `n_fft / 2` zeros on each side and apply the
@@ -103,8 +109,8 @@ impl Frontend {
 
     /// Power spectrogram of the padded signal, then mel projection,
     /// `ln(x + 2^-24)` and per-feature normalization (mean=0, std=1, Bessel's
-    /// correction) into `self.features`.
-    fn mel_features(&mut self) -> Result<(), ParakeetError> {
+    /// correction) into `self.features`. Returns the frame count.
+    fn mel_features(&mut self) -> Result<usize, ParakeetError> {
         // Every frame has a full `n_fft` of padded signal, so the analysis
         // window (shorter than `n_fft`) always fits.
         let time_steps = (self.padded.len() - self.config.n_fft) / self.config.hop_length + 1;
@@ -113,32 +119,26 @@ impl Frontend {
             .power(&self.padded, self.config.hop_length, time_steps)
             .map_err(|e| ParakeetError::Frontend(format!("FFT failed: {e}")))?;
         let num_features = self.config.feature_size;
-        if self.features.shape() != [1, num_features, time_steps] {
-            self.features = Array3::zeros((1, num_features, time_steps));
+        let len = num_features * time_steps;
+        if self.features.len() < len {
+            self.features.resize(len, 0.0);
         }
         // NeMo: log_zero_guard_type="add", value=2^-24.
         let log_zero_guard: f32 = 2.0f32.powi(-24);
         // C <- 1 * mel_basis * spectrogram + 0 * C: the same gemm call the
         // former `mel_basis.dot(&spectrogram)` made, writing into the cached
         // feature buffer instead of a fresh array.
-        let mut features = self.features.view_mut();
-        let mut mel = features.index_axis_mut(Axis(0), 0);
-        general_mat_mul(
-            1.0,
-            &self.mel_basis.view(),
-            &spectrogram,
-            0.0,
-            &mut mel,
-        );
-        for value in self.features.iter_mut() {
+        let mut mel =
+            ArrayViewMut2::from_shape((num_features, time_steps), &mut self.features[..len])?;
+        general_mat_mul(1.0, &self.mel_basis.view(), &spectrogram, 0.0, &mut mel);
+        for value in mel.iter_mut() {
             *value = (*value + log_zero_guard).ln();
         }
         if time_steps <= 1 {
-            return Ok(());
+            return Ok(time_steps);
         }
         let num_frames = time_steps as f32;
-        for feat_idx in 0..num_features {
-            let mut feature = self.features.index_axis_mut(Axis(1), feat_idx);
+        for mut feature in mel.axis_iter_mut(Axis(0)) {
             let mean: f32 = feature.iter().sum::<f32>() / num_frames;
             let variance: f32 =
                 feature.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / (num_frames - 1.0);
@@ -147,7 +147,7 @@ impl Frontend {
                 *value = (*value - mean) / std;
             }
         }
-        Ok(())
+        Ok(time_steps)
     }
 }
 
@@ -160,6 +160,7 @@ fn hann_window(window_length: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray17::Array3;
 
     fn tone(len: usize) -> Vec<f32> {
         (0..len)
@@ -247,12 +248,12 @@ mod tests {
     #[test]
     fn extract_reuses_buffers_across_calls() {
         let mut frontend = Frontend::new(PreprocessorConfig::tdt_0_6b());
-        let first = frontend.extract(&tone(3200)).unwrap();
-        let second = frontend.extract(&tone(4800)).unwrap();
+        let first = frontend.extract(&tone(3200)).unwrap().to_owned();
+        let second = frontend.extract(&tone(4800)).unwrap().to_owned();
         // A longer utterance needs more frames than the first one.
         assert!(second.shape()[2] > first.shape()[2]);
-        // The second result must not alias the first: the frontend hands its
-        // buffer out and allocates a fresh one.
+        // Back to the shorter utterance: a prefix of the grown buffer, fully
+        // rewritten, so nothing of the longer call leaks into it.
         let third = frontend.extract(&tone(3200)).unwrap();
         assert_eq!(first.shape(), third.shape());
         for (a, c) in first.iter().zip(third.iter()) {
