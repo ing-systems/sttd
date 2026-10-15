@@ -1,0 +1,8 @@
+[package]
+name = "sttd-dbus-names"
+version = "0.1.0"
+edition = "2021"
+description = "The session-bus names sttd serves and sttctl calls"
+license = "MIT"
+
+[dependencies]

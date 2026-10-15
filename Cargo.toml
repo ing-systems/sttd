@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "sttctl"]
+members = [".", "sttctl", "sttd-dbus-names"]
 
 [package]
 name = "sttd"
@@ -9,6 +9,7 @@ description = "Real-time Speech-to-Text pipeline: cpal + resampler + deep_filter
 license = "MIT"
 
 [dependencies]
+sttd-dbus-names = { path = "sttd-dbus-names" }
 clap = { version = "4", features = ["derive", "env"] }
 log = "0.4"
 env_logger = "0.11"

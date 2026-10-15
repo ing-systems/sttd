@@ -38,7 +38,7 @@ Details:
 - Drops never emit. Emits go to the configured emitter.
 - The gates see the source text. With `--translate`, the step between the gates and the emitter rewrites the text, so only the emitter gets the translation (see *Translation*).
 
-See `src/main.rs:1-51` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdict`, `gate`, `hallucination`, `emission`, `translation`, `translator`, `model spec`, `VAD/model branch`, `direct hop`).
+See the doc comment at the top of `src/main.rs` and `CONTEXT.md` for vocabulary (`utterance`, `VAD verdict`, `gate`, `hallucination`, `emission`, `translation`, `translator`, `model spec`, `VAD/model branch`, `direct hop`).
 
 ## Requirements
 
@@ -370,7 +370,7 @@ Bool parser accepts `1/0`, `true/false`, `yes/no`, `on/off`.
 
 ## Runtime control
 
-Signals (microphone mode, `src/main.rs:458-486`):
+Signals (microphone mode, `src/run/unix_signals.rs`):
 
 | Signal | Effect |
 | --- | --- |
@@ -506,16 +506,20 @@ Transcript gates run after the model:
 ## Project layout
 
 ```text
-src/main.rs          pipeline doc, dispatch, mic/file modes
+src/main.rs          pipeline doc, module list, dispatch
+src/run/             orchestration: microphone loop, file mode, setup from flags, queues, Unix signals, one-shot commands
 src/cli.rs           clap flags + STTD_* env
-src/config.rs        constants, Parakeet catalog, parsers
+src/config.rs        constants, parsers
+src/language.rs      the requested decoding language (--language)
 src/capture.rs       cpal input, device list
-src/signal.rs        VAD/model branch topology
+src/signal_path.rs   VAD/model branch topology
 src/frame.rs         FrameProcessor: Hp/Agc + VAD + buffering
 src/vad.rs           earshot 16 ms windows to 10 ms frames
 src/noise.rs         noise floor + hysteresis
 src/utterance.rs     pre-roll, UtteranceBuffer, splits
-src/asr.rs           worker thread, conditioning, metrics
+src/speech.rs        SpeechModel seam the engines implement, EngineConfig, dither padding
+src/asr/             worker thread (worker), one utterance through the model (pipeline), conditioning, live dictionary
+src/metrics.rs       --metrics JSONL rows
 src/parakeet.rs      SpeechModel impl (Parakeet)
 src/parakeet_core/   ONNX engine, mel frontend, booster
 src/whisper.rs       SpeechModel impl (Whisper), decoding language
@@ -523,17 +527,21 @@ src/whisper_core/    ONNX engine, log-mel frontend, KV-cached decode, in-memory 
 src/mel.rs           Slaney mel filterbank, shared by both frontends
 src/decode.rs        argmax/softmax/word confidences, shared by both engines
 src/gate.rs          acoustic/transcript verdicts
-src/emit.rs          stdout/clipboard/paste/speak/dump/last-text
+src/emit/            Emitter seam; system emitter, speak thread, clipboard/paste/last-text, dump dir
 src/piper.rs         piper voice: config, espeak phonemes, ort VITS run
-src/voice_store.rs   voice index, --voice resolution, voice download
-src/translate.rs     seq2seq translator (both families) + the translation thread, and the runtime switch
-src/translator_store.rs  translator catalog and families, resolution, download, config read
+src/model_store.rs   speech model catalogs, --model resolution
+src/voice_store.rs   voice index, --voice resolution
+src/translate/       seq2seq translator (both families), the runtime switch, the translation thread
+src/translator_store/  translator catalog and families, language codes, resolution, config read
+src/download.rs      the HTTP download and fetch loop the three stores share
 src/dictionary.rs    custom vocabulary
 src/clean.rs         filler stripping
-src/dbus.rs          session bus: pause, live dictionary, translation switch
+src/control/         pause and live-dictionary state shared by bus, signals, loop and worker
+src/dbus.rs          session bus adapter: pause, live dictionary, translation switch
 src/daemon.rs        start/stop/status
-src/device.rs        GPU fallback owner
-src/dsp.rs, src/hp.rs, src/agc.rs, src/denoise.rs, src/sound.rs, src/wav.rs
+src/device.rs        ort session settings, --threads, GPU fallback owner
+src/dsp.rs, src/hp.rs, src/agc.rs, src/denoise.rs, src/sound.rs, src/wav.rs, src/clock.rs, src/fsutil.rs
+sttd-dbus-names/     bus name, object paths and interface names shared by sttd and sttctl
 sttctl/src/main.rs   sttctl entry, timeout, dispatch
 sttctl/src/cli.rs    sttctl commands: daemon, dictionary, translation, status, watch
 sttctl/src/commands.rs  sttctl text and JSON output

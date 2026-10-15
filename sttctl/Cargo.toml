@@ -6,6 +6,7 @@ description = "Control sttd daemon via D-Bus"
 license = "MIT"
 
 [dependencies]
+sttd-dbus-names = { path = "../sttd-dbus-names" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 zbus = { version = "5", default-features = false, features = [

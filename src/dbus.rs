@@ -47,20 +47,11 @@ use zbus::object_server::SignalEmitter;
 
 use crate::control::{DictionaryState, PauseState};
 
-/// Well-known bus name. Both interfaces are served on it.
-pub(crate) const SERVICE_NAME: &str = "org.sttd.Daemon";
-
-/// Pause control.
-pub(crate) const DAEMON_PATH: &str = "/org/sttd/Daemon";
-pub(crate) const DAEMON_INTERFACE: &str = "org.sttd.Daemon";
-
-/// Live dictionary control.
-pub(crate) const DICT_PATH: &str = "/org/sttd/Dictionary";
-pub(crate) const DICT_INTERFACE: &str = "org.sttd.Dictionary";
-
-/// Translation control.
-pub(crate) const TRANSLATION_PATH: &str = "/org/sttd/Translation";
-pub(crate) const TRANSLATION_INTERFACE: &str = "org.sttd.Translation";
+// The names live in `sttd-dbus-names`, shared with `sttctl`.
+use sttd_dbus_names::{
+    DAEMON_INTERFACE, DAEMON_PATH, DICT_INTERFACE, DICT_PATH, SERVICE_NAME, TRANSLATION_INTERFACE,
+    TRANSLATION_PATH,
+};
 
 /// The connection, kept alive for the process life. `None` until the service
 /// thread claims the name (or forever with `--no-dbus`).

@@ -4,13 +4,10 @@ use std::time::Duration;
 use zbus::blocking::connection::Builder;
 use zbus::blocking::Connection;
 
-const SERVICE_NAME: &str = "org.sttd.Daemon";
-const DAEMON_PATH: &str = "/org/sttd/Daemon";
-const DAEMON_INTERFACE: &str = "org.sttd.Daemon";
-const DICT_PATH: &str = "/org/sttd/Dictionary";
-const DICT_INTERFACE: &str = "org.sttd.Dictionary";
-const TRANSLATION_PATH: &str = "/org/sttd/Translation";
-const TRANSLATION_INTERFACE: &str = "org.sttd.Translation";
+use sttd_dbus_names::{
+    DAEMON_INTERFACE, DAEMON_PATH, DICT_INTERFACE, DICT_PATH, SERVICE_NAME, TRANSLATION_INTERFACE,
+    TRANSLATION_PATH,
+};
 
 pub struct SttdClient {
     conn: Connection,

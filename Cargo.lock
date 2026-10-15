@@ -2830,6 +2830,7 @@ dependencies = [
  "clap_complete",
  "serde",
  "serde_json",
+ "sttd-dbus-names",
  "zbus",
 ]
 
@@ -2861,12 +2862,17 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "sttd-dbus-names",
  "thiserror 2.0.20",
  "tokenizers",
  "unicode-normalization",
  "ureq 2.12.1",
  "zbus",
 ]
+
+[[package]]
+name = "sttd-dbus-names"
+version = "0.1.0"
 
 [[package]]
 name = "subtle"
