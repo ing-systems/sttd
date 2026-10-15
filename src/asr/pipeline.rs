@@ -15,6 +15,17 @@ use crate::utterance::Utterance;
 
 use super::condition::{condition_utterance, remove_split_overlap};
 
+/// What the model decodes for `pcm`, a final or a partial alike: the
+/// conditioned audio plus trailing context past the last word, so final tokens
+/// are not clipped (dithered, not digital zero — see `INFERENCE_PAD_SAMPLES`).
+/// No leading pad: the utterance already starts with pre-roll. One buffer: the
+/// pad goes into capacity `condition_utterance` reserved.
+fn model_input(pcm: &[f32]) -> Vec<f32> {
+    let mut out = condition_utterance(pcm, INFERENCE_PAD_SAMPLES);
+    pad_trailing_with_dither(&mut out, INFERENCE_PAD_SAMPLES);
+    out
+}
+
 /// Decode one partial and return its log line, or `None` when there is nothing
 /// worth showing: an empty or gated transcript (hallucination boilerplate,
 /// a repetition loop) or a failed decode. Conditioned and padded exactly like a
@@ -26,8 +37,7 @@ pub(super) fn partial_line(
     gate: &GateConfig,
     running: &Arc<AtomicBool>,
 ) -> Option<String> {
-    let conditioned = condition_utterance(pcm);
-    let padded = pad_trailing_with_dither(&conditioned, INFERENCE_PAD_SAMPLES);
+    let padded = model_input(pcm);
     let t0 = Instant::now();
     let result = model.transcribe(&padded, running);
     let infer_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -112,14 +122,10 @@ pub(super) fn transcribe_and_emit(
 
     // Levels already normalized frame-wise by `Agc` (VAD-gated, shared-gain);
     // no per-utterance static gain here — that path is deleted.
-    let conditioned = condition_utterance(&utterance.pcm);
-    // Trailing context past the last word so final tokens are not clipped
-    // (dithered, not digital zero — see `INFERENCE_PAD_SAMPLES`). No leading
-    // pad: the utterance already starts with pre-roll. The WAV
-    // dump still uses raw `utterance.pcm`; metrics/RTF count what the model
-    // actually decoded (padded length, plus the short-input floor via
-    // `decoded_sample_count`).
-    let padded = pad_trailing_with_dither(&conditioned, INFERENCE_PAD_SAMPLES);
+    // The WAV dump still uses raw `utterance.pcm`; metrics/RTF count what
+    // the model actually decoded (padded length, plus the short-input floor
+    // via `decoded_sample_count`).
+    let padded = model_input(&utterance.pcm);
 
     // Inference time only (conditioning + edge pad excluded): feeds the RTF
     // column of the `--metrics` JSONL log.

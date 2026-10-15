@@ -8,15 +8,17 @@ use crate::config::CONDITION_FADE_SAMPLES;
 /// `Hp` (80 Hz biquad after resampling); levels already normalized by `Agc`.
 ///
 /// Kept deliberately light: the 5 ms fades land in pre-roll/tail silence
-/// rather than speech.
-pub(crate) fn condition_utterance(pcm: &[f32]) -> Vec<f32> {
+/// rather than speech. `headroom` reserves that much extra capacity, so the
+/// caller can append its trailing pad without reallocating.
+pub(crate) fn condition_utterance(pcm: &[f32], headroom: usize) -> Vec<f32> {
     if pcm.is_empty() {
         return Vec::new();
     }
     // DC removal: subtract the mean so soundcard offset can't bias fades or
     // peak safety.
     let mean = pcm.iter().fold(0.0f64, |m, &s| m + s as f64) / pcm.len() as f64;
-    let mut out: Vec<f32> = pcm.iter().map(|&s| s - mean as f32).collect();
+    let mut out: Vec<f32> = Vec::with_capacity(pcm.len() + headroom);
+    out.extend(pcm.iter().map(|&s| s - mean as f32));
 
     // Linear fades at both ends; shortened for very short utterances so the
     // ramps never overlap.
@@ -91,7 +93,7 @@ mod tests {
         // Soundcard offset must not reach the model: a constant 0.1 offset
         // carries no speech and would bias gain.
         let pcm = vec![0.1f32; 1600];
-        let out = condition_utterance(&pcm);
+        let out = condition_utterance(&pcm, 0);
         assert_eq!(out.len(), pcm.len());
         let mean = out.iter().fold(0.0f64, |m, &s| m + s as f64) / out.len() as f64;
         assert!(mean.abs() < 1e-5, "mean={mean}");
@@ -103,7 +105,7 @@ mod tests {
         let tone: Vec<f32> = (0..16_000)
             .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 16_000.0).sin() * 0.2)
             .collect();
-        let out = condition_utterance(&tone);
+        let out = condition_utterance(&tone, 0);
         let rms = |v: &[f32]| {
             (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / v.len() as f64).sqrt()
         };
@@ -118,7 +120,7 @@ mod tests {
         // Flat loud input: fades pull both ends to near zero, peak safety
         // caps the middle at 0.99.
         let pcm = vec![2.0f32; 1600];
-        let out = condition_utterance(&pcm);
+        let out = condition_utterance(&pcm, 0);
         assert_eq!(out.len(), pcm.len());
         assert!(out[0].abs() < 0.05, "first={}", out[0]);
         assert!(
@@ -129,13 +131,13 @@ mod tests {
         assert!(out.iter().all(|&s| s.abs() <= 0.99 + 1e-6));
         // Short input: fades shorten instead of overlapping.
         let short = vec![0.5f32; 10];
-        let out_short = condition_utterance(&short);
+        let out_short = condition_utterance(&short, 0);
         assert_eq!(out_short.len(), short.len());
     }
 
     #[test]
     fn condition_empty_stays_empty() {
-        assert!(condition_utterance(&[]).is_empty());
+        assert!(condition_utterance(&[], 0).is_empty());
     }
 
     #[test]
@@ -147,7 +149,7 @@ mod tests {
         let hum: Vec<f32> = (0..16_000)
             .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 16_000.0).sin() * 0.2)
             .collect();
-        let out = condition_utterance(&hum);
+        let out = condition_utterance(&hum, 0);
         assert_eq!(out.len(), hum.len());
     }
 

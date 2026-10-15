@@ -132,18 +132,15 @@ pub(crate) fn pad_with_dither(pcm_16k: &[f32], min_samples: usize) -> Vec<f32> {
     out
 }
 
-/// Append `pad_samples` of quiet dither after conditioned audio
+/// Append `pad_samples` of quiet dither after conditioned audio, in place
 /// (see `config::INFERENCE_PAD_SAMPLES` for why dither, not zero).
 /// Empty input stays empty (callers skip empty utterances before here).
-pub(crate) fn pad_trailing_with_dither(pcm_16k: &[f32], pad_samples: usize) -> Vec<f32> {
+pub(crate) fn pad_trailing_with_dither(pcm_16k: &mut Vec<f32>, pad_samples: usize) {
     if pcm_16k.is_empty() || pad_samples == 0 {
-        return pcm_16k.to_vec();
+        return;
     }
-    let mut out = Vec::with_capacity(pcm_16k.len() + pad_samples);
-    out.extend_from_slice(pcm_16k);
     let seed = 0x9E37_79B9 ^ (pcm_16k.len() as u32).wrapping_mul(0x85EB_CA6B);
-    out.extend(dither_samples(seed, pad_samples));
-    out
+    pcm_16k.extend(dither_samples(seed, pad_samples));
 }
 
 #[cfg(test)]
@@ -154,7 +151,8 @@ mod tests {
     fn trailing_pad_appends_dither_and_preserves_start() {
         use crate::config::INFERENCE_PAD_SAMPLES;
         let pcm = vec![0.5f32; 1_600];
-        let padded = pad_trailing_with_dither(&pcm, INFERENCE_PAD_SAMPLES);
+        let mut padded = pcm.clone();
+        pad_trailing_with_dither(&mut padded, INFERENCE_PAD_SAMPLES);
         assert_eq!(padded.len(), pcm.len() + INFERENCE_PAD_SAMPLES);
         assert_eq!(&padded[..pcm.len()], &pcm[..]);
         assert!(padded[pcm.len()..].iter().all(|&s| s.abs() <= 1e-4));
@@ -163,9 +161,13 @@ mod tests {
 
     #[test]
     fn trailing_pad_empty_and_zero_are_noop() {
-        assert!(pad_trailing_with_dither(&[], 4000).is_empty());
+        let mut empty = Vec::new();
+        pad_trailing_with_dither(&mut empty, 4000);
+        assert!(empty.is_empty());
         let pcm = vec![0.1f32; 100];
-        assert_eq!(pad_trailing_with_dither(&pcm, 0), pcm);
+        let mut unpadded = pcm.clone();
+        pad_trailing_with_dither(&mut unpadded, 0);
+        assert_eq!(unpadded, pcm);
     }
 
     #[test]
