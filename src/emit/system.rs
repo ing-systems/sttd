@@ -3,12 +3,11 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::{Emission, Emitter, OwnedEmission};
 use crate::config::{DUMP_KEEP_FILES, SAMPLE_RATE};
@@ -27,7 +26,7 @@ use crate::fsutil::write_owner_only_text;
 /// transcripts, dump dir.
 ///
 /// Async by design: `emit()` only clones into an `OwnedEmission` and does a
-/// non-blocking `rtrb` push, so a stuck `wl-copy`/`ydotool`/disk never
+/// non-blocking send on a bounded channel, so a stuck `wl-copy`/`ydotool`/disk never
 /// stalls inference. A single `emit` worker thread owns all side
 /// effects in FIFO order; `Drop` closes the channel and joins it, so shutdown
 /// (`asr_handle.join()`) flushes the queue before the process exits.
@@ -35,18 +34,15 @@ use crate::fsutil::write_owner_only_text;
 /// exercised through `RecordingEmitter`; this only shells out to binaries
 /// and files.
 pub(crate) struct SystemEmitter {
-    /// The emission queue, shared with any `sharing()` handle.
-    ///
-    /// `Producer` is `Send` but not `Sync`, so two emitters writing the same queue
-    /// need the mutex. One uncontended lock per utterance against a disk write and
-    /// a process spawn on the other side.
-    tx: Option<Arc<Mutex<Producer<OwnedEmission>>>>,
+    /// The emission queue's sending end; every `sharing()` handle holds a
+    /// clone. The worker exits once the last one is dropped.
+    tx: Option<SyncSender<OwnedEmission>>,
     worker: Option<JoinHandle<()>>,
     /// True on the handle that owns the queue and the worker thread.
     ///
     /// This flag, not `worker: None`, is what tells `Drop` whether closing the
-    /// queue is its job: `tx` is an `Arc`, so `take()` on a sharing handle would
-    /// close the queue for the owner too and lose the trailing utterance.
+    /// queue is its job: the owner's `Drop` joins the worker, which only exits
+    /// once every sender (the sharing handles' too) is gone.
     owns_queue: bool,
     /// Kept for the final prune in `Drop` (the worker thread owns the only
     /// other copy).
@@ -62,7 +58,7 @@ pub(crate) struct SystemEmitter {
     worker_cut: Option<Arc<SpeechCut>>,
 }
 
-/// Bounded `rtrb` capacity for the emission queue. Emissions are seconds
+/// Bounded capacity of the emission queue. Emissions are seconds
 /// apart; 512 slots never fills in practice (the 200-rapid-emits test fits),
 /// and a full ring drops the newest with a warn rather than blocking
 /// inference.
@@ -160,24 +156,19 @@ impl SystemEmitter {
             worker.clipboard_available = false;
             worker.paste_available = false;
         }
-        let (tx, mut rx): (Producer<OwnedEmission>, Consumer<OwnedEmission>) =
-            RingBuffer::new(EMIT_QUEUE_CAP);
+        let (tx, rx) = sync_channel::<OwnedEmission>(EMIT_QUEUE_CAP);
+        // Blocks while the queue is empty and ends when every sender is gone,
+        // so an idle daemon has no thread polling the queue.
         let handle = std::thread::Builder::new()
             .name("emit".into())
-            .spawn(move || loop {
-                match rx.pop() {
-                    Ok(owned) => worker.handle(owned),
-                    Err(_) => {
-                        if rx.is_abandoned() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
+            .spawn(move || {
+                for owned in rx {
+                    worker.handle(owned);
                 }
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn emit thread: {e}"))?;
         Ok(Self {
-            tx: Some(Arc::new(Mutex::new(tx))),
+            tx: Some(tx),
             worker: Some(handle),
             owns_queue: true,
             dump_dir,
@@ -279,17 +270,16 @@ impl Drop for SystemEmitter {
 impl Emitter for SystemEmitter {
     fn emit(&mut self, emission: Emission<'_>) {
         let owned = OwnedEmission::from_borrowed(emission);
-        let Some(cell) = self.tx.as_ref() else { return };
-        // Locked rather than `get_mut`: with a translation step in play this
-        // emitter is one of two writing the same queue.
-        let mut tx = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tx) = self.tx.as_ref() else { return };
         // Bounded: never blocks inference. Only fails when full or when
         // the worker died, neither of which must take transcription down.
-        if let Err(rtrb::PushError::Full(back)) = tx.push(owned) {
-            if tx.is_abandoned() {
-                log::warn!("emit worker gone, dropping {}", back.tag);
-            } else {
+        match tx.try_send(owned) {
+            Ok(()) => {}
+            Err(TrySendError::Full(back)) => {
                 log::warn!("emit queue full, dropping {}", back.tag);
+            }
+            Err(TrySendError::Disconnected(back)) => {
+                log::warn!("emit worker gone, dropping {}", back.tag);
             }
         }
     }
