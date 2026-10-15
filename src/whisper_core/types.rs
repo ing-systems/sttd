@@ -262,6 +262,10 @@ pub struct KvCache {
     /// the same order as `tensors`. Built once at capture: they never change,
     /// and the cached steps feed them once per token.
     input_names: Vec<String>,
+    /// The self-attention slots as `(index into tensors, present.* output
+    /// name)`: what `update_decoder` reads back after every step, so the
+    /// names are built once here rather than formatted per token.
+    decoder_outputs: Vec<(usize, String)>,
 }
 
 impl KvCache {
@@ -270,13 +274,14 @@ impl KvCache {
     pub fn capture(outputs: &ort::session::SessionOutputs<'_>) -> Result<Self, WhisperError> {
         let mut tensors = Vec::with_capacity(DECODER_LAYERS * 4);
         let mut input_names = Vec::with_capacity(DECODER_LAYERS * 4);
-        for (layer, half, kv) in input_slots() {
+        let mut decoder_outputs = Vec::with_capacity(DECODER_LAYERS * 2);
+        for (index, (layer, half, kv)) in input_slots().enumerate() {
             input_names.push(format!("past_key_values.{layer}.{}.{kv}", half.as_str()));
             let name = present_name(input_names.last().expect("just pushed"));
             tensors.push(
                 outputs
                     .get(name.as_str())
-                    .ok_or(WhisperError::OutputNotFound(name.clone()))?
+                    .ok_or_else(|| WhisperError::OutputNotFound(name.clone()))?
                     // The output tensor is owned by the session's output borrow,
                     // so the cache needs its own copy to outlive this call. The
                     // self-attn half is 4 x 20 x seq x 64 floats; the encoder
@@ -285,11 +290,15 @@ impl KvCache {
                     .try_extract_array::<f32>()?
                     .to_owned(),
             );
+            if half == Half::Decoder {
+                decoder_outputs.push((index, name));
+            }
         }
         debug_assert_eq!(tensors.len(), input_names.len());
         Ok(Self {
             tensors,
             input_names,
+            decoder_outputs,
         })
     }
 
@@ -333,17 +342,13 @@ impl KvCache {
         &mut self,
         outputs: &ort::session::SessionOutputs<'_>,
     ) -> Result<(), WhisperError> {
-        for (index, (_, half, _)) in input_slots().enumerate() {
-            if half != Half::Decoder {
-                continue;
-            }
-            let name = present_name(&self.input_names[index]);
+        for (index, name) in &self.decoder_outputs {
             let value = outputs
                 .get(name.as_str())
-                .ok_or(WhisperError::OutputNotFound(name.clone()))?
+                .ok_or_else(|| WhisperError::OutputNotFound(name.clone()))?
                 .try_extract_array::<f32>()?
                 .to_owned();
-            self.tensors[index] = value;
+            self.tensors[*index] = value;
         }
         Ok(())
     }
