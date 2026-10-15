@@ -29,9 +29,9 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SupportedStreamConfig;
-use resampler::{Attenuation, Latency, ResamplerFir};
 
 use crate::clock::{now_ms, past_deadline};
+use crate::dsp::FirStream;
 
 /// Peak amplitude of the cue tones. Conservative so a loud desktop mix
 /// doesn't clip.
@@ -168,57 +168,28 @@ fn default_output() -> Option<(cpal::Device, SupportedStreamConfig, u32)> {
 
 /// Resample mono `input` from `in_rate` to `out_rate`, once, as a whole buffer.
 ///
-/// The same `ResamplerFir` the capture path uses (`dsp::FirStream`), so speech
-/// and mic audio pass one filter: a pass-through when the rates already agree,
-/// and one zero-drain at the end so the FIR's own tail is not truncated. Pure
-/// over its inputs, so it is unit-tested; device I/O is not.
+/// The capture path's own `dsp::FirStream`, so speech and mic audio pass one
+/// filter: a pass-through when the rates already agree, and a zero-drain at
+/// the end so the last few milliseconds still inside the FIR come out too. The
+/// filter starts its output already compensated for its own delay, so the
+/// result is cut back to the input's duration: the signal ends just before
+/// that, and the rest of the drain is silence. Pure over its inputs, so it is
+/// unit-tested; device I/O is not.
 pub(crate) fn resample_mono(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
     if input.is_empty() || in_rate == out_rate || in_rate == 0 || out_rate == 0 {
         return input.to_vec();
     }
-    let mut resampler =
-        ResamplerFir::new_from_hz(1, in_rate, out_rate, Latency::Sample32, Attenuation::Db90);
-    let out: Vec<f32> = resample_all(&mut resampler, input);
-    // Drain the FIR delay and the buffered tail, as `FirStream::flush`
-    // does for the capture path. Bounded: zeros in produce zeros out, so a
-    // fixed drain cannot synthesize indefinite silence.
-    let flush = vec![0.0f32; (resampler.delay() + 2048).max(2048)];
-    let drained = resample_all(&mut resampler, &flush);
-    if drained.iter().any(|s| *s != 0.0) {
-        log::trace!(
-            "playback resampler drain produced {} samples",
-            drained.len()
-        );
-    }
-    out
-}
-
-/// Feed `input` through `resampler` until it is consumed, appending every output
-/// sample.
-///
-/// One `resample` call consumes only what fits its output slice and buffers the
-/// rest, so this loops — the same reason `dsp::FirStream::feed` does, and
-/// without it a 1 s buffer would come back a fraction of its length.
-fn resample_all(resampler: &mut ResamplerFir, input: &[f32]) -> Vec<f32> {
-    let mut out: Vec<f32> = Vec::with_capacity(input.len() * 2 + 4096);
-    // A generous fixed scratch: big enough that the loop is one or two passes,
-    // and no allocation happens inside it.
-    let mut scratch = vec![0.0f32; 16 * 1024];
-    let mut offset = 0usize;
-    while offset < input.len() {
-        let (consumed, produced) = match resampler.resample(&input[offset..], &mut scratch) {
-            Ok(pair) => pair,
-            Err(e) => {
-                log::warn!("playback resampling failed ({e:?}); playing what was converted");
-                break;
-            }
-        };
-        out.extend_from_slice(&scratch[..produced]);
-        offset += consumed;
-        if consumed == 0 && produced == 0 {
-            break;
-        }
-    }
+    // 10 ms of output: only sizes the stream's scratch and its drain.
+    let frame_out = (out_rate as usize / 100).max(1);
+    let Ok(mut fir) = FirStream::new(in_rate, out_rate, frame_out) else {
+        // Unreachable with distinct non-zero rates; play it unconverted.
+        return input.to_vec();
+    };
+    let mut out = Vec::with_capacity(input.len() * out_rate as usize / in_rate as usize + 4096);
+    fir.feed(input, &mut out);
+    fir.flush(&mut out);
+    let duration = (input.len() as u64 * u64::from(out_rate)).div_ceil(u64::from(in_rate));
+    out.truncate(duration as usize);
     out
 }
 
@@ -445,6 +416,29 @@ mod tests {
             down.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.5,
             "the signal survived"
         );
+    }
+
+    #[test]
+    fn resampling_keeps_the_end_of_the_audio() {
+        // A steady level up to the very last input sample. The filter
+        // compensates its delay at the front, so the signal runs until `delay`
+        // input samples before the end of the one-second output: 1 ms before
+        // that (clear of the edge's ringing) it must still be at the level,
+        // not cut off because the FIR's tail was never drained into it. And the
+        // output lasts exactly the input's second.
+        for (in_rate, out_rate) in [(22_050u32, 48_000u32), (16_000, 48_000), (48_000, 22_050)] {
+            let input = vec![0.5f32; in_rate as usize];
+            let out = resample_mono(&input, in_rate, out_rate);
+            assert_eq!(out.len(), out_rate as usize, "{in_rate}->{out_rate}");
+            let delay = FirStream::new(in_rate, out_rate, 1).unwrap().delay();
+            let signal_end = (in_rate as usize - delay) * out_rate as usize / in_rate as usize;
+            let probe = signal_end - out_rate as usize / 1000;
+            let level = out[probe];
+            assert!(
+                (level - 0.5).abs() < 0.02,
+                "{in_rate}->{out_rate}: sample {probe} is {level}"
+            );
+        }
     }
 
     /// Sign changes over the whole buffer, a cheap frequency proxy.

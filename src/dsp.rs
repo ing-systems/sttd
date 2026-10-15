@@ -383,6 +383,12 @@ impl FirStream {
         }
     }
 
+    /// The filter's delay in input samples. Zero for a pass-through.
+    #[cfg(test)]
+    pub(crate) fn delay(&self) -> usize {
+        self.inner.as_ref().map_or(0, ResamplerFir::delay)
+    }
+
     /// Drop buffered state for a pause transition, so the first frames after
     /// resume aren't blended from pre-pause audio.
     pub(crate) fn clear(&mut self) {
