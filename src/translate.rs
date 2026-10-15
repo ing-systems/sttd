@@ -53,7 +53,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -1216,8 +1216,9 @@ fn cache_slots(
 // The state lives in this module rather than in `dbus` because it owns the
 // weights and the loader threads, and `translator_store` plus three `ort`
 // sessions are not a bus concern: `dbus` holds this handle and forwards calls,
-// the way `asr` holds `control::DictionaryState`. The dependency therefore points
-// one way, `dbus -> translate`.
+// the way `asr` holds `control::DictionaryState`. The dependency therefore
+// points one way, `dbus -> translate`: what this module announces goes through
+// a hook `dbus::spawn` installs (`TranslationState::set_change_hook`).
 //
 // Two rules hold the whole thing together:
 //
@@ -1555,7 +1556,15 @@ pub(crate) struct TranslationState<T = Translator, L = RealTranslator> {
     /// keeps two sets of weights from being built side by side beyond the pair
     /// already held and the one arriving.
     loading: Arc<Mutex<()>>,
+    /// Who hears about a change no bus call is waiting on. Set once, after
+    /// construction, and shared by every clone.
+    on_change: Arc<OnceLock<ChangeHook>>,
 }
+
+/// The listener for [`TranslationState`] changes: `(enabled, target, model, ok,
+/// message)`, the arguments of the bus's `TranslationChanged` signal. Injected
+/// rather than called, so the dependency points one way, `dbus -> translate`.
+pub(crate) type ChangeHook = Box<dyn Fn(bool, &str, &str, bool, &str) + Send + Sync>;
 
 /// A poisoned lock must not kill transcription: take the value and continue.
 fn lock_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -1584,6 +1593,15 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
             plan: Arc::new(plan),
             loader,
             loading: Arc::new(Mutex::new(())),
+            on_change: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Install the listener `announce` reports to. Only the first call takes
+    /// effect; a run has one bus.
+    pub(crate) fn set_change_hook(&self, hook: ChangeHook) {
+        if self.on_change.set(hook).is_err() {
+            log::warn!("translate: a change hook is already installed");
         }
     }
 
@@ -1905,8 +1923,6 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
         }
     }
 
-    /// Emit `TranslationChanged` from outside an interface method: the loader
-    /// thread, and every refusal, which have no emitter to hand.
     /// A load that was superseded before it landed, reported as a debug line
     /// rather than a failure: it did its work, and a newer request wants the slot.
     #[cfg(test)]
@@ -1916,15 +1932,15 @@ impl<T: Loaded, L: Loads<T>> TranslationState<T, L> {
         }
     }
 
+    /// Report a change from outside an interface method — the loader thread,
+    /// and every refusal, which have no emitter to hand — through the hook
+    /// [`Self::set_change_hook`] installed. Silent when none is installed.
     fn announce(&self, ok: bool, message: &str) {
+        let Some(hook) = self.on_change.get() else {
+            return;
+        };
         let cached = lock_read(&self.cached);
-        crate::dbus::emit_translation_changed(
-            cached.enabled,
-            &cached.target,
-            &cached.model,
-            ok,
-            message,
-        );
+        hook(cached.enabled, &cached.target, &cached.model, ok, message);
     }
 
     /// The translation thread's half: run one decode under the slot lock, so a
@@ -2004,6 +2020,7 @@ impl<T, L: Clone> Clone for TranslationState<T, L> {
             plan: Arc::clone(&self.plan),
             loader: self.loader.clone(),
             loading: Arc::clone(&self.loading),
+            on_change: Arc::clone(&self.on_change),
         }
     }
 }

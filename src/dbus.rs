@@ -430,6 +430,9 @@ pub(crate) fn spawn(
     dictionary: DictionaryState,
     translation: crate::translate::TranslationState,
 ) {
+    // The loader thread and the refusals announce through this; installed
+    // before the service runs, and a no-op until the name is claimed.
+    translation.set_change_hook(Box::new(emit_translation_changed));
     thread::spawn(move || {
         const BACKOFF: [Duration; 4] = [
             Duration::from_secs(2),
