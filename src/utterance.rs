@@ -232,14 +232,15 @@ impl UtteranceBuffer {
     /// utterance (and sent to the model) — only the two loudness
     /// measurements are redirected.
     ///
-    /// `FrameProcessor` passes the *pre-AGC* model-frame RMS
-    /// (`Agc::process_pair`'s return value) as `evidence_rms`, so evidence
+    /// `FrameProcessor` passes the *pre-AGC* model-frame RMS (the first value
+    /// `Agc::process_pair` returns) as `evidence_rms`, so evidence
     /// describes what the microphone actually heard rather than what the
     /// shared-gain AGC did to it afterward: `Agc` can amplify quiet-but-real
     /// speech up to 8x toward `--target-rms`, which used to amplify the
     /// evidence RMS regardless of how quiet the speech actually was. It passes
-    /// the *post-AGC* RMS as `frame_rms`, because the quiet run and the
-    /// early-split gate judge the audio that actually reaches the model.
+    /// the *post-AGC* RMS (the second value) as `frame_rms`, because the quiet
+    /// run and the early-split gate judge the audio that actually reaches the
+    /// model.
     pub(crate) fn push_frame_evidenced(
         &mut self,
         frame: &[f32],

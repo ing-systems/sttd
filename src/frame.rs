@@ -224,19 +224,17 @@ impl Detect {
     fn absorb_pair(&mut self, pair: PairedFrames<'_>) -> Option<Utterance> {
         match pair {
             PairedFrames::Shared(frame) => {
-                let evidence_rms = self.agc.process_shared(frame, self.prev_speech);
-                let loudness = frame_rms(frame);
+                let (evidence_rms, loudness) = self.agc.process_shared(frame, self.prev_speech);
                 let is_speech = self.vad.verdict(frame, loudness);
                 self.prev_speech = is_speech;
                 self.absorb_frame(frame, is_speech, evidence_rms, loudness)
             }
             PairedFrames::Split(vad_frame, model_frame) => {
-                let evidence_rms = self
-                    .agc
-                    .process_pair(vad_frame, model_frame, self.prev_speech);
+                let (evidence_rms, loudness) =
+                    self.agc
+                        .process_pair(vad_frame, model_frame, self.prev_speech);
                 let is_speech = self.vad.verdict(vad_frame, frame_rms(vad_frame));
                 self.prev_speech = is_speech;
-                let loudness = frame_rms(model_frame);
                 self.absorb_frame(model_frame, is_speech, evidence_rms, loudness)
             }
         }

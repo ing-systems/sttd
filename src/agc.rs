@@ -91,7 +91,9 @@ impl Agc {
     /// `peak` is the caller's already-measured peak of this buffer. A single
     /// hot sample only limits this frame's application; the loop state keeps
     /// the smoother gain.
-    fn apply_gain(buf: &mut [f32], gain: f32, peak: f32) {
+    ///
+    /// Returns whether the buffer was scaled at all.
+    fn apply_gain(buf: &mut [f32], gain: f32, peak: f32) -> bool {
         let applied = if peak > 0.0 {
             gain.min(0.99 / peak).max(1.0)
         } else {
@@ -102,6 +104,22 @@ impl Agc {
                 *s *= applied;
             }
         }
+        applied > 1.0
+    }
+
+    /// Scale `buf` by `gain` under the 0.99 peak limit and return its RMS
+    /// afterwards: `rms` (the caller's pre-gain measurement) when it was left
+    /// untouched, so silence and gated-off frames are scanned only once.
+    fn gain_and_measure(buf: &mut [f32], gain: Option<f32>, rms: f32) -> f32 {
+        let Some(gain) = gain else {
+            return rms;
+        };
+        let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        if Self::apply_gain(buf, gain, peak) {
+            frame_rms(buf)
+        } else {
+            rms
+        }
     }
 
     /// Process a VAD/model pair with shared gain, gated by the previous
@@ -110,43 +128,40 @@ impl Agc {
     /// the model (stored) branch then applies the same gain to both so the
     /// verdict always describes the buffered audio.
     ///
-    /// Returns the model frame's RMS *before* any gain is applied, on every code
-    /// path (including the silence/gated-off early returns). Callers use
-    /// this as the utterance buffer's acoustic evidence (`Evidence.rms`,
-    /// `gate::floor_for`'s weak/strong split) instead of `frame_rms` on the
-    /// (possibly gained) buffered audio — evidence should describe what the
-    /// microphone actually heard, not what this AGC did to it afterward.
+    /// Returns `(pre_gain_rms, post_gain_rms)` of the model frame. The
+    /// pre-gain RMS is reported on every code path (including the
+    /// silence/gated-off early returns): callers use it as the utterance
+    /// buffer's acoustic evidence (`Evidence.rms`, `gate::floor_for`'s
+    /// weak/strong split) instead of the RMS of the (possibly gained)
+    /// buffered audio — evidence should describe what the microphone actually
+    /// heard, not what this AGC did to it afterward. The post-gain RMS is what
+    /// the buffer and the model get.
     pub(crate) fn process_pair(
         &mut self,
         vad: &mut [f32],
         model: &mut [f32],
         prev_speech: bool,
-    ) -> f32 {
+    ) -> (f32, f32) {
         debug_assert_eq!(model.len(), FRAME_16K, "frames are fixed size");
         let rms = frame_rms(model);
-        if let Some(gain) = self.adapt(rms, prev_speech) {
-            for buf in [vad, model] {
-                let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-                Self::apply_gain(buf, gain, peak);
-            }
+        let gain = self.adapt(rms, prev_speech);
+        if let Some(gain) = gain {
+            let peak = vad.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            Self::apply_gain(vad, gain, peak);
         }
-        rms
+        (rms, Self::gain_and_measure(model, gain, rms))
     }
 
     /// Same as `process_pair`, for the default `Direct` topology where one
-    /// allocation serves both roles: the gain is measured and applied once,
-    /// and the caller reads the same samples for the VAD verdict and for the
+    /// frame serves both roles: the gain is measured and applied once, and
+    /// the caller reads the same samples for the VAD verdict and for the
     /// utterance buffer. Applying the pair's per-buffer gain twice to one
     /// buffer would be a double gain, so the shared path scales once.
-    pub(crate) fn process_shared(&mut self, frame: &mut [f32], prev_speech: bool) -> f32 {
+    pub(crate) fn process_shared(&mut self, frame: &mut [f32], prev_speech: bool) -> (f32, f32) {
         debug_assert_eq!(frame.len(), FRAME_16K, "frames are fixed size");
         let rms = frame_rms(frame);
-        if let Some(gain) = self.adapt(rms, prev_speech) {
-            // Clip safety: never push peak past 0.99.
-            let peak = frame.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-            Self::apply_gain(frame, gain, peak);
-        }
-        rms
+        let gain = self.adapt(rms, prev_speech);
+        (rms, Self::gain_and_measure(frame, gain, rms))
     }
 
     /// Reset to unity gain + target envelope for pause/discard transitions.
@@ -242,9 +257,9 @@ mod tests {
 
         let mut vad = vec![0.005f32; FRAME_16K];
         let mut model = vec![0.005f32; FRAME_16K];
-        let pre_gain_rms = agc.process_pair(&mut vad, &mut model, true);
-        // The buffer itself was amplified...
-        let post_gain_rms = frame_rms(&model);
+        let (pre_gain_rms, post_gain_rms) = agc.process_pair(&mut vad, &mut model, true);
+        // The buffer itself was amplified, and the second value measures it...
+        assert_eq!(post_gain_rms, frame_rms(&model));
         assert!(
             post_gain_rms > pre_gain_rms * 1.2,
             "sanity: frame must actually have been amplified, pre={pre_gain_rms} post={post_gain_rms}"
@@ -265,8 +280,9 @@ mod tests {
         let mut agc = Agc::new(0.04, 8.0);
         let mut vad = vec![0.01f32; FRAME_16K];
         let mut model = vec![0.01f32; FRAME_16K];
-        let rms = agc.process_pair(&mut vad, &mut model, false); // prev_speech=false
+        let (rms, post) = agc.process_pair(&mut vad, &mut model, false); // prev_speech=false
         assert!((rms - 0.01).abs() < 1e-4, "got {rms}");
+        assert_eq!(post, rms, "an untouched frame keeps its level");
         assert_eq!(
             model,
             vec![0.01f32; FRAME_16K],
@@ -276,7 +292,7 @@ mod tests {
         let mut agc_off = Agc::new(0.0, 8.0); // target <= 0 disables entirely
         let mut vad2 = vec![0.01f32; FRAME_16K];
         let mut model2 = vec![0.01f32; FRAME_16K];
-        let rms2 = agc_off.process_pair(&mut vad2, &mut model2, true);
+        let (rms2, _) = agc_off.process_pair(&mut vad2, &mut model2, true);
         assert!((rms2 - 0.01).abs() < 1e-4, "got {rms2}");
     }
 }
