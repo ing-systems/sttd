@@ -19,7 +19,7 @@ Levenshtein gives S/D/I and WER = (S+D+I) / N.
 Sweep example (cartesian product, `;` between vars, `,` between values)::
 
     tools/eval.py --corpus corpus/ --output eval-out/ \\
-      --sweep "STTD_MIN_CONF=0.4,0.6;STTD_MIN_DENSITY=0.2,0.3" \\
+      --sweep "STTD_MIN_RMS=0.002,0.004;STTD_MIN_DENSITY=0.2,0.3" \\
       --extra-args --model whisper --language pl
 
 Comparing engines over one corpus::

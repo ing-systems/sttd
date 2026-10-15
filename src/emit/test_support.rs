@@ -11,7 +11,6 @@ use crate::utterance::Evidence;
 /// Spoken emission is absent rather than disabled: it has no in-memory stand-in
 /// (it would need a loaded voice and an output device), so `RecordingEmitter`
 /// mirrors it with a flag and the real thread is asserted elsewhere.
-#[cfg(test)]
 pub(crate) fn policy_off() -> EmissionPolicy {
     EmissionPolicy {
         dump_dir: None,
@@ -26,7 +25,6 @@ pub(crate) fn policy_off() -> EmissionPolicy {
 /// In-memory adapter: records what would reach the user instead of printing,
 /// copying, pasting, or touching the filesystem. Tests drive the gate →
 /// emission composition through this.
-#[cfg(test)]
 pub(crate) struct RecordingEmitter {
     pub records: Vec<RecordedEmission>,
     /// Simulate a failed clipboard copy: nothing is pasted, but the
@@ -41,7 +39,6 @@ pub(crate) struct RecordingEmitter {
 }
 
 /// What one `emit` call would have done.
-#[cfg(test)]
 pub(crate) struct RecordedEmission {
     pub tag: String,
     pub text: String,
@@ -62,7 +59,6 @@ pub(crate) struct RecordedEmission {
     pub wav_samples: usize,
 }
 
-#[cfg(test)]
 impl RecordingEmitter {
     pub(crate) fn new() -> Self {
         Self {
@@ -74,7 +70,6 @@ impl RecordingEmitter {
     }
 }
 
-#[cfg(test)]
 impl Emitter for RecordingEmitter {
     fn emit(&mut self, emission: Emission<'_>) {
         let wav_samples = emission.pcm.len();
@@ -122,14 +117,6 @@ pub(super) fn evidence() -> Evidence {
         total_frames: 200,
         rms: 0.01178,
     }
-}
-
-pub(super) fn strong_evidence() -> Evidence {
-    evidence()
-}
-
-pub(super) fn weak_evidence() -> Evidence {
-    evidence()
 }
 
 pub(super) fn emit<'a>(

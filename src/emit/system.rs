@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn confident_transcript_is_emitted_with_copy_and_paste() {
-        let evidence = strong_evidence();
+        let evidence = evidence();
         let verdict = gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn stdout_print_is_opt_in() {
-        let evidence = strong_evidence();
+        let evidence = evidence();
         let verdict = gate().decide_transcript("Dzień dobry");
         let pcm = vec![0.01f32; 1600];
         let mut emitter = RecordingEmitter::new();
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn paste_only_runs_on_fresh_copy() {
-        let evidence = strong_evidence();
+        let evidence = evidence();
         let verdict = gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         emitter.fail_copy = true;
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn hallucination_and_repetition_drops_record_kind() {
-        let evidence = strong_evidence();
+        let evidence = evidence();
         for (text, kind) in [
             (
                 "Napisy stworzone przez społeczność Amara.org",
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn empty_transcript_drops_but_wav_still_recorded() {
-        let evidence = weak_evidence();
+        let evidence = evidence();
         let verdict = gate().decide_transcript("   ");
         assert_eq!(verdict, TranscriptVerdict::DropEmpty);
         let mut emitter = RecordingEmitter::new();
@@ -579,7 +579,7 @@ mod tests {
         // an emit and a drop must exist immediately after drop returns.
         let dir = std::env::temp_dir().join(format!("sttd-emit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let evidence = strong_evidence();
+        let evidence = evidence();
         {
             let mut emitter = SystemEmitter::new(EmissionPolicy {
                 dump_dir: Some(dir.clone()),
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn emission_still_copies() {
         // The emission path must treat Emit exactly like any other Emit verdict.
-        let evidence = strong_evidence();
+        let evidence = evidence();
         let verdict = gate().decide_transcript("Dzień dobry");
         assert!(matches!(verdict, TranscriptVerdict::Emit));
         let mut emitter = RecordingEmitter::new();
@@ -641,7 +641,7 @@ mod tests {
         // still draining on the worker.
         let dir = std::env::temp_dir().join(format!("sttd-emit-nb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let evidence = strong_evidence();
+        let evidence = evidence();
         let mut emitter = SystemEmitter::new(EmissionPolicy {
             dump_dir: Some(dir.clone()),
             ..policy_off()
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn empty_emit_never_copies() {
-        let evidence = strong_evidence();
+        let evidence = evidence();
         let verdict = gate().decide_transcript("Dzień dobry");
         let mut emitter = RecordingEmitter::new();
         let pcm = vec![0.01f32; 1600];
@@ -687,7 +687,7 @@ mod tests {
     fn empty_emit_dumped_as_cleaned_drop() {
         let dir = std::env::temp_dir().join(format!("sttd-emit-empty-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
-        let evidence = strong_evidence();
+        let evidence = evidence();
         {
             let mut emitter = SystemEmitter::new(EmissionPolicy {
                 dump_dir: Some(dir.clone()),

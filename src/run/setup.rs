@@ -38,7 +38,7 @@ pub(super) fn prepare_model(
 ) -> Result<(ModelRef, Producer<Utterance>, Consumer<Utterance>)> {
     let model = resolve_model_input(cli)?;
     log::info!("model: {model}");
-    validate_model_flags(cli, &model)?;
+    validate_model_flags(cli, &model);
     let (tx, rx) = RingBuffer::<Utterance>::new(crate::asr::ASR_QUEUE_CAP);
     Ok((model, tx, rx))
 }
@@ -81,7 +81,7 @@ pub(super) fn ignored_model_flags(cli: &Cli, model: &ModelRef) -> Vec<&'static s
 
 /// Warn about flags the selected engine ignores, then log what that engine
 /// does about the spoken language.
-pub(super) fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
+pub(super) fn validate_model_flags(cli: &Cli, model: &ModelRef) {
     let ignored = ignored_model_flags(cli, model);
     if !ignored.is_empty() {
         log::warn!(
@@ -101,7 +101,6 @@ pub(super) fn validate_model_flags(cli: &Cli, model: &ModelRef) -> Result<()> {
             language => log::info!("Whisper decodes in {language} (--language)"),
         },
     }
-    Ok(())
 }
 
 /// The worker's whole configuration, resolved once from `Cli` on this thread
@@ -348,7 +347,7 @@ mod tests {
                 "{}",
                 kind.as_str()
             );
-            assert!(validate_model_flags(&cli, &model).is_ok());
+            validate_model_flags(&cli, &model);
         }
     }
 
@@ -402,7 +401,7 @@ mod tests {
         assert_eq!(ignored_model_flags(&cli, &parakeet), vec!["--audio-ctx"]);
         // Whisper's encoder is patched when the model loads, so the floor applies.
         assert!(ignored_model_flags(&cli, &whisper).is_empty());
-        assert!(validate_model_flags(&cli, &parakeet).is_ok());
+        validate_model_flags(&cli, &parakeet);
 
         // The default is not a setting, so nothing is reported for it.
         let plain = Cli::try_parse_from(["sttd"]).expect("must parse");

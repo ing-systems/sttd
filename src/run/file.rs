@@ -103,12 +103,10 @@ pub(crate) fn run_file_mode(path: &Path, cli: &Cli) -> Result<()> {
         }
     }
 
-    let mut offset = 0usize;
-    while offset + input_frames <= wav.samples.len() {
-        if let Some(utterance) = fp.process_frame(&wav.samples[offset..offset + input_frames]) {
+    for frame in wav.samples.chunks_exact(input_frames) {
+        if let Some(utterance) = fp.process_frame(frame) {
             push_utterance(&mut asr_tx, utterance, Backpressure::Wait);
         }
-        offset += input_frames;
     }
     // A trailing partial chunk (< input_frames samples, at most ~30 ms) is
     // dropped; fine for offline comparison runs.

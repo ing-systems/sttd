@@ -75,10 +75,7 @@ impl Daemon {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         self.state.set_paused(true);
-        emitter
-            .state_changed(true)
-            .await
-            .map_err(zbus::fdo::Error::ZBus)
+        Ok(emitter.state_changed(true).await?)
     }
 
     /// Resume transcription. Idempotent. With `--autopause` the ASR lane arms
@@ -88,10 +85,7 @@ impl Daemon {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         self.state.set_paused(false);
-        emitter
-            .state_changed(false)
-            .await
-            .map_err(zbus::fdo::Error::ZBus)
+        Ok(emitter.state_changed(false).await?)
     }
 
     /// Flip the pause state and return the new value.
@@ -476,20 +470,23 @@ fn build(
         .build()
 }
 
+/// An emitter for a signal on `path`, for the senders outside an interface
+/// method. `None` without a connection (the bus is optional), or, logged at
+/// debug, when one cannot be made.
+fn signal_emitter(path: &'static str) -> Option<SignalEmitter<'static>> {
+    let conn = CONNECTION.get()?;
+    SignalEmitter::new(conn.inner(), path)
+        .inspect_err(|e| log::debug!("dbus: no signal emitter ({e})"))
+        .ok()
+}
+
 /// Emit `StateChanged` from outside an interface method (signal handlers).
 ///
 /// Silent no-op when the bus is not available: the caller is a signal
 /// handler, and a pause must never fail because the bus is missing.
 pub(crate) fn emit_state_changed(paused: bool) {
-    let Some(conn) = CONNECTION.get() else {
+    let Some(emitter) = signal_emitter(DAEMON_PATH) else {
         return;
-    };
-    let emitter = match SignalEmitter::new(conn.inner(), DAEMON_PATH) {
-        Ok(emitter) => emitter,
-        Err(e) => {
-            log::debug!("dbus: no signal emitter ({e})");
-            return;
-        }
     };
     if let Err(e) = zbus::block_on(emitter.state_changed(paused)) {
         log::warn!("dbus: StateChanged({paused}) failed: {e}");
@@ -509,15 +506,8 @@ pub(crate) fn emit_translation_changed(
     ok: bool,
     message: &str,
 ) {
-    let Some(conn) = CONNECTION.get() else {
+    let Some(emitter) = signal_emitter(TRANSLATION_PATH) else {
         return;
-    };
-    let emitter = match SignalEmitter::new(conn.inner(), TRANSLATION_PATH) {
-        Ok(emitter) => emitter,
-        Err(e) => {
-            log::debug!("dbus: no signal emitter ({e})");
-            return;
-        }
     };
     if let Err(e) = zbus::block_on(emitter.translation_changed(
         enabled,

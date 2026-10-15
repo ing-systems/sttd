@@ -348,7 +348,7 @@ mod tests {
     fn speech_is_opt_in_and_follows_the_same_emit_rules() {
         // The channel mirrors stdout: off by default, and only ever handed an
         // utterance the gate actually emitted.
-        let evidence = strong_evidence();
+        let evidence = evidence();
         let pcm = vec![0.01f32; 1600];
         let mut emitter = RecordingEmitter::new();
         emit(

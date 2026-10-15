@@ -143,7 +143,7 @@ mod tests {
         use crate::config::DUMP_KEEP_FILES;
         let dir = std::env::temp_dir().join(format!("sttd-emit-retain-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
-        let evidence = strong_evidence();
+        let evidence = evidence();
         {
             let mut emitter = SystemEmitter::new(EmissionPolicy {
                 dump_dir: Some(dir.clone()),
