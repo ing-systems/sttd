@@ -49,7 +49,7 @@ See the doc comment at the top of `src/main.rs` and `CONTEXT.md` for vocabulary 
 
 ## Models
 
-Two engines ship behind one `--model` flag. Catalog (`src/config.rs`):
+Two engines ship behind one `--model` flag. Catalog (`src/model_store.rs`):
 
 | Spec | Size | Contents |
 | --- | --- | --- |
