@@ -5,14 +5,14 @@
 // One concept — a paired VAD verdict describing the model-branch audio it
 // is attached to — used to require bouncing between `frame`, `dsp`,
 // `denoise` and `vad`. `FrameProcessor` managed three `FirStream` adapters,
-// paired queues, `Arc` sharing and `clean48` scratch, triplicating
-// Direct vs Denoised logic across feed / flush / discard.
+// paired queues and `clean48` scratch, triplicating Direct vs Denoised logic
+// across feed / flush / discard.
 //
 // This module owns branch topology, resampling cadence, denoising, high-pass
 // filtering and verdict pairing internally. Callers feed hw-rate chunks and
-// receive ready `PairedFrames` (already 80 Hz HP'd); they never see
-// `FirStream`, the denoiser's 48 kHz intermediate, or how pairing stays in
-// lockstep. `feed`/`flush` share one body per topology; only the resampler
+// are lent each ready `PairedFrames` (already 80 Hz HP'd) in place, from one
+// contiguous buffer per branch; they never see `FirStream`, the denoiser's
+// 48 kHz intermediate, or how pairing stays in lockstep. `feed`/`flush` share one body per topology; only the resampler
 // call differs between feeding a chunk and flushing the tail.
 
 use anyhow::{Context, Result};
