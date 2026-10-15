@@ -41,7 +41,7 @@ const FADE_MS: u64 = 10;
 /// Silence between the two `ready` tones.
 const READY_GAP_MS: u64 = 50;
 /// Quiet window the capture side discards around cue playback so cue tones
-/// are never transcribed (see `main::cue_guard`). Covers the longest cue
+/// are never transcribed (see `run::microphone::MicLoop::cue_guard`). Covers the longest cue
 /// (ready: 100 + 50 gap + 150 = 300 ms) plus output-device open latency on
 /// the detached cue thread.
 pub(crate) const CUE_QUIET_MS: u64 = 500;

@@ -302,7 +302,7 @@ pub(crate) fn select_input_device(host: &cpal::Host, wanted: Option<&str>) -> Re
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StreamTelemetry {
     /// Callbacks that overflowed the raw sample ring (capture outruns
-    /// resampling; see `RAW_RING_SECS` in `main`).
+    /// resampling; see `run::microphone::RAW_RING_SECS`).
     pub(crate) dropped_chunks: Arc<AtomicUsize>,
     /// `err_fn` invocations (xruns, backend errors).
     pub(crate) errors: Arc<AtomicUsize>,

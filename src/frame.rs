@@ -89,7 +89,7 @@ impl FrameProcessor {
     }
 
     /// Whether an utterance is currently buffered (opened, not yet closed).
-    /// The beep-leak guard (`main::cue_guard`) skips its discard when speech
+    /// The beep-leak guard (`run::microphone::MicLoop::cue_guard`) skips its discard when speech
     /// is in flight so a cue never cuts real audio.
     pub(crate) const fn has_open_utterance(&self) -> bool {
         self.utterance.is_open()

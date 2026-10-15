@@ -72,7 +72,7 @@ pub(crate) struct SpeechCut {
 /// The case it exists for is `--file`, the only path that transcribes to the
 /// end. A live run never reaches it with a new utterance: `running` is false by
 /// then, so the engine's shutdown check rejects the trailing decode
-/// (`main.rs`, `parakeet.rs`, `whisper.rs`) and nothing new is queued. What the
+/// (`run::microphone`, `parakeet.rs`, `whisper.rs`) and nothing new is queued. What the
 /// drain waits for there is the queue already built — the sentence playing, plus
 /// whatever the emit worker hands over while it closes — which is exactly what
 /// Ctrl-C must not wait 15 s for. See `SpeechCut`.

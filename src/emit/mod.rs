@@ -33,7 +33,7 @@ pub(crate) use clipboard::{
     copy_to_clipboard, is_wayland_session_env, last_text_path, paste_via_ydotool, type_via_ydotool,
     PasteMode,
 };
-pub(crate) use speech::SpeechOut;
+pub(crate) use speech::{SpeechCut, SpeechOut};
 pub(crate) use system::{EmissionPolicy, SystemEmitter};
 #[cfg(test)]
 pub(crate) use test_support::{RecordedEmission, RecordingEmitter};
