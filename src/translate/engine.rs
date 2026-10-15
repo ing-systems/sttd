@@ -2,7 +2,7 @@
 //! the greedy decode over them.
 
 use anyhow::{Context, Result};
-use ndarray17::{ArrayD, ArrayViewD};
+use ndarray17::{ArrayD, ArrayView2, ArrayViewD};
 use ort::session::Session;
 use ort::session::SessionInputValue;
 use ort::value::{Tensor, TensorRef};
@@ -376,11 +376,11 @@ impl Translator {
                 ids.push(self.eos_token);
             }
         }
-        let hidden = self.run_encoder(&ids)?;
-        let enc_len = ids.len();
-        // The one attention mask both steps take, built once: the prompt step
-        // masks the encoder for the whole decode, and so does every step after it.
-        let encoder_mask = vec![1i64; enc_len];
+        // The one attention mask the encoder and both decoder steps take, built
+        // once: the prompt step masks the encoder for the whole decode, and so
+        // does every step after it.
+        let encoder_mask = vec![1i64; ids.len()];
+        let hidden = self.run_encoder(&ids, &encoder_mask)?;
 
         // The decoder opens on the family's opening ids and nothing else: the source
         // text reaches the model through `encoder_hidden_states` and nowhere else.
@@ -422,18 +422,13 @@ impl Translator {
             .map_err(|e| anyhow::anyhow!("failed to decode the translated tokens: {e}"))
     }
 
-    /// The encoder over one piece's token ids, returning its hidden states.
-    fn run_encoder(&mut self, ids: &[i64]) -> Result<ArrayD<f32>> {
+    /// The encoder over one piece's token ids (all attended: `mask` is ones),
+    /// returning its hidden states.
+    fn run_encoder(&mut self, ids: &[i64], mask: &[i64]) -> Result<ArrayD<f32>> {
         let len = ids.len();
         let named: Vec<(&str, SessionInputValue<'_>)> = vec![
-            (
-                "input_ids",
-                Tensor::from_array((vec![1usize, len], ids.to_vec()))?.into(),
-            ),
-            (
-                "attention_mask",
-                Tensor::from_array((vec![1usize, len], vec![1i64; len]))?.into(),
-            ),
+            ("input_ids", row(ids)?.into()),
+            ("attention_mask", row(mask)?.into()),
         ];
         let outputs = self
             .encoder
@@ -488,18 +483,12 @@ impl Translator {
         let slots = self.prompt_slots.empty_inputs();
         let mut named: Vec<(&str, SessionInputValue<'_>)> =
             Vec::with_capacity(self.prompt_slots.empty.len() + 4);
-        named.push((
-            "input_ids",
-            Tensor::from_array((vec![1usize, opening.len()], opening.to_vec()))?.into(),
-        ));
+        named.push(("input_ids", row(opening)?.into()));
         named.push((
             "encoder_hidden_states",
             TensorRef::from_array_view(hidden.view())?.into(),
         ));
-        named.push((
-            "encoder_attention_mask",
-            Tensor::from_array((vec![1usize, encoder_mask.len()], encoder_mask.to_vec()))?.into(),
-        ));
+        named.push(("encoder_attention_mask", row(encoder_mask)?.into()));
         named.push(("use_cache_branch", use_cache_branch_tensor(false)?.into()));
         named.extend(slots);
         let outputs = self
@@ -526,16 +515,13 @@ impl Translator {
         cache: &mut KvCache,
         encoder_mask: &[i64],
     ) -> Result<usize> {
+        let token = [token];
         let mut named: Vec<(&str, SessionInputValue<'_>)> = Vec::with_capacity(cache.len() + 2);
-        named.push((
-            "input_ids",
-            Tensor::from_array((vec![1usize, 1], vec![token]))?.into(),
-        ));
-        named.push((
-            "encoder_attention_mask",
-            Tensor::from_array((vec![1usize, encoder_mask.len()], encoder_mask.to_vec()))?.into(),
-        ));
-        named.extend(cache.named_inputs()?);
+        named.push(("input_ids", row(&token)?.into()));
+        named.push(("encoder_attention_mask", row(encoder_mask)?.into()));
+        for input in cache.named_inputs() {
+            named.push(input?);
+        }
         let outputs = self
             .decoder_cached
             .run(named)
@@ -546,6 +532,15 @@ impl Translator {
             .context("failed to read the decoder's next key/value cache")?;
         Ok(next)
     }
+}
+
+/// `values` as a `[1, len]` input, borrowed in place: the ids and the mask
+/// already live in a slice, so no step copies them into a tensor of its own.
+fn row(values: &[i64]) -> Result<TensorRef<'_, i64>> {
+    Ok(TensorRef::from_array_view(ArrayView2::from_shape(
+        (1, values.len()),
+        values,
+    )?)?)
 }
 
 /// The token a decoder run's last logits row points at.

@@ -129,19 +129,19 @@ impl KvCache {
         self.slots.len()
     }
 
-    /// Every slot as a named input, in slot order, borrowed rather than rebuilt.
-    pub(super) fn named_inputs(&self) -> Result<Vec<(&str, SessionInputValue<'_>)>> {
-        self.slots
-            .iter()
-            .map(|(name, tensor)| {
-                Ok((
-                    name.as_str(),
-                    TensorRef::from_array_view(tensor.view())
-                        .with_context(|| format!("{name} must be convertible"))?
-                        .into(),
-                ))
-            })
-            .collect()
+    /// Every slot as a named input, in slot order, borrowed rather than rebuilt,
+    /// for the caller to append to its own input list.
+    pub(super) fn named_inputs(
+        &self,
+    ) -> impl Iterator<Item = Result<(&str, SessionInputValue<'_>)>> {
+        self.slots.iter().map(|(name, tensor)| {
+            Ok((
+                name.as_str(),
+                TensorRef::from_array_view(tensor.view())
+                    .with_context(|| format!("{name} must be convertible"))?
+                    .into(),
+            ))
+        })
     }
 
     /// Replace the self-attention half from one cached run, leaving the
